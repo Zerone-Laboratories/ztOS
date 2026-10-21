@@ -10,6 +10,7 @@ namespace (mke2fs -d, mtools), so nothing is ever mounted for real.
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -26,7 +27,9 @@ TARBALL = ROOT / "build" / "alarm.tar.gz"
 TARBALL_URL = "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
 SDK = ROOT / "sdk"
 PKGCACHE = ROOT / "build" / "pkg-cache"
-EDK2 = Path("/usr/share/edk2/aarch64")
+# Arch's edk2-aarch64 package; the Nix development shell exports ZTOS_EDK2
+# with the same QEMU_EFI.fd from nixpkgs.
+EDK2 = Path(os.environ.get("ZTOS_EDK2", "/usr/share/edk2/aarch64"))
 
 
 class Fail(Exception):
@@ -72,7 +75,9 @@ def check_host():
             missing.append(tool)
     if not Path("/usr/bin/mke2fs").exists() and not Path("/usr/sbin/mke2fs").exists():
         missing.append("mke2fs (e2fsprogs)")
-    if not Path("/proc/sys/fs/binfmt_misc/qemu-aarch64").exists():
+    if platform.machine() not in ("aarch64", "arm64") and not Path(
+        "/proc/sys/fs/binfmt_misc/qemu-aarch64"
+    ).exists():
         missing.append("qemu-user-static + qemu-user-static-binfmt (to run aarch64 programs)")
     user = os.environ.get("USER", "")
     subuid = Path("/etc/subuid").read_text() if Path("/etc/subuid").exists() else ""
