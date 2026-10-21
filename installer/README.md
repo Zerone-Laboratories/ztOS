@@ -39,6 +39,18 @@ needs a subordinate ID range in `/etc/subuid` and `/etc/subgid` (most
 distributions add one per user). ARM programs run through qemu-user, so a
 build takes 30–60 minutes.
 
+Instead of the `pacman` packages above, run the installer from the repository's
+Nix development shell. It supplies QEMU, the aarch64 UEFI firmware, and the
+image and build tools:
+
+```sh
+nix develop
+./installer/ztos install --target qemu
+```
+
+On x86-64 hosts you still need `qemu-user-static-binfmt` on Arch Linux, or
+`boot.binfmt.emulatedSystems = [ "aarch64-linux" ];` on NixOS.
+
 ## Trying it in the emulator
 
 ```
