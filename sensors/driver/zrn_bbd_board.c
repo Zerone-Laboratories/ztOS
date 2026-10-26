@@ -155,16 +155,23 @@ static int prescaler = 3;
 module_param(prescaler, int, 0444);
 MODULE_PARM_DESC(prescaler, "SPI clock = source / (2 * (prescaler + 1))");
 
+/* Configures the controller; safe to call again (the reset path does, since
+ * the pins are taken away from it while the chip is held in standby). */
 static int hw_spi_setup(void)
 {
 	u32 v;
 
 	void __iomem *cmu_chub = ioremap(0x13a00000, 0x4000);
 
-	spi_regs = ioremap(SPI_BASE, 0x100);
-	usi_sw_conf = ioremap(USI_SW_CONF, 4);
-	if (!spi_regs || !usi_sw_conf || !cmu_chub)
+	if (!spi_regs)
+		spi_regs = ioremap(SPI_BASE, 0x100);
+	if (!usi_sw_conf)
+		usi_sw_conf = ioremap(USI_SW_CONF, 4);
+	if (!spi_regs || !usi_sw_conf || !cmu_chub) {
+		if (cmu_chub)
+			iounmap(cmu_chub);
 		return -ENOMEM;
+	}
 	/* its clock: from the block's bus clock, undivided, gates held open
 	 * (left to themselves they stay shut) */
 	writel(0x00300000, cmu_chub + 0x2010);
@@ -306,19 +313,101 @@ static ssize_t mcu_power_store(struct device *dev, struct device_attribute *attr
 }
 static DEVICE_ATTR_RW(mcu_power);
 
-static int hub_power_sequence(void)
+/*
+ * Resetting the chip after a warm reboot (see sensors/HUB-COLDBOOT-REA.md).
+ *
+ * Samsung's kernel never cuts LDO37 (always-on in its device tree) and never
+ * resets the chip itself: lhd's BrcmGpsHalGpio::Normal() only drops the enable
+ * pin (gpg0-2, "nSTANDBY") for 20 ms if it reads high and raises it again.
+ * What a TWRP pass or a power-off add is time with the enable pin low and
+ * every other line to the chip low too. A warm reboot of ztOS leaves the chip
+ * running (MCU_RESP high with MCU_REQ low, SHUB_INT low) and a 100 ms pulse
+ * did not clear that, nor did a 3 s supply cut made while chip select, the
+ * SPI clock, MCU_REQ and AP_SLEEP were still driven high (those can keep the
+ * chip's I/O ring and core partly powered through its input clamp diodes).
+ *
+ * So: park every line we drive towards the chip low (or as a pulled-down
+ * input), hold it in standby, then bring it up in Samsung's order: AP_SLEEP
+ * high (ssp_dev.c probe), pins back, enable pin high, 100 ms. If MCU_RESP is
+ * still high afterwards the hold is repeated, longer.
+ */
+static unsigned int standby_ms = 1000;
+module_param(standby_ms, uint, 0644);
+MODULE_PARM_DESC(standby_ms, "how long the reset path holds the chip in standby with its lines parked");
+static bool supply_cut;
+module_param(supply_cut, bool, 0644);
+MODULE_PARM_DESC(supply_cut, "also switch LDO37 off during the hold (off by default: the stock kernel never does)");
+
+static bool mcu_resp_high(void)
+{
+	return gpiod_get_value(zrn_gpios[ZRN_GPIO_MCU_RESP]) > 0;
+}
+
+static void hub_pins_park(void)
+{
+	zrn_mcu_req(0);
+	gpiod_set_value(zrn_gpios[ZRN_GPIO_AP_SLEEP], 0);
+	if (bitbang) {
+		gph0_set(PIN_SCK, false);
+		gph0_set(PIN_MOSI, false);
+	} else {
+		/* clock, MOSI, MISO from the controller to inputs; their pull-downs
+		 * (gph0 PUD 0x..111) hold them low */
+		writel(readl(gph0 + GPH0_CON) & ~0xfffU, gph0 + GPH0_CON);
+	}
+	gph0_set(PIN_CS, false);
+}
+
+static int hub_pins_restore(void)
+{
+	gpiod_set_value(zrn_gpios[ZRN_GPIO_AP_SLEEP], 1);
+	gph0_set(PIN_CS, true);
+	if (bitbang) {
+		gph0_set(PIN_SCK, true);
+		return 0;
+	}
+	return hw_spi_setup();
+}
+
+static int hub_cycle(unsigned int hold_ms)
 {
 	int ret;
 
+	hub_pins_park();
+	gpiod_set_value(zrn_gpios[ZRN_GPIO_GPS_PWR], 0);
+	if (supply_cut)
+		s9p_acpm_pmic_update(S2MPS18_L37CTRL, 0, LDO_ON_MODE);
+	msleep(hold_ms);
 	ret = s9p_acpm_pmic_update(S2MPS18_L37CTRL, LDO_ON_MODE, LDO_ON_MODE);
+	if (ret)
+		return ret;
+	msleep(20);
+	ret = hub_pins_restore();
 	if (ret)
 		return ret;
 	/* Enable the hub after its supply stabilizes; gpg0-4 is an unrelated,
 	 * unpulled input used by the disabled USB PHY port. */
-	gpiod_set_value(zrn_gpios[ZRN_GPIO_GPS_PWR], 0);
-	msleep(100);
 	gpiod_set_value(zrn_gpios[ZRN_GPIO_GPS_PWR], 1);
 	msleep(100);
+	return 0;
+}
+
+static int hub_power_sequence(unsigned int hold_ms)
+{
+	unsigned int hold = hold_ms;
+	bool stale = mcu_resp_high();
+	int i, ret;
+
+	for (i = 0; i < 3; i++) {
+		ret = hub_cycle(hold);
+		pr_info("zrn-bbd: hub standby %u ms%s: MCU_RESP %d (was %d), SHUB_INT %d\n", hold,
+			supply_cut ? " with supply cut" : "", mcu_resp_high(), stale,
+			gpiod_get_value(zrn_gpios[ZRN_GPIO_SHUB_INT]));
+		if (ret || !mcu_resp_high())
+			return ret;
+		hold = max(hold * 3, standby_ms);
+	}
+	pr_warn("zrn-bbd: MCU_RESP still high with MCU_REQ low; the chip did not reset\n");
 	return 0;
 }
 
@@ -329,7 +418,7 @@ static ssize_t reset_store(struct device *dev, struct device_attribute *attr,
 
 	if (kstrtoint(buf, 0, &reset) || reset != 1)
 		return -EINVAL;
-	reset = hub_power_sequence();
+	reset = hub_power_sequence(standby_ms);
 	return reset ? reset : size;
 }
 static DEVICE_ATTR_WO(reset);
@@ -664,8 +753,9 @@ static int __init board_init(void)
 	}
 	/* after the probe: it clears the whole bbd state, callbacks included */
 	bbd_register(NULL, &ssp_callbacks);
-	/* Match Samsung's power-up order on every probe, including module reload. */
-	ret = hub_power_sequence();
+	/* Match Samsung's power-up order on every probe, including module reload;
+	 * a chip left running by a warm reboot gets the long hold */
+	ret = hub_power_sequence(mcu_resp_high() ? standby_ms : 100);
 	if (ret)
 		goto err;
 	{
