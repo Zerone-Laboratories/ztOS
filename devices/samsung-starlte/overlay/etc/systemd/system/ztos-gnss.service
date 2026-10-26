@@ -1,0 +1,18 @@
+[Unit]
+Description=ztOS GNSS: Broadcom gpsd on the BCM4773, NMEA on 127.0.0.1:10110
+Requires=ztoscsf-sensorhub.service
+After=ztoscsf-sensorhub.service
+# a few tries only: a dead hub must not spin this forever
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+ExecStartPre=/usr/local/sbin/ztos-gnss --pre
+ExecStart=/usr/local/sbin/ztos-gnss --run
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=graphical.target

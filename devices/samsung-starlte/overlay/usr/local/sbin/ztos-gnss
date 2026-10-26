@@ -1,0 +1,46 @@
+#!/bin/sh
+# ztos-gnss: GPS on the Galaxy S9 (BCM4773), from the phone's own Broadcom
+# daemons in /run/android:
+#   lhd (ztoscsf-sensorhub.service, owns /dev/ttyBCM, boots the hub)
+#   -> gpsd (vendor, /vendor/bin/hw/gpsd, Broadcom's GLL engine) over the
+#      named pipe /data/vendor/gps/.pipe.gpsd_to_lhd
+#   -> zrn-gnss-nmea (ours: loads /vendor/lib64/hw/gps.default.so)
+#   -> NMEA on 127.0.0.1:10110 and /var/lib/zrn-android/data/vendor/gps/ztos-nmea.sock
+# Needs the sensor hub up (lhd: ESW:READY). Evidence: sensors/GPS-REA.md.
+R=/run/android
+D=/var/lib/zrn-android/data/vendor/gps
+L=/usr/local/lib/ztos-gnss
+log() { echo "ztos-gnss: $*"; }
+
+case "${1:-}" in
+--pre)
+	/usr/local/sbin/zrn-android-root up || exit 1
+	mkdir -p $D/log /var/lib/zrn-android/data/local /dev/socket
+	# stock init.gps.rc, post-fs-data: stale engine state files
+	rm -f $D/gps_started $D/glonass_started $D/beidou_started $D/smd_started $D/sv_cno.info
+	install -m 0644 $L/gps.xml $D/gps.xml
+	install -m 0755 $L/zrn-gnss-nmea /var/lib/zrn-android/data/local/zrn-gnss-nmea
+	# the hub (lhd) must already be serving: wait up to 60 s
+	i=0
+	while ! pgrep -x lhd >/dev/null; do
+		i=$((i + 1)); [ $i -gt 60 ] && { log "lhd not running; sensor hub down"; exit 1; }
+		sleep 1
+	done
+	;;
+--run)
+	/usr/bin/chroot $R /vendor/bin/hw/gpsd -c /data/vendor/gps/gps.xml &
+	gpsd_pid=$!
+	trap 'kill $gpsd_pid 2>/dev/null' EXIT
+	sleep 3
+	kill -0 $gpsd_pid 2>/dev/null || { log "vendor gpsd exited"; exit 1; }
+	# bridge in the foreground: if either dies, the unit restarts both
+	/usr/bin/chroot $R /data/local/zrn-gnss-nmea ${ZTOS_GNSS_DEBUG:+-d} &
+	nmea_pid=$!
+	trap 'kill $gpsd_pid $nmea_pid 2>/dev/null' EXIT
+	while kill -0 $gpsd_pid 2>/dev/null && kill -0 $nmea_pid 2>/dev/null; do sleep 2; done
+	log "gpsd or bridge stopped"
+	exit 1
+	;;
+*)
+	echo "usage: ztos-gnss --pre | --run" >&2; exit 2 ;;
+esac
