@@ -43,7 +43,11 @@ ztmetro/core/*-protocol.c
 ztmetro/core/*-client-protocol.h
 
 # SDK native renderer artifacts, rebuilt for each target
-sdk/native/prebuilt/
+sdk/native/prebuilt/*
+# the phone's renderer ships with the source: a fresh clone (and the release
+# workflow) cannot build it, being on x86-64; the SDK refuses it when its
+# .sha256 no longer matches renderer.c, so rebuild it then (make -C sdk/native on the phone)
+!sdk/native/prebuilt/aarch64/
 ztmetro/auth/ztos-polkit-agent
 ztmetro/sounds/ztos-sounds
 ztmetro/devices/ztdevices
