@@ -139,10 +139,14 @@ step() { echo "STEP $*"; }
 R=$ROOTFS
 umask 022
 
-if [ "$FRESH" = 1 ] || [ ! -e "$R/etc/arch-release" ]; then
+# A run stopped half way through the unpack leaves etc/arch-release without
+# the rest (no var/lib/pacman): only a mark written after the whole tarball
+# counts as unpacked.
+if [ "$FRESH" = 1 ] || [ ! -e "$R/.ztos-unpacked" ]; then
 	step "unpacking Arch Linux ARM"
 	rm -rf "$R"; mkdir -p "$R"
 	bsdtar -xpf "$TARBALL" -C "$R" --no-xattrs --no-acls --no-fflags
+	touch "$R/.ztos-unpacked"
 fi
 
 mount --bind "$R" "$R"
