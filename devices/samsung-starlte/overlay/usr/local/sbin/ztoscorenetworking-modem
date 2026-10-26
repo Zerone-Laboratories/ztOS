@@ -33,7 +33,7 @@ chmod 0660 /dev/umts_* /dev/multipdp*
 RADIO=$(readlink -f /dev/disk/by-partlabel/RADIO)
 EFS=$(readlink -f /dev/disk/by-partlabel/EFS)
 chgrp 1001 "$RADIO"; chmod 0640 "$RADIO"
-/usr/local/sbin/zrn-android-root up
+/usr/local/sbin/zrn-android-root up || exit 1
 mkdir -p $R/dev/block/platform/11120000.ufs/by-name $R/mnt/vendor/efs
 ln -sf "$RADIO" $R/dev/block/platform/11120000.ufs/by-name/RADIO
 ln -sf "$EFS" $R/dev/block/platform/11120000.ufs/by-name/EFS
