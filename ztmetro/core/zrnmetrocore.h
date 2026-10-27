@@ -188,6 +188,8 @@ struct zmc_state {
 };
 
 extern struct zmc_state zmc;
+/* ZTMETRO_PERFLOG=1: frame and page timings on stderr (off by default) */
+bool zmc_perflog(void);
 
 /* ---- running ---- */
 int zmc_run(const struct zmc_app *app, int first_page);

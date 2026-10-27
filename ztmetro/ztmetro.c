@@ -820,6 +820,18 @@ static void auth_finish(struct zt_server *);
 static void draw_dialog(struct zt_server *);
 static void run_detached(const char *, const char *, const char *, const char *);
 
+/* ZTMETRO_PERFLOG=1: frame timings into the session log. Off, as every line
+ * is a write to the log file, and the slow frames it reports are the ones
+ * with the least time to spare */
+static bool perflog(void) {
+	static int on = -1;
+	if (on < 0) {
+		const char *v = getenv("ZTMETRO_PERFLOG");
+		on = v && *v && *v != '0';
+	}
+	return on;
+}
+
 static uint32_t now_ms(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -9165,10 +9177,8 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		 * and its launch */
 		float *v = p->on_list ? &server->list_v : &server->scroll_v;
 		bool coasting = fabsf(*v) > 0.4f;
-		wlr_log(WLR_INFO, "touch on %s: v %.3f%s", p->on_list ? "list" : "Start", *v,
+		if (perflog()) wlr_log(WLR_INFO, "touch on %s: v %.3f%s", p->on_list ? "list" : "Start", *v,
 			coasting ? " (coasting: stopped, not a tap)" : "");
-		wlr_log(WLR_INFO, "touch on %s: v %.3f%s, tile %d", p->on_list ? "list" : "Start", *v,
-			coasting ? " (coasting: stopped, not a tap)" : "", p->on_list ? item_at(server, x, y) : tile_at(server, x, y));
 		*v = 0;
 		p->scroll0 = p->on_list ? server->list_scroll : server->scroll;
 		if (coasting) {
@@ -11262,7 +11272,7 @@ static void render_frame(struct zt_server *server) {
 		}
 		if (server->anim_frames > 0 && now - server->anim_last_ms > 25) {
 			/* a frame missed: say what was going on, to find what held it up */
-			wlr_log(WLR_INFO, "slow frame: %u ms since the last; start_t %.2f back %d page %.2f "
+			if (perflog()) wlr_log(WLR_INFO, "slow frame: %u ms since the last; start_t %.2f back %d page %.2f "
 				"shown %s leaving %d alpha %.2f moving %d; this one drew in %.1f ms",
 				now - server->anim_last_ms, server->start_t, server->start_back, server->page,
 				server->shown ? app_name(server->shown) : "-", server->leaving != NULL,
@@ -11273,7 +11283,7 @@ static void render_frame(struct zt_server *server) {
 		server->anim_last_ms = now;
 		wlr_output_schedule_frame(output);
 	} else if (server->anim_frames > 1) {
-		wlr_log(WLR_INFO, "animation: %u frames in %u ms (%.1f ms each, worst %u ms); "
+		if (perflog()) wlr_log(WLR_INFO, "animation: %u frames in %u ms (%.1f ms each, worst %u ms); "
 			"per frame: draw %.1f, finish %.1f, commit %.1f ms; %.0f quads covering %.1f screens, "
 			"%.2f uploads (%.1f MB)",
 			server->anim_frames, now - server->anim_first_ms,
