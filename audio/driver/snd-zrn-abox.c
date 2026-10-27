@@ -305,6 +305,14 @@ static DEFINE_MUTEX(amp_lock);
 static bool capture;
 module_param(capture, bool, 0444);
 MODULE_PARM_DESC(capture, "offer the main microphones as hw:0,2 (default off; see audio/MIC-REA.md)");
+/*
+ * The microphones' digital gain over 0 dB, in 0.5 dB steps (0..63), from the
+ * next capture on. At 0 dB, Samsung's "media-mic" level, speech came out far
+ * too quiet: their HAL adds gain after the codec, ours does not.
+ */
+static int mic_gain = 40;
+module_param(mic_gain, int, 0644);
+MODULE_PARM_DESC(mic_gain, "microphone gain over 0 dB in 0.5 dB steps, 0..63, from the next capture");
 static int cap_wdma = 1;	/* stock: route-nsrc0-to-wdma1, capture_link 9 */
 module_param(cap_wdma, int, 0444);
 MODULE_PARM_DESC(cap_wdma, "the DSP's capture DMA behind NSRC0/SIFM0 (0 or 1; stock 1)");
@@ -2099,9 +2107,9 @@ static int codec_start(void)
 	codec_update(CODEC_AIF1_TX_ENABLES, 0x0003, 0x0003);
 	codec_update(CODEC_INPUT_ENABLES, 0x0030, 0x0030);
 	usleep_range(1000, 3000);
-	/* unmuted at 0 dB, then the volume update (madera_in_ev) */
-	codec_update(CODEC_ADC_VOL_3L, 0x01ff, 0x0080);
-	codec_update(CODEC_ADC_VOL_3R, 0x01ff, 0x0080);
+	/* unmuted at mic_gain over 0 dB (0x80), then the volume update (madera_in_ev) */
+	codec_update(CODEC_ADC_VOL_3L, 0x01ff, 0x0080 + clamp(mic_gain, 0, 63));
+	codec_update(CODEC_ADC_VOL_3R, 0x01ff, 0x0080 + clamp(mic_gain, 0, 63));
 	codec_update(CODEC_ADC_VOL_3L, CODEC_IN_VU, CODEC_IN_VU);
 	codec_update(CODEC_ADC_VOL_3R, CODEC_IN_VU, CODEC_IN_VU);
 	pr_info("snd-zrn-abox: codec capture on (inputs %04x, AIF1 TX %04x, sysclk %04x)\n",
