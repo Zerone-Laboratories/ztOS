@@ -30,6 +30,13 @@ up)
 	mount --bind /mnt/vendor $R/vendor
 	mount --bind /mnt/system/system/apex/com.android.runtime.release $R/apex/com.android.runtime
 	mount --rbind /dev $R/dev
+	# No binder in here. /dev/hwbinder is Waydroid's (binderfs): seeing it,
+	# lhd went to register with a hardware service manager and waited for
+	# ever, and the sensor hub never started (26 to 27 Oct 2026). A slave
+	# copy first, so taking binderfs off here leaves the host's (and
+	# Waydroid's) alone.
+	mount --make-rslave $R/dev
+	umount -l $R/dev/binderfs 2>/dev/null || true
 	mount -t proc proc $R/proc
 	mount --rbind /sys $R/sys
 	mount --bind /var/lib/zrn-android/data $R/data
