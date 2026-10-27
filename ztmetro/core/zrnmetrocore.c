@@ -875,14 +875,20 @@ static bool hit_at(double x, double y, struct zmc_hit *out) {
  * grows with how far off the middle the finger is, (|nx| + |ny|) of a quarter
  * of a radian, toward the finger; lean and sink both fade out PRESS_RANGE
  * points from the middle; a press at the middle sinks to 88% of its size.
- * w and h in points; rx, ry in radians; returns the sink as a share of the
- * eye's distance. */
+ * w and h in points; rx, ry in radians; returns how much smaller it gets. */
 #define PRESS_RANGE	188.0	/* WP's 250 px threshold, at 480 px across */
-#define PRESS_SINK	0.136	/* eye / (eye + 0.136 eye) = 0.88 */
+#define PRESS_SINK	0.12	/* shrinks to 88%, as the shell's tiles (a scale, not depth: the
+				 * GPU's projection made a depth sink of the same size all but invisible) */
 static double press_geometry(double w, double h, double *rx, double *ry) {
 	double nx = zmc.press_fx - 0.5, ny = zmc.press_fy - 0.5;
 	double dist = hypot(nx * w, ny * h), len = hypot(nx, ny);
 	double fall = dist < PRESS_RANGE ? 1.0 - dist / PRESS_RANGE : 0.0;
+	/* a row as wide as the screen is pressed far from its middle in points
+	 * but not for its size: fading only by points left it a 5% sink and a
+	 * 2-degree lean (recorded beside a tile); fade by its own size too, and
+	 * take whichever leaves more */
+	double fall_own = 1.0 - len / M_SQRT1_2;
+	if (fall_own > fall) fall = fall_own;
 	double ang = 0.25 * (fabs(nx) + fabs(ny)) * fall;
 	*ry = len > 1e-6 ? ang * nx / len : 0;
 	*rx = len > 1e-6 ? ang * ny / len : 0;
@@ -898,15 +904,15 @@ static void draw_press(cairo_t *cr, int scale) {
 		struct zmc_hit *hit = &zmc.pressed;
 		double w = hit->w, h = hit->h, x = hit->x, y = hit->y - zmc.scroll;
 		if (w <= 0 || h <= 0) return;
-		double eye = (zmc.height / 2.0) / tan(DEPTH_FOV_DEG * M_PI / 360.0);
 		double rx, ry, sink = press_geometry(w, h, &rx, &ry);
 		rx *= p; ry *= p;
+		double k = 1.0 - sink * p;
 		struct zmg_vertex q[4];
 		for (int i = 0; i < 4; i++) {
-			double X = ((i & 1) ? 0.5 : -0.5) * w;
-			double Y = ((i & 2) ? 0.5 : -0.5) * h;
+			double X = ((i & 1) ? 0.5 : -0.5) * w * k;
+			double Y = ((i & 2) ? 0.5 : -0.5) * h * k;
 			q[i] = (struct zmg_vertex){ x+w/2+X*cos(ry), y+h/2+Y*cos(rx),
-				-sink*eye*p-X*sin(ry)-Y*sin(rx) };
+				-X*sin(ry)-Y*sin(rx) };
 		}
 		zmg_clip(0, HEADER_H, zmc.width, zmc.height - HEADER_H);
 		zmg_rect(x, y, w, h, 0, 0, 0);
@@ -925,12 +931,12 @@ static void draw_press(cairo_t *cr, int scale) {
 	 * horizontal the bottom. */
 	double rx, ry, sink = press_geometry(h->w, h->h, &rx, &ry);
 	rx *= p; ry *= p;
-	double z0 = -sink * eye * p;
+	double k = 1.0 - sink * p, z0 = 0;
 	double cx = x + w / 2, cy = y + hh / 2;
 	double gx[PRESS_NX + 1][PRESS_NY + 1], gy[PRESS_NX + 1][PRESS_NY + 1];
 	for (int i = 0; i <= PRESS_NX; i++) {
 		for (int j = 0; j <= PRESS_NY; j++) {
-			double X = ((double)i / PRESS_NX - 0.5) * w, Y = ((double)j / PRESS_NY - 0.5) * hh;
+			double X = ((double)i / PRESS_NX - 0.5) * w * k, Y = ((double)j / PRESS_NY - 0.5) * hh * k;
 			double Z = z0 - X * sin(ry) - Y * sin(rx);
 			double s = eye / (eye - Z);
 			gx[i][j] = cx + X * cos(ry) * s;
