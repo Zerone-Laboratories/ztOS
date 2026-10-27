@@ -126,6 +126,9 @@ static bool demoloop_active(void) {
 #define SWIPE		56	/* how far a system gesture has to travel */
 #define SLOP		8	/* movement that turns a tap into a drag */
 #define LONG_PRESS_MS	450
+/* A tile or row leans in only once the finger has stayed put this long: shown
+ * at once, the start of every scroll pressed the tile under it first */
+#define PRESS_DELAY_MS	80
 #define PEEK_H		(STATUS_H + 22)	/* the status bar held: its second line too */
 #define PEEK_HOLD_MS	320	/* how long a finger rests on it first */
 #define PEEK_STAY_MS	3000	/* and how long it stays after the finger lifts */
@@ -184,7 +187,9 @@ static bool demoloop_active(void) {
 #define TORCH_PATH	"/sys/class/leds/white:torch/brightness"	/* leds/zrn-flash.ko */
 #define TORCH_LEVEL	9	/* of 15: the top of Samsung's torch table */
 #define TILT_IN_MS	70
-#define TILT_OUT_MS	160
+#define TILT_OUT_MS	200	/* back up on Log(10) (Windows Phone's TiltUp) */
+#define MAGNET_RANGE	188.0	/* points: WP's 250 px threshold on its 480-px-wide screen */
+#define MAGNET_SINK	0.12	/* how far a tile pressed at its middle shrinks (WP: 88 px deep) */
 /* Turns round the screen's left edge; positive takes the right-hand side
  * away from the viewer. As on a Lumia (screen capture, 60 fps): whatever
  * arrives comes from behind and swings forward into place; what leaves swings
@@ -360,6 +365,7 @@ struct zt_anim {
 	uint32_t start, duration;	/* ms */
 	bool linear;			/* otherwise exponential ease-out */
 	float overshoot;		/* >0: a back-ease-out, past the target then back */
+	float wplog;			/* >0: Windows Phone's Log(weight) interpolation */
 };
 
 struct zt_text_input {
@@ -428,6 +434,7 @@ struct touch_point {
 	bool dragging;		/* it carries the tile being edited */
 	double gx, gy;		/* where on that tile it took hold */
 	int badge;		/* 1 unpin, 2 resize: the button it went down on */
+	bool press_shown;	/* its tile or row has leant in (PRESS_DELAY_MS) */
 };
 
 /* ---- the on-screen keyboard's keys ---------------------------------------- */
@@ -755,6 +762,7 @@ struct zt_server {
 	struct wl_list keyboards;
 	struct touch_point touches[MAX_TOUCH];
 	struct wl_event_source *long_press_timer;
+	struct wl_event_source *press_timer;	/* PRESS_DELAY_MS after a finger came down on Start */
 	int nav_pressed;		/* -1: none */
 
 	/* on-screen keyboard */
@@ -853,6 +861,14 @@ static void motion_lease(uint32_t until) {
 
 /* Move *value to `to` over `duration` ms, after `delay` ms, at the speed the
  * user set. A value already being animated is redirected from where it is now. */
+/* Windows Phone's interpolations (uixrender.dll): g(t, b) = (b^t - 1)/(b - 1);
+ * Exp(w) is g(t, w), accelerating; Log(w) is g(t, 1/w), decelerating */
+static float wp_g(float t, float b) {
+	return b == 1.0f ? t : (powf(b, t) - 1.0f) / (b - 1.0f);
+}
+static float wp_log(float t, float w) { return wp_g(t, 1.0f / w); }
+static float wp_exp(float t, float w) { return wp_g(t, w); }
+
 static void animate(struct zt_server *server, float *value, float to, uint32_t duration,
 		uint32_t delay, bool linear) {
 	struct zt_anim *slot = NULL;
@@ -911,6 +927,19 @@ static void animate_at(struct zt_server *server, float *value, float to,
 	}
 }
 
+/* Like animate(), on Windows Phone's Log(weight) curve: fast, then slower
+ * and slower to a standstill (uixrender.dll; Log 10 lifts a pressed tile) */
+static void animate_wplog(struct zt_server *server, float *value, float to, uint32_t duration,
+		uint32_t delay, float weight) {
+	animate(server, value, to, duration, delay, false);
+	for (int i = 0; i < MAX_ANIMS; i++) {
+		if (server->anims[i].active && server->anims[i].value == value) {
+			server->anims[i].wplog = weight;
+			break;
+		}
+	}
+}
+
 /* Where *value is going: the end of its animation, or where it is. */
 static float anim_target(struct zt_server *server, float *value) {
 	for (int i = 0; i < MAX_ANIMS; i++) {
@@ -957,6 +986,7 @@ static bool anims_step(struct zt_server *server, uint32_t now) {
 			e = 1.0f + c3 * u * u * u + c1 * u * u;
 		} else {
 			e = a->linear ? t : (1.0f - powf(2.0f, -10.0f * t)) / (1.0f - 1.0f / 1024.0f);
+			if (a->wplog > 0.0f) e = wp_log(t, a->wplog);
 		}
 		*a->value = a->from + (a->to - a->from) * e;
 		running = true;
@@ -3211,6 +3241,7 @@ static void draw_glyph(struct zt_server *server, cairo_t *cr, const char *icon,
 
 #define WALL_PARALLAX	0.25	/* Start's photo moves at a quarter of the tiles' speed */
 #define WALL_TALL	1.6	/* and is this many screens tall, for that */
+#define WALL_MARGIN	0.2	/* of a screen, above it: what tiles leaving the top show */
 #define WALL_TINT	0.15	/* black over a tile's window onto the photo, for its label */
 
 /* A photo scaled to cover pw x ph pixels and cropped about its middle, as a
@@ -3296,7 +3327,16 @@ static void wall_under(struct zt_server *server, const float model[16], double t
 	if (server->wall_h <= 0 || !w->tex || !w->tw || !w->th) {
 		return;
 	}
-	double py = STATUS_H + ty - server->scroll * (1.0 - WALL_PARALLAX);
+	/* The photo is one picture behind all the tiles: a band above the screen
+	 * (WALL_MARGIN of its height) for tiles leaving at the top, and its
+	 * travel at WALL_PARALLAX of the scroll, stopped for all of them at once
+	 * where the photo ends. Each tile's own window used to be clamped at the
+	 * photo's top edge, so a tile scrolling out above stopped moving its
+	 * photo and the picture inside it froze. */
+	double margin = server->height * WALL_MARGIN;
+	double travel = server->scroll * WALL_PARALLAX, most = server->wall_h - server->height - margin;
+	travel = travel < 0 ? 0 : travel > most ? (most > 0 ? most : 0) : travel;
+	double py = STATUS_H + ty - server->scroll + margin + travel;
 	double max = server->wall_h - th;
 	py = py < 0 ? 0 : py > max ? max : py;
 	double s = server->scale;
@@ -7589,14 +7629,18 @@ static int tile_at(struct zt_server *server, double x, double y) {
  * middle it only sinks. */
 static void tile_press(struct zt_server *server, int index, double x, double y) {
 	struct tile *t = &server->tiles[index];
-	double fx = (x - t->x) / t->w * 2 - 1;
-	double fy = (y - STATUS_H + server->scroll - t->y) / t->h * 2 - 1;
-	if (fabs(fx) < 0.25 && fabs(fy) < 0.25) {
-		fx = fy = 0;
-	}
-	animate(server, &t->tilt_y, (float)(fx * TILT_DEG), TILT_IN_MS, 0, false);
-	animate(server, &t->tilt_x, (float)(fy * TILT_DEG), TILT_IN_MS, 0, false);
-	animate(server, &t->press, 0.88f, TILT_IN_MS, 0, false);	/* sinks well in */
+	/* Windows Phone's magnetic tilt (startmenu.dll MagneticTilt.uix): the
+	 * lean grows with how far off centre the finger is, (|nx| + |ny|) of
+	 * 25% of a radian, and both lean and sink fade out MAGNET_RANGE from the
+	 * middle; in, linearly, over 75 ms (lean) and 90 ms (sink) */
+	double dx = x - (t->x + t->w / 2.0), dy = y - STATUS_H + server->scroll - (t->y + t->h / 2.0);
+	double nx = dx / t->w, ny = dy / t->h, dist = hypot(dx, dy);
+	double fall = dist < MAGNET_RANGE ? 1.0 - dist / MAGNET_RANGE : 0.0;
+	double deg = 0.25 * (fabs(nx) + fabs(ny)) * fall * 57.29578, len = hypot(nx, ny);
+	double lx = len > 1e-6 ? nx / len : 0, ly = len > 1e-6 ? ny / len : 0;
+	animate(server, &t->tilt_y, (float)(lx * deg), 75, 0, true);
+	animate(server, &t->tilt_x, (float)(ly * deg), 75, 0, true);
+	animate(server, &t->press, (float)(1.0 - MAGNET_SINK * fall), 90, 0, true);
 }
 
 /* The action centre's quick actions answer a finger the same way. `y` is in
@@ -7619,11 +7663,16 @@ static void shade_tile_release(struct zt_server *server, int index) {
 	animate(server, &server->shade_press[index], 1.0f, TILT_OUT_MS, 0, false);
 }
 
-static void tile_release(struct zt_server *server, int index) {
+static void tile_release_after(struct zt_server *server, int index, uint32_t delay) {
 	struct tile *t = &server->tiles[index];
-	animate(server, &t->tilt_y, 0.0f, TILT_OUT_MS, 0, false);
-	animate(server, &t->tilt_x, 0.0f, TILT_OUT_MS, 0, false);
-	animate(server, &t->press, 1.0f, TILT_OUT_MS, 0, false);
+	/* back up on Windows Phone's Log(10): fast, then slower and slower */
+	animate_wplog(server, &t->tilt_y, 0.0f, TILT_OUT_MS, delay, 10.0f);
+	animate_wplog(server, &t->tilt_x, 0.0f, TILT_OUT_MS, delay, 10.0f);
+	animate_wplog(server, &t->press, 1.0f, TILT_OUT_MS, delay, 10.0f);
+}
+
+static void tile_release(struct zt_server *server, int index) {
+	tile_release_after(server, index, 0);
 }
 
 static double next_key_weight(const char *prefix, char next) {
@@ -7699,11 +7748,15 @@ static void item_press(struct zt_server *server, int index, double x, double y) 
 	animate(server, &it->press, 0.91f, TILT_IN_MS, 0, false);
 }
 
-static void item_release(struct zt_server *server, int index) {
+static void item_release_after(struct zt_server *server, int index, uint32_t delay) {
 	struct app_item *it = &server->items[index];
-	animate(server, &it->tilt_y, 0.0f, TILT_OUT_MS, 0, false);
-	animate(server, &it->tilt_x, 0.0f, TILT_OUT_MS, 0, false);
-	animate(server, &it->press, 1.0f, TILT_OUT_MS, 0, false);
+	animate_wplog(server, &it->tilt_y, 0.0f, TILT_OUT_MS, delay, 10.0f);
+	animate_wplog(server, &it->tilt_x, 0.0f, TILT_OUT_MS, delay, 10.0f);
+	animate_wplog(server, &it->press, 1.0f, TILT_OUT_MS, delay, 10.0f);
+}
+
+static void item_release(struct zt_server *server, int index) {
+	item_release_after(server, index, 0);
 }
 
 static int tile_of(struct zt_server *server, const char *command) {
@@ -8091,6 +8144,28 @@ static void home_reset(struct zt_server *server) {
 		server->moving = true;
 		damage(server);
 	}
+}
+
+/* The lean of the tile or row a still finger is on (see PRESS_DELAY_MS). */
+static void start_press_show(struct zt_server *server, struct touch_point *p) {
+	p->press_shown = true;
+	if (p->on_list) {
+		item_press(server, p->index, p->x0, p->y0);
+	} else {
+		tile_press(server, p->index, p->x0, p->y0);
+	}
+}
+
+static int press_fired(void *data) {
+	struct zt_server *server = data;
+	for (int i = 0; i < MAX_TOUCH; i++) {
+		struct touch_point *p = &server->touches[i];
+		if (p->used && p->role == ROLE_START && p->index >= 0 && !p->moved && !p->press_shown &&
+				!p->dragging && !p->long_pressed) {
+			start_press_show(server, p);
+		}
+	}
+	return 0;
 }
 
 static int long_press_fired(void *data) {
@@ -9073,9 +9148,16 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		if (!server->start_back && server->start_t > 0.01f) {
 			return;	/* Start is on its way out */
 		}
-		/* a finger on a list that is coasting stops it, and is not a tap */
+		/* a finger on a list that is coasting stops it, and is not a tap. Only
+		 * a glide that can be seen counts (400 points a second): at 0.1 a list
+		 * that had all but stopped after a scroll ate the next tap, its dip
+		 * and its launch */
 		float *v = p->on_list ? &server->list_v : &server->scroll_v;
-		bool coasting = fabsf(*v) > 0.1f;
+		bool coasting = fabsf(*v) > 0.4f;
+		wlr_log(WLR_INFO, "touch on %s: v %.3f%s", p->on_list ? "list" : "Start", *v,
+			coasting ? " (coasting: stopped, not a tap)" : "");
+		wlr_log(WLR_INFO, "touch on %s: v %.3f%s, tile %d", p->on_list ? "list" : "Start", *v,
+			coasting ? " (coasting: stopped, not a tap)" : "", p->on_list ? item_at(server, x, y) : tile_at(server, x, y));
 		*v = 0;
 		p->scroll0 = p->on_list ? server->list_scroll : server->scroll;
 		if (coasting) {
@@ -9091,7 +9173,8 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		} else if (p->on_list) {
 			p->index = item_at(server, x, y);
 			if (p->index >= 0) {
-				item_press(server, p->index, x, y);
+				p->press_shown = false;	/* leans in after PRESS_DELAY_MS, if still */
+				wl_event_source_timer_update(server->press_timer, PRESS_DELAY_MS);
 				wl_event_source_timer_update(server->long_press_timer, LONG_PRESS_MS);
 			}
 		} else if (server->editing) {
@@ -9107,7 +9190,8 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		} else {
 			p->index = tile_at(server, x, y);
 			if (p->index >= 0) {
-				tile_press(server, p->index, x, y);
+				p->press_shown = false;	/* leans in after PRESS_DELAY_MS, if still */
+				wl_event_source_timer_update(server->press_timer, PRESS_DELAY_MS);
 				wl_event_source_timer_update(server->long_press_timer, LONG_PRESS_MS);
 			}
 		}
@@ -9470,11 +9554,17 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 		wl_event_source_timer_update(server->long_press_timer, 0);
 		/* a finger that rested before it lifted throws nothing */
 		bool rested = (int32_t)(time - p->t_last) > 90;
+		/* a quick tap: it dips all the way, then comes back */
+		uint32_t back_after = 0;
+		if (p->index >= 0 && !p->moved && !p->press_shown) {
+			start_press_show(server, p);
+			back_after = TILT_IN_MS;
+		}
 		if (p->index >= 0) {
 			if (p->on_list) {
-				item_release(server, p->index);
+				item_release_after(server, p->index, back_after);
 			} else {
-				tile_release(server, p->index);
+				tile_release_after(server, p->index, back_after);
 			}
 		}
 		if (p->dragging) {
@@ -10434,6 +10524,12 @@ static float item_turn(struct zt_server *server, int i) {
 /* Where something of Start's is at `turn` of its swing: `m` is left at its
  * middle, turned, ready for its own lean and size. x, y: its top left on the
  * screen; `span`: the width it swings as. Returns how solid it is. */
+/* 1 - smoothstep's complement: 0 at 0, 1 at 1, flat at both ends */
+static float smooth01(float x) {
+	x = x < 0 ? 0 : x > 1 ? 1 : x;
+	return x * x * (3.0f - 2.0f * x);
+}
+
 static float turn_place(struct zt_server *server, float m[16], float x, float y, float w,
 		float h, float span, float turn, float jit_travel, bool hinge_right) {
 	/* Each turns on its own edge, with depth: leaving, it comes a little
@@ -10458,9 +10554,14 @@ static float turn_place(struct zt_server *server, float m[16], float x, float y,
 		 * edge heights of four of the Lumia's tiles over 12 frames
 		 * each: 2.9 px rms on tiles 215 px wide (scripts/anim). */
 		float u = 1.0f - turn;
-		float fade = sqrtf(1.0f - u);
-		angle = TILE_IN_DEG * expf(-2.649f * u) * powf(1.0f - u, 0.165f);
-		z = -TILE_IN_DEPTH * server->eye * expf(-1.656f * u) * (1.0f - u);
+		/* Landing: the fit's (1-u)^0.165 and sqrt(1-u) reach zero with an
+		 * upright slope, so the last degrees and the last of the slide went
+		 * in about one frame, a click, seen on the top left tile that lands
+		 * alone. Both now come to rest with no speed left (smoothstep). */
+		float land = u <= 0.5f ? 1.0f : 1.0f - smooth01((u - 0.5f) / 0.5f);
+		float fade = 1.0f - smooth01(u);
+		angle = TILE_IN_DEG * expf(-2.649f * u) * powf(1.0f - (u < 0.5f ? u : 0.5f), 0.165f) * land;
+		z = -TILE_IN_DEPTH * server->eye * expf(-1.656f * u) * (1.0f - u) * (1.0f - u);
 		dx = span * (-0.476f * expf(-7.157f * u) +
 			(1.0f + TILE_JITTER_TRAVEL * jit_travel) * 0.193f * expf(-0.849f * u)) * fade;
 		/* a turned tile catches less light, and one that has not
@@ -11663,6 +11764,7 @@ int main(int argc, char *argv[]) {
 	wlr_seat_set_keyboard(server.seat, &server.vkbd);
 
 	server.long_press_timer = wl_event_loop_add_timer(server.loop, long_press_fired, &server);
+	server.press_timer = wl_event_loop_add_timer(server.loop, press_fired, &server);
 	server.key_repeat_timer = wl_event_loop_add_timer(server.loop, key_repeat_fired, &server);
 	server.repeat_index = -1;
 	server.idle_timer = wl_event_loop_add_timer(server.loop, idle_fired, &server);
