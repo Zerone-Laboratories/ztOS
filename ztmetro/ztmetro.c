@@ -366,6 +366,7 @@ struct zt_anim {
 	bool linear;			/* otherwise exponential ease-out */
 	float overshoot;		/* >0: a back-ease-out, past the target then back */
 	float wplog;			/* >0: Windows Phone's Log(weight) interpolation */
+	bool queued;			/* set off after another on the same value: starts from where that left it */
 };
 
 struct zt_text_input {
@@ -871,16 +872,16 @@ static float wp_exp(float t, float w) { return wp_g(t, w); }
 
 static void animate(struct zt_server *server, float *value, float to, uint32_t duration,
 		uint32_t delay, bool linear) {
-	struct zt_anim *slot = NULL;
+	struct zt_anim *slot = NULL, *running = NULL, *free_slot = NULL;
 	for (int i = 0; i < MAX_ANIMS; i++) {
-		if (server->anims[i].active && server->anims[i].value == value) {
-			slot = &server->anims[i];
-			break;
-		}
-		if (!server->anims[i].active && !slot) {
-			slot = &server->anims[i];
-		}
+		struct zt_anim *a = &server->anims[i];
+		if (a->active && a->value == value && !running) running = a;
+		if (!a->active && !free_slot) free_slot = a;
 	}
+	/* With a delay, what is moving now goes on until then (a tile's dip,
+	 * then its release); without one, it is redirected from where it is */
+	bool queue = delay > 0 && running && free_slot;
+	slot = queue ? free_slot : running ? running : free_slot;
 	if (!slot) {
 		*value = to;	/* out of slots: jump */
 		damage(server);
@@ -895,6 +896,7 @@ static void animate(struct zt_server *server, float *value, float to, uint32_t d
 	*slot = (struct zt_anim){
 		.active = true, .value = value, .from = *value, .to = to,
 		.start = now_ms() + delay, .duration = duration ? duration : 1, .linear = linear,
+		.queued = queue,
 	};
 	motion_lease(now_ms() + delay + duration);
 	damage(server);
@@ -971,6 +973,15 @@ static bool anims_step(struct zt_server *server, uint32_t now) {
 		if ((int32_t)(now - a->start) < 0) {
 			running = true;	/* still in its delay */
 			continue;
+		}
+		if (a->queued) {
+			/* its turn: from where the one before left the value, which stops */
+			a->queued = false;
+			a->from = *a->value;
+			for (int j = 0; j < MAX_ANIMS; j++) {
+				if (&server->anims[j] != a && server->anims[j].active && server->anims[j].value == a->value)
+					server->anims[j].active = false;
+			}
 		}
 		float t = (float)(now - a->start) / a->duration;
 		if (t >= 1.0f) {
@@ -9556,9 +9567,19 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 		bool rested = (int32_t)(time - p->t_last) > 90;
 		/* a quick tap: it dips all the way, then comes back */
 		uint32_t back_after = 0;
+		float *dip = p->index < 0 ? NULL : p->on_list ? &server->items[p->index].press : &server->tiles[p->index].press;
 		if (p->index >= 0 && !p->moved && !p->press_shown) {
 			start_press_show(server, p);
-			back_after = TILT_IN_MS;
+			back_after = 0;
+		}
+		if (dip) {
+			/* never cut the dip short: back up once it has gone all the way */
+			uint32_t now = now_ms();
+			for (int i = 0; i < MAX_ANIMS; i++) {
+				struct zt_anim *a = &server->anims[i];
+				if (a->active && a->value == dip && (int32_t)(a->start + a->duration - now) > (int32_t)back_after)
+					back_after = a->start + a->duration - now;
+			}
 		}
 		if (p->index >= 0) {
 			if (p->on_list) {
