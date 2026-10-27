@@ -5339,8 +5339,12 @@ static int boot_check_sensorhub(void *data) {
 	}
 
 	server->boot_check_count++;
-	/* Show the existing sensor-hub warning after ~2.5s, while Android keeps starting. */
-	if (sensor_ready || (server->boot_check_count < 25 && !test_fail)) {
+	/*
+	 * Show the sensor-hub warning only once the hub has had its time: lhd
+	 * loads the firmware patch for ~13 s and the hub is ready ~27 s into a
+	 * boot, long after the shell starts (~5 s). At 2.5 s it warned every boot.
+	 */
+	if (sensor_ready || (server->boot_check_count < 350 && !test_fail)) {
 		wl_event_source_timer_update(server->boot_check_timer, 100);
 		return 0;
 	}
