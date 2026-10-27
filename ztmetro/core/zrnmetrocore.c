@@ -738,6 +738,7 @@ static void cache_ensure(int scale) {
 		return;
 	}
 	int h = zmc.cache ? cairo_image_surface_get_height(zmc.cache) : zmc.height * scale;
+	uint32_t began = now_ms();
 	for (int pass = 0; pass < 2; pass++) {
 		if (!zmc.cache || cairo_image_surface_get_height(zmc.cache) != h ||
 				cairo_image_surface_get_width(zmc.cache) != zmc.width * scale) {
@@ -768,6 +769,12 @@ static void cache_ensure(int scale) {
 	}
 	zmc.cache_stale = false;
 	cache_gen++;
+	/* into the session log: a page drawn again that cost a frame or more */
+	uint32_t took = now_ms() - began;
+	if (took >= 16) {
+		fprintf(stderr, "%s: page %d drawn in %u ms (%dx%d px)\n", zmc.app->app_id, zmc.page, took,
+			cairo_image_surface_get_width(zmc.cache), cairo_image_surface_get_height(zmc.cache));
+	}
 }
 
 static void back_forget(void);
@@ -2931,6 +2938,14 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 	zmc.app = app;
 	zmc.page = first_page;
 	zmc.accent = zmc_config_accent();
+	/* Pixels per point: the shell's scale, rounded up, as it asks of every
+	 * surface. 4 was the S9 (1440 px) for every phone: the J5 (720 px, 1.67)
+	 * drew Settings 1728 px wide, 5.8 times the pixels its panel shows */
+	const char *shell_scale = getenv("ZTMETRO_SCALE");
+	if (shell_scale && strtod(shell_scale, NULL) >= 1.0) {
+		double s = ceil(strtod(shell_scale, NULL) - 0.01);
+		zmc.scale = s > 4 ? 4 : (int)s;
+	}
 	zmc.display = wl_display_connect(NULL);
 	if (!zmc.display) {
 		fprintf(stderr, "%s: failed to connect to Wayland display\n", app->app_id);

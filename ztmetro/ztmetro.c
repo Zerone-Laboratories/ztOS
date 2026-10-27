@@ -464,6 +464,7 @@ struct zt_server {
 	struct wlr_output_layout *output_layout;
 	struct zt_output *output;
 	float scale;
+	float size_step;	/* Settings' display size: 0.875, 1 or 1.125 of the automatic scale */
 	int width, height;	/* of the output, in points */
 	uint32_t accent;
 	bool haptics_enabled;
@@ -1124,6 +1125,11 @@ static void renderer_init(struct zt_server *server) {
 
 /* Draw the unit square through `model` (which maps it to points on screen).
  * The context must be current. */
+/* what each frame costs the GPU, for the animation summary in the log:
+ * quads drawn, the pixels they cover (overdraw), and textures uploaded */
+static unsigned frame_quads, frame_uploads, anim_quads, anim_uploads;
+static double frame_px, frame_upload_bytes, anim_px, anim_upload_bytes;
+
 static void quad(struct zt_server *server, GLenum target, GLuint tex, const float model[16],
 		float alpha, bool swap_rb, bool opaque, float u_max, float v_max) {
 	static const GLfloat corners[8] = { 0, 0, 1, 0, 0, 1, 1, 1 };
@@ -1131,6 +1137,9 @@ static void quad(struct zt_server *server, GLenum target, GLuint tex, const floa
 	if (!program || !tex || alpha <= 0.003f) {
 		return;
 	}
+	frame_quads++;
+	frame_px += fabs((double)model[0] * model[5] - (double)model[1] * model[4]) *
+		server->scale * server->scale;
 	float mvp[16];
 	if (server->vp_on) {
 		/* seen from in front of (vp_x, vp_y) instead of the screen's middle:
@@ -1243,6 +1252,8 @@ static void zt_buffer_show(struct zt_server *server, struct zt_layer *layer,
 		 * their dimensions usually stay fixed. Keep the GPU allocation and only
 		 * replace its pixels; reallocating it on every shade update stalls some
 		 * mobile GLES drivers. */
+		frame_uploads++;
+		frame_upload_bytes += (double)layer->tw * layer->th * 4;
 		if (created || layer->alloc_tw != layer->tw || layer->alloc_th != layer->th) {
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, layer->tw, layer->th, 0, GL_RGBA,
 				GL_UNSIGNED_BYTE, cairo_image_surface_get_data(buffer->surface));
@@ -2680,7 +2691,8 @@ static void load_config(struct zt_server *server) {
 	for (int i = 0; i < 8; i++) {
 		server->haptic_level[i] = 100;
 	}
-	server->scale = 4.0f;
+	server->scale = 0.0f;	/* automatic: from the panel's width (server_new_output) */
+	server->size_step = 1.0f;
 	server->units = 6;		/* three medium tiles across */
 	server->menu_speed = 75;
 	server->key_height = DEFAULT_KEY_HEIGHT;
@@ -2742,7 +2754,11 @@ static void load_config(struct zt_server *server) {
 		} else if (strcmp(key, "quick") == 0) {
 			quick_parse(server, value);
 		} else if (strcmp(key, "scale") == 0) {
-			server->scale = strtof(value, NULL);
+			server->scale = strcmp(value, "auto") == 0 ? 0.0f : strtof(value, NULL);
+		} else if (strcmp(key, "display_size") == 0) {
+			/* Settings' step either side of the automatic scale */
+			server->size_step = strcmp(value, "compact") == 0 ? 0.875f :
+				strcmp(value, "large") == 0 ? 1.125f : 1.0f;
 		} else if (strcmp(key, "columns") == 0) {
 			/* medium tiles across: 2, 3 or 4 */
 			int columns = atoi(value);
@@ -9945,6 +9961,10 @@ static void ctl_command(struct zt_server *server, char *line) {
 		damage(server);
 	} else if (sscanf(line, "volume %d", &id) == 1) {
 		volume_step(server, id);
+	} else if (strcmp(line, "restart") == 0) {
+		/* a new display size: greetd starts the session again at it */
+		wlr_log(WLR_INFO, "restart asked for");
+		wl_display_terminate(server->wl_display);
 	} else if (strncmp(line, "screen off", 10) == 0) {
 		screen_set(server, false);
 	} else if (strncmp(line, "screen on", 9) == 0) {
@@ -11018,7 +11038,13 @@ static void render_frame(struct zt_server *server) {
 		server->anim_draw_ms += (t1.tv_sec * 1e3 + t1.tv_nsec / 1e6) - now;
 		server->anim_finish_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
 		server->anim_commit_ms += (t3.tv_sec - t2.tv_sec) * 1e3 + (t3.tv_nsec - t2.tv_nsec) / 1e6;
+		anim_quads += frame_quads;
+		anim_uploads += frame_uploads;
+		anim_px += frame_px;
+		anim_upload_bytes += frame_upload_bytes;
 	}
+	frame_quads = frame_uploads = 0;
+	frame_px = frame_upload_bytes = 0;
 
 	if (app && app->mapped) {
 		clock_gettime(CLOCK_MONOTONIC, &draw.when);
@@ -11047,12 +11073,19 @@ static void render_frame(struct zt_server *server) {
 		wlr_output_schedule_frame(output);
 	} else if (server->anim_frames > 1) {
 		wlr_log(WLR_INFO, "animation: %u frames in %u ms (%.1f ms each, worst %u ms); "
-			"per frame: draw %.1f, finish %.1f, commit %.1f ms",
+			"per frame: draw %.1f, finish %.1f, commit %.1f ms; %.0f quads covering %.1f screens, "
+			"%.2f uploads (%.1f MB)",
 			server->anim_frames, now - server->anim_first_ms,
 			(float)(now - server->anim_first_ms) / (server->anim_frames - 1),
 			server->anim_worst_ms, server->anim_draw_ms / server->anim_frames,
 			server->anim_finish_ms / server->anim_frames,
-			server->anim_commit_ms / server->anim_frames);
+			server->anim_commit_ms / server->anim_frames,
+			(double)anim_quads / server->anim_frames,
+			anim_px / server->anim_frames / ((double)server->output->wlr_output->width *
+				server->output->wlr_output->height),
+			(double)anim_uploads / server->anim_frames, anim_upload_bytes / server->anim_frames / 1e6);
+		anim_quads = anim_uploads = 0;
+		anim_px = anim_upload_bytes = 0;
 		server->anim_frames = 0;
 		server->anim_draw_ms = server->anim_finish_ms = server->anim_commit_ms = 0;
 	} else {
@@ -11090,6 +11123,11 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	free(output);
 }
 
+/* the panel's short side: portrait phones, but a mode may come either way round */
+static int mode_height(const struct wlr_output_mode *mode, const struct wlr_output *wlr_output) {
+	return mode ? mode->height : wlr_output->height;
+}
+
 static void server_new_output(struct wl_listener *listener, void *data) {
 	struct zt_server *server = wl_container_of(listener, server, new_output);
 	struct wlr_output *wlr_output = data;
@@ -11105,6 +11143,20 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	if (mode) {
 		wlr_output_state_set_mode(&state, mode);
 	}
+	if (server->scale <= 0.0f) {
+		/* automatic: 360 points across the panel, as the S9 (1440 px, 4.0)
+		 * was laid out, so every phone shows the same layout; the J5's
+		 * 720 px give 2.0. Settings' display size steps it either side */
+		int px = mode ? mode->width : wlr_output->width;
+		if (px > mode_height(mode, wlr_output)) px = mode_height(mode, wlr_output);
+		float s = px > 0 ? px / 360.0f * server->size_step : 4.0f;
+		server->scale = roundf(s * 20.0f) / 20.0f;	/* a step of 0.05 */
+		if (server->scale < 1.0f) server->scale = 1.0f;
+	}
+	/* the apps it starts draw at this scale too (zrnmetrocore reads it) */
+	char scale_text[16];
+	snprintf(scale_text, sizeof(scale_text), "%.2f", server->scale);
+	setenv("ZTMETRO_SCALE", scale_text, 1);
 	wlr_output_state_set_scale(&state, server->scale);
 	wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
@@ -11425,7 +11477,7 @@ int main(int argc, char *argv[]) {
 	if (argc == 3 && strcmp(argv[1], "--render") == 0) {
 		return render_to_files(&server, argv[2]);
 	}
-	if (server.scale < 1.0f) {
+	if (server.scale > 0.0f && server.scale < 1.0f) {
 		server.scale = 1.0f;
 	}
 

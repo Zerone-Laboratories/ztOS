@@ -1087,7 +1087,14 @@ static void apply(void) {
 	int n = points(perfial_gpu_file("available_frequencies"), table, 32);
 	if (n > 0) {
 		long top = table[n - 1];
-		long max = idle0 ? table[0] : profile == POWERSAVE ? capped(table, n, 0.8) : top;
+		/* idle0's ceiling: the lowest step that can still draw Start, not the
+		 * lowest there is. The J5's Adreno lists only 19.2 MHz (the crystal,
+		 * an idle rate) and 400 MHz, and capped at 19.2 every frame took
+		 * 150-240 ms; the S9's Mali steps all clear a quarter of its top */
+		long rest = table[0];
+		for (int i = 0; i < n && rest < top / 4; i++)
+			rest = table[i];
+		long max = idle0 ? rest : profile == POWERSAVE ? capped(table, n, 0.8) : top;
 		if (power_level >= 4 && max > capped(table, n, 0.6))
 			max = capped(table, n, 0.6);
 		put(perfial_gpu_file("governor"), "simple_ondemand");
