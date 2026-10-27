@@ -871,6 +871,24 @@ static bool hit_at(double x, double y, struct zmc_hit *out) {
  * fall when seen from in front of the thing's middle at the shell's depth. */
 #define PRESS_NX	12
 #define PRESS_NY	4
+/* Windows Phone's magnetic tilt, as the shell's Start tiles have it: the lean
+ * grows with how far off the middle the finger is, (|nx| + |ny|) of a quarter
+ * of a radian, toward the finger; lean and sink both fade out PRESS_RANGE
+ * points from the middle; a press at the middle sinks to 88% of its size.
+ * w and h in points; rx, ry in radians; returns the sink as a share of the
+ * eye's distance. */
+#define PRESS_RANGE	188.0	/* WP's 250 px threshold, at 480 px across */
+#define PRESS_SINK	0.136	/* eye / (eye + 0.136 eye) = 0.88 */
+static double press_geometry(double w, double h, double *rx, double *ry) {
+	double nx = zmc.press_fx - 0.5, ny = zmc.press_fy - 0.5;
+	double dist = hypot(nx * w, ny * h), len = hypot(nx, ny);
+	double fall = dist < PRESS_RANGE ? 1.0 - dist / PRESS_RANGE : 0.0;
+	double ang = 0.25 * (fabs(nx) + fabs(ny)) * fall;
+	*ry = len > 1e-6 ? ang * nx / len : 0;
+	*rx = len > 1e-6 ? ang * ny / len : 0;
+	return PRESS_SINK * fall;
+}
+
 static void draw_press(cairo_t *cr, int scale) {
 	double p = press_amount();
 	if (p <= 0.001) {
@@ -881,15 +899,14 @@ static void draw_press(cairo_t *cr, int scale) {
 		double w = hit->w, h = hit->h, x = hit->x, y = hit->y - zmc.scroll;
 		if (w <= 0 || h <= 0) return;
 		double eye = (zmc.height / 2.0) / tan(DEPTH_FOV_DEG * M_PI / 360.0);
-		double max = ZMC_TILT_DEG * M_PI / 180.0;
-		double ry = (zmc.press_fx - 0.5) * 2 * fmin(max, asin(fmin(1.0, ZMC_TILT_LIFT / (w/2)))) * p;
-		double rx = (zmc.press_fy - 0.5) * 2 * fmin(max, asin(fmin(1.0, ZMC_TILT_LIFT / (h/2)))) * p;
+		double rx, ry, sink = press_geometry(w, h, &rx, &ry);
+		rx *= p; ry *= p;
 		struct zmg_vertex q[4];
 		for (int i = 0; i < 4; i++) {
 			double X = ((i & 1) ? 0.5 : -0.5) * w;
 			double Y = ((i & 2) ? 0.5 : -0.5) * h;
 			q[i] = (struct zmg_vertex){ x+w/2+X*cos(ry), y+h/2+Y*cos(rx),
-				-ZMC_PRESS_SINK*eye*p-X*sin(ry)-Y*sin(rx) };
+				-sink*eye*p-X*sin(ry)-Y*sin(rx) };
 		}
 		zmg_clip(0, HEADER_H, zmc.width, zmc.height - HEADER_H);
 		zmg_rect(x, y, w, h, 0, 0, 0);
@@ -903,14 +920,12 @@ static void draw_press(cairo_t *cr, int scale) {
 	double x = h->x * scale, y = (h->y - off) * scale, w = h->w * scale, hh = h->h * scale;
 	double top = HEADER_H * scale;
 	double eye = (zmc.height * scale / 2.0) / tan(DEPTH_FOV_DEG * M_PI / 360.0);
-	/* The lean: up to ZMC_TILT_DEG, but no more than lifts the far end
-	 * ZMC_TILT_LIFT points (a row as wide as the screen leans a few degrees,
-	 * a small button the full amount). Positive about the vertical carries
-	 * the right-hand side away, about the horizontal the bottom. */
-	double max = ZMC_TILT_DEG * M_PI / 180.0, lift = ZMC_TILT_LIFT * scale;
-	double ay = fmin(max, asin(fmin(1.0, lift / (w / 2)))), ax = fmin(max, asin(fmin(1.0, lift / (hh / 2))));
-	double ry = (zmc.press_fx - 0.5) * 2 * ay * p, rx = (zmc.press_fy - 0.5) * 2 * ax * p;
-	double z0 = -ZMC_PRESS_SINK * eye * p;
+	/* The lean and sink: press_geometry (WP's magnetic tilt). Positive
+	 * about the vertical carries the right-hand side away, about the
+	 * horizontal the bottom. */
+	double rx, ry, sink = press_geometry(h->w, h->h, &rx, &ry);
+	rx *= p; ry *= p;
+	double z0 = -sink * eye * p;
 	double cx = x + w / 2, cy = y + hh / 2;
 	double gx[PRESS_NX + 1][PRESS_NY + 1], gy[PRESS_NX + 1][PRESS_NY + 1];
 	for (int i = 0; i <= PRESS_NX; i++) {
