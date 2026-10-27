@@ -32,8 +32,8 @@
 #define ZMC_TILT_DEG	14.0
 #define ZMC_TILT_LIFT	40.0
 #define ZMC_PRESS_SINK	0.045
-#define ZMC_TILT_IN_MS	70
-#define ZMC_TILT_OUT_MS	160
+#define ZMC_TILT_IN_MS	90
+#define ZMC_TILT_OUT_MS	200
 #define ZMC_MARGIN	16	/* left edge of everything: 20 px on a 450 px wide reference */
 #define ZMC_HEADER_H	104	/* the title stays; the list moves under it */
 #define ZMC_ACT_BACK	(-1)	/* the title: up a page */

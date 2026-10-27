@@ -810,20 +810,44 @@ void zmc_redraw(void) {
 #define PRESS_IN_MS	ZMC_TILT_IN_MS
 #define PRESS_OUT_MS	ZMC_TILT_OUT_MS
 
+/* As the shell's tiles (Windows Phone's tilt): in, linearly; out on WP's
+ * Log(10) curve, fast and then slower and slower, and only once the dip has
+ * gone all the way, so that a quick tap still shows a whole press. */
+static double press_in_from;
+static uint32_t press_in_start;
+
 static double press_amount(void) {
-	uint32_t ms = PRESS_IN_MS;
-	if (zmc.press_to < zmc.press_from) {
-		ms = PRESS_OUT_MS;
+	uint32_t now = now_ms();
+	if (zmc.press_to < zmc.press_from && (int32_t)(now - zmc.press_start) < 0) {
+		/* lifted, but the dip is still on its way down */
+		double t = clamp01((double)(now - press_in_start) / PRESS_IN_MS);
+		return press_in_from + (1.0 - press_in_from) * t;
 	}
-	double t = clamp01((double)(now_ms() - zmc.press_start) / ms);
-	t = 1 - (1 - t) * (1 - t);	/* quick, then easing */
+	if (zmc.press_to >= zmc.press_from) {
+		double t = clamp01((double)(now - zmc.press_start) / PRESS_IN_MS);
+		return zmc.press_from + (zmc.press_to - zmc.press_from) * t;
+	}
+	double t = clamp01((double)(now - zmc.press_start) / PRESS_OUT_MS);
+	t = (1.0 - pow(0.1, t)) / 0.9;	/* Log(10) = (b^t - 1)/(b - 1), b = 1/10 */
 	return zmc.press_from + (zmc.press_to - zmc.press_from) * t;
 }
 
 static void press_set(double to) {
-	zmc.press_from = press_amount();
+	uint32_t now = now_ms();
+	if (to > 0) {
+		press_in_from = press_amount();
+		press_in_start = now;
+		zmc.press_from = press_in_from;
+		zmc.press_start = now;
+	} else if (zmc.press_to > 0 && (int32_t)(now - (zmc.press_start + PRESS_IN_MS)) < 0) {
+		/* back up from the bottom, once there */
+		zmc.press_from = 1.0;
+		zmc.press_start = zmc.press_start + PRESS_IN_MS;
+	} else {
+		zmc.press_from = press_amount();
+		zmc.press_start = now;
+	}
 	zmc.press_to = to;
-	zmc.press_start = now_ms();
 	present();
 }
 
