@@ -13,6 +13,10 @@ Restart=on-failure
 RestartSec=10
 KillMode=control-group
 TimeoutStopSec=5
+# lhd passes GNSS data to gpsd through a pipe: once gpsd is gone, lhd blocks
+# writing to it and the whole sensor hub stops (2026-10-27). Restart lhd
+# after gpsd so it starts again without a reader.
+ExecStopPost=/usr/bin/systemctl --no-block restart ztoscsf-sensorhub.service
 
 [Install]
 WantedBy=graphical.target
