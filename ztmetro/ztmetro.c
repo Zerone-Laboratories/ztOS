@@ -10799,6 +10799,12 @@ static void render_frame(struct zt_server *server) {
 	}
 	int under_bottom = server->sensorhub_fail_screen ? output->height :
 		output->height - (int)floorf(NAV_H * server->scale);
+	/* the lock screen nearly down: only the nav bar's strip, which covers
+	 * the rest, is left. An empty scissor (height below zero) was a GL
+	 * error, and every frame of the lock screen's last 0.5 s was dropped */
+	if (under_bottom <= under_top) {
+		lock_covers = true;
+	}
 	if (!lock_covers && (under_top > 0 || under_bottom < output->height)) {
 		glEnable(GL_SCISSOR_TEST);
 		glScissor(0, under_top, output->width, under_bottom - under_top);	/* row 0 is the top */
