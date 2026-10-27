@@ -14,9 +14,10 @@ RestartSec=10
 KillMode=control-group
 TimeoutStopSec=5
 # lhd passes GNSS data to gpsd through a pipe: once gpsd is gone, lhd blocks
-# writing to it and the whole sensor hub stops (2026-10-27). Restart lhd
-# after gpsd so it starts again without a reader.
-ExecStopPost=/usr/bin/systemctl --no-block restart ztoscsf-sensorhub.service
+# writing to it and the whole sensor hub stops (2026-10-27). Restart the
+# whole framework after gpsd: a bare lhd restart without the hub's reset
+# sequence made the firmware assert (transport_layer.c line 165) a minute on.
+ExecStopPost=/usr/bin/systemctl --no-block restart ztoscoresensorframework.service
 
 [Install]
 WantedBy=graphical.target
