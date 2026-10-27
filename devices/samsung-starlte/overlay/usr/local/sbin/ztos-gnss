@@ -28,7 +28,8 @@ case "${1:-}" in
 	done
 	;;
 --run)
-	/usr/bin/chroot $R /vendor/bin/hw/gpsd -c /data/vendor/gps/gps.xml &
+	# no Android linker config in this root: libandroidicu.so is in the runtime APEX
+	LD_LIBRARY_PATH=/apex/com.android.runtime/lib64 /usr/bin/chroot $R /vendor/bin/hw/gpsd -c /data/vendor/gps/gps.xml &
 	gpsd_pid=$!
 	trap 'kill $gpsd_pid 2>/dev/null' EXIT
 	sleep 3
