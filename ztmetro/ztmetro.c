@@ -572,6 +572,8 @@ struct zt_server {
 	char media_title[100], media_artist[80];
 	struct zt_layer volume_layer;
 	struct wl_event_source *volume_timer;
+	struct wl_event_source *volume_repeat_timer, *volume_pip_timer;
+	int volume_repeat_by;	/* +1 or -1 while a volume key is held, else 0 */
 	/* Lumia Metro top modal dialog */
     bool auth_active, auth_busy, auth_success, auth_osk_was_visible;
     int auth_fd;
@@ -4681,8 +4683,10 @@ static void ui_sound(struct zt_server *server, enum ui_sound sound) {
 	if (!runtime) return;
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
 	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/ztos-sounds.sock", runtime);
-	unsigned char packet[2] = { (unsigned char)sound,
-		(unsigned char)(server->ring_volume * 100 / VOLUME_MAX) };
+	/* keyboard taps sit well under the ringer: at its level they were too loud */
+	int percent = server->ring_volume * 100 / VOLUME_MAX;
+	if (sound == UIS_KEY || sound == UIS_SPACE || sound == UIS_FUNCTION) percent = percent * 35 / 100;
+	unsigned char packet[2] = { (unsigned char)sound, (unsigned char)percent };
 	sendto(server->key_sound_fd, packet, sizeof(packet), MSG_DONTWAIT, (struct sockaddr *)&addr, sizeof(addr));
 }
 
@@ -8530,8 +8534,15 @@ static int volume_hide(void *data) {
 	return 0;
 }
 
+static int volume_pip(void *data) {
+    ui_sound(data, UIS_PIP);	/* once, at the level the keys came to rest on */
+    return 0;
+}
+
 static void volume_step(struct zt_server *server, int by) {
-    server->volume_is_media = server->audio_known ? server->audio_active : server->media_playing;
+    /* the stream is chosen on the first press; repeats keep it */
+    if (!server->volume_repeat_by)
+        server->volume_is_media = server->audio_known ? server->audio_active : server->media_playing;
     int *level = server->volume_is_media ? &server->volume : &server->ring_volume;
     int previous = *level, to = previous + by;
     *level = to < 0 ? 0 : to > VOLUME_MAX ? VOLUME_MAX : to;
@@ -8548,8 +8559,28 @@ static void volume_step(struct zt_server *server, int by) {
     }
     hap(server, !server->volume_is_media && previous > 0 && *level == 0 ? HAP_TAP : HAP_TICK, HG_SYSTEM);
     if (!server->volume_is_media && *level != previous) {
-        ui_sound(server, UIS_PIP);	/* the ringer at its new level, as Windows Phone does */
+        /* the ringer at its new level, as Windows Phone does: one pip after
+         * the keys stop, not one per step */
+        wl_event_source_timer_update(server->volume_pip_timer, 250);
     }
+}
+
+/* A held volume key steps on, as on a phone: after 400 ms, every 90 ms. */
+static int volume_repeat(void *data) {
+    struct zt_server *server = data;
+    if (!server->volume_repeat_by || !server->screen_on) {
+        server->volume_repeat_by = 0;	/* the key-up may never come with the screen off */
+        return 0;
+    }
+    int *level = server->volume_is_media ? &server->volume : &server->ring_volume;
+    int before = *level;
+    volume_step(server, server->volume_repeat_by);
+    if (*level == before) {	/* at the end of the scale: no more ticks */
+        server->volume_repeat_by = 0;
+        return 0;
+    }
+    wl_event_source_timer_update(server->volume_repeat_timer, 90);
+    return 0;
 }
 
 /* What white becomes at a colour temperature, against 6500 K as (1, 1, 1):
@@ -10058,8 +10089,14 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 			if (demoloop_active()) {
 				/* Volume down is handled above; volume up is suppressed too. */
 			} else {
+				server->volume_repeat_by = 0;
 				volume_step(server, event->keycode == KEY_VOLUMEUP ? 1 : -1);
+				server->volume_repeat_by = event->keycode == KEY_VOLUMEUP ? 1 : -1;
+				wl_event_source_timer_update(server->volume_repeat_timer, 400);
 			}
+		} else {
+			server->volume_repeat_by = 0;
+			wl_event_source_timer_update(server->volume_repeat_timer, 0);
 		}
 		return;
 	}
@@ -11477,6 +11514,8 @@ int main(int argc, char *argv[]) {
 	wl_event_loop_add_signal(server.loop, SIGHUP, reload, &server);
 	server.launch_timer = wl_event_loop_add_timer(server.loop, launch_timed_out, &server);
 	server.volume_timer = wl_event_loop_add_timer(server.loop, volume_hide, &server);
+	server.volume_repeat_timer = wl_event_loop_add_timer(server.loop, volume_repeat, &server);
+	server.volume_pip_timer = wl_event_loop_add_timer(server.loop, volume_pip, &server);
 	server.peek_timer = wl_event_loop_add_timer(server.loop, peek_timed_out, &server);
 	server.net_timer = wl_event_loop_add_timer(server.loop, net_tick, &server);
 	wl_event_source_timer_update(server.net_timer, 3000);
