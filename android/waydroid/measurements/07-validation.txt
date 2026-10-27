@@ -1,0 +1,58 @@
+Device: Galaxy S9, kernel 7.1, Waydroid 1.6.3, Android 13 VANILLA 20260927.
+Date: 2026-10-23 UTC / 2026-10-24 Colombo.
+
+INSTALL/APP
+New org.ztos.waydroid.probe APK: pm install -> Success.
+Probe log after composer fixes: Install and launch passed; is64Bit=true.
+Cold activity launch: Status ok, TotalTime 1455 ms, WaitTime 1463 ms.
+WhatsApp primaryCpuAbi=arm64-v8a, versionName=2.26.41.78.
+WhatsApp launch reached registration EULA/Main; no account login performed.
+Probe uninstalled after tests: Success. Existing WhatsApp data retained.
+
+NETWORK
+Before: Android had no default route; ping returned Network is unreachable.
+Initial main-table route repair immediately returned HTTP 204.
+After service/session restarts and phone reboots: default via 192.168.240.1 dev eth0;
+DNS resolution for connectivitycheck.gstatic.com succeeded; HTTP 204;
+Active default network: 100; restricted_networking_mode=0.
+Fault injection: delete Android main default route and only ip ztos_waydroid NAT table.
+Seven seconds later both existed again; HTTP 204.
+
+RECOVERY
+Three phone reboots: host container and network services active, user session STOPPED.
+One cold launch: status=0, elapsed=35 seconds, sys.boot_completed=1.
+SIGSTOP session manager PID 6656; next launcher replaced it with PID 10675,
+rebooted Android and reopened WhatsApp; no manual SIGCONT was needed.
+User session unit is static; host container and network units are enabled.
+
+FREEZE
+Native idle suspend missed a timeout in one test, despite no wake locks.
+Added host fallback based on HWC waydroid.open_windows, not activity focus.
+Zero HWC windows at 20:44:56; host freeze at 20:45:12.
+FROZEN at 20:45:16 and 20:45:26; usage_usec=236121741 in both samples.
+Relaunch: RUNNING, waydroid.open_windows=1, WhatsApp activity resumed.
+Final zero-window test: RUNNING at 20:50:25 and 20:50:35;
+host freeze at 20:50:42; FROZEN/cgroup.freeze=1 at 20:50:45 and 20:50:55;
+usage_usec=199797248 in both frozen samples.
+Final phone state: idle/FROZEN. User session remains available for lazy app launches.
+
+TRACING/STABILITY
+Before tracing disable, while WhatsApp was loading: memory.current=2365927424.
+Three seconds after: 2430214144. This transient difference is not a savings benchmark.
+Final install --config-only: successful; exact pinned vendor hash unchanged.
+Final subsequent launch: status=0; sys.boot_completed=1; waydroid.open_windows=1;
+init.svc.traced=stopped; init.svc.traced_probes=stopped; crash buffer empty.
+Earlier post-composer-fix cold phone boot recorded one SurfaceFlinger SIGSEGV in
+TracingMuxer / perfetto::base::UnixTaskRunner::AddFileDescriptorWatch, followed by
+a Settings window error. Automatic recovery worked. Root cause and long-run
+crash-free startup remain unproven despite the clean final session restart.
+
+HOST/STATIC CHECKS
+systemd-analyze verify passed for both installed units.
+visudo validated the restricted recovery rule.
+bash -n passed for all delivered shell scripts; Python AST parsing passed.
+Composer binary patch: expected hash passed; repeated patch produced same hash;
+unknown input was rejected without modification.
+Stock system/vendor backups and original config remain on phone.
+No cgroup hard cap added; memory.max=max and memory.events oom_kill=0 in snapshots.
+No ztMETRO or ATL files changed by this task.

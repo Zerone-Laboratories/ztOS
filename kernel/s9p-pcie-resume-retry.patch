@@ -1,0 +1,152 @@
+PCIe (BCM4361 Wi-Fi): retry link training after sleep, and answer config
+accesses while the link is down.
+
+Training now and then fails after SYS_SLEEP and Wi-Fi was gone until a
+reboot: power the endpoint off (WL_REG_ON) and train again, up to three
+times. While the link is stopped for sleep, or never came back, config
+accesses below the root port get a bus error from this root complex that
+hangs the SoC: answer them as an absent device instead, so a rebind of
+brcmfmac fails cleanly. Both after Omonulloh's pcie1 driver for the Exynos
+9820 (OmonullOS, 2026-10-19). Applied after s9p-pcie-pm.patch.
+
+--- a/drivers/pci/controller/dwc/pcie-exynos9810.c
++++ b/drivers/pci/controller/dwc/pcie-exynos9810.c
+@@ -125,10 +125,13 @@
+ 	void __iomem		*cmu_top;	/* 0x1a240000: FSYS1_PCIE gate */
+ 	void __iomem		*fsys1_gates;	/* 0x11402000: GOUT gates */
+ 	struct irq_domain	*intx_domain;
++	bool			link_off;	/* stopped for sleep, or failed to train */
+ };
+ 
+ #define to_exynos9810_pcie(x)	container_of(x, struct exynos9810_pcie, pci)
+ 
++static void exynos9810_pcie_guard_cfg(struct dw_pcie_rp *pp);
++
+ static u32 elb_readl(struct exynos9810_pcie *ep, u32 reg)
+ {
+ 	return readl(ep->pci.elbi_base + reg);
+@@ -558,6 +561,8 @@
+ 	ret = dw_pcie_host_init(&pci->pp);
+ 	if (ret)
+ 		dev_err(dev, "failed to initialize host: %d\n", ret);
++	else
++		exynos9810_pcie_guard_cfg(&pci->pp);
+ 
+ 	return ret;
+ }
+@@ -569,6 +574,58 @@
+ 	dw_pcie_host_deinit(&ep->pci.pp);
+ }
+ 
++/*
++ * Config accesses below the root port while the link is down (sleep, or a
++ * resume that failed to train) get a bus error from this root complex that
++ * hangs the SoC: answer them as an absent device instead. The child bus ops
++ * are swapped after dw_pcie_host_init, as setup_rc only programs the iATU
++ * while they are the stock ones. Based on Omonulloh's pcie1 guard for the
++ * Exynos 9820 (OmonullOS, 2026-10-19).
++ */
++static struct pci_ops exynos9810_pcie_child_ops;
++static struct pci_ops *exynos9810_pcie_dw_child_ops;
++
++static bool exynos9810_pcie_bus_off(struct pci_bus *bus)
++{
++	struct dw_pcie_rp *pp = bus->sysdata;
++
++	return READ_ONCE(to_exynos9810_pcie(to_dw_pcie_from_pp(pp))->link_off);
++}
++
++static int exynos9810_pcie_rd_other(struct pci_bus *bus, unsigned int devfn,
++				    int where, int size, u32 *val)
++{
++	if (exynos9810_pcie_bus_off(bus)) {
++		PCI_SET_ERROR_RESPONSE(val);
++		return PCIBIOS_DEVICE_NOT_FOUND;
++	}
++	return exynos9810_pcie_dw_child_ops->read(bus, devfn, where, size, val);
++}
++
++static int exynos9810_pcie_wr_other(struct pci_bus *bus, unsigned int devfn,
++				    int where, int size, u32 val)
++{
++	if (exynos9810_pcie_bus_off(bus))
++		return PCIBIOS_DEVICE_NOT_FOUND;
++	return exynos9810_pcie_dw_child_ops->write(bus, devfn, where, size, val);
++}
++
++static void exynos9810_pcie_guard_cfg(struct dw_pcie_rp *pp)
++{
++	struct pci_bus *child;
++
++	if (!pp->bridge || !pp->bridge->bus)
++		return;
++	if (!exynos9810_pcie_dw_child_ops) {
++		exynos9810_pcie_dw_child_ops = pp->bridge->child_ops;
++		exynos9810_pcie_child_ops = *pp->bridge->child_ops;
++		exynos9810_pcie_child_ops.read = exynos9810_pcie_rd_other;
++		exynos9810_pcie_child_ops.write = exynos9810_pcie_wr_other;
++	}
++	list_for_each_entry(child, &pp->bridge->bus->children, node)
++		child->ops = &exynos9810_pcie_child_ops;
++}
++
+ static int exynos9810_pcie_suspend_noirq(struct device *dev)
+ {
+ 	struct exynos9810_pcie *ep = dev_get_drvdata(dev);
+@@ -579,6 +636,7 @@
+ 	elb_writel(ep, 0, PCIE_IRQ_EN_PULSE);
+ 	elb_writel(ep, 0, PCIE_IRQ_EN_LEVEL);
+ 	elb_writel(ep, 0, PCIE_IRQ_EN_SPECIAL);
++	WRITE_ONCE(ep->link_off, true);
+ 	dw_pcie_stop_link(&ep->pci);
+ 	ep->pci.suspended = true;
+ 	return 0;
+@@ -587,18 +645,40 @@
+ static int exynos9810_pcie_resume_noirq(struct device *dev)
+ {
+ 	struct exynos9810_pcie *ep = dev_get_drvdata(dev);
++	int ret, try;
+ 
+ 	/* Parent resumes before PCI children: replay PHY/host setup, restore
+ 	 * outbound mappings and train the link before their config accesses. */
+-	/* GPIO providers may have restored the pre-suspend PERST# value. */
+-	dw_pcie_stop_link(&ep->pci);
+-	if (ep->wl_reg_on) {
+-		/* A powerdown GPIO may have removed WLAN power during sleep.
+-		 * Keep PERST# asserted for the same cold-start delay as probe. */
+-		gpiod_set_value_cansleep(ep->wl_reg_on, 1);
+-		msleep(200);
++	for (try = 1; ; try++) {
++		/* GPIO providers may have restored the pre-suspend PERST# value. */
++		dw_pcie_stop_link(&ep->pci);
++		if (ep->wl_reg_on) {
++			/* A powerdown GPIO may have removed WLAN power during sleep.
++			 * Keep PERST# asserted for the same cold-start delay as probe. */
++			gpiod_set_value_cansleep(ep->wl_reg_on, 1);
++			msleep(200);
++		}
++		ret = dw_pcie_resume_noirq(&ep->pci);
++		if (!ret || try == 3)
++			break;
++		/*
++		 * Training now and then fails once after sleep, and Wi-Fi was
++		 * gone until a reboot: power the endpoint off and train from
++		 * the start again (as Omonulloh's pcie1 resume does on the 9820).
++		 */
++		dev_warn(dev, "link training after sleep failed (%d), retry %d\n", ret, try + 1);
++		ep->pci.suspended = true;
++		if (ep->wl_reg_on) {
++			gpiod_set_value_cansleep(ep->wl_reg_on, 0);
++			msleep(50);
++		}
+ 	}
+-	return dw_pcie_resume_noirq(&ep->pci);
++	if (ret) {
++		dev_err(dev, "no link after sleep: Wi-Fi stays off until a reboot\n");
++		return 0;	/* the guard answers config accesses; the rest of resume goes on */
++	}
++	WRITE_ONCE(ep->link_off, false);
++	return 0;
+ }
+ 
+ static const struct dev_pm_ops exynos9810_pcie_pm_ops = {

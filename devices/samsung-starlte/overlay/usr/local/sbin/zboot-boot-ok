@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""zboot-boot-ok: let a watchdog reset come back into ztOS, not TWRP.
+
+The boot image sets PMU INFORM3 to "recovery" at the very start, so a panic or
+hang before ztOS is up lands in TWRP. Left that way all boot, every later
+watchdog reset (a hang at 3 a.m.) also went to TWRP, and the unattended phone
+sat there until someone pressed buttons. Once this boot has run BOOT_OK_S
+seconds, INFORM3 is set to "normal": the watchdog then restarts ztOS.
+
+A crash loop must still end in TWRP: each boot that did not shut down cleanly
+counts one; at MAX_UNCLEAN in a row, INFORM3 is left on recovery. A clean
+shutdown (ExecStop) resets the count. A clean reboot rewrites INFORM3 itself
+(syscon-reboot-mode), so `reboot recovery` still works.
+
+    zboot-boot-ok start     (systemd: after the wait) | stop (clean shutdown)
+"""
+import ctypes, mmap, os, sys, time
+from pathlib import Path
+
+INFORM3 = 0x1406080c
+NORMAL, RECOVERY = 0x12345670, 0x12345674
+BOOT_OK_S = 120
+MAX_UNCLEAN = 3
+STATE = Path('/var/lib/zboot')
+CLEAN, COUNT = STATE / 'clean-shutdown', STATE / 'unclean-boots'
+
+
+def write32(addr, value):
+    fd = os.open('/dev/mem', os.O_RDWR | os.O_SYNC)
+    try:
+        page = addr & ~0xfff
+        m = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=page)
+        ctypes.c_uint32.from_buffer(m, addr - page).value = value
+        v = ctypes.c_uint32.from_buffer(m, addr - page).value
+        return v
+    finally:
+        os.close(fd)
+
+
+def start():
+    STATE.mkdir(parents=True, exist_ok=True)
+    unclean = 0 if CLEAN.exists() else int((COUNT.read_text() if COUNT.exists() else '0') or 0) + 1
+    CLEAN.unlink(missing_ok=True)
+    COUNT.write_text(f'{unclean}\n')
+    if unclean >= MAX_UNCLEAN:
+        print(f'zboot-boot-ok: {unclean} unclean boots in a row: a reset stays on recovery (TWRP)')
+        return 0
+    up = float(Path('/proc/uptime').read_text().split()[0])
+    if up < BOOT_OK_S:
+        time.sleep(BOOT_OK_S - up)
+    v = write32(INFORM3, NORMAL)
+    print(f'zboot-boot-ok: up {BOOT_OK_S}s ({unclean} unclean before): a watchdog reset now restarts ztOS (INFORM3 {v:#x})')
+    return 0
+
+
+def stop():
+    STATE.mkdir(parents=True, exist_ok=True)
+    CLEAN.touch()
+    COUNT.write_text('0\n')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit({'start': start, 'stop': stop}[sys.argv[1] if len(sys.argv) > 1 else 'start']())

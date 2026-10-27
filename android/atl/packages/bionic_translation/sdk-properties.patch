@@ -1,0 +1,28 @@
+--- a/libc/libc.c
++++ b/libc/libc.c
+@@ -65,8 +65,23 @@
+ {
+ 	verbose("%s", name);
+ 
+-	if (!strcmp(name, "ro.build.version.sdk"))
+-		return snprintf(value, PROP_VALUE_MAX, "%d", 21);
++	if (!strcmp(name, "ro.build.version.sdk")) {
++		const char *env_val = getenv("ATL_SDK_INT");
++		int sdk = 21;
++		if (env_val && *env_val) {
++			const char *p = env_val;
++			long parsed = 0;
++			while (*p >= '0' && *p <= '9') {
++				parsed = parsed * 10 + (*p - '0');
++				if (parsed > 1000) break;
++				p++;
++			}
++			if (!*p && parsed >= 1 && parsed <= 1000) {
++				sdk = (int)parsed;
++			}
++		}
++		return snprintf(value, PROP_VALUE_MAX, "%d", sdk);
++	}
+ 
+ 	*value = 0;
+ 	return 0;

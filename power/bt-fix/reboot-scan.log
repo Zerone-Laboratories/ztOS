@@ -1,0 +1,52 @@
+active
+active
+Controller 50:77:05:8E:75:B9 starlte [default]
+Controller 50:77:05:8E:75:B9 (public)
+	Manufacturer: 0x000f (15)
+	Version: 0x09 (9)
+	Name: starlte
+	Alias: starlte
+	Class: 0x006c0110 (7078160)
+	Powered: yes
+	PowerState: on
+	Discoverable: no
+	DiscoverableTimeout: 0x000000b4 (180)
+	Pairable: no
+	UUID: Headset AG                (00001112-0000-1000-8000-00805f9b34fb)
+	UUID: A/V Remote Control        (0000110e-0000-1000-8000-00805f9b34fb)
+	UUID: PnP Information           (00001200-0000-1000-8000-00805f9b34fb)
+	UUID: Audio Sink                (0000110b-0000-1000-8000-00805f9b34fb)
+	UUID: Headset                   (00001108-0000-1000-8000-00805f9b34fb)
+	UUID: A/V Remote Control Target (0000110c-0000-1000-8000-00805f9b34fb)
+	UUID: Generic Access Profile    (00001800-0000-1000-8000-00805f9b34fb)
+	UUID: Handsfree Audio Gateway   (0000111f-0000-1000-8000-00805f9b34fb)
+	UUID: Generic Attribute Profile (00001801-0000-1000-8000-00805f9b34fb)
+	UUID: Device Information        (0000180a-0000-1000-8000-00805f9b34fb)
+	UUID: Audio Source              (0000110a-0000-1000-8000-00805f9b34fb)
+	UUID: Handsfree                 (0000111e-0000-1000-8000-00805f9b34fb)
+	UUID: Vendor specific           (03b80e5a-ede8-4b33-a751-6ce34ec4c700)
+	Modalias: usb:v1D6Bp0246d0557
+	Discovering: no
+	Roles: central
+	Roles: peripheral
+Advertising Features:
+	ActiveInstances: 0x00 (0)
+	SupportedInstances: 0x05 (5)
+	SupportedIncludes: tx-power
+	SupportedIncludes: appearance
+	SupportedIncludes: local-name
+	SupportedCapabilities.MaxAdvLen: 0x1f (31)
+	SupportedCapabilities.MaxScnRspLen: 0x1f (31)
+Index list with 1 item
+hci0:	Primary controller
+	addr 50:77:05:8E:75:B9 version 9 manufacturer 15 class 0x6c0110
+	supported settings: powered connectable fast-connectable discoverable bondable link-security ssp br/edr le advertising secure-conn debug-keys privacy configuration static-addr phy-configuration ll-privacy 
+	current settings: powered ssp br/edr le secure-conn ll-privacy 
+	name starlte
+	short name 
+hci0:	Configuration options
+	supported options: public-address 
+	missing options: 
+SetDiscoveryFilter success
+Discovery started
+[[0;93mCHG[0m] Controller 50:77:05:8E:75:B9 Discovering: yes

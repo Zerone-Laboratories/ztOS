@@ -1,0 +1,95 @@
+# ztOSIAL manifest: Samsung Galaxy S9 (SM-G960, starlte), Exynos 9810.
+# The GSI's ztos-iald serves each interface from the backend named here; see
+# design/ztOSIAL.md. Generic backends with this phone's parameters wherever
+# Linux is standard; starlte.py for what is not.
+
+[device]
+codename = "samsung-starlte"
+name = "Samsung Galaxy S9"
+form_factor = "phone"
+scale = 2.5
+
+[gsi]
+min = "0.2.0"
+
+[ial.Power1]
+backend = "generic"
+battery = "/sys/class/power_supply/max170xx_battery"
+charger = "/sys/class/power_supply/max77705-charger"
+current_sign = 1                 # max1720x: + charging, - draining, as ztOSIAL
+current_node = "/sys/class/power_supply/max170xx_battery/current_now"
+
+[ial.Perf1]
+backend = "generic"
+gpu_devfreq = "/sys/class/devfreq/17500000.gpu"
+thermal_unit = "celsius"
+thermal_marks = [70, 76, 82]
+# Never the last core of a cluster (a whole cluster offline can hang the bus),
+# and only with zrn-hotplug loaded.
+keep_online = [0, 1, 4]
+hotplug = true
+# C2 on cpu2 and cpu3 only: all eight in C2 froze the display (0xff).
+idle_mask = "0x0c"
+
+[ial.Perf1.thermal]
+big = "/sys/module/s9p_cpufreq/parameters/temp_big"
+little = "/sys/module/s9p_cpufreq/parameters/temp_little"
+gpu = "/sys/module/s9p_cpufreq/parameters/temp_gpu"
+
+# The Mongoose cores' ceiling by how many run: four at 2.3-2.7 GHz drew more
+# than the battery and PMIC deliver and the phone cut out (2026-10-25).
+[ial.Perf1.caps.policy4]
+1 = 2704000
+2 = 2314000
+3 = 1794000
+4 = 1794000
+
+[ial.Display1]
+backend = "vendor"
+module = "/vendor/ztos/ial/starlte.py"
+node = "/sys/class/backlight/s9p-panel"
+nits_path = "/var/lib/ztos/panel-bl-nits.txt"
+
+[ial.Sleep1]
+backend = "vendor"
+module = "/vendor/ztos/ial/starlte.py"
+
+[ial.Sensors1]
+backend = "vendor"
+module = "/vendor/ztos/ial/starlte.py"
+
+[ial.Haptics1]
+backend = "generic"
+device = "zrn-haptic"
+
+[ial.Lights1]
+backend = "generic"
+rgb = ["red:status", "green:status", "blue:status"]
+torch = "white:torch"
+
+[ial.Modem1]
+backend = "vendor"
+module = "/vendor/ztos/ial/starlte.py"
+
+[ial.CallAudio1]
+backend = "vendor"
+module = "/vendor/ztos/ial/starlte.py"
+
+[ial.AudioDevice1]
+backend = "vendor"
+module = "/vendor/ztos/ial/starlte.py"
+
+[ial.Accel1]
+backend = "vendor"
+module = "/vendor/ztos/ial/starlte.py"
+
+[ial.Android1]
+backend = "generic"
+
+[android]
+binder = "binderfs"
+gralloc = "gbm"
+memory_budget_mb = 1600
+
+[boot]
+usb_gadget_udc = "10c00000.dwc3"

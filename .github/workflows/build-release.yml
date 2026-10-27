@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+    # the website and its device list (accepted entries commit there) need no new image
+    paths-ignore:
+      - 'docs/**'
+      - 'services/**'
+      - '**.md'
     tags:
       - 'v*'
   workflow_dispatch:

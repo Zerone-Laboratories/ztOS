@@ -35,7 +35,7 @@ class Fail(Exception):
 
 @dataclass
 class Settings:
-    target: str = "qemu"            # qemu | starlte
+    target: str = "qemu"            # qemu | starlte | gsi (the generic system alone, as a tarball)
     user: str = "ztos"
     password: str = "ztos"
     hostname: str = "ztos"
@@ -52,10 +52,22 @@ def say(*words):
     print("ztos:", *words, flush=True)
 
 
+# a target's device layer (devices/<dir>/: manifest, layer.sh, packages.txt);
+# the GSI has none (design/ztOSIAL.md)
+DEVICES = {"starlte": "samsung-starlte", "qemu": "qemu-virt"}
+
+
+def gsi_version() -> str:
+    """0.2.0 for "0.2.0-BETA-1": the GSI's version is the release without its stage."""
+    return (ROOT / "VERSION").read_text().split()[0].split("-")[0]
+
+
 def packages(target: str) -> list:
     names = []
-    for name in ("common", target):
-        path = OS / "packages" / name
+    paths = [OS / "packages" / "common"]
+    if target in DEVICES:
+        paths.append(ROOT / "devices" / DEVICES[target] / "packages.txt")
+    for path in paths:
         if path.exists():
             for line in path.read_text().splitlines():
                 line = line.split("#", 1)[0].strip()
@@ -127,10 +139,14 @@ step() { echo "STEP $*"; }
 R=$ROOTFS
 umask 022
 
-if [ "$FRESH" = 1 ] || [ ! -e "$R/etc/arch-release" ]; then
+# A run stopped half way through the unpack leaves etc/arch-release without
+# the rest (no var/lib/pacman): only a mark written after the whole tarball
+# counts as unpacked.
+if [ "$FRESH" = 1 ] || [ ! -e "$R/.ztos-unpacked" ]; then
 	step "unpacking Arch Linux ARM"
 	rm -rf "$R"; mkdir -p "$R"
 	bsdtar -xpf "$TARBALL" -C "$R" --no-xattrs --no-acls --no-fflags
+	touch "$R/.ztos-unpacked"
 fi
 
 mount --bind "$R" "$R"
@@ -159,70 +175,69 @@ ch $P -Syu
 step "installing ztOS's packages (this is the long part)"
 ch $P -S --needed $PACKAGES
 
+# Ship the tested ARM64 runtime: OS installs do not compile ART or ATL.
+ATL_PACKAGES="$SRC/prebuilts/ztOSAndroidRuntimeV1/packages"
+if [ ! -f "$ATL_PACKAGES/SHA256SUMS" ]; then
+    ATL_PACKAGES="$SRC/build/atl/packages"
+fi
+if [ -f "$ATL_PACKAGES/SHA256SUMS" ]; then
+    step "installing ztOSAndroidRuntimeV1 (prebuilt ARM64 runtime)"
+    mkdir -p "$R/var/tmp/ztos-atl-packages"
+    cp -a "$ATL_PACKAGES/." "$R/var/tmp/ztos-atl-packages/"
+    cp "$SRC/android/atl/install-runtime.sh" "$R/var/tmp/ztos-atl-install.sh"
+    ch bash /var/tmp/ztos-atl-install.sh /var/tmp/ztos-atl-packages
+    mkdir -p "$R/usr/local/share/ztos/android-runtime"
+    rm -rf "$R/usr/local/share/ztos/android-runtime/packages"
+    mv "$R/var/tmp/ztos-atl-packages" "$R/usr/local/share/ztos/android-runtime/packages"
+    mv "$R/var/tmp/ztos-atl-install.sh" "$R/usr/local/share/ztos/android-runtime/install-runtime.sh"
+    chown -R 0:0 "$R/usr/local/share/ztos/android-runtime"
+else
+    echo "Missing ztOSAndroidRuntimeV1; restore prebuilts/ztOSAndroidRuntimeV1 or build android/atl first" >&2
+    exit 1
+fi
+
 step "removing the other desktops (ztMETRO is the only shell)"
 for p in sddm gdm lightdm hyprland plasma-workspace kwin phosh phoc gnome-shell weston sway; do
 	ch pacman -Qq "$p" > /dev/null 2>&1 && ch $P -Rns "$p" || true
 done
+
+# before ztMETRO: the shell links libztos-ial
+step "installing ztOSIAL (the hardware interfaces)"
+rm -rf "$R/usr/src/ztos-ial"; mkdir -p "$R/usr/src"
+cp -a "$SRC/ial" "$R/usr/src/ztos-ial"
+sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$GSIVERSION\"/" "$R/usr/src/ztos-ial/gsi.json"
+ch sh -c 'cd /usr/src/ztos-ial && make clean >/dev/null 2>&1; make && make install PREFIX=/usr'
+rm -rf "$R/usr/src/ztos-ial"
 
 step "building ztMETRO and its apps"
 rm -rf "$R/usr/src/ztmetro"; mkdir -p "$R/usr/src"
 cp -a "$SRC/ztmetro" "$R/usr/src/ztmetro"
 rm -rf "$R/usr/src/ztmetro/ref"
 ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1; make -j"$(nproc)" && make install'
+ch sh -c 'cd /usr/src/ztmetro && make install-browser'
 ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1' || true
 
 step "adding ztOS's files"
 cp -a "$SRC/os/overlay/." "$R/"
-cp -a "$SRC/os/overlay-$TARGET/." "$R/"
-if [ "$TARGET" = starlte ]; then
-	cp -a "$SRC/rootfs/overlay/." "$R/"         # the phone's own: USB link, charger, fallbacks
-	# the panel's brightness table is made from its calibration (ztos-panel-bl)
-	install -Dm755 "$SRC/kernel/s9p-bl-table.py" "$R/usr/local/lib/ztos/s9p-bl-table.py"
-	# the Windows Phone / Lumia photos, made from the OneDrive zip by os/wallpapers/make-wallpapers.py
-	if [ -d "$SRC/build/wallpapers/backgrounds/ztos" ]; then
-		install -d "$R/usr/local/share/backgrounds"
-		cp -a "$SRC/build/wallpapers/backgrounds/ztos" "$R/usr/local/share/backgrounds/"
-	fi
-	install -Dm644 -t "$R/usr/lib/firmware/brcm" "$SRC"/firmware/bcmdhd* "$SRC"/firmware/nvram*
-	for f in "$SRC"/firmware/calliope_*.bin; do
-		[ -f "$f" ] && install -Dm644 -t "$R/usr/lib/firmware" "$f"
-	done
-	install -d "$R/usr/lib/modules/7.1.0-zboot/extra"
-	install -d "$R/usr/local/lib"
-	if [ -f "$SRC/modem/zrn-modem/zrn-modem.ko" ]; then
-		install -m644 "$SRC/modem/zrn-modem/zrn-modem.ko" "$R/usr/local/lib/zrn-modem.ko"
-		install -m644 "$SRC/modem/zrn-modem/zrn-modem.ko" "$R/usr/lib/modules/7.1.0-zboot/extra/"
-	elif [ -f "$SRC/prebuilts/modules/zrn-modem.ko" ]; then
-		install -m644 "$SRC/prebuilts/modules/zrn-modem.ko" "$R/usr/local/lib/zrn-modem.ko"
-		install -m644 "$SRC/prebuilts/modules/zrn-modem.ko" "$R/usr/lib/modules/7.1.0-zboot/extra/"
-	fi
-	for k in "$SRC"/prebuilts/modules/*.ko \
-	         "$SRC"/power/idle/zrn-cpuidle.ko "$SRC"/haptics/zrn-haptic.ko \
-	         "$SRC"/power/hotplug/zrn-hotplug.ko "$SRC"/leds/zrn-led.ko \
-	         "$SRC"/sensors/driver/zrn-bbd.ko "$SRC"/audio/driver/snd-zrn-abox.ko \
-	         "$SRC"/audio/modules/*.ko; do
-		[ -f "$k" ] && install -m644 "$k" "$R/usr/lib/modules/7.1.0-zboot/extra/"
-	done
-	if [ -f "$SRC/build/linux-7.1/out/modules.builtin" ]; then
-		install -m644 "$SRC/build/linux-7.1/out/modules.builtin" "$R/usr/lib/modules/7.1.0-zboot/"
-		install -m644 "$SRC/build/linux-7.1/out/modules.builtin.modinfo" "$R/usr/lib/modules/7.1.0-zboot/"
-	fi
-	ch depmod -a 7.1.0-zboot > /dev/null 2>&1 || true
-	for moddir in "$R"/usr/lib/modules/*; do
-		[ -d "$moddir" ] || continue
-		kver=$(basename "$moddir")
-		[ "$kver" = "7.1.0-zboot" ] && continue
-		install -d "$moddir/extra"
-		for k in "$SRC"/prebuilts/modules/*.ko \
-		         "$SRC"/power/idle/zrn-cpuidle.ko "$SRC"/haptics/zrn-haptic.ko \
-		         "$SRC"/power/hotplug/zrn-hotplug.ko "$SRC"/leds/zrn-led.ko \
-		         "$SRC"/sensors/driver/zrn-bbd.ko "$SRC"/audio/driver/snd-zrn-abox.ko \
-		         "$SRC"/audio/modules/*.ko; do
-			[ -f "$k" ] && install -m644 "$k" "$moddir/extra/"
-		done
-		ch depmod -a "$kver" > /dev/null 2>&1 || true
-	done
-	chmod 755 "$R"/usr/local/sbin/* 2>/dev/null || true
+cp -a "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
+ch update-desktop-database /usr/share/applications
+
+step "adding Android (Waydroid and the recipe for its image)"
+W=$R/usr/share/ztos-waydroid
+rm -rf "$W"; install -d "$W"
+for f in install.sh strip-image.sh patch-vendor.sh patch-composer.py waydroid.cfg network.py recover.sh \
+		audio-recover.py launch.sh power.sh ztos-waydroid-boot README.md \
+		ztos-waydroid-network.service ztos-waydroid-session.service ztos-waydroid-boot.service \
+		ztos-waydroid-audio-reconnect.service; do
+	[ -e "$SRC/android/waydroid/$f" ] && cp -a "$SRC/android/waydroid/$f" "$W/"
+done
+install -Dm755 "$SRC/android/waydroid/ztos-waydroid-images" "$R/usr/lib/ztos/ztos-waydroid-images"
+install -Dm644 "$SRC/android/waydroid/ztos-waydroid-images.service" \
+	"$R/usr/lib/systemd/system/ztos-waydroid-images.service"
+
+DEVICE_UNITS=
+if [ "$TARGET" != gsi ]; then
+	. "$DEVSRC/layer.sh"
 fi
 install -d "$R/usr/local/share/fonts/selawik"
 install -m644 "$SRC"/os/fonts/selawik/*.ttf "$R/usr/local/share/fonts/selawik/"
@@ -247,6 +262,7 @@ for f in "$STAGEDIR"/apps/*.desktop; do
 	install -m644 "$STAGEDIR/apps/$id.svg" "$R/usr/local/share/icons/hicolor/scalable/apps/$id.svg"
 done
 
+if [ "$TARGET" != gsi ]; then	# the GSI has no user: its device layer's installer makes one
 step "making your account"
 OLD_USER=$(ch getent passwd 1000 | cut -d: -f1 || true)
 if [ -n "$OLD_USER" ] && [ "$OLD_USER" != "$USERNAME" ]; then
@@ -267,7 +283,17 @@ if [ -d "$R/etc/sudoers.d" ]; then
 		sed -i "s/^alarm /$USERNAME /" "$R/etc/sudoers.d/99-ztos-alarm"
 	fi
 fi
-sed -i "s/@USER@/$USERNAME/" "$R/etc/greetd/config.toml"
+# The one place the system learns who its user is (user.sh, ztos_user.py and
+# ztos-user.h read it). ztos-user-dropins then writes what cannot read it:
+# greetd's config, sudoers, polkit, the user manager's drop-in.
+install -Dm644 /dev/stdin "$R/etc/ztos/user.conf" <<USERCONF
+ZTOS_USER=$USERNAME
+ZTOS_UID=$(ch id -u "$USERNAME")
+ZTOS_GID=$(ch id -g "$USERNAME")
+ZTOS_HOME=$(ch getent passwd "$USERNAME" | cut -d: -f6)
+USERCONF
+ch /usr/local/sbin/ztos-user-dropins > /dev/null
+fi
 
 step "time, language and name"
 echo "$HOSTNAME" > "$R/etc/hostname"
@@ -280,39 +306,40 @@ echo LANG=en_US.UTF-8 > "$R/etc/locale.conf"
 step "turning on ztOS's services"
 # (systemd-resolved: names; NetworkManager hands it each network's DNS)
 # (systemd-pstore: the kernel log of a crash or hang is kept in /var/lib/systemd/pstore)
-for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoresensorframework ztos-update-check.timer; do
+for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoresensorframework ztos-update-check.timer \
+		ztos-iald waydroid-container ztos-waydroid-images; do
 	ch systemctl enable "$u" > /dev/null 2>&1 || echo "(no $u)"
 done
 for u in systemd-networkd getty@tty1; do
 	ch systemctl disable "$u" > /dev/null 2>&1 || true
 done
-if [ "$TARGET" = starlte ]; then
-	for u in zboot-usb-gadget zboot-firstboot zboot-charge-hold zrn-charge zrn-cpuidle ztoscirrusaudio ztoscsf-sensorhub \
-			ztoscsf-sensord ztoscorenetworking-modem ztoscorenetworking zrnperfd ztos-panel-selfmask ztos-panel-bl; do
-		ch systemctl enable "$u" > /dev/null 2>&1 || echo "(no $u)"
-	done
-fi
-if [ "$TARGET" = qemu ]; then
-	cat > "$R/etc/fstab" <<'FSTAB'
-# ztOS in QEMU
-PARTLABEL=ztos-root  /          ext4  rw,relatime  0 1
-PARTLABEL=ztos-esp   /boot/efi  vfat  rw,relatime,fmask=0077,dmask=0077  0 2
-FSTAB
-	mkdir -p "$R/boot/efi"
-	step "making the start-up image (initramfs)"
-	ch mkinitcpio -P > /dev/null 2>&1 || ch mkinitcpio -P
-	# what the boot partition takes, readable outside this namespace
-	install -d "$STAGEDIR/boot"
-	install -m644 "$R/boot/Image" "$STAGEDIR/boot/Image"
-	install -m644 "$R/boot/initramfs-linux.img" "$STAGEDIR/boot/initramfs.img"
-	install -m644 "$R/usr/lib/systemd/boot/efi/systemd-bootaa64.efi" "$STAGEDIR/boot/BOOTAA64.EFI"
-fi
+for u in $DEVICE_UNITS; do
+	ch systemctl enable "$u" > /dev/null 2>&1 || echo "(no $u)"
+done
 
 step "tidying up"
 rm -f "$R/etc/resolv.conf"; ln -sf /run/systemd/resolve/stub-resolv.conf "$R/etc/resolv.conf"
 rm -rf "$R/tmp/"* "$R/var/log/pacman.log"
+install -d "$R/etc/ztos"
 echo ztos > "$R/etc/ztos/built"
 date -u +%Y-%m-%dT%H:%MZ >> "$R/etc/ztos/built"
+
+if [ "$TARGET" = gsi ]; then
+	# the kernel and its modules are each phone's (its device layer): not the GSI's
+	if ch pacman -Qq linux-aarch64 > /dev/null 2>&1; then
+		ch pacman --noconfirm -Rdd linux-aarch64 > /dev/null
+	fi
+	rm -f "$R/etc/ztos/user.conf"
+	step "packing the GSI"
+	umount -l "$R/var/cache/pacman/pkg" 2>/dev/null || true
+	umount -l "$R/tmp" "$R/proc" 2>/dev/null || true
+	umount -lR "$R/dev" 2>/dev/null || true
+	umount -l "$R" 2>/dev/null || true
+	rm -f "$GSITAR"
+	bsdtar --zstd -cpf "$GSITAR" -C "$R" .
+	echo STAGE-OK
+	exit 0
+fi
 
 step "writing the system image"
 # Re-arm first boot even when building from a previously used root tree.
@@ -343,6 +370,12 @@ def run_stage(s: Settings, log: Path) -> None:
         "ROOTIMG": str(s.dir / "root.img"), "SIZE": str(s.size_gb), "MKE2FS": mke2fs,
         "LABEL": "ZR_ARCH" if s.target == "starlte" else "ztos-root",
         "PKGCACHE": str(PKGCACHE),
+        "DEVDIR": DEVICES.get(s.target, ""), "GSIVERSION": gsi_version(),
+        # the device layer: devices/<dir> here; after the repository split, a
+        # checkout of the device's own repository (ZTOS_DEVICE=<path>)
+        "DEVSRC": os.environ.get("ZTOS_DEVICE") or str(ROOT / "devices" / DEVICES.get(s.target, "none")),
+        "DEVROOT": os.environ.get("ZTOS_DEVICE") or str(ROOT),
+        "GSITAR": str(s.dir / f"ztos-gsi-{gsi_version()}-aarch64.tar.zst"),
         "PATH": os.environ.get("PATH", "/usr/bin"),
     }
     script = s.dir / "stage.sh"
@@ -458,12 +491,19 @@ def build(s: Settings) -> Path:
     check_host()
     fetch_tarball()
     log = s.dir / "build.log"
-    rootimg = s.dir / "root.img"
+    rootimg = s.dir / ("ztos-gsi-%s-aarch64.tar.zst" % gsi_version() if s.target == "gsi" else "root.img")
     if rootimg.exists() and not s.fresh:
         say(f"using existing system image: {rootimg}")
     else:
         say(f"building ztOS for {s.target} (log: {log})")
         run_stage(s, log)
+    if s.target == "gsi":
+        tarball = s.dir / f"ztos-gsi-{gsi_version()}-aarch64.tar.zst"
+        digest = subprocess.run(["sha256sum", tarball.name], cwd=s.dir, check=True,
+                                capture_output=True, text=True).stdout
+        (s.dir / (tarball.name + ".sha256")).write_text(digest)
+        say(f"ready: {tarball} ({tarball.stat().st_size // (1024 ** 2)} MB), the GSI for ztConflo (--gsi)")
+        return tarball
     if s.target == "qemu":
         disk = make_qemu_disk(s)
         (s.dir / "root.img").unlink(missing_ok=True)

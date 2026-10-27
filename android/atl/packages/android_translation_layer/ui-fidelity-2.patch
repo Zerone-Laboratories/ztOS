@@ -1,0 +1,1574 @@
+--- a/src/api-impl/android/app/Activity.java
++++ b/src/api-impl/android/app/Activity.java
+@@ -160,6 +160,7 @@
+ 	}
+ 
+ 	protected void onStart() {
++		ActivityThread.internalTrackViewDump(this, true);
+ 		Slog.i(TAG, "- onStart - yay!");
+ 		window.setTitle(title);
+ 
+@@ -177,6 +178,7 @@
+ 	}
+ 
+ 	protected void onResume() {
++		ActivityThread.internalTrackViewDump(this, true);
+ 		Slog.i(TAG, "- onResume - yay!");
+ 
+ 		for (Fragment fragment : fragments) {
+@@ -204,6 +206,7 @@
+ 	}
+ 
+ 	protected void onStop() {
++		ActivityThread.internalTrackViewDump(this, false);
+ 		Slog.i(TAG, "- onStop - yay!");
+ 
+ 		for (Fragment fragment : fragments) {
+@@ -214,6 +217,7 @@
+ 	}
+ 
+ 	protected void onDestroy() {
++		ActivityThread.internalTrackViewDump(this, false);
+ 		Slog.i(TAG, "- onDestroy - yay!");
+ 
+ 		for (Fragment fragment : fragments) {
+--- a/src/api-impl/android/app/ActivityThread.java
++++ b/src/api-impl/android/app/ActivityThread.java
+@@ -31,4 +31,145 @@
+ 	public Configuration getConfiguration() {
+ 		return Context.sys_config;
+ 	}
++	private static final boolean VIEW_DUMP = "1".equals(System.getenv("ATL_VIEW_DUMP"));
++	private static java.util.ArrayList<java.lang.ref.WeakReference<Object>> dumpWindows;
++	private static android.os.Handler dumpHandler;
++
++	public static synchronized void internalTrackViewDump(Object owner, boolean live) {
++		if (!VIEW_DUMP) return;
++		try {
++			if (dumpWindows == null) dumpWindows = new java.util.ArrayList<>();
++			for (int i = dumpWindows.size() - 1; i >= 0; i--) {
++				Object item = dumpWindows.get(i).get();
++				if (item == null || item == owner) dumpWindows.remove(i);
++			}
++			if (live) dumpWindows.add(new java.lang.ref.WeakReference<Object>(owner));
++			if (dumpHandler == null) {
++				dumpHandler = new android.os.Handler(android.os.Looper.getMainLooper());
++				dumpHandler.postDelayed(new Runnable() {
++					public void run() {
++						try { pollViewDump(); } catch (Throwable error) { dumpError(error); }
++						try { dumpHandler.postDelayed(this, 1000); } catch (Throwable error) { dumpError(error); }
++					}
++				}, 1000);
++			}
++		} catch (Throwable error) { dumpError(error); }
++	}
++
++	private static void dumpError(Throwable error) {
++		try { System.out.println("VIEWDUMP ERR " + error.getClass().getName()); } catch (Throwable ignored) {}
++	}
++
++	private static void pollViewDump() {
++		java.io.File trigger = new java.io.File("/tmp/atl-viewdump-" + currentPackageName());
++		if (!trigger.exists() || !trigger.delete()) return;
++		int count = 0;
++		try {
++			Object[] owners;
++			synchronized (ActivityThread.class) {
++				java.util.ArrayList<Object> live = new java.util.ArrayList<>();
++				for (int i = dumpWindows.size() - 1; i >= 0; i--) {
++					Object owner = dumpWindows.get(i).get();
++					if (owner == null) dumpWindows.remove(i);
++					else live.add(owner);
++				}
++				owners = live.toArray();
++			}
++			for (Object owner : owners) {
++				try {
++					android.view.View root;
++					if (owner instanceof Activity) root = ((Activity)owner).getWindow().getDecorView();
++					else if (owner instanceof Dialog) {
++						if (!((Dialog)owner).isShowing()) continue;
++						root = ((Dialog)owner).getWindow().getDecorView();
++					} else {
++						android.widget.PopupWindow popup = (android.widget.PopupWindow)owner;
++						if (!popup.isShowing()) continue;
++						root = popup.getContentView();
++					}
++					if (root == null) continue;
++					System.out.println("VIEWDUMP ROOT " + owner.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(owner)));
++					count += dumpView(root, 0);
++				} catch (Throwable error) { dumpError(error); }
++			}
++		} finally { System.out.println("VIEWDUMP END " + count); }
++	}
++
++	private static String dumpText(CharSequence text) {
++		if (text == null) return "";
++		return text.subSequence(0, Math.min(30, text.length())).toString()
++			.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\"", "\\\"");
++	}
++
++	private static String dumpRect(android.graphics.Rect rect) {
++		return rect.left + "," + rect.top + "," + rect.right + "," + rect.bottom;
++	}
++
++	private static int dumpView(android.view.View view, int depth) {
++		try {
++			StringBuilder line = new StringBuilder("VIEWDUMP ");
++			for (int i = 0; i < depth; i++) line.append("  ");
++			Class<?> type = view.getClass();
++			String name = type.getSimpleName();
++			line.append(name.isEmpty() ? type.getName() : name);
++			if (!type.getName().startsWith("android.") && !type.getName().startsWith("androidx.")) {
++				for (Class<?> base = type.getSuperclass(); base != null; base = base.getSuperclass()) {
++					if (base.getName().startsWith("android.")) {
++						line.append('[').append(base.getSimpleName()).append(']');
++						break;
++					}
++				}
++			}
++			String id = "-";
++			if (view.getId() > 0) {
++				try { id = view.getResources().getResourceEntryName(view.getId()); }
++				catch (Throwable ignored) { id = "0x" + Integer.toHexString(view.getId()); }
++			}
++			line.append(" id=").append(id).append(" vis=").append(view.getVisibility() == 0 ? "V" : view.getVisibility() == 4 ? "I" : "G")
++				.append(" m=").append(view.getMeasuredWidth()).append('x').append(view.getMeasuredHeight())
++				.append(" l=").append(view.getLeft()).append(',').append(view.getTop())
++				.append(" s=").append(view.getWidth()).append('x').append(view.getHeight());
++			if (view.getPaddingLeft() != 0 || view.getPaddingTop() != 0 || view.getPaddingRight() != 0 || view.getPaddingBottom() != 0)
++				line.append(" pad=").append(view.getPaddingLeft()).append(',').append(view.getPaddingTop()).append(',').append(view.getPaddingRight()).append(',').append(view.getPaddingBottom());
++			if (view instanceof android.widget.TextView) {
++				android.widget.TextView text = (android.widget.TextView)view;
++				if (text instanceof android.widget.EditText) line.append(" len=").append(text.length());
++				else line.append(" text=\"").append(dumpText(text.getText())).append('"');
++				line.append(" hint=\"").append(dumpText(text.getHint())).append("\" size=").append(text.getTextSize())
++					.append(" color=#").append(String.format(java.util.Locale.ROOT, "%08X", text.getCurrentTextColor()))
++					.append(" gravity=0x").append(Integer.toHexString(text.getGravity()));
++				android.text.Layout layout = text.getLayout();
++				if (layout != null) line.append(" lines=").append(layout.getLineCount());
++			}
++			android.graphics.drawable.Drawable background = view.getBackground();
++			if (background != null) {
++				line.append(" bg=").append(background.getClass().getSimpleName()).append(" bounds=").append(dumpRect(background.getBounds()))
++					.append(" intr=").append(background.getIntrinsicWidth()).append('x').append(background.getIntrinsicHeight());
++				android.graphics.Rect padding = new android.graphics.Rect();
++				if (background.getPadding(padding)) line.append(" bgpad=").append(dumpRect(padding));
++			}
++			if (view instanceof android.widget.ImageView) {
++				android.widget.ImageView image = (android.widget.ImageView)view;
++				android.graphics.drawable.Drawable drawable = image.getDrawable();
++				line.append(" dr=").append(drawable == null ? "-" : drawable.getClass().getSimpleName());
++				if (drawable != null) line.append(" intr=").append(drawable.getIntrinsicWidth()).append('x').append(drawable.getIntrinsicHeight());
++				line.append(" scale=").append(image.getScaleType());
++			}
++			if (view.getAlpha() != 1) line.append(" alpha=").append(view.getAlpha());
++			if (view.getTranslationX() != 0) line.append(" translationX=").append(view.getTranslationX());
++			if (view.getTranslationY() != 0) line.append(" translationY=").append(view.getTranslationY());
++			System.out.println(line);
++		} catch (Throwable error) { dumpError(error); }
++		int count = 1;
++		if (view instanceof android.view.ViewGroup) {
++			android.view.ViewGroup group = (android.view.ViewGroup)view;
++			try {
++				for (int i = 0; i < group.getChildCount(); i++) {
++					try { count += dumpView(group.getChildAt(i), depth + 1); }
++					catch (Throwable error) { dumpError(error); }
++				}
++			} catch (Throwable error) { dumpError(error); }
++		}
++		return count;
++	}
+ }
+--- a/src/api-impl/android/app/Dialog.java
++++ b/src/api-impl/android/app/Dialog.java
+@@ -123,6 +123,7 @@
+ 				getWindow().getDecorView().internalSetDefaultMeasureSpec(widthMeasureSpec, heightMeasureSpec);
+ 
+ 				nativeShow(nativePtr);
++				ActivityThread.internalTrackViewDump(Dialog.this, true);
+ 				if (onShowListener != null)
+ 					onShowListener.onShow(Dialog.this);
+ 			}
+@@ -148,6 +149,7 @@
+ 			@Override
+ 			public void run() {
+ 				nativeClose(nativePtr);
++				ActivityThread.internalTrackViewDump(Dialog.this, false);
+ 				if (onDismissListener != null)
+ 					onDismissListener.onDismiss(Dialog.this);
+ 			}
+@@ -210,6 +212,7 @@
+ 	public void hide() {
+ 		System.out.println("hiding the Dialog " + this);
+ 		nativeClose(nativePtr);
++		ActivityThread.internalTrackViewDump(Dialog.this, false);
+ 	}
+ 
+ 	@Override
+--- a/src/api-impl/android/atl/GskCanvas.java
++++ b/src/api-impl/android/atl/GskCanvas.java
+@@ -12,6 +12,21 @@
+  */
+ public class GskCanvas extends DisplayListCanvas {
+ 	public long snapshot;
++	private int width, height;
++	private Stack<RectF> clipStack = new Stack<>();
++
++	public void setViewport(int width, int height) {
++		this.width = width;
++		this.height = height;
++		clipStack.clear();
++		clipStack.push(new RectF(0, 0, width, height));
++	}
++
++	@Override
++	public int getWidth() { return width; }
++
++	@Override
++	public int getHeight() { return height; }
+ 	private int[] push_history = null;
+ 	private Stack<Matrix> state_stack = new Stack<>();
+ 
+@@ -46,6 +61,7 @@
+ 	public int save() {
+ 		native_save(snapshot);
+ 		state_stack.push(new Matrix(state_stack.peek()));
++		if (!clipStack.empty()) clipStack.push(new RectF(clipStack.peek()));
+ 		return getSaveCount() - 1;
+ 	}
+ 
+@@ -59,6 +75,7 @@
+ 			push_history[save_count] = 0;
+ 		}
+ 		state_stack.pop();
++		if (clipStack.size() > 1) clipStack.pop();
+ 		native_restore(snapshot);
+ 	}
+ 
+@@ -101,6 +118,11 @@
+ 	@Override
+ 	public boolean clipRect(float left, float top, float right, float bottom) {
+ 		native_clipRect(snapshot, left, top, right, bottom);
++		if (!clipStack.empty()) {
++			RectF rect = new RectF(left, top, right, bottom);
++			state_stack.peek().mapRect(rect);
++			if (!clipStack.peek().intersect(rect)) clipStack.peek().setEmpty();
++		}
+ 		int save_count = getSaveCount();
+ 		if (push_history == null)
+ 			push_history = new int[save_count + 1];
+@@ -111,6 +133,16 @@
+ 	}
+ 
+ 	@Override
++	public boolean getClipBounds(Rect outRect) {
++		if (clipStack.empty()) { outRect.setEmpty(); return false; }
++		RectF rect = new RectF(clipStack.peek());
++		Matrix inverse = new Matrix();
++		if (state_stack.peek().invert(inverse)) inverse.mapRect(rect);
++		rect.roundOut(outRect);
++		return !outRect.isEmpty();
++	}
++
++	@Override
+ 	public boolean clipPath(Path path) {
+ 		native_clipPath(snapshot, path.getGskPath(), path.getFillType().fill_rule);
+ 		int save_count = getSaveCount();
+@@ -121,6 +153,10 @@
+ 		push_history[save_count]++;
+ 		RectF bounds = new RectF();
+ 		path.computeBounds(bounds, true);
++		if (!clipStack.empty()) {
++			state_stack.peek().mapRect(bounds);
++			if (!clipStack.peek().intersect(bounds)) clipStack.peek().setEmpty();
++		}
+ 		return !bounds.isEmpty();
+ 	}
+ 
+--- a/src/api-impl/android/graphics/drawable/ClipDrawable.java
++++ b/src/api-impl/android/graphics/drawable/ClipDrawable.java
+@@ -83,7 +83,7 @@
+ 		setDrawable(drawable);
+ 	}
+ 
+-	/*@Override
++	@Override
+ 	public void inflate(@NonNull Resources r, @NonNull XmlPullParser parser,
+ 			    @NonNull AttributeSet attrs, @Nullable Theme theme)
+ 	    throws XmlPullParserException, IOException {
+@@ -95,8 +95,7 @@
+ 		updateStateFromTypedArray(a);
+ 		verifyRequiredAttributes(a);
+ 		a.recycle();
+-	}*/
+-
++	}
+ 	/*@Override
+ 	public void applyTheme(@NonNull Theme t) {
+ 		super.applyTheme(t);
+@@ -194,6 +193,7 @@
+ 
+ 		//final int layoutDirection = getLayoutDirection();
+ 		//Gravity.apply(mState.mGravity, w, h, bounds, r, layoutDirection);
++		Gravity.apply(mState.mGravity, w, h, bounds, r, getLayoutDirection());
+ 
+ 		if (w > 0 && h > 0) {
+ 			canvas.save();
+--- a/src/api-impl/android/graphics/drawable/Drawable.java
++++ b/src/api-impl/android/graphics/drawable/Drawable.java
+@@ -271,6 +271,16 @@
+ 
+ 	public static Drawable createFromXmlInner(Resources resources, XmlPullParser parser, AttributeSet attrs, Theme theme) throws XmlPullParserException, IOException {
+ 		switch (parser.getName()) {
++			case "clip": {
++				ClipDrawable drawable = new ClipDrawable();
++				drawable.inflate(resources, parser, attrs, theme);
++				return drawable;
++			}
++			case "scale": {
++				ScaleDrawable drawable = new ScaleDrawable();
++				drawable.inflate(resources, parser, attrs, theme);
++				return drawable;
++			}
+ 			case "selector": {
+ 				StateListDrawable drawable = new StateListDrawable();
+ 				drawable.inflate(resources, parser, attrs, theme);
+--- a/src/api-impl/android/graphics/drawable/ScaleDrawable.java
++++ b/src/api-impl/android/graphics/drawable/ScaleDrawable.java
+@@ -1,12 +1,76 @@
+ package android.graphics.drawable;
+ 
+ import android.graphics.Canvas;
++import android.graphics.Rect;
++import android.view.Gravity;
+ 
+-public class ScaleDrawable extends Drawable {
++public class ScaleDrawable extends DrawableWrapper {
++	private int gravity = Gravity.LEFT;
++	private float scaleWidth = -1, scaleHeight = -1;
++	private boolean useIntrinsicSizeAsMinimum;
++	private final Rect scaledBounds = new Rect();
++
++	public ScaleDrawable() { super((Drawable)null); }
++
++	public ScaleDrawable(Drawable drawable, int gravity, float scaleWidth, float scaleHeight) {
++		super(drawable);
++		this.gravity = gravity;
++		this.scaleWidth = scaleWidth;
++		this.scaleHeight = scaleHeight;
++	}
++
++	@Override
++	public void inflate(android.content.res.Resources r, org.xmlpull.v1.XmlPullParser parser,
++		android.util.AttributeSet attrs, android.content.res.Resources.Theme theme)
++		throws org.xmlpull.v1.XmlPullParserException, java.io.IOException {
++		android.content.res.TypedArray a = obtainAttributes(r, theme, attrs, com.android.internal.R.styleable.ScaleDrawable);
++		gravity = a.getInt(com.android.internal.R.styleable.ScaleDrawable_scaleGravity, Gravity.LEFT);
++		scaleWidth = readScale(a, com.android.internal.R.styleable.ScaleDrawable_scaleWidth);
++		scaleHeight = readScale(a, com.android.internal.R.styleable.ScaleDrawable_scaleHeight);
++		useIntrinsicSizeAsMinimum = a.getBoolean(com.android.internal.R.styleable.ScaleDrawable_useIntrinsicSizeAsMinimum, false);
++		int level = a.getInt(com.android.internal.R.styleable.ScaleDrawable_level, 0);
++		Drawable drawable = a.getDrawable(com.android.internal.R.styleable.ScaleDrawable_drawable);
++		a.recycle();
++		if (drawable != null) setDrawable(drawable);
++		inflateChildDrawable(r, parser, attrs, theme);
++		if (getDrawable() == null)
++			throw new org.xmlpull.v1.XmlPullParserException("<scale> requires a drawable");
++		setLevel(level);
++	}
++
++	private static float readScale(android.content.res.TypedArray a, int index) {
++		String value = a.getString(index);
++		if (value != null && value.endsWith("%"))
++			return Float.parseFloat(value.substring(0, value.length() - 1)) / 100;
++		return -1;
++	}
+ 
+ 	@Override
+ 	public void draw(Canvas canvas) {
+-		// TODO Auto-generated method stub
+-		throw new UnsupportedOperationException("Unimplemented method 'draw'");
++		Drawable drawable = getDrawable();
++		if (drawable != null && drawable.getLevel() != 0)
++			drawable.draw(canvas);
++	}
++
++	@Override
++	protected boolean onLevelChange(int level) {
++		super.onLevelChange(level);
++		onBoundsChange(getBounds());
++		invalidateSelf();
++		return true;
++	}
++
++	@Override
++	protected void onBoundsChange(Rect bounds) {
++		Drawable drawable = getDrawable();
++		if (drawable == null) return;
++		int w = bounds.width(), h = bounds.height();
++		if (scaleWidth > 0)
++			w -= (int)((w - (useIntrinsicSizeAsMinimum ? drawable.getIntrinsicWidth() : 0)) * (10000 - getLevel()) * scaleWidth / 10000);
++		if (scaleHeight > 0)
++			h -= (int)((h - (useIntrinsicSizeAsMinimum ? drawable.getIntrinsicHeight() : 0)) * (10000 - getLevel()) * scaleHeight / 10000);
++		Gravity.apply(gravity, w, h, bounds, scaledBounds, getLayoutDirection());
++		if (w > 0 && h > 0)
++			drawable.setBounds(scaledBounds);
+ 	}
+ }
+--- a/src/api-impl/android/text/Layout.java
++++ b/src/api-impl/android/text/Layout.java
+@@ -121,9 +121,9 @@
+ 		return native_get_line_descent(layout, line);
+ 	}
+ 
+-	public int getTopPadding() { return -5; }
++	public int getTopPadding() { return 0; }
+ 
+-	public int getBottomPadding() { return 5; }
++	public int getBottomPadding() { return 0; }
+ 
+ 	public boolean isRtlCharAt(int offset) { return false; }
+ 
+@@ -154,9 +154,9 @@
+ 	}
+ 
+ 	public int getLineTop(int line) {
+-		if (line < 0 || line >= getLineCount())
++		if (line < 0 || line > getLineCount())
+ 			throw new ArrayIndexOutOfBoundsException();
+-		return native_get_line_top(layout, line);
++		return line == getLineCount() ? getHeight() : native_get_line_top(layout, line);
+ 	}
+ 
+ 	public int getLineBottom(int line) {
+@@ -277,7 +277,7 @@
+ 	protected native int native_get_line_bottom(long layout, int line);
+ 	protected native int native_get_line_left(long layout, int line);
+ 	protected native int native_get_line_right(long layout, int line);
+-	protected native int native_get_line_width(long layout, int line);
++	protected native float native_get_line_width(long layout, int line);
+ 	protected native int native_get_line_baseline(long layout, int line);
+ 	protected native int native_get_line_ascent(long layout, int line);
+ 	protected native int native_get_line_descent(long layout, int line);
+--- a/src/api-impl/android/view/View.java
++++ b/src/api-impl/android/view/View.java
+@@ -1170,6 +1170,8 @@
+ 	}
+ 	public void draw(Canvas canvas) {
+ 		if (canvas instanceof GskCanvas)
++			((GskCanvas)canvas).setViewport(getWidth(), getHeight());
++		if (canvas instanceof GskCanvas)
+ 			native_drawBackground(widget, ((GskCanvas)canvas).snapshot);
+ 		onDraw(canvas);
+ 		// HACK: catch non critical exceptions happening in some composeUI apps
+--- a/src/api-impl/android/widget/AbsSeekBar.java
++++ b/src/api-impl/android/widget/AbsSeekBar.java
+@@ -3,29 +3,62 @@
+ import android.content.Context;
+ import android.content.res.ColorStateList;
+ import android.graphics.drawable.Drawable;
++import android.graphics.Canvas;
+ import android.util.AttributeSet;
+ 
+ public abstract class AbsSeekBar extends ProgressBar {
++	private Drawable thumb;
++	private int thumbOffset;
+ 
+ 	public AbsSeekBar(Context context) {
+-		super(context);
++		this(context, null);
+ 	}
+ 
+ 	public AbsSeekBar(Context context, AttributeSet attributeSet) {
+ 		super(context, attributeSet);
++		android.content.res.TypedArray a = context.obtainStyledAttributes(attributeSet, com.android.internal.R.styleable.SeekBar, 0, 0);
++		setThumb(a.getDrawable(com.android.internal.R.styleable.SeekBar_thumb));
++		thumbOffset = a.getDimensionPixelOffset(com.android.internal.R.styleable.SeekBar_thumbOffset, thumbOffset);
++		a.recycle();
+ 	}
+ 
+ 	public Drawable getThumb() {
+-		return new Drawable();
++		return thumb;
+ 	}
+ 
+ 	public void setKeyProgressIncrement(int keyProgressIncrement) {}
+ 
+ 	public int getKeyProgressIncrement() { return 0; }
+ 
+-	public int getThumbOffset() { return 0; }
++	public int getThumbOffset() { return thumbOffset; }
++
++	public void setThumbOffset(int offset) { thumbOffset = offset; invalidate(); }
+ 
+ 	public void setThumbTintList(ColorStateList tint) {}
+ 
+-	public void setThumb(Drawable thumb) {}
++	public void setThumb(Drawable thumb) {
++		if (this.thumb != null) this.thumb.setCallback(null);
++		this.thumb = thumb;
++		if (thumb != null) {
++			thumb.setCallback(this);
++			thumbOffset = Math.max(0, thumb.getIntrinsicWidth()) / 2;
++		}
++		invalidate();
++	}
++
++	@Override
++	public void onDraw(Canvas canvas) {
++		super.onDraw(canvas);
++		if (thumb == null) return;
++		int w = Math.max(0, thumb.getIntrinsicWidth());
++		int h = Math.max(0, thumb.getIntrinsicHeight());
++		int available = Math.max(0, getWidth() - getPaddingLeft() - getPaddingRight() - w + 2 * thumbOffset);
++		float scale = max > 0 ? getProgress() / (float)max : 0;
++		if (getLayoutDirection() == LAYOUT_DIRECTION_RTL) scale = 1 - scale;
++		int left = getPaddingLeft() - thumbOffset + Math.round(available * scale);
++		int top = getPaddingTop() + (getHeight() - getPaddingTop() - getPaddingBottom() - h) / 2;
++		thumb.setBounds(left, top, left + w, top + h);
++		thumb.setState(getDrawableState());
++		thumb.draw(canvas);
++	}
+ }
+--- a/src/api-impl/android/widget/ImageView.java
++++ b/src/api-impl/android/widget/ImageView.java
+@@ -23,6 +23,10 @@
+ 	private ScaleType scaleType = ScaleType.FIT_CENTER;
+ 	private Drawable drawable = null;
+ 	private ColorFilter colorFilter = null;
++	private Matrix imageMatrix = new Matrix();
++	private Matrix drawMatrix = new Matrix();
++	private boolean cropToPadding;
++	private int intrinsicWidth, intrinsicHeight;
+ 	/* last paintable pushed into the GtkPicture, to detect handle changes */
+ 	private long lastSetPaintable = 0;
+ 
+@@ -57,6 +61,7 @@
+ 		if (a.hasValue(com.android.internal.R.styleable.ImageView_scaleType))
+ 			setScaleType(scaletype_from_int[a.getInt(com.android.internal.R.styleable.ImageView_scaleType, 3 /*CENTER*/)]);
+ 		a.recycle();
++		configureBounds();
+ 	}
+ 
+ 	public void setImageResource(final int resid) {
+@@ -66,8 +71,11 @@
+ 	public void setAdjustViewBounds(boolean adjustViewBounds) {}
+ 
+ 	public void setScaleType(ScaleType scaleType) {
++		if (scaleType == null)
++			throw new NullPointerException();
+ 		this.scaleType = scaleType;
+-		native_setScaleType(widget, scaleType.nativeInt);
++		configureBounds();
++		invalidate();
+ 	}
+ 
+ 	public ScaleType getScaleType() {
+@@ -92,10 +100,17 @@
+ 		}
+ 		native_setDrawable(widget, drawable != null ? drawable.paintable : 0);
+ 		lastSetPaintable = drawable != null ? drawable.paintable : 0;
++		configureBounds();
++		requestLayout();
++		invalidate();
+ 	}
+ 
+ 	@Override
+ 	public void invalidateDrawable(Drawable drawable) {
++		if (drawable != this.drawable) {
++			super.invalidateDrawable(drawable);
++			return;
++		}
+ 		/* A Drawable that switched its own paintable (e.g. a tinted or
+ 		 * alpha-scaled BitmapDrawable) needs the new handle pushed into the
+ 		 * GtkPicture; plain invalidation would keep showing the stale one. */
+@@ -103,10 +118,15 @@
+ 			lastSetPaintable = drawable.paintable;
+ 			native_setDrawable(widget, drawable.paintable);
+ 		}
++		configureBounds();
+ 		invalidate();
+ 	}
+ 
+-	public void setImageMatrix(Matrix matrix) {}
++	public void setImageMatrix(Matrix matrix) {
++		imageMatrix.set(matrix);
++		configureBounds();
++		invalidate();
++	}
+ 
+ 	public void setImageBitmap(Bitmap bitmap) {
+         this.bitmap = bitmap;
+@@ -214,7 +234,11 @@
+ 
+ 	public void setImageTintMode(PorterDuff.Mode tintMode) {}
+ 
+-	public void setCropToPadding(boolean crop) {}
++	public void setCropToPadding(boolean crop) {
++		cropToPadding = crop;
++		configureBounds();
++		invalidate();
++	}
+ 
+ 	public void setColorFilter(int color) { setColorFilter(color, PorterDuff.Mode.SRC_ATOP); }
+ 
+@@ -225,17 +249,87 @@
+     }
+ 
+ 	public Matrix getImageMatrix() {
+-		return Matrix.IDENTITY_MATRIX;
++		return imageMatrix;
+ 	}
+ 
+ 	public void clearColorFilter() {
+         setColorFilter((ColorFilter)null);
+     }
+ 
++	/* Geometry follows AOSP android13-release ImageView.configureBounds(). */
++	private void configureBounds() {
++		if (drawMatrix == null)
++			return;
++		int iw = drawable == null ? 0 : drawable.getIntrinsicWidth();
++		int ih = drawable == null ? 0 : drawable.getIntrinsicHeight();
++		if (iw != intrinsicWidth || ih != intrinsicHeight) {
++			intrinsicWidth = iw;
++			intrinsicHeight = ih;
++			requestLayout();
++		}
++		if (drawable == null) {
++			pushImageGeometry(0, 0);
++			return;
++		}
++		int width = Math.max(0, getWidth() - getPaddingLeft() - getPaddingRight());
++		int height = Math.max(0, getHeight() - getPaddingTop() - getPaddingBottom());
++		int dw = drawable.getIntrinsicWidth(), dh = drawable.getIntrinsicHeight();
++		drawMatrix.reset();
++		if (dw <= 0 || dh <= 0 || scaleType == ScaleType.FIT_XY) {
++			drawable.setBounds(0, 0, width, height);
++			pushImageGeometry(dw == 0 || dh == 0 ? 0 : width, dw == 0 || dh == 0 ? 0 : height);
++			return;
++		}
++		drawable.setBounds(0, 0, dw, dh);
++		if (scaleType == ScaleType.MATRIX) {
++			drawMatrix.set(imageMatrix);
++		} else if (scaleType == ScaleType.CENTER) {
++			drawMatrix.setTranslate(Math.round((width - dw) * 0.5f), Math.round((height - dh) * 0.5f));
++		} else if (scaleType == ScaleType.CENTER_CROP || scaleType == ScaleType.CENTER_INSIDE) {
++			float sx = (float)width / dw, sy = (float)height / dh;
++			float scale = scaleType == ScaleType.CENTER_CROP ? Math.max(sx, sy) : Math.min(1.0f, Math.min(sx, sy));
++			drawMatrix.setScale(scale, scale);
++			drawMatrix.postTranslate(Math.round((width - dw * scale) * 0.5f), Math.round((height - dh * scale) * 0.5f));
++		} else {
++			Matrix.ScaleToFit fit = scaleType == ScaleType.FIT_START ? Matrix.ScaleToFit.START
++					: scaleType == ScaleType.FIT_END ? Matrix.ScaleToFit.END : Matrix.ScaleToFit.CENTER;
++			drawMatrix.setRectToRect(new android.graphics.RectF(0, 0, dw, dh),
++					new android.graphics.RectF(0, 0, width, height), fit);
++		}
++		pushImageGeometry(dw, dh);
++	}
++
++	private void pushImageGeometry(int width, int height) {
++		float[] values = new float[9];
++		drawMatrix.getValues(values);
++		native_setImageGeometry(widget, width, height, values,
++				getPaddingLeft(), getPaddingTop(), getPaddingRight(), getPaddingBottom(),
++				intrinsicWidth, intrinsicHeight, cropToPadding);
++	}
++
++	@Override
++	protected void onSizeChanged(int w, int h, int oldw, int oldh) {
++		super.onSizeChanged(w, h, oldw, oldh);
++		configureBounds();
++	}
++
++	@Override
++	public void setPadding(int left, int top, int right, int bottom) {
++		super.setPadding(left, top, right, bottom);
++		configureBounds();
++		invalidate();
++	}
++
++	/* Padding is applied by image geometry, never by GTK CSS. */
++	@Override
++	public void native_setPadding(long widget, int left, int top, int right, int bottom) {}
++
+ 	@Override
+ 	protected native long native_constructor(Context context, AttributeSet attrs);
+ 	protected native void native_setDrawable(long widget, long paintable);
+ 	protected native void native_setScaleType(long widget, int scale_type);
++	private native void native_setImageGeometry(long widget, float width, float height, float[] matrix,
++			int left, int top, int right, int bottom, int intrinsicWidth, int intrinsicHeight, boolean crop);
+ 
+ 
+ 	// Ported from AOSP android13-release ImageView.java
+--- a/src/api-impl/android/widget/PopupWindow.java
++++ b/src/api-impl/android/widget/PopupWindow.java
+@@ -93,6 +93,7 @@
+ 
+ 	public void showAsDropDown(View anchor, int xoff, int yoff, int gravity) {
+ 		native_showAsDropDown(popover, anchor.widget, xoff, yoff, gravity);
++		android.app.ActivityThread.internalTrackViewDump(this, true);
+ 	}
+ 
+ 	public View getContentView() {
+@@ -109,14 +110,17 @@
+ 			return;
+ 		}
+ 		native_showAsDropDown(popover, anchor.widget, xoff, yoff, Gravity.NO_GRAVITY);
++		android.app.ActivityThread.internalTrackViewDump(this, true);
+ 	}
+ 
+ 	public void showAtLocation(View parent, int gravity, int x, int y) {
+ 		native_showAsDropDown(popover, parent.widget, x, y, gravity);
++		android.app.ActivityThread.internalTrackViewDump(this, true);
+ 	}
+ 
+ 	public void dismiss() {
+ 		native_dismiss(popover);
++		android.app.ActivityThread.internalTrackViewDump(this, false);
+ 	}
+ 
+ 	public void setAnimationStyle(int animationStyle) {}
+--- a/src/api-impl/android/widget/ProgressBar.java
++++ b/src/api-impl/android/widget/ProgressBar.java
+@@ -15,7 +15,9 @@
+ 	protected int progress = 0;
+ 	private boolean indeterminate = false;
+ 	private Drawable indeterminateDrawable;
+-	private Drawable progressDrawable = new Drawable();
++	private boolean hasIndeterminateDrawable;
++	private Drawable progressDrawable;
++	private int secondaryProgress;
+ 
+ 	public ProgressBar(Context context, AttributeSet attrs, int defStyle) {
+ 		super(context, attrs, defStyle);
+@@ -58,7 +60,8 @@
+ 
+ 	public void setIndeterminate(boolean indeterminate) {
+ 		native_setIndeterminate(indeterminate);
+-		indeterminate = true;
++		this.indeterminate = indeterminate;
++		invalidate();
+ 	}
+ 
+ 	public Drawable getProgressDrawable() {
+@@ -70,8 +73,8 @@
+ 	}
+ 
+ 	public void setMax(int max) {
+-		this.max = max;
+-		native_setProgress(widget, progress / (float)max);
++		this.max = Math.max(0, max);
++		setProgress(progress);
+ 	}
+ 
+ 	public int getMax() {
+@@ -84,25 +87,66 @@
+ 		else if (progress < 0)
+ 			progress = 0;
+ 		this.progress = progress;
+-		native_setProgress(widget, progress / (float)max);
++		native_setProgress(widget, max > 0 ? progress / (float)max : 0);
++		invalidate();
+ 	}
+ 
+ 	public void setProgress(int progress, boolean animate) {
+ 		setProgress(progress);
+ 	}
+ 
+-	public void setSecondaryProgress(int secondaryProgress) {}
++	public void setSecondaryProgress(int secondaryProgress) {
++		this.secondaryProgress = Math.max(0, Math.min(max, secondaryProgress));
++		invalidate();
++	}
+ 
+ 	public int getProgress() {
+ 		return progress;
+ 	}
+ 
+ 	public void setIndeterminateDrawable(Drawable indeterminateDrawable) {
++		if (this.indeterminateDrawable != null) this.indeterminateDrawable.setCallback(null);
+ 		this.indeterminateDrawable = indeterminateDrawable;
++		hasIndeterminateDrawable = indeterminateDrawable != null;
++		if (indeterminateDrawable != null) indeterminateDrawable.setCallback(this);
++		invalidate();
+ 	}
+ 
+ 	public void setProgressDrawable(Drawable progressDrawable) {
++		if (this.progressDrawable != null) this.progressDrawable.setCallback(null);
+ 		this.progressDrawable = progressDrawable;
++		if (progressDrawable != null) progressDrawable.setCallback(this);
++		invalidate();
++	}
++
++	protected void updateProgressLevels(Drawable drawable) {
++		int level = max > 0 ? (int)(getProgress() * 10000L / max) : 0;
++		if (drawable instanceof android.graphics.drawable.LayerDrawable) {
++			android.graphics.drawable.LayerDrawable layers = (android.graphics.drawable.LayerDrawable)drawable;
++			Drawable primary = layers.findDrawableByLayerId(android.R.id.progress);
++			Drawable secondary = layers.findDrawableByLayerId(android.R.id.secondaryProgress);
++			if (primary != null) primary.setLevel(level);
++			if (secondary != null) secondary.setLevel(max > 0 ? (int)(secondaryProgress * 10000L / max) : 0);
++		} else {
++			drawable.setLevel(level);
++		}
++	}
++
++	@Override
++	public void onDraw(Canvas canvas) {
++		Drawable drawable = indeterminate ? (hasIndeterminateDrawable ? indeterminateDrawable : null) : progressDrawable;
++		if (drawable == null) {
++			super.onDraw(canvas);
++			return;
++		}
++		int save = canvas.save();
++		canvas.translate(getPaddingLeft(), getPaddingTop());
++		drawable.setBounds(0, 0, Math.max(0, getWidth() - getPaddingLeft() - getPaddingRight()),
++			Math.max(0, getHeight() - getPaddingTop() - getPaddingBottom()));
++		drawable.setState(getDrawableState());
++		if (!indeterminate) updateProgressLevels(drawable);
++		drawable.draw(canvas);
++		canvas.restoreToCount(save);
+ 	}
+ 
+ 	public native void native_setIndeterminate(boolean indeterminate);
+@@ -112,7 +156,7 @@
+ 	}
+ 
+ 	public int getSecondaryProgress() {
+-		return 0;
++		return secondaryProgress;
+ 	}
+ 
+ 	public void setIndeterminateTintList(ColorStateList tint) {}
+--- a/src/api-impl/android/widget/SeekBar.java
++++ b/src/api-impl/android/widget/SeekBar.java
+@@ -24,13 +24,15 @@
+ 
+ 	@Override
+ 	public void setMax(int max) {
+-		this.max = max;
+-		native_setMax(widget, max);
++		this.max = Math.max(0, max);
++		native_setMax(widget, Math.max(1, this.max));
++		setProgress(progress);
+ 	}
+ 	@Override
+ 	public void setProgress(int progress) {
+-		this.progress = progress;
+-		native_setProgress(widget, progress);
++		this.progress = Math.max(0, Math.min(max, progress));
++		native_setProgress(widget, this.progress);
++		invalidate();
+ 	}
+ 
+ 	public native void setOnSeekBarChangeListener(final OnSeekBarChangeListener l);
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -224,9 +224,8 @@
+ 		typeface = tf;
+ 		paint.setTypeface(tf);
+ 		native_removeClasses(widget, new String[] {"ATL-font-bold", "ATL-font-italic"});
+-		/* single coherent path: applyTypography rebuilds the Pango attrs and
+-		 * re-applies the typeface on top, so features/spacing/line-height and
+-		 * the family/weight/style all survive */
++		/* Single coherent path: copy the TextPaint font into the Pango attrs,
++		 * preserving features/spacing/line-height and family/weight/style. */
+ 		applyTypography();
+ 		requestLayout();
+ 		invalidate();
+@@ -853,15 +852,10 @@
+         return result.toString();
+     }
+     private void applyTypography() {
+-        native_applyTypography(pangoFontFeatures, pangoFontVariations,
++        native_applyTypography(paint.paint, pangoFontFeatures, pangoFontVariations,
+                 letterSpacing * getTextSize(), lineSpacingExtra, lineSpacingMultiplier);
+-        /* native_applyTypography rebuilds the font-desc attribute without the
+-         * family/weight/style, so re-apply the typeface on top of it */
+-        if (typeface != null)
+-            native_setTypeface(typeface.getFamily(), typeface.getWeight(), typeface.isItalic(), pangoFontVariations);
+     }
+-    private native void native_applyTypography(String features, String variations, float spacing, float extra, float multiplier);
+-    private native void native_setTypeface(String family, int weight, boolean italic, String variations);
++    private native void native_applyTypography(long paint, String features, String variations, float spacing, float extra, float multiplier);
+     private native void native_setSelectable(boolean selectable);
+     public ColorStateList getHintTextColors() { return hintColors; }
+     public int getCurrentHintTextColor() { return hintColors.getColorForState(getDrawableState(), hintColors.getDefaultColor()); }
+--- a/src/api-impl-jni/generated_headers/android_text_Layout.h
++++ b/src/api-impl-jni/generated_headers/android_text_Layout.h
+@@ -98,9 +98,9 @@
+ /*
+  * Class:     android_text_Layout
+  * Method:    native_get_line_width
+- * Signature: (JI)I
++ * Signature: (JI)F
+  */
+-JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1width
++JNIEXPORT jfloat JNICALL Java_android_text_Layout_native_1get_1line_1width
+   (JNIEnv *, jobject, jlong, jint);
+ 
+ /*
+--- a/src/api-impl-jni/generated_headers/android_widget_ImageView.h
++++ b/src/api-impl-jni/generated_headers/android_widget_ImageView.h
+@@ -235,6 +235,10 @@
+ JNIEXPORT void JNICALL Java_android_widget_ImageView_native_1setScaleType
+   (JNIEnv *, jobject, jlong, jint);
+ 
++JNIEXPORT void JNICALL Java_android_widget_ImageView_native_1setImageGeometry
++  (JNIEnv *, jobject, jlong, jfloat, jfloat, jfloatArray,
++   jint, jint, jint, jint, jint, jint, jboolean);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/src/api-impl-jni/generated_headers/android_widget_TextView.h
++++ b/src/api-impl-jni/generated_headers/android_widget_TextView.h
+@@ -275,6 +275,10 @@
+ JNIEXPORT jint JNICALL Java_android_widget_TextView_native_1getBaseline
+   (JNIEnv *, jobject, jint, jint);
+ 
++/* TextPaint is the source of the rendered font description. */
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1applyTypography
++  (JNIEnv *, jobject, jlong, jstring, jstring, jfloat, jfloat, jfloat);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/src/api-impl-jni/graphics/android_atl_GskCanvas.c
++++ b/src/api-impl-jni/graphics/android_atl_GskCanvas.c
+@@ -114,18 +114,16 @@
+ 	}
+ 	GdkSnapshot *snapshot = GTK_SNAPSHOT(_PTR(snapshot_ptr));
+ 	struct AndroidPaint *paint = _PTR(paint_ptr);
+-	gtk_snapshot_save(snapshot);
+-	gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(x0, y0));
+-	float rotation = atan2(y1 - y0, x1 - x0);
+-	gtk_snapshot_rotate(snapshot, rotation * 180 / M_PI);
+-	float length = sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+-	float stroke_width = gsk_stroke_get_line_width(paint->gsk_stroke);
++	GskPathBuilder *builder = gsk_path_builder_new();
++	gsk_path_builder_move_to(builder, x0, y0);
++	gsk_path_builder_line_to(builder, x1, y1);
++	GskPath *path = gsk_path_builder_free_to_path(builder);
+ 	if (paint->use_color_filter)
+ 		gtk_snapshot_push_color_matrix(snapshot, &paint->color_matrix, &paint->color_offset);
+-	gtk_snapshot_append_color(snapshot, &paint->color, &GRAPHENE_RECT_INIT(0, -stroke_width / 2, length, stroke_width));
++	gtk_snapshot_append_stroke(snapshot, path, paint->gsk_stroke, &paint->color);
+ 	if (paint->use_color_filter)
+ 		gtk_snapshot_pop(snapshot);
+-	gtk_snapshot_restore(snapshot);
++	gsk_path_unref(path);
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_atl_GskCanvas_native_1drawLines(JNIEnv *env, jclass this_class, jlong snapshot_ptr, jfloatArray points_arr, jint offset, jint count, jlong paint_ptr)
+--- a/src/api-impl-jni/graphics/android_graphics_Paint.c
++++ b/src/api-impl-jni/graphics/android_graphics_Paint.c
+@@ -8,12 +8,34 @@
+ 
+ #include "../generated_headers/android_graphics_Paint.h"
+ 
++/* Typeface's null family denotes this platform default, shared with GTK text. */
++const char *android_default_font_family(void)
++{
++	static gsize cached_family;
++	if (g_once_init_enter(&cached_family)) {
++		char *name = NULL;
++		GtkSettings *settings = gtk_settings_get_default();
++		if (settings) g_object_get(settings, "gtk-font-name", &name, NULL);
++		PangoFontDescription *font = pango_font_description_from_string(name ? name : "Sans 10");
++		const char *family = pango_font_description_get_family(font);
++		char *copy = g_strdup(family ? family : "Sans");
++		pango_font_description_free(font);
++		g_free(name);
++		g_once_init_leave(&cached_family, (gsize)copy);
++	}
++	return (const char *)cached_family;
++}
++
+ JNIEXPORT jlong JNICALL Java_android_graphics_Paint_native_1create(JNIEnv *env, jclass clazz)
+ {
+ 	struct AndroidPaint *paint = g_new0(struct AndroidPaint, 1);
+ 	paint->color.alpha = 1.f;
+ 	paint->gsk_stroke = gsk_stroke_new(1);
+ 	paint->font = pango_font_description_new();
++	pango_font_description_set_family(paint->font, android_default_font_family());
++	pango_font_description_set_weight(paint->font, PANGO_WEIGHT_NORMAL);
++	pango_font_description_set_style(paint->font, PANGO_STYLE_NORMAL);
++	paint->text_attrs = pango_attr_list_new();
+ 	pango_font_description_set_absolute_size(paint->font, 16 * PANGO_SCALE);
+ 	paint->is_fill = true;
+ 	return _INTPTR(paint);
+@@ -25,6 +47,7 @@
+ 	struct AndroidPaint *clone = g_memdup2(paint, sizeof(struct AndroidPaint));
+ 	clone->gsk_stroke = gsk_stroke_copy(paint->gsk_stroke);
+ 	clone->font = pango_font_description_copy(paint->font);
++	clone->text_attrs = pango_attr_list_copy(paint->text_attrs);
+ 	return _INTPTR(clone);
+ }
+ 
+@@ -33,6 +56,7 @@
+ 	struct AndroidPaint *paint = _PTR(paint_ptr);
+ 	gsk_stroke_free(paint->gsk_stroke);
+ 	pango_font_description_free(paint->font);
++	pango_attr_list_unref(paint->text_attrs);
+ 	g_free(paint);
+ }
+ 
+@@ -149,7 +173,7 @@
+ 	if (family)
+ 		pango_font_description_set_family(paint->font, family);
+ 	else
+-		pango_font_description_unset_fields(paint->font, PANGO_FONT_MASK_FAMILY);
++		pango_font_description_set_family(paint->font, android_default_font_family());
+ 	pango_font_description_set_weight(paint->font, (PangoWeight)CLAMP(weight, 100, 1000));
+ 	pango_font_description_set_style(paint->font, italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
+ 	if (family)
+@@ -201,6 +225,7 @@
+ 	(*env)->ReleaseStringChars(env, text, chars);
+ 	PangoLayout *layout = pango_layout_new(gtk_widget_get_pango_context(window));
+ 	pango_layout_set_font_description(layout, paint->font);
++	pango_layout_set_attributes(layout, paint->text_attrs);
+ 	pango_layout_set_text(layout, utf8->str, utf8->len);
+ 	g_string_free(utf8, TRUE);
+ 	return layout;
+--- a/src/api-impl-jni/graphics/AndroidPaint.h
++++ b/src/api-impl-jni/graphics/AndroidPaint.h
+@@ -9,6 +9,7 @@
+ 	GskStroke *gsk_stroke;
+ 	PangoFontDescription *font;
+ 	PangoAlignment alignment;
++	PangoAttrList *text_attrs;
+ 	graphene_matrix_t color_matrix;
+ 	graphene_vec4_t color_offset;
+ 	bool is_fill : 1;
+@@ -17,3 +18,5 @@
+ };
+ 
+ PangoLayout *android_paint_create_text_layout(struct AndroidPaint *paint, JNIEnv *env, jstring text);
++
++const char *android_default_font_family(void);
+--- a/src/api-impl-jni/text/android_text_Layout.c
++++ b/src/api-impl-jni/text/android_text_Layout.c
+@@ -1,5 +1,6 @@
+ #include <gtk/gtk.h>
+ #include <pango/pango.h>
++#include <pango/pangocairo.h>
+ #include <string.h>
+ 
+ #include "../defines.h"
+@@ -37,9 +38,13 @@
+ 	pango_context_set_font_description(context, pango_context_get_font_description(widget_context));
+ 	pango_context_set_language(context, pango_context_get_language(widget_context));
+ 	pango_context_set_base_dir(context, pango_context_get_base_dir(widget_context));
++	pango_context_set_round_glyph_positions(context, pango_context_get_round_glyph_positions(widget_context));
++	pango_cairo_context_set_font_options(context, pango_cairo_context_get_font_options(widget_context));
++	pango_cairo_context_set_resolution(context, pango_cairo_context_get_resolution(widget_context));
+ 	PangoLayout *layout = pango_layout_new(context);
+ 	g_object_unref(context);
+ 	pango_layout_set_font_description(layout, android_paint->font);
++	pango_layout_set_attributes(layout, android_paint->text_attrs);
+ 	char *str = atl_jstring_to_utf8(env, text);
+ 	if (!str) { g_object_unref(layout); return 0; }
+ 	pango_layout_set_text(layout, str, -1);
+@@ -66,7 +71,7 @@
+ 	PangoLayout *pango_layout = _PTR(layout);
+ 	PangoRectangle logical_rect;
+ 	pango_layout_get_extents(pango_layout, NULL, &logical_rect);
+-	return logical_rect.height / PANGO_SCALE;
++	return PANGO_PIXELS_CEIL(logical_rect.height);
+ }
+ 
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1count(JNIEnv *env, jobject object, jlong layout)
+@@ -96,7 +101,7 @@
+ 	PangoLayoutIter *pango_iter = pango_layout_get_iter(pango_layout);
+ 	while (line--)
+ 		pango_layout_iter_next_line(pango_iter);
+-	*baseline = pango_layout_iter_get_baseline(pango_iter) / PANGO_SCALE;
++	*baseline = pango_layout_iter_get_baseline(pango_iter);
+ 	pango_layout_line_get_extents(pango_layout_iter_get_line_readonly(pango_iter), NULL, logical_rect);
+ 	pango_layout_iter_free(pango_iter);
+ }
+@@ -106,7 +111,7 @@
+ 	int baseline;
+ 	PangoRectangle logical_rect;
+ 	get_line_metrics(_PTR(layout), line, &baseline, &logical_rect);
+-	return baseline - PANGO_ASCENT(logical_rect) / PANGO_SCALE;
++	return PANGO_PIXELS_CEIL(baseline - PANGO_ASCENT(logical_rect));
+ }
+ 
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1bottom(JNIEnv *env, jobject object, jlong layout, jint line)
+@@ -114,7 +119,7 @@
+ 	int baseline;
+ 	PangoRectangle logical_rect;
+ 	get_line_metrics(_PTR(layout), line, &baseline, &logical_rect);
+-	return baseline + PANGO_DESCENT(logical_rect) / PANGO_SCALE;
++	return PANGO_PIXELS_CEIL(baseline + PANGO_DESCENT(logical_rect));
+ }
+ 
+ // pango_layout_line_get_extents is not alignment-aware; the iterator's extents are layout-relative
+@@ -141,12 +146,12 @@
+ 	return (logical_rect.x + logical_rect.width) / PANGO_SCALE;
+ }
+ 
+-JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1width(JNIEnv *env, jobject object, jlong layout, jint line)
++JNIEXPORT jfloat JNICALL Java_android_text_Layout_native_1get_1line_1width(JNIEnv *env, jobject object, jlong layout, jint line)
+ {
+ 	PangoLayoutLine *pango_line = pango_layout_get_line_readonly(PANGO_LAYOUT(_PTR(layout)), line);
+ 	PangoRectangle logical_rect;
+ 	pango_layout_line_get_extents(pango_line, NULL, &logical_rect);
+-	return logical_rect.width / PANGO_SCALE;
++	return (jfloat)logical_rect.width / PANGO_SCALE;
+ }
+ 
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1baseline(JNIEnv *env, jobject object, jlong layout, jint line)
+@@ -154,25 +159,23 @@
+ 	int baseline;
+ 	PangoRectangle logical_rect;
+ 	get_line_metrics(_PTR(layout), line, &baseline, &logical_rect);
+-	return baseline;
++	return PANGO_PIXELS_CEIL(baseline);
+ }
+ 
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1ascent(JNIEnv *env, jobject object, jlong layout, jint line)
+ {
+-	PangoLayout *pango_layout = _PTR(layout);
+-	PangoLayoutLine *pango_line = pango_layout_get_line_readonly(pango_layout, line);
++	int baseline;
+ 	PangoRectangle logical_rect;
+-	pango_layout_line_get_extents(pango_line, NULL, &logical_rect);
+-	return -PANGO_ASCENT(logical_rect) / PANGO_SCALE;
++	get_line_metrics(_PTR(layout), line, &baseline, &logical_rect);
++	return PANGO_PIXELS_CEIL(baseline - PANGO_ASCENT(logical_rect)) - PANGO_PIXELS_CEIL(baseline);
+ }
+ 
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1descent(JNIEnv *env, jobject object, jlong layout, jint line)
+ {
+-	PangoLayout *pango_layout = _PTR(layout);
+-	PangoLayoutLine *pango_line = pango_layout_get_line_readonly(pango_layout, line);
++	int baseline;
+ 	PangoRectangle logical_rect;
+-	pango_layout_line_get_extents(pango_line, NULL, &logical_rect);
+-	return PANGO_DESCENT(logical_rect) / PANGO_SCALE;
++	get_line_metrics(_PTR(layout), line, &baseline, &logical_rect);
++	return PANGO_PIXELS_CEIL(baseline + PANGO_DESCENT(logical_rect)) - PANGO_PIXELS_CEIL(baseline);
+ }
+ 
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1for_1vertical(JNIEnv *env, jobject object, jlong layout, jint y)
+--- a/src/api-impl-jni/widgets/android_widget_ImageButton.c
++++ b/src/api-impl-jni/widgets/android_widget_ImageButton.c
+@@ -4,6 +4,8 @@
+ #include "../util.h"
+ 
+ #include "WrapperWidget.h"
++#include "ImageWidget.h"
++#include "../generated_headers/android_widget_ImageView.h"
+ 
+ #include "../generated_headers/android_widget_ImageButton.h"
+ 
+@@ -13,7 +15,12 @@
+ 	GtkWidget *button = gtk_button_new();
+ 	/* Android touch clicks do not transfer keyboard focus from the editor. */
+ 	gtk_widget_set_focus_on_click(button, FALSE);
+-	GtkWidget *image = gtk_picture_new_for_resource("/org/gtk/libgtk/icons/16x16/status/image-missing.png"); // show "broken image" icon
++	GtkWidget *image = atl_image_widget_new();
++	/* Geometry includes Android padding; keep the child in view coordinates. */
++	GtkCssProvider *provider = gtk_css_provider_new();
++	gtk_css_provider_load_from_string(provider, "button { padding: 0; border: 0; min-width: 0; min-height: 0; background: none; box-shadow: none; }");
++	gtk_style_context_add_provider(gtk_widget_get_style_context(button), GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
++	g_object_unref(provider);
+ 	gtk_button_set_child(GTK_BUTTON(button), image);
+ 	wrapper_widget_set_child(WRAPPER_WIDGET(wrapper), button);
+ 	wrapper_widget_set_jobject(WRAPPER_WIDGET(wrapper), env, this);
+@@ -45,10 +52,7 @@
+ 
+ JNIEXPORT void JNICALL Java_android_widget_ImageButton_native_1setDrawable(JNIEnv *env, jobject this, jlong widget_ptr, jlong paintable_ptr)
+ {
+-	GtkButton *button = _PTR(widget_ptr);
+-	GtkPicture *picture = GTK_PICTURE(gtk_button_get_child(GTK_BUTTON(button)));
+-	GdkPaintable *paintable = _PTR(paintable_ptr);
+-	gtk_picture_set_paintable(picture, paintable);
++	Java_android_widget_ImageView_native_1setDrawable(env, this, widget_ptr, paintable_ptr);
+ 
+-	gtk_widget_add_css_class(GTK_WIDGET(button), "ATL-no-border");
++	gtk_widget_add_css_class(GTK_WIDGET(_PTR(widget_ptr)), "ATL-no-border");
+ }
+--- a/src/api-impl-jni/widgets/android_widget_ImageView.c
++++ b/src/api-impl-jni/widgets/android_widget_ImageView.c
+@@ -4,23 +4,125 @@
+ #include "../util.h"
+ 
+ #include "WrapperWidget.h"
++#include "ImageWidget.h"
+ 
+ #include "../generated_headers/android_widget_ImageView.h"
+ 
+-#define SCALE_TYPE_MATRIX        0
+-#define SCALE_TYPE_FIT_XY        1
+-#define SCALE_TYPE_FIT_START     2
+-#define SCALE_TYPE_FIT_CENTER    3
+-#define SCALE_TYPE_FIT_END       4
+-#define SCALE_TYPE_CENTER        5
+-#define SCALE_TYPE_CENTER_CROP   6
+-#define SCALE_TYPE_CENTER_INSIDE 7
++typedef struct {
++	GtkWidget parent_instance;
++	GdkPaintable *paintable;
++	graphene_matrix_t matrix;
++	float width, height;
++	int left, top, right, bottom, intrinsic_width, intrinsic_height;
++	gboolean crop;
++	int allocated_width, allocated_height;
++	jmethodID configure_bounds;
++} AtlImageWidget;
++
++typedef GtkWidgetClass AtlImageWidgetClass;
++G_DEFINE_TYPE(AtlImageWidget, atl_image_widget, GTK_TYPE_WIDGET)
++
++static void atl_image_widget_measure(GtkWidget *widget, GtkOrientation orientation, int for_size,
++		int *minimum, int *natural, int *minimum_baseline, int *natural_baseline)
++{
++	AtlImageWidget *image = (AtlImageWidget *)widget;
++	*minimum = *natural = orientation == GTK_ORIENTATION_HORIZONTAL
++		? MAX(0, image->intrinsic_width) + image->left + image->right
++		: MAX(0, image->intrinsic_height) + image->top + image->bottom;
++	*minimum_baseline = *natural_baseline = -1;
++}
++
++static void atl_image_widget_snapshot(GtkWidget *widget, GtkSnapshot *snapshot)
++{
++	AtlImageWidget *image = (AtlImageWidget *)widget;
++	if (!image->paintable || image->width <= 0 || image->height <= 0)
++		return;
++	float width = gtk_widget_get_width(widget), height = gtk_widget_get_height(widget);
++	gtk_snapshot_push_clip(snapshot, &GRAPHENE_RECT_INIT(0, 0, width, height));
++	if (image->crop)
++		gtk_snapshot_push_clip(snapshot, &GRAPHENE_RECT_INIT(image->left, image->top,
++			MAX(0, width - image->left - image->right), MAX(0, height - image->top - image->bottom)));
++	gtk_snapshot_save(snapshot);
++	gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(image->left, image->top));
++	gtk_snapshot_transform_matrix(snapshot, &image->matrix);
++	gdk_paintable_snapshot(image->paintable, GDK_SNAPSHOT(snapshot), image->width, image->height);
++	gtk_snapshot_restore(snapshot);
++	if (image->crop)
++		gtk_snapshot_pop(snapshot);
++	gtk_snapshot_pop(snapshot);
++}
++
++/* Native widgets do not use AndroidLayout's layoutInternal callback. */
++static void atl_image_widget_allocate(GtkWidget *widget, int width, int height, int baseline)
++{
++	AtlImageWidget *image = (AtlImageWidget *)widget;
++	if (width == image->allocated_width && height == image->allocated_height)
++		return;
++	image->allocated_width = width;
++	image->allocated_height = height;
++	GtkWidget *parent = gtk_widget_get_parent(widget);
++	if (GTK_IS_BUTTON(parent))
++		parent = gtk_widget_get_parent(parent);
++	if (!parent || !WRAPPER_IS_WIDGET(parent) || !image->configure_bounds)
++		return;
++	JNIEnv *env = get_jni_env();
++	(*env)->CallVoidMethod(env, WRAPPER_WIDGET(parent)->jobj, image->configure_bounds);
++	if ((*env)->ExceptionCheck(env))
++		(*env)->ExceptionDescribe(env);
++}
++
++static void atl_image_widget_dispose(GObject *object)
++{
++	AtlImageWidget *image = (AtlImageWidget *)object;
++	if (image->paintable) {
++		g_signal_handlers_disconnect_by_data(image->paintable, image);
++		g_clear_object(&image->paintable);
++	}
++	G_OBJECT_CLASS(atl_image_widget_parent_class)->dispose(object);
++}
++
++static void atl_image_widget_class_init(AtlImageWidgetClass *klass)
++{
++	GTK_WIDGET_CLASS(klass)->measure = atl_image_widget_measure;
++	GTK_WIDGET_CLASS(klass)->snapshot = atl_image_widget_snapshot;
++	GTK_WIDGET_CLASS(klass)->size_allocate = atl_image_widget_allocate;
++	G_OBJECT_CLASS(klass)->dispose = atl_image_widget_dispose;
++}
++
++static void atl_image_widget_init(AtlImageWidget *image)
++{
++	graphene_matrix_init_identity(&image->matrix);
++	image->allocated_width = image->allocated_height = -1;
++	JNIEnv *env = get_jni_env();
++	jclass cls = (*env)->FindClass(env, "android/widget/ImageView");
++	if (cls) {
++		image->configure_bounds = (*env)->GetMethodID(env, cls, "configureBounds", "()V");
++		(*env)->DeleteLocalRef(env, cls);
++	}
++}
++
++GtkWidget *atl_image_widget_new(void)
++{
++	return g_object_new(atl_image_widget_get_type(), NULL);
++}
++
++static AtlImageWidget *get_image(jlong widget_ptr)
++{
++	GtkWidget *widget = _PTR(widget_ptr);
++	if (GTK_IS_BUTTON(widget))
++		widget = gtk_button_get_child(GTK_BUTTON(widget));
++	return (AtlImageWidget *)widget;
++}
++
++static void invalidate_contents(GdkPaintable *paintable, gpointer data)
++{
++	gtk_widget_queue_draw(GTK_WIDGET(data));
++}
+ 
+ JNIEXPORT jlong JNICALL Java_android_widget_ImageView_native_1constructor(JNIEnv *env, jobject this, jobject context, jobject attrs)
+ {
+ 	GtkWidget *wrapper = g_object_ref(wrapper_widget_new());
+-	GtkWidget *image = gtk_picture_new();
+-	gtk_picture_set_content_fit(GTK_PICTURE(image), GTK_CONTENT_FIT_CONTAIN);
++	GtkWidget *image = atl_image_widget_new();
+ 	wrapper_widget_set_child(WRAPPER_WIDGET(wrapper), image);
+ 	wrapper_widget_set_jobject(WRAPPER_WIDGET(wrapper), env, this);
+ 	return _INTPTR(image);
+@@ -28,33 +130,48 @@
+ 
+ JNIEXPORT void JNICALL Java_android_widget_ImageView_native_1setDrawable(JNIEnv *env, jobject this, jlong widget_ptr, jlong paintable_ptr)
+ {
+-	GtkPicture *picture = _PTR(widget_ptr);
++	AtlImageWidget *image = get_image(widget_ptr);
+ 	GdkPaintable *paintable = _PTR(paintable_ptr);
+-	gtk_picture_set_paintable(picture, paintable);
++	if (paintable == image->paintable)
++		return;
++	if (image->paintable)
++		g_signal_handlers_disconnect_by_data(image->paintable, image);
++	g_set_object(&image->paintable, paintable);
++	if (paintable)
++		g_signal_connect(paintable, "invalidate-contents", G_CALLBACK(invalidate_contents), image);
++	gtk_widget_queue_draw(GTK_WIDGET(image));
++}
++
++JNIEXPORT void JNICALL Java_android_widget_ImageView_native_1setImageGeometry(JNIEnv *env, jobject this,
++		jlong widget_ptr, jfloat width, jfloat height, jfloatArray matrix,
++		jint left, jint top, jint right, jint bottom, jint intrinsic_width, jint intrinsic_height, jboolean crop)
++{
++	jfloat m[9];
++	(*env)->GetFloatArrayRegion(env, matrix, 0, 9, m);
++	if ((*env)->ExceptionCheck(env))
++		return;
++	AtlImageWidget *image = get_image(widget_ptr);
++	/* Android row-major 3x3 to Graphene column-major 4x4, including perspective. */
++	float values[16] = {m[0], m[3], 0, m[6], m[1], m[4], 0, m[7],
++		0, 0, 1, 0, m[2], m[5], 0, m[8]};
++	graphene_matrix_init_from_float(&image->matrix, values);
++	gboolean resize = image->intrinsic_width != intrinsic_width || image->intrinsic_height != intrinsic_height
++		|| image->left != left || image->top != top || image->right != right || image->bottom != bottom;
++	image->width = width;
++	image->height = height;
++	image->left = left;
++	image->top = top;
++	image->right = right;
++	image->bottom = bottom;
++	image->intrinsic_width = intrinsic_width;
++	image->intrinsic_height = intrinsic_height;
++	image->crop = crop;
++	if (resize)
++		gtk_widget_queue_resize(GTK_WIDGET(image));
++	gtk_widget_queue_draw(GTK_WIDGET(image));
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_widget_ImageView_native_1setScaleType(JNIEnv *env, jobject this, jlong widget_ptr, jint scale_type)
+ {
+-	GtkPicture *picture = _PTR(widget_ptr);
+-	/* TODO: somehow handle all the types */
+-	switch (scale_type) {
+-		case SCALE_TYPE_FIT_XY:
+-			gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_FILL);
+-			break;
+-		case SCALE_TYPE_CENTER:
+-			/* should probably let it overflow instead */
+-			gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_SCALE_DOWN);
+-			break;
+-		case SCALE_TYPE_CENTER_CROP:
+-			gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_COVER);
+-			break;
+-		case SCALE_TYPE_CENTER_INSIDE:
+-            gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_SCALE_DOWN);
+-            break;
+-        case SCALE_TYPE_FIT_START:
+-        case SCALE_TYPE_FIT_CENTER:
+-        case SCALE_TYPE_FIT_END:
+-            gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_CONTAIN);
+-            break;
+-	}
++	/* Java configureBounds supplies the complete transform. */
+ }
+--- a/src/api-impl-jni/widgets/android_widget_TextView.c
++++ b/src/api-impl-jni/widgets/android_widget_TextView.c
+@@ -2,6 +2,7 @@
+ 
+ #include "../defines.h"
+ #include "../util.h"
++#include "../graphics/AndroidPaint.h"
+ 
+ #include "WrapperWidget.h"
+ 
+@@ -109,6 +110,14 @@
+ 	g_free(css);
+ 	gtk_style_context_add_provider(context, GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+ 	g_object_set_data_full(G_OBJECT(widget), "text-size-provider", provider, g_object_unref);
++	GtkLabel *label = box_get_label(env, widget);
++	if (label && !g_object_get_data(G_OBJECT(label), "text-insets-provider")) {
++		GtkCssProvider *insets = gtk_css_provider_new();
++		gtk_css_provider_load_from_string(insets, "label { padding: 0; border-width: 0; margin: 0; }");
++		gtk_style_context_add_provider(gtk_widget_get_style_context(GTK_WIDGET(label)),
++			GTK_STYLE_PROVIDER(insets), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
++		g_object_set_data_full(G_OBJECT(label), "text-insets-provider", insets, g_object_unref);
++	}
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_widget_TextView_native_1set_1markup(JNIEnv *env, jobject this, jint value)
+@@ -211,6 +220,11 @@
+         int middle = low + (high - low) / 2;
+         pango_font_description_set_absolute_size(font, (double)sizes[middle] * PANGO_SCALE);
+         pango_layout_set_font_description(layout, font);
++        PangoAttrList *attrs = pango_layout_get_attributes(layout);
++        attrs = attrs ? pango_attr_list_copy(attrs) : pango_attr_list_new();
++        pango_attr_list_change(attrs, pango_attr_font_desc_new(font));
++        pango_layout_set_attributes(layout, attrs);
++        pango_attr_list_unref(attrs);
+         int text_width, text_height;
+         pango_layout_get_pixel_size(layout, &text_width, &text_height);
+         if (text_width <= width && text_height <= height && pango_layout_get_line_count(layout) <= max_lines) {
+@@ -232,35 +246,38 @@
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_widget_TextView_native_1applyTypography(JNIEnv *env, jobject this,
+-        jstring features, jstring variations, jfloat spacing, jfloat extra, jfloat multiplier)
++		jlong paint_ptr, jstring features, jstring variations, jfloat spacing, jfloat extra, jfloat multiplier)
+ {
+-    GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
+-    GtkLabel *label = GTK_IS_TEXT(widget) ? NULL : text_limits_find_label(widget);
+-    if (!label && !GTK_IS_TEXT(widget)) return;
+-    PangoAttrList *current = label ? gtk_label_get_attributes(label) : gtk_text_get_attributes(GTK_TEXT(widget));
+-    PangoAttrList *attributes = current ? pango_attr_list_copy(current) : pango_attr_list_new();
+-    const char *feature_string = features ? (*env)->GetStringUTFChars(env, features, NULL) : NULL;
+-    const char *variation_string = variations ? (*env)->GetStringUTFChars(env, variations, NULL) : NULL;
+-    pango_attr_list_change(attributes, pango_attr_font_features_new(feature_string ? feature_string : ""));
+-    PangoFontDescription *font = pango_font_description_new();
+-    pango_font_description_set_variations(font, variation_string && *variation_string ? variation_string : NULL);
+-    pango_attr_list_change(attributes, pango_attr_font_desc_new(font));
+-    pango_font_description_free(font);
+-    pango_attr_list_change(attributes, pango_attr_letter_spacing_new((int)CLAMP((double)spacing * PANGO_SCALE, G_MININT, G_MAXINT)));
+-    PangoAttrList *removed = pango_attr_list_filter(attributes, remove_line_height_attribute, NULL);
+-    if (removed) pango_attr_list_unref(removed);
+-    if (extra != 0 || multiplier != 1) {
+-        PangoContext *context = gtk_widget_get_pango_context(label ? GTK_WIDGET(label) : widget);
+-        PangoFontMetrics *metrics = pango_context_get_metrics(context, pango_context_get_font_description(context), pango_context_get_language(context));
+-        double height = (pango_font_metrics_get_ascent(metrics) + pango_font_metrics_get_descent(metrics)) * multiplier + extra * PANGO_SCALE;
+-        pango_attr_list_insert(attributes, pango_attr_line_height_new_absolute((int)CLAMP(height, 1, G_MAXINT)));
+-        pango_font_metrics_unref(metrics);
+-    }
+-    if (label) gtk_label_set_attributes(label, attributes);
+-    else gtk_text_set_attributes(GTK_TEXT(widget), attributes);
+-    pango_attr_list_unref(attributes);
+-    if (feature_string) (*env)->ReleaseStringUTFChars(env, features, feature_string);
+-    if (variation_string) (*env)->ReleaseStringUTFChars(env, variations, variation_string);
++	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++	GtkLabel *label = GTK_IS_TEXT(widget) ? NULL : text_limits_find_label(widget);
++	if (!label && !GTK_IS_TEXT(widget)) return;
++	PangoAttrList *current = label ? gtk_label_get_attributes(label) : gtk_text_get_attributes(GTK_TEXT(widget));
++	PangoAttrList *attributes = current ? pango_attr_list_copy(current) : pango_attr_list_new();
++	const char *feature_string = features ? (*env)->GetStringUTFChars(env, features, NULL) : NULL;
++	const char *variation_string = variations ? (*env)->GetStringUTFChars(env, variations, NULL) : NULL;
++	pango_attr_list_change(attributes, pango_attr_font_features_new(feature_string ? feature_string : ""));
++	struct AndroidPaint *paint = _PTR(paint_ptr);
++	pango_font_description_set_variations(paint->font, variation_string && *variation_string ? variation_string : NULL);
++	PangoFontDescription *font = pango_font_description_copy(paint->font);
++	pango_attr_list_change(attributes, pango_attr_font_desc_new(font));
++	pango_font_description_free(font);
++	pango_attr_list_change(attributes, pango_attr_letter_spacing_new((int)CLAMP((double)spacing * PANGO_SCALE, G_MININT, G_MAXINT)));
++	pango_attr_list_change(paint->text_attrs, pango_attr_font_features_new(feature_string ? feature_string : ""));
++	pango_attr_list_change(paint->text_attrs, pango_attr_letter_spacing_new((int)CLAMP((double)spacing * PANGO_SCALE, G_MININT, G_MAXINT)));
++	PangoAttrList *removed = pango_attr_list_filter(attributes, remove_line_height_attribute, NULL);
++	if (removed) pango_attr_list_unref(removed);
++	if (extra != 0 || multiplier != 1) {
++		PangoContext *context = gtk_widget_get_pango_context(label ? GTK_WIDGET(label) : widget);
++		PangoFontMetrics *metrics = pango_context_get_metrics(context, paint->font, pango_context_get_language(context));
++		double height = (pango_font_metrics_get_ascent(metrics) + pango_font_metrics_get_descent(metrics)) * multiplier + extra * PANGO_SCALE;
++		pango_attr_list_insert(attributes, pango_attr_line_height_new_absolute((int)CLAMP(height, 1, G_MAXINT)));
++		pango_font_metrics_unref(metrics);
++	}
++	if (label) gtk_label_set_attributes(label, attributes);
++	else gtk_text_set_attributes(GTK_TEXT(widget), attributes);
++	pango_attr_list_unref(attributes);
++	if (feature_string) (*env)->ReleaseStringUTFChars(env, features, feature_string);
++	if (variation_string) (*env)->ReleaseStringUTFChars(env, variations, variation_string);
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setSelectable(JNIEnv *env, jobject this, jboolean selectable)
+@@ -271,40 +288,6 @@
+     if (label) gtk_label_set_selectable(label, selectable);
+ }
+ 
+-/* Apply Typeface family/weight/style through the existing Pango attr list,
+- * same update pattern as native_applyTypography: copy the current list and
+- * change only a font-desc attribute without a size, so the CSS font-size,
+- * the tnum font features and line-height attributes are preserved. */
+-JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setTypeface(JNIEnv *env, jobject this,
+-        jstring family_ptr, jint weight, jboolean italic, jstring variations_ptr)
+-{
+-    GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
+-    GtkLabel *label = GTK_IS_TEXT(widget) ? NULL : text_limits_find_label(widget);
+-    if (!label && !GTK_IS_TEXT(widget)) return;
+-    PangoAttrList *current = label ? gtk_label_get_attributes(label) : gtk_text_get_attributes(GTK_TEXT(widget));
+-    PangoAttrList *attributes = current ? pango_attr_list_copy(current) : pango_attr_list_new();
+-
+-    PangoFontDescription *font = pango_font_description_new();
+-    const char *family = family_ptr ? (*env)->GetStringUTFChars(env, family_ptr, NULL) : NULL;
+-    const char *variations = variations_ptr ? (*env)->GetStringUTFChars(env, variations_ptr, NULL) : NULL;
+-    if (family)
+-        pango_font_description_set_family(font, family);
+-    pango_font_description_set_weight(font, (PangoWeight)CLAMP(weight, 100, 1000));
+-    pango_font_description_set_style(font, italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
+-    if (variations && *variations)
+-        pango_font_description_set_variations(font, variations);
+-    pango_attr_list_change(attributes, pango_attr_font_desc_new(font));
+-    pango_font_description_free(font);
+-
+-    if (label) gtk_label_set_attributes(label, attributes);
+-    else gtk_text_set_attributes(GTK_TEXT(widget), attributes);
+-    pango_attr_list_unref(attributes);
+-    if (family)
+-        (*env)->ReleaseStringUTFChars(env, family_ptr, family);
+-    if (variations)
+-        (*env)->ReleaseStringUTFChars(env, variations_ptr, variations);
+-}
+-
+ JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setHint(JNIEnv *env, jobject this, jstring hint, jint color, jboolean showing_hint)
+ {
+ 	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
+--- a/src/api-impl-jni/widgets/ImageWidget.h
++++ b/src/api-impl-jni/widgets/ImageWidget.h
+@@ -0,0 +1,8 @@
++#ifndef ATL_IMAGE_WIDGET_H
++#define ATL_IMAGE_WIDGET_H
++
++#include <gtk/gtk.h>
++
++GtkWidget *atl_image_widget_new(void);
++
++#endif
+--- a/src/api-impl-jni/widgets/WrapperWidget.c
++++ b/src/api-impl-jni/widgets/WrapperWidget.c
+@@ -522,6 +522,8 @@
+ 	}
+ 	if (!wrapper->background) {
+ 		wrapper->background = gtk_picture_new();
++		gtk_picture_set_content_fit(GTK_PICTURE(wrapper->background), GTK_CONTENT_FIT_FILL);
++		gtk_picture_set_can_shrink(GTK_PICTURE(wrapper->background), TRUE);
+ 		gtk_widget_insert_after(wrapper->background, GTK_WIDGET(wrapper), NULL);
+ 	}
+ 	gtk_picture_set_paintable(GTK_PICTURE(wrapper->background), paintable);

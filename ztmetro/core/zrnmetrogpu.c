@@ -4,6 +4,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "zrnmetrogpu.h"
 #include "zrnmetrorender.h"
+#include <stdbool.h>
+bool zmc_perflog(void);	/* zrnmetrocore.c */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -18,6 +20,7 @@
 
 #define TEXTURES 6
 #define TILE_HEIGHT 2048
+#define CACHE_BYTES (64u * 1024u * 1024u)
 struct picture {
 	cairo_surface_t *source; /* retain it: an address cannot be recycled under a texture */
 	unsigned revision, used;
@@ -33,7 +36,7 @@ static struct {
 	GLuint program, white;
 	GLint size, eye, alpha, opaque, solid, color, native;
 	int w, h, scale, tile_h, max_size;
-	bool ready;
+	bool ready, failed;
 	unsigned clock;
 	struct picture pictures[TEXTURES];
 	double began, submit, worst, swap;
@@ -152,6 +155,7 @@ fail:
 
 void zmg_begin(int w, int h, int scale) {
 	gpu.began = clock_ms();
+	gpu.failed = false;
 	if (gpu.w != w || gpu.h != h || gpu.scale != scale) {
 		wl_surface_set_buffer_scale(gpu.wl_surface, scale);
 		wl_egl_window_resize(gpu.window, w * scale, h * scale, 0, 0);
@@ -177,16 +181,25 @@ bool zmg_end(void) {
 	double now = clock_ms(), submit = now - gpu.began;
 	gpu.submit += submit;
 	if (submit > gpu.worst) gpu.worst = submit;
+	GLenum error = glGetError();
+	if (error != GL_NO_ERROR || gpu.failed) {
+		fprintf(stderr, "ZrnMetroCore: skipping failed GL frame (0x%x), dropping page textures\n", error);
+		for (int i = 0; i < TEXTURES; i++) forget(&gpu.pictures[i]);
+		return false;
+	}
 	bool ok = eglSwapBuffers(gpu.display, gpu.surface);
 	gpu.swap += clock_ms() - now;
 	gpu.frames++;
-	if (!ok) fprintf(stderr, "ZrnMetroCore: eglSwapBuffers failed: 0x%x\n", eglGetError());
+	if (!ok) {
+		fprintf(stderr, "ZrnMetroCore: eglSwapBuffers failed: 0x%x\n", eglGetError());
+		for (int i = 0; i < TEXTURES; i++) forget(&gpu.pictures[i]);
+	}
 	return ok;
 }
 
 void zmg_report(const char *app_id) {
 	if (!gpu.ready || !gpu.frames) return;
-	fprintf(stderr, "%s: GLES %u frames, CPU submit %.2f ms/frame (worst %.2f), swap %.2f ms/frame, %u texture uploads (%.1f MB)\n",
+	if (zmc_perflog()) fprintf(stderr, "%s: GLES %u frames, CPU submit %.2f ms/frame (worst %.2f), swap %.2f ms/frame, %u texture uploads (%.1f MB)\n",
 		app_id, gpu.frames, gpu.submit / gpu.frames, gpu.worst, gpu.swap / gpu.frames,
 		gpu.uploads, gpu.bytes / 1048576.0);
 	gpu.frames = gpu.uploads = 0;
@@ -229,6 +242,24 @@ static struct picture *picture(cairo_surface_t *source, unsigned revision) {
 	if (p && (revision == 0 || p->revision == revision)) { p->used = ++gpu.clock; return p; }
 	int w = cairo_image_surface_get_width(source), h = cairo_image_surface_get_height(source);
 	if (w <= 0 || h <= 0 || w > gpu.max_size || cairo_image_surface_get_stride(source) != w * 4) return NULL;
+	size_t bytes = (size_t)w * h * 4, retained = 0;
+	/* A single long page must still render. Keep it exclusively rather than
+	 * retaining other pages alongside an oversized current picture. */
+	size_t budget = bytes > CACHE_BYTES ? bytes : CACHE_BYTES;
+	for (int i = 0; i < TEXTURES; i++) {
+		struct picture *q = &gpu.pictures[i];
+		if (q != p) retained += (size_t)q->w * q->h * 4;
+	}
+	while (retained + bytes > budget) {
+		struct picture *victim = NULL;
+		for (int i = 0; i < TEXTURES; i++) {
+			struct picture *q = &gpu.pictures[i];
+			if (q != p && q->source && (!victim || q->used < victim->used)) victim = q;
+		}
+		if (!victim) return NULL;
+		retained -= (size_t)victim->w * victim->h * 4;
+		forget(victim);
+	}
 	if (!p) {
 		p = oldest;
 		forget(p);
@@ -236,7 +267,7 @@ static struct picture *picture(cairo_surface_t *source, unsigned revision) {
 		p->w = w; p->h = h;
 		p->n = (h + gpu.tile_h - 1) / gpu.tile_h;
 		p->tiles = calloc((size_t)p->n, sizeof(GLuint));
-		if (!p->tiles) { forget(p); return NULL; }
+		if (!p->tiles) { gpu.failed = true; forget(p); return NULL; }
 		glGenTextures(p->n, p->tiles);
 		for (int i = 0; i < p->n; i++) {
 			glBindTexture(GL_TEXTURE_2D, p->tiles[i]);
@@ -247,8 +278,11 @@ static struct picture *picture(cairo_surface_t *source, unsigned revision) {
 			int th = h - i * gpu.tile_h;
 			if (th > gpu.tile_h) th = gpu.tile_h;
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			if (glGetError() != GL_NO_ERROR) { gpu.failed = true; forget(p); return NULL; }
 		}
 	}
+	struct timespec up0, up1;
+	clock_gettime(CLOCK_MONOTONIC, &up0);
 	cairo_surface_flush(source);
 	const unsigned char *data = cairo_image_surface_get_data(source);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -258,9 +292,15 @@ static struct picture *picture(cairo_surface_t *source, unsigned revision) {
 		glBindTexture(GL_TEXTURE_2D, p->tiles[i]);
 		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, th, GL_RGBA, GL_UNSIGNED_BYTE,
 			data + (size_t)i * gpu.tile_h * w * 4);
+		if (glGetError() != GL_NO_ERROR) { gpu.failed = true; forget(p); return NULL; }
 	}
 	p->revision = revision;
 	p->used = ++gpu.clock;
+	clock_gettime(CLOCK_MONOTONIC, &up1);
+	double up_ms = (up1.tv_sec - up0.tv_sec) * 1e3 + (up1.tv_nsec - up0.tv_nsec) / 1e6;
+	if (up_ms >= 8) {
+		if (zmc_perflog()) fprintf(stderr, "ZrnMetroCore: %dx%d page uploaded in %.0f ms (revision %u)\n", w, h, up_ms, revision);
+	}
 	gpu.uploads++;
 	gpu.bytes += (size_t)w * h * 4;
 	return p;
@@ -276,6 +316,16 @@ static struct zmg_vertex mix(const struct zmg_vertex q[4], double x, double y) {
 
 void zmg_prepare(cairo_surface_t *source, unsigned revision) {
 	if (gpu.ready && source) picture(source, revision);
+}
+
+/* The GPU's upload of a picture the app has let go of (never the live cache):
+ * drop its tiles now, so the memory is free for whoever needs it, instead of
+ * waiting to be pushed out by other pictures. */
+void zmg_forget(cairo_surface_t *source) {
+	if (!gpu.ready || !source) return;
+	for (int i = 0; i < TEXTURES; i++) {
+		if (gpu.pictures[i].source == source) forget(&gpu.pictures[i]);
+	}
 }
 
 void zmg_surface(cairo_surface_t *source, unsigned revision, double x0, double y0, double x1,
@@ -372,6 +422,12 @@ void *zmg_dmabuf_import(int w, int h, uint32_t fourcc, uint64_t modifier, int pl
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	image_target(GL_TEXTURE_2D, (GLeglImageOES)image);
+	if (glGetError() != GL_NO_ERROR) {
+		glDeleteTextures(1, &e->tex);
+		destroy_image(gpu.display, e->image);
+		free(e);
+		return NULL;
+	}
 	return e;
 }
 

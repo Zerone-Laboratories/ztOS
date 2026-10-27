@@ -1,0 +1,14 @@
+[Unit]
+Description=ztOSCoreSensorFramework, sensor hub: Broadcom's daemon for the Galaxy S9's BCM4773
+After=multi-user.target
+
+[Service]
+ExecStartPre=/usr/local/sbin/ztoscsf-sensorhub
+ExecStart=/usr/local/sbin/ztoscsf-sensorhub --run
+# ztoscsf owns the two recovery attempts. Do not restart a dead hub forever.
+Restart=no
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=graphical.target

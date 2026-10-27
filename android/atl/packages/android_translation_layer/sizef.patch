@@ -1,0 +1,47 @@
+--- a/src/api-impl/android/util/SizeF.java
++++ b/src/api-impl/android/util/SizeF.java
+@@ -1,4 +1,43 @@
+ package android.util;
+ 
+-public class SizeF {
++/** AOSP-compatible immutable width/height pair; ATL upstream ships an empty stub. */
++public final class SizeF {
++	private final float width;
++	private final float height;
++
++	public SizeF() {
++		this.width = 0.0f;
++		this.height = 0.0f;
++	}
++
++	public SizeF(float width, float height) {
++		this.width = width;
++		this.height = height;
++	}
++
++	public float getWidth() {
++		return width;
++	}
++
++	public float getHeight() {
++		return height;
++	}
++
++	@Override
++	public boolean equals(Object obj) {
++		if (this == obj) return true;
++		if (obj == null || getClass() != obj.getClass()) return false;
++		SizeF other = (SizeF) obj;
++		return width == other.width && height == other.height;
++	}
++
++	@Override
++	public int hashCode() {
++		return Float.floatToIntBits(width) ^ Float.floatToIntBits(height);
++	}
++
++	@Override
++	public String toString() {
++		return width + "x" + height;
++	}
+ }

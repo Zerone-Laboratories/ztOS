@@ -1,0 +1,1097 @@
+--- a/src/api-impl/android/graphics/Paint.java
++++ b/src/api-impl/android/graphics/Paint.java
+@@ -21,6 +21,7 @@
+ 
+ 	public long paint; // native paint
+ 	private int flags;
++	private float letterSpacing;
+ 	private Xfermode xfermode;
+ 	private Shader shader;
+ 	private Align align = Align.LEFT;
+@@ -39,6 +40,7 @@
+ 	public Paint(Paint paint) {
+ 		this.paint = native_clone(paint.paint);
+ 		this.flags = paint.flags;
++		this.letterSpacing = paint.letterSpacing;
+ 		xfermode = paint.xfermode;
+ 		shader = paint.shader;
+ 		align = paint.align;
+@@ -87,6 +89,7 @@
+ 	}
+ 	public void setTextSize(float size) {
+ 		native_set_text_size(paint, size);
++		if (letterSpacing != 0) native_set_letter_spacing(paint, letterSpacing);
+ 	}
+ 
+ 	/**
+@@ -365,7 +368,8 @@
+ 		return null;
+ 	}
+ 
+-	public void setLetterSpacing(float spacing) {}
++	public void setLetterSpacing(float spacing) { letterSpacing = spacing; native_set_letter_spacing(paint, spacing); }
++	private static native void native_set_letter_spacing(long paint, float spacing);
+ 
+ 	public enum Cap {
+ 		/**
+@@ -468,6 +472,7 @@
+ 		native_recycle(this.paint);
+ 		this.paint = replacement;
+ 		flags = paint.flags;
++		letterSpacing = paint.letterSpacing;
+ 		xfermode = paint.xfermode;
+ 		shader = paint.shader;
+ 		align = paint.align;
+@@ -489,7 +494,7 @@
+ 
+ 	public Locale getTextLocale() { return Locale.getDefault(); }
+ 
+-	public float getLetterSpacing() { return 1.0f; }
++	public float getLetterSpacing() { return letterSpacing; }
+ 
+ 	public Style getStyle() {
+ 		return Style.values[native_get_style(paint)];
+@@ -510,10 +515,16 @@
+ 		return false;
+ 	}
+ 
++	/** @hide Releases temporary span paints after native attributes have been copied. */
++	public final void releaseSpanPaint() {
++		if (paint != 0) { native_recycle(paint); paint = 0; }
++	}
++
+ 	public void reset() {
+ 		native_recycle(paint);
+ 		paint = native_create();
+ 		flags = 0;
++		letterSpacing = 0;
+ 		xfermode = null;
+ 		shader = null;
+ 		align = Align.LEFT;
+--- a/src/api-impl/android/text/Layout.java
++++ b/src/api-impl/android/text/Layout.java
+@@ -26,12 +26,6 @@
+ 	private Alignment align;
+ 
+ 	protected Layout(CharSequence text, TextPaint paint, int width, Layout.Alignment align, float spacingMult, float spacingAdd) {
+-		if (text instanceof Spanned) {
+-			Spanned spanned = (Spanned)text;
+-			// call every ReplacementSpan.getSize method to prevent "PlaceholderSpan is not laid out yet." errors in ComposeUI
+-			for (ReplacementSpan span : spanned.getSpans(0, spanned.length(), ReplacementSpan.class))
+-				span.getSize(paint, text, spanned.getSpanStart(span), spanned.getSpanEnd(span), paint.getFontMetricsInt());
+-		}
+ 		// text is kept as the original CharSequence so isSpanned() and span access still work
+ 		this.text = text != null ? text : "";
+ 		this.paint = paint;
+@@ -39,6 +33,7 @@
+ 		this.spacing_add = spacingAdd;
+ 		this.align = align;
+ 		layout = native_constructor(this.text.toString(), paint.paint, width);
++		applySpans(layout, this.text, paint);
+ 	}
+ 
+ 	protected void setAlign(Alignment align) {
+@@ -78,8 +73,11 @@
+ 	public void draw(Canvas canvas) {
+ 		if (canvas instanceof GskCanvas)
+ 			native_draw(layout, ((GskCanvas)canvas).snapshot, paint.paint);
++		else if (text instanceof Spanned)
++			drawSpannedCanvas(canvas);
+ 		else
+ 			native_draw_custom_canvas(layout, canvas, paint);
++		drawReplacements(canvas);
+ 	}
+ 
+ 	public void draw(Canvas canvas, Path selectionHighlight, Paint paint, int selectionOffset) {
+@@ -97,12 +95,108 @@
+ 	}
+ 
+ 	public static float getDesiredWidth(CharSequence source, TextPaint paint) {
+-		long layout = native_constructor(source != null ? source.toString() : "", paint.paint, -1);
+-		float width = native_get_desired_width(layout);
+-		native_free(layout);
+-		return width;
++		Layout measured = new Layout(source, paint, -1, Alignment.ALIGN_NORMAL, 1, 0);
++		try { return native_get_desired_width(measured.layout); }
++		finally { native_free(measured.layout); }
++	}
++
++	public static void applySpans(long layout, CharSequence text, TextPaint base) {
++		if (!(text instanceof Spanned)) return;
++		Spanned spanned = (Spanned)text;
++		java.util.ArrayList<TextPaint> paints = new java.util.ArrayList<>();
++		java.util.ArrayList<Integer> values = new java.util.ArrayList<>();
++		for (int start = 0, end; start < text.length(); start = end) {
++			end = spanned.nextSpanTransition(start, text.length(), android.text.style.CharacterStyle.class);
++			TextPaint measure = new TextPaint();
++			measure.set(base);
++			TextPaint draw = new TextPaint();
++			draw.set(base);
++			for (android.text.style.CharacterStyle span : spanned.getSpans(start, end, android.text.style.CharacterStyle.class)) {
++				if (spanned.getSpanStart(span) == spanned.getSpanEnd(span)) continue;
++				if (!(span instanceof ReplacementSpan)) {
++					if (span instanceof android.text.style.MetricAffectingSpan)
++						((android.text.style.MetricAffectingSpan)span).updateMeasureState(measure);
++					span.updateDrawState(draw);
++				}
++			}
++			paints.add(measure);
++			paints.add(draw);
++			values.add(start); values.add(end); values.add(draw.bgColor); values.add(draw.baselineShift);
++			values.add((draw.isUnderlineText() ? 1 : 0) | (draw.isStrikeThruText() ? 2 : 0));
++		}
++		int[] runs = new int[values.size()];
++		for (int i = 0; i < runs.length; i++) runs[i] = values.get(i);
++		long[] handles = new long[paints.size()];
++		for (int i = 0; i < handles.length; i++) handles[i] = paints.get(i).paint;
++		try { native_set_runs(layout, base.paint, runs, handles); }
++		finally { for (TextPaint run : paints) run.releaseSpanPaint(); }
++		// Replacement spans are atomic even when character styles transition inside them.
++		for (ReplacementSpan span : spanned.getSpans(0, text.length(), ReplacementSpan.class)) {
++			int start = spanned.getSpanStart(span), end = spanned.getSpanEnd(span);
++			if (start >= end) continue;
++			TextPaint measure = new TextPaint();
++			measure.set(base);
++			for (android.text.style.MetricAffectingSpan metric : spanned.getSpans(start, end, android.text.style.MetricAffectingSpan.class))
++				if (!(metric instanceof ReplacementSpan)) metric.updateMeasureState(measure);
++			Paint.FontMetricsInt metrics = measure.getFontMetricsInt();
++			int width = span.getSize(measure, text, start, end, metrics);
++			native_set_shape(layout, start, end, width, metrics.ascent + measure.baselineShift, metrics.descent + measure.baselineShift);
++			measure.releaseSpanPaint();
++		}
++	}
++
++	private void drawSpannedCanvas(Canvas canvas) {
++		Spanned spanned = (Spanned)text;
++		for (int line = 0; line < getLineCount(); line++) {
++			int limit = getLineEnd(line);
++			for (int start = getLineStart(line), end; start < limit; start = end) {
++				end = spanned.nextSpanTransition(start, limit, android.text.style.CharacterStyle.class);
++				TextPaint run = new TextPaint();
++				run.set(paint);
++				boolean replacement = false;
++				for (android.text.style.CharacterStyle span : spanned.getSpans(start, end, android.text.style.CharacterStyle.class)) {
++					if (spanned.getSpanStart(span) == spanned.getSpanEnd(span)) continue;
++					if (span instanceof ReplacementSpan) replacement = true;
++					else span.updateDrawState(run);
++				}
++				try {
++					if (!replacement) {
++						float x = native_shape_x(layout, start);
++						if (run.bgColor != 0) {
++							int color = run.getColor();
++							run.setColor(run.bgColor);
++							canvas.drawRect(x, getLineTop(line), getPrimaryHorizontal(end), getLineBottom(line), run);
++							run.setColor(color);
++						}
++						canvas.drawText(text, start, end, x, getLineBaseline(line) + run.baselineShift, run);
++					}
++				} finally { run.releaseSpanPaint(); }
++			}
++		}
+ 	}
+ 
++	protected void drawReplacements(Canvas canvas) {
++		if (!(text instanceof Spanned)) return;
++		Spanned spanned = (Spanned)text;
++		for (ReplacementSpan span : spanned.getSpans(0, text.length(), ReplacementSpan.class)) {
++			int start = spanned.getSpanStart(span), end = spanned.getSpanEnd(span);
++			if (start >= end) continue;
++			int line = getLineForOffset(start);
++			if (line >= getLineCount()) continue;
++			TextPaint run = new TextPaint();
++			run.set(paint);
++			for (android.text.style.CharacterStyle style : spanned.getSpans(start, end, android.text.style.CharacterStyle.class))
++				if (!(style instanceof ReplacementSpan)) style.updateDrawState(run);
++			span.draw(canvas, text, start, end, native_shape_x(layout, start),
++					getLineTop(line), getLineBaseline(line), getLineBottom(line), run);
++			run.releaseSpanPaint();
++		}
++	}
++
++	private static native void native_set_runs(long layout, long base, int[] runs, long[] paints);
++	private static native void native_set_shape(long layout, int start, int end, int width, int ascent, int descent);
++	private static native float native_shape_x(long layout, int start);
++
+ 	public int getLineBaseline(int line) {
+ 		if (line < 0 || line >= getLineCount())
+ 			throw new ArrayIndexOutOfBoundsException();
+--- a/src/api-impl/android/text/StaticLayout.java
++++ b/src/api-impl/android/text/StaticLayout.java
+@@ -90,9 +90,7 @@
+ 
+ 	@Override
+ 	public void draw(Canvas canvas) {
+-		if (maxLines < super.getLineCount() && canvas instanceof GskCanvas)
+-			native_draw_capped(layout, ((GskCanvas)canvas).snapshot, getPaint().paint, getHeight());
+-		else if (maxLines < super.getLineCount()) {
++		if (maxLines < super.getLineCount()) {
+ 			int saved = canvas.save();
+ 			try {
+ 				canvas.clipRect(0, 0, getWidth(), getHeight());
+--- a/src/api-impl/android/text/style/AbsoluteSizeSpan.java
++++ b/src/api-impl/android/text/style/AbsoluteSizeSpan.java
+@@ -1,7 +1,15 @@
+ package android.text.style;
+ 
++import android.text.TextPaint;
++
+ public class AbsoluteSizeSpan extends MetricAffectingSpan {
+-	public AbsoluteSizeSpan() {}
+-	public AbsoluteSizeSpan(int dummy) {}
+-	public AbsoluteSizeSpan(int size, boolean dip) {}
++	private final int size;
++	private final boolean dip;
++	public AbsoluteSizeSpan() { this(0); }
++	public AbsoluteSizeSpan(int size) { this(size, false); }
++	public AbsoluteSizeSpan(int size, boolean dip) { this.size = size; this.dip = dip; }
++	public int getSize() { return size; }
++	public boolean getDip() { return dip; }
++	@Override public void updateMeasureState(TextPaint paint) { paint.setTextSize(dip ? size * paint.density : size); }
++	@Override public void updateDrawState(TextPaint paint) { updateMeasureState(paint); }
+ }
+--- a/src/api-impl/android/text/style/BackgroundColorSpan.java
++++ b/src/api-impl/android/text/style/BackgroundColorSpan.java
+@@ -1,5 +1,10 @@
+ package android.text.style;
+ 
++import android.text.TextPaint;
++
+ public class BackgroundColorSpan extends CharacterStyle {
+-	public BackgroundColorSpan(int color) {}
++	private final int color;
++	public BackgroundColorSpan(int color) { this.color = color; }
++	public int getBackgroundColor() { return color; }
++	@Override public void updateDrawState(TextPaint paint) { paint.bgColor = color; }
+ }
+--- a/src/api-impl/android/text/style/CharacterStyle.java
++++ b/src/api-impl/android/text/style/CharacterStyle.java
+@@ -1,4 +1,21 @@
+ package android.text.style;
+ 
++import android.text.TextPaint;
++
+ public class CharacterStyle {
++	public void updateDrawState(TextPaint paint) {}
++	public static CharacterStyle wrap(final CharacterStyle style) {
++		if (style instanceof MetricAffectingSpan) {
++			return new MetricAffectingSpan() {
++				@Override public void updateMeasureState(TextPaint paint) { ((MetricAffectingSpan)style).updateMeasureState(paint); }
++				@Override public void updateDrawState(TextPaint paint) { style.updateDrawState(paint); }
++				@Override public CharacterStyle getUnderlying() { return style.getUnderlying(); }
++			};
++		}
++		return new CharacterStyle() {
++			@Override public void updateDrawState(TextPaint paint) { style.updateDrawState(paint); }
++			@Override public CharacterStyle getUnderlying() { return style.getUnderlying(); }
++		};
++	}
++	public CharacterStyle getUnderlying() { return this; }
+ }
+--- a/src/api-impl/android/text/style/ClickableSpan.java
++++ b/src/api-impl/android/text/style/ClickableSpan.java
+@@ -1,4 +1,5 @@
+ package android.text.style;
+ 
+ public class ClickableSpan extends CharacterStyle {
++	@Override public void updateDrawState(android.text.TextPaint paint) { paint.setColor(paint.linkColor); paint.setUnderlineText(true); }
+ }
+--- a/src/api-impl/android/text/style/DynamicDrawableSpan.java
++++ b/src/api-impl/android/text/style/DynamicDrawableSpan.java
+@@ -4,5 +4,26 @@
+ 
+ public abstract class DynamicDrawableSpan extends ReplacementSpan {
+ 
++	public static final int ALIGN_BOTTOM = 0;
++	public static final int ALIGN_BASELINE = 1;
++	public static final int ALIGN_CENTER = 2;
++	protected final int mVerticalAlignment;
++	public DynamicDrawableSpan() { this(ALIGN_BOTTOM); }
++	public DynamicDrawableSpan(int alignment) { mVerticalAlignment = alignment; }
++	@Override public int getSize(android.graphics.Paint paint, CharSequence text, int start, int end, android.graphics.Paint.FontMetricsInt fm) {
++		android.graphics.Rect bounds = getDrawable().getBounds();
++		if (fm != null) { fm.ascent = -bounds.bottom; fm.descent = 0; fm.top = fm.ascent; fm.bottom = 0; }
++		return bounds.right;
++	}
++	@Override public void draw(android.graphics.Canvas canvas, CharSequence text, int start, int end,
++			float x, int top, int y, int bottom, android.graphics.Paint paint) {
++		Drawable drawable = getDrawable();
++		int transY = bottom - drawable.getBounds().bottom;
++		if (mVerticalAlignment == ALIGN_BASELINE) transY -= paint.getFontMetricsInt().descent;
++		else if (mVerticalAlignment == ALIGN_CENTER) transY = top + (bottom - top - drawable.getBounds().height()) / 2;
++		int saved = canvas.save();
++		try { canvas.translate(x, transY); drawable.draw(canvas); }
++		finally { canvas.restoreToCount(saved); }
++	}
+ 	public abstract Drawable getDrawable();
+ }
+--- a/src/api-impl/android/text/style/ForegroundColorSpan.java
++++ b/src/api-impl/android/text/style/ForegroundColorSpan.java
+@@ -1,5 +1,10 @@
+ package android.text.style;
+ 
++import android.text.TextPaint;
++
+ public class ForegroundColorSpan extends CharacterStyle {
+-	public ForegroundColorSpan(int dummy) {}
++	private final int color;
++	public ForegroundColorSpan(int color) { this.color = color; }
++	public int getForegroundColor() { return color; }
++	@Override public void updateDrawState(TextPaint paint) { paint.setColor(color); }
+ }
+--- a/src/api-impl/android/text/style/ImageSpan.java
++++ b/src/api-impl/android/text/style/ImageSpan.java
+@@ -6,20 +6,24 @@
+ 
+ public class ImageSpan extends DynamicDrawableSpan {
+ 
+-	public ImageSpan(Context context, int resId) {}
++	public ImageSpan(Context context, int resId) { this(context.getResources().getDrawable(resId)); }
+ 
+ 	private Drawable drawable;
+ 
+ 	public ImageSpan(Drawable d) {
+ 		drawable = d;
++		if (d != null && d.getBounds().isEmpty()) d.setBounds(0, 0, d.getIntrinsicWidth(), d.getIntrinsicHeight());
+ 	}
+ 
+ 	public ImageSpan(Drawable d, String source) {
+ 		drawable = d;
++		if (d != null && d.getBounds().isEmpty()) d.setBounds(0, 0, d.getIntrinsicWidth(), d.getIntrinsicHeight());
+ 	}
+ 
+ 	public ImageSpan(Drawable d, int verticalAlignment) {
++		super(verticalAlignment);
+ 		drawable = d;
++		if (d != null && d.getBounds().isEmpty()) d.setBounds(0, 0, d.getIntrinsicWidth(), d.getIntrinsicHeight());
+ 	}
+ 
+ 	public Drawable getDrawable() {
+@@ -28,6 +32,6 @@
+ 
+ 	@Override
+ 	public int getSize(Paint paint, CharSequence text, int start, int end, Paint.FontMetricsInt fm) {
+-		return drawable.getIntrinsicWidth();
++		return super.getSize(paint, text, start, end, fm);
+ 	}
+ }
+--- a/src/api-impl/android/text/style/RelativeSizeSpan.java
++++ b/src/api-impl/android/text/style/RelativeSizeSpan.java
+@@ -1,5 +1,11 @@
+ package android.text.style;
+ 
++import android.text.TextPaint;
++
+ public class RelativeSizeSpan extends MetricAffectingSpan {
+-	public RelativeSizeSpan(float proportion) {}
++	private final float proportion;
++	public RelativeSizeSpan(float proportion) { this.proportion = proportion; }
++	public float getSizeChange() { return proportion; }
++	@Override public void updateMeasureState(TextPaint paint) { paint.setTextSize(paint.getTextSize() * proportion); }
++	@Override public void updateDrawState(TextPaint paint) { updateMeasureState(paint); }
+ }
+--- a/src/api-impl/android/text/style/ReplacementSpan.java
++++ b/src/api-impl/android/text/style/ReplacementSpan.java
+@@ -5,4 +5,11 @@
+ public abstract class ReplacementSpan extends MetricAffectingSpan {
+ 
+ 	public abstract int getSize(Paint paint, CharSequence text, int start, int end, Paint.FontMetricsInt fm);
++	public abstract void draw(android.graphics.Canvas canvas, CharSequence text, int start, int end,
++			float x, int top, int y, int bottom, Paint paint);
++	@Override public void updateMeasureState(android.text.TextPaint paint) {}
++	@Override public void updateDrawState(android.text.TextPaint paint) {}
++
+ }
++
++
+--- a/src/api-impl/android/text/style/StrikethroughSpan.java
++++ b/src/api-impl/android/text/style/StrikethroughSpan.java
+@@ -1,4 +1,7 @@
+ package android.text.style;
+ 
++import android.text.TextPaint;
++
+ public class StrikethroughSpan extends CharacterStyle {
++	@Override public void updateDrawState(TextPaint paint) { paint.setStrikeThruText(true); }
+ }
+--- a/src/api-impl/android/text/style/StyleSpan.java
++++ b/src/api-impl/android/text/style/StyleSpan.java
+@@ -10,6 +10,13 @@
+ 		this.style = style;
+ 	}
+ 
++	@Override public void updateMeasureState(android.text.TextPaint paint) {
++		android.graphics.Typeface old = paint.getTypeface();
++		paint.setTypeface(android.graphics.Typeface.create(old, style | (old == null ? 0 : old.getStyle())));
++	}
++	@Override public void updateDrawState(android.text.TextPaint paint) { updateMeasureState(paint); }
++
++
+ 	public int getStyle() {
+ 		return style;
+ 	}
+--- a/src/api-impl/android/text/style/SubscriptSpan.java
++++ b/src/api-impl/android/text/style/SubscriptSpan.java
+@@ -3,4 +3,7 @@
+ import android.text.ParcelableSpan;
+ 
+ public class SubscriptSpan extends MetricAffectingSpan implements ParcelableSpan {
++	@Override public void updateMeasureState(android.text.TextPaint paint) { paint.baselineShift -= (int)(paint.ascent() / 2); }
++	@Override public void updateDrawState(android.text.TextPaint paint) { updateMeasureState(paint); }
+ }
++
+--- a/src/api-impl/android/text/style/SuperscriptSpan.java
++++ b/src/api-impl/android/text/style/SuperscriptSpan.java
+@@ -0,0 +1,8 @@
++package android.text.style;
++
++import android.text.TextPaint;
++
++public class SuperscriptSpan extends MetricAffectingSpan implements android.text.ParcelableSpan {
++	@Override public void updateMeasureState(TextPaint paint) { paint.baselineShift += (int)(paint.ascent() / 2); }
++	@Override public void updateDrawState(TextPaint paint) { updateMeasureState(paint); }
++}
+--- a/src/api-impl/android/text/style/TypefaceSpan.java
++++ b/src/api-impl/android/text/style/TypefaceSpan.java
+@@ -1,5 +1,15 @@
+ package android.text.style;
+ 
++import android.text.TextPaint;
++import android.graphics.Typeface;
++
+ public class TypefaceSpan extends MetricAffectingSpan {
+-	public TypefaceSpan(String typeface) {}
++	private final String family;
++	public TypefaceSpan(String family) { this.family = family; }
++	public String getFamily() { return family; }
++	@Override public void updateMeasureState(TextPaint paint) {
++		Typeface old = paint.getTypeface();
++		paint.setTypeface(Typeface.create(family, old == null ? 0 : old.getStyle()));
++	}
++	@Override public void updateDrawState(TextPaint paint) { updateMeasureState(paint); }
+ }
+--- a/src/api-impl/android/text/style/UnderlineSpan.java
++++ b/src/api-impl/android/text/style/UnderlineSpan.java
+@@ -1,4 +1,7 @@
+ package android.text.style;
+ 
++import android.text.TextPaint;
++
+ public class UnderlineSpan extends CharacterStyle {
++	@Override public void updateDrawState(TextPaint paint) { paint.setUnderlineText(true); }
+ }
+--- a/src/api-impl/android/text/TextPaint.java
++++ b/src/api-impl/android/text/TextPaint.java
+@@ -51,6 +51,7 @@
+ 
+ 	public TextPaint(Paint p) {
+ 		super(p);
++		if (p instanceof TextPaint) set((TextPaint)p);
+ 	}
+ 
+ 	/**
+@@ -81,6 +82,6 @@
+ 	}
+ 
+ 	public float getLetterSpacing() {
+-		return 1.0f;
++		return super.getLetterSpacing();
+ 	}
+ }
+--- a/src/api-impl/android/view/ViewStub.java
++++ b/src/api-impl/android/view/ViewStub.java
+@@ -66,17 +66,15 @@
+  */
+ public final class ViewStub extends View {
+ 	private int mLayoutResource = 0;
+-	private int mInflatedId;
++	private int mInflatedId = NO_ID;
+ 
+ 	private WeakReference<View> mInflatedViewRef;
+ 
+ 	private LayoutInflater mInflater;
+ 	private OnInflateListener mInflateListener;
+-	private boolean initialized = false;
+ 
+ 	public ViewStub(Context context) {
+-		super(context);
+-		initialize(context);
++		this(context, 0);
+ 	}
+ 
+ 	/**
+@@ -86,9 +84,8 @@
+ 	 * @param layoutResource The reference to a layout resource that will be inflated.
+ 	 */
+ 	public ViewStub(Context context, int layoutResource) {
+-		super(context);
++		this(context, (AttributeSet)null);
+ 		mLayoutResource = layoutResource;
+-		initialize(context);
+ 	}
+ 
+ 	public ViewStub(Context context, AttributeSet attrs) {
+@@ -97,16 +94,20 @@
+ 
+ 	@SuppressWarnings({"UnusedDeclaration"})
+ 	public ViewStub(Context context, AttributeSet attrs, int defStyle) {
+-		super(context, attrs, defStyle);
++		this(context, attrs, defStyle, 0);
++	}
++
++	public ViewStub(Context context, AttributeSet attrs, int defStyle, int defStyleRes) {
++		super(context);
+ 		TypedArray a = context.obtainStyledAttributes(attrs, com.android.internal.R.styleable.ViewStub,
+-		                                              defStyle, 0);
++		                                              defStyle, defStyleRes);
+ 
+ 		mInflatedId = a.getResourceId(R.styleable.ViewStub_inflatedId, NO_ID);
+ 		mLayoutResource = a.getResourceId(R.styleable.ViewStub_layout, 0);
+ 
+ 		a.recycle();
+ 
+-		a = context.obtainStyledAttributes(attrs, com.android.internal.R.styleable.View, defStyle, 0);
++		a = context.obtainStyledAttributes(attrs, com.android.internal.R.styleable.View, defStyle, defStyleRes);
+ 		id = a.getResourceId(R.styleable.View_id, NO_ID);
+ 		a.recycle();
+ 
+@@ -114,8 +115,7 @@
+ 	}
+ 
+ 	private void initialize(Context context) {
+-		initialized = true;
+-		setVisibility(GONE);
++		super.setVisibility(GONE);
+ 		setWillNotDraw(true);
+ 	}
+ 
+@@ -219,8 +219,6 @@
+ 	 */
+ 	@Override
+ 	public void setVisibility(int visibility) {
+-		if (!initialized)
+-			return;
+ 		if (mInflatedViewRef != null) {
+ 			View view = mInflatedViewRef.get();
+ 			if (view != null) {
+@@ -231,7 +229,7 @@
+ 		} else {
+ 			super.setVisibility(visibility);
+ 			if (visibility == VISIBLE || visibility == INVISIBLE) {
+-				inflate();
++				inflate().setVisibility(visibility);
+ 			}
+ 		}
+ 	}
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -49,6 +49,7 @@
+ 	private CharSequence text = "";
+ 	private CharSequence hint;
+ 	private TextPaint paint = new TextPaint();
++	private ColorStateList linkColors;
+ 	private boolean include_padding = false;
+ 	private int break_strategy = 0 /*BREAK_STRATEGY_SIMPLE*/;
+ 	private int hyphenation_frequency = 0 /*HYPHENATION_FREQUENCY_NONE*/;
+@@ -261,7 +262,9 @@
+ 		if (colors != null) { hintColors = colors; updateDisplayedText(); }
+ 	}
+ 	public void setHintTextColor(int color) { setHintTextColor(ColorStateList.valueOf(color)); }
+-	public void setLinkTextColor(ColorStateList colorStateList) {}
++	public void setLinkTextColor(ColorStateList colorStateList) {
++		if (colorStateList != null) { linkColors = colorStateList; updateDisplayedText(); }
++	}
+ 
+ 	public void setSingleLine() { setSingleLine(true); }
+ 	public void setSelection(int i) {}
+@@ -527,6 +530,7 @@
+ 		if (!(this instanceof EditText)) native_setText(text.toString());
+ 		native_setHint(hint == null ? null : hint.toString(), getCurrentHintTextColor(), showingHint);
+ 		native_setTextColor(this instanceof EditText || !showingHint ? getCurrentTextColor() : getCurrentHintTextColor());
++		applyTypography();
+ 	}
+ 
+ 	private native void native_setHint(String hint, int color, boolean showingHint);
+@@ -562,7 +566,7 @@
+ 
+ 	public void nullLayouts() {}
+ 
+-	public void setLinkTextColor(int color) {}
++	public void setLinkTextColor(int color) { setLinkTextColor(ColorStateList.valueOf(color)); }
+ 
+ 	public void setCustomSelectionActionModeCallback(ActionMode.Callback actionModeCallback) {}
+ 
+@@ -854,7 +858,18 @@
+     private void applyTypography() {
+         native_applyTypography(paint.paint, pangoFontFeatures, pangoFontVariations,
+                 letterSpacing * getTextSize(), lineSpacingExtra, lineSpacingMultiplier);
++		if (!(this instanceof EditText)) {
++			paint.setColor(getCurrentTextColor());
++			paint.linkColor = linkColors == null ? getCurrentTextColor() : linkColors.getColorForState(getDrawableState(), linkColors.getDefaultColor());
++			long target = native_spanLayout();
++			if (target != 0) {
++				android.text.Layout.applySpans(target, text.length() == 0 && hint != null ? hint : text, paint);
++				native_commitSpans(target);
++			}
++		}
+     }
++    private native long native_spanLayout();
++	private native void native_commitSpans(long layout);
+     private native void native_applyTypography(long paint, String features, String variations, float spacing, float extra, float multiplier);
+     private native void native_setSelectable(boolean selectable);
+     public ColorStateList getHintTextColors() { return hintColors; }
+--- a/src/api-impl/meson.build
++++ b/src/api-impl/meson.build
+@@ -549,6 +549,7 @@
+ 	'android/text/style/StrikethroughSpan.java',
+ 	'android/text/style/StyleSpan.java',
+ 	'android/text/style/SubscriptSpan.java',
++	'android/text/style/SuperscriptSpan.java',
+ 	'android/text/style/SuggestionSpan.java',
+ 	'android/text/style/TextAppearanceSpan.java',
+ 	'android/text/style/TypefaceSpan.java',
+--- a/src/api-impl-jni/graphics/android_graphics_drawable_Drawable.c
++++ b/src/api-impl-jni/graphics/android_graphics_drawable_Drawable.c
+@@ -107,6 +107,10 @@
+ 
+ JNIEXPORT void JNICALL Java_android_graphics_drawable_Drawable_native_1invalidate(JNIEnv *env, jobject this, jlong paintable_ptr)
+ {
++	GdkPaintable *paintable = GDK_PAINTABLE(_PTR(paintable_ptr));
++	// Static paintables (textures, nine-patches) are replaced rather than changed; GTK rejects invalidating them
++	if (gdk_paintable_get_flags(paintable) & GDK_PAINTABLE_STATIC_CONTENTS)
++		return;
+ 	// GTK doesn't allow invalidating a paintable while it's being drawn, so we need to queue it up
+ 	g_idle_add_full(G_PRIORITY_HIGH_IDLE + 20, G_SOURCE_FUNC(queue_invalidate_contents), g_object_ref(GDK_PAINTABLE(_PTR(paintable_ptr))), NULL);
+ }
+--- a/src/api-impl-jni/graphics/android_graphics_drawable_NinePatchDrawable.c
++++ b/src/api-impl-jni/graphics/android_graphics_drawable_NinePatchDrawable.c
+@@ -1,5 +1,9 @@
+ #include <arpa/inet.h>
+ #include <gdk/gdk.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "../defines.h"
+ #include "NinePatchPaintable.h"
+@@ -8,6 +12,8 @@
+ 
+ JNIEXPORT jlong JNICALL Java_android_graphics_drawable_NinePatchDrawable_nativeCreate___3BJ(JNIEnv *env, jobject this, jbyteArray chunk_array, jlong texture_ptr)
+ {
++	if (!chunk_array || !texture_ptr)
++		return 0;
+ 	GdkTexture *texture = GDK_TEXTURE(_PTR(texture_ptr));
+ 	int size = (*env)->GetArrayLength(env, chunk_array);
+ 	if (size < sizeof(struct Res_png_9patch))
+@@ -16,7 +22,15 @@
+ 	if (!chunk)
+ 		return 0;
+ 	(*env)->GetByteArrayRegion(env, chunk_array, 0, size, (jbyte *)chunk);
+-	GdkPaintable *paintable = ninepatch_paintable_new(chunk, size, g_object_ref(texture));
++	if ((*env)->ExceptionCheck(env)) {
++		free(chunk);
++		return 0;
++	}
++	GdkPaintable *paintable = ninepatch_paintable_new(chunk, size, texture, FALSE);
++	if (paintable)
++		g_object_ref(texture);
++	else
++		free(chunk);
+ 	return _INTPTR(paintable);
+ }
+ 
+@@ -29,58 +43,73 @@
+ 	uint32_t chunk_size = 0;
+ 	uint8_t buf[8];
+ 
++	if (!path_jstr)
++		return 0;
+ 	const char *path = (*env)->GetStringUTFChars(env, path_jstr, NULL);
++	if (!path)
++		return 0;
+ 	GdkTexture *texture = gdk_texture_new_from_filename(path, NULL);
+ 	FILE *f = fopen(path, "rb");
+ 	(*env)->ReleaseStringUTFChars(env, path_jstr, path);
+ 
+-	if (!f)
++	if (!f) {
++		if (texture)
++			g_object_unref(texture);
+ 		return 0;
++	}
+ 	// always check that we actually read all bytes, to avoid uninitialized data
+ 	if (fread(buf, 1, 8, f) != 8) {
+-		fclose(f);
+-		return 0;
++		goto done;
+ 	}
+-	if (buf[0] != 0x89 || buf[1] != 'P' || buf[2] != 'N' || buf[3] != 'G') {
+-		fclose(f);
+-		return 0;
++	if (memcmp(buf, "\211PNG\r\n\032\n", 8) != 0) {
++		goto done;
+ 	}
+ 	while (fread(buf, 1, 8, f) == 8) {
+ 
+-		chunk_size = ntohl(((uint32_t *)buf)[0]);
+-		chunk_size += 4; // 4 bytes checksum
++		uint32_t length;
++		memcpy(&length, buf, sizeof(length));
++		chunk_size = ntohl(length);
++		if (chunk_size > UINT32_MAX - 4)
++			break;
+ 
+ 		if (!strncmp((char *)&buf[4], "npTc", 4)) {
+ 			// check minimal size to avoid out-of-bounds access and limit maximum size to 1MB to make potential unknown vulnerabilities harder to exploit
+ 			if (chunk_size < sizeof(struct Res_png_9patch) || chunk_size > 1024 * 1024) {
+-				fclose(f);
+-				return 0;
++				goto done;
+ 			}
+ 			chunk = malloc(chunk_size);
+ 			if (!chunk) {
+-				fclose(f);
+-				return 0;
++				goto done;
+ 			}
+ 			if (fread(chunk, 1, chunk_size, f) != chunk_size) {
+ 				free(chunk);
+-				fclose(f);
+-				return 0;
++				chunk = NULL;
++				goto done;
+ 			}
+ 			break;
+ 		} else {
+-			fseek(f, chunk_size, SEEK_CUR);
++			if (fseek(f, (long)chunk_size + 4, SEEK_CUR) != 0) // 4 bytes checksum
++				break;
+ 		}
+ 	}
++done:
+ 	fclose(f);
+ 
+ 	if (chunk)
+-		paintable = ninepatch_paintable_new(chunk, chunk_size, texture);
++		paintable = ninepatch_paintable_new(chunk, chunk_size, texture, TRUE);
+ 
++	if (!paintable) {
++		free(chunk);
++		if (texture)
++			g_object_unref(texture);
++	}
+ 	return _INTPTR(paintable);
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_graphics_drawable_NinePatchDrawable_nativeSetTint(JNIEnv *env, jobject this, jlong paintable_ptr, jint color)
+ {
++	if (!paintable_ptr)
++		return;
+ 	NinePatchPaintable *paintable = NINEPATCH_PAINTABLE(_PTR(paintable_ptr));
+ 	paintable->tint = color;
+ }
+@@ -90,10 +119,10 @@
+ 	NinePatchPaintable *paintable = NINEPATCH_PAINTABLE(_PTR(paintable_ptr));
+ 	struct Res_png_9patch *chunk = paintable->chunk;
+ 	jint values[7] = { paintable->width, paintable->height, 0, 0, 0, 0, -1 };
+-	values[2] = chunk->wasDeserialized ? chunk->paddingLeft : (int32_t)ntohl(chunk->paddingLeft);
+-	values[3] = chunk->wasDeserialized ? chunk->paddingTop : (int32_t)ntohl(chunk->paddingTop);
+-	values[4] = chunk->wasDeserialized ? chunk->paddingRight : (int32_t)ntohl(chunk->paddingRight);
+-	values[5] = chunk->wasDeserialized ? chunk->paddingBottom : (int32_t)ntohl(chunk->paddingBottom);
++	values[2] = !paintable->file_chunk ? chunk->paddingLeft : (int32_t)ntohl(chunk->paddingLeft);
++	values[3] = !paintable->file_chunk ? chunk->paddingTop : (int32_t)ntohl(chunk->paddingTop);
++	values[4] = !paintable->file_chunk ? chunk->paddingRight : (int32_t)ntohl(chunk->paddingRight);
++	values[5] = !paintable->file_chunk ? chunk->paddingBottom : (int32_t)ntohl(chunk->paddingBottom);
+ 	// GDK downloads native-endian premultiplied ARGB pixels.
+ 	gsize stride = (gsize)paintable->width * 4;
+ 	guint32 *pixels = g_try_malloc_n(stride, paintable->height);
+--- a/src/api-impl-jni/graphics/android_graphics_Paint.c
++++ b/src/api-impl-jni/graphics/android_graphics_Paint.c
+@@ -304,3 +304,10 @@
+ 	pango_font_metrics_unref(font_metrics);
+ 	return height;
+ }
++
++JNIEXPORT void JNICALL Java_android_graphics_Paint_native_1set_1letter_1spacing(JNIEnv *env, jclass clazz, jlong ptr, jfloat spacing)
++{
++	struct AndroidPaint *paint = _PTR(ptr);
++	double size = pango_font_description_get_size(paint->font);
++	pango_attr_list_change(paint->text_attrs, pango_attr_letter_spacing_new((int)CLAMP(size * spacing, G_MININT, G_MAXINT)));
++}
+--- a/src/api-impl-jni/graphics/NinePatchPaintable.c
++++ b/src/api-impl-jni/graphics/NinePatchPaintable.c
+@@ -17,9 +17,9 @@
+ 	NinePatchPaintable *ninepatch = NINEPATCH_PAINTABLE(paintable);
+ 	struct Res_png_9patch *chunk = ninepatch->chunk;
+ 	if (chunk) {
+-		int32_t *xDivs = (void *)chunk + chunk->xDivsOffset;
+-		int32_t *yDivs = (void *)chunk + chunk->yDivsOffset;
+-		int32_t *color = (void *)chunk + chunk->colorsOffset;
++		int32_t *xDivs = (int32_t *)((uint8_t *)chunk + chunk->xDivsOffset);
++		int32_t *yDivs = (int32_t *)((uint8_t *)chunk + chunk->yDivsOffset);
++		int32_t *color = (int32_t *)((uint8_t *)chunk + chunk->colorsOffset);
+ 		float strech_factor_width = (width - (ninepatch->width - ninepatch->strechy_width)) / ninepatch->strechy_width;
+ 		float strech_factor_height = (height - (ninepatch->height - ninepatch->strechy_height)) / ninepatch->strechy_height;
+ 
+@@ -84,7 +84,8 @@
+ 
+ static GdkPaintableFlags ninepatch_paintable_get_flags(GdkPaintable *paintable)
+ {
+-	return GDK_PAINTABLE_STATIC_CONTENTS | GDK_PAINTABLE_STATIC_SIZE;
++	/* tint is changed in place (nativeSetTint), so contents are not static */
++	return GDK_PAINTABLE_STATIC_SIZE;
+ }
+ 
+ static void ninepatch_paintable_init(NinePatchPaintable *ninepatch_paintable)
+@@ -104,7 +105,7 @@
+ G_DEFINE_TYPE_WITH_CODE(NinePatchPaintable, ninepatch_paintable, G_TYPE_OBJECT,
+                         G_IMPLEMENT_INTERFACE(GDK_TYPE_PAINTABLE, ninepatch_paintable_paintable_init))
+ 
+-GdkPaintable *ninepatch_paintable_new(struct Res_png_9patch *chunk, uint32_t chunk_size, GdkTexture *texture)
++GdkPaintable *ninepatch_paintable_new(struct Res_png_9patch *chunk, uint32_t chunk_size, GdkTexture *texture, gboolean file_chunk)
+ {
+ 	int width = 0;
+ 	int height = 0;
+@@ -112,11 +113,15 @@
+ 	int strechy_height = 0;
+ 	int i;
+ 
+-	if (chunk->wasDeserialized) {
+-		chunk->xDivsOffset = sizeof(struct Res_png_9patch);
+-		chunk->yDivsOffset = chunk->xDivsOffset + chunk->numXDivs * sizeof(int32_t);
+-		chunk->colorsOffset = chunk->yDivsOffset + chunk->numYDivs * sizeof(int32_t);
+-	}
++	if (!chunk || !texture || chunk_size < sizeof(*chunk)
++	    || !chunk->numXDivs || !chunk->numYDivs
++	    || (chunk->numXDivs & 1) || (chunk->numYDivs & 1))
++		return NULL;
++
++	// Serialized offsets are not meaningful; deserialize both sources like AOSP.
++	chunk->xDivsOffset = sizeof(struct Res_png_9patch);
++	chunk->yDivsOffset = chunk->xDivsOffset + chunk->numXDivs * sizeof(int32_t);
++	chunk->colorsOffset = chunk->yDivsOffset + chunk->numYDivs * sizeof(int32_t);
+ 
+ 	// verify that that all arrays are fully inside the chunk bounds
+ 	if (chunk->xDivsOffset > chunk_size || chunk->yDivsOffset > chunk_size || chunk->colorsOffset > chunk_size
+@@ -125,11 +130,11 @@
+ 	    || chunk->numColors > (chunk_size - chunk->colorsOffset) / sizeof(int32_t))
+ 		return NULL;
+ 
+-	int32_t *xDivs = (void *)chunk + chunk->xDivsOffset;
+-	int32_t *yDivs = (void *)chunk + chunk->yDivsOffset;
+-	int32_t *colors = (void *)chunk + chunk->colorsOffset;
++	int32_t *xDivs = (int32_t *)((uint8_t *)chunk + chunk->xDivsOffset);
++	int32_t *yDivs = (int32_t *)((uint8_t *)chunk + chunk->yDivsOffset);
++	int32_t *colors = (int32_t *)((uint8_t *)chunk + chunk->colorsOffset);
+ 
+-	if (!chunk->wasDeserialized) {
++	if (file_chunk) {
+ 		for (i = 0; i < chunk->numXDivs; i++)
+ 			xDivs[i] = ntohl(xDivs[i]);
+ 		for (i = 0; i < chunk->numYDivs; i++)
+@@ -141,6 +146,21 @@
+ 	width = gdk_texture_get_width(texture);
+ 	height = gdk_texture_get_height(texture);
+ 
++	int xsections = chunk->numXDivs + 1;
++	int ysections = chunk->numYDivs + 1;
++	for (i = 0; i < chunk->numXDivs; i++) {
++		if (xDivs[i] < 0 || xDivs[i] > width || (i && xDivs[i] <= xDivs[i - 1]))
++			return NULL;
++	}
++	for (i = 0; i < chunk->numYDivs; i++) {
++		if (yDivs[i] < 0 || yDivs[i] > height || (i && yDivs[i] <= yDivs[i - 1]))
++			return NULL;
++	}
++	xsections -= (xDivs[0] == 0) + (xDivs[chunk->numXDivs - 1] == width);
++	ysections -= (yDivs[0] == 0) + (yDivs[chunk->numYDivs - 1] == height);
++	if (chunk->numColors < xsections * ysections)
++		return NULL;
++
+ 	for (i = 1; i < chunk->numXDivs + 1; i += 2)
+ 		strechy_width += (i == chunk->numXDivs ? width : xDivs[i]) - xDivs[i - 1];
+ 	for (i = 1; i < chunk->numYDivs + 1; i += 2)
+@@ -148,6 +168,8 @@
+ 
+ 	NinePatchPaintable *ninepatch = NINEPATCH_PAINTABLE(g_object_new(ninepatch_paintable_get_type(), NULL));
+ 	ninepatch->chunk = chunk;
++	ninepatch->file_chunk = file_chunk;
++	chunk->wasDeserialized = 1;
+ 	ninepatch->width = width;
+ 	ninepatch->height = height;
+ 	ninepatch->strechy_width = strechy_width;
+--- a/src/api-impl-jni/graphics/NinePatchPaintable.h
++++ b/src/api-impl-jni/graphics/NinePatchPaintable.h
+@@ -23,6 +23,7 @@
+ 	GObject parent_instance;
+ 	GdkTexture *texture;
+ 	struct Res_png_9patch *chunk;
++	gboolean file_chunk;
+ 	int width;
+ 	int height;
+ 	int strechy_width;
+@@ -31,4 +32,4 @@
+ };
+ G_DECLARE_FINAL_TYPE(NinePatchPaintable, ninepatch_paintable, NINEPATCH, PAINTABLE, GObject)
+ 
+-GdkPaintable *ninepatch_paintable_new(struct Res_png_9patch *chunk, uint32_t chunk_size, GdkTexture *texture);
++GdkPaintable *ninepatch_paintable_new(struct Res_png_9patch *chunk, uint32_t chunk_size, GdkTexture *texture, gboolean file_chunk);
+--- a/src/api-impl-jni/text/android_text_Layout.c
++++ b/src/api-impl-jni/text/android_text_Layout.c
+@@ -314,7 +314,7 @@
+ 	// allow both settings to participate in the measured and rendered line positions.
+ 	PangoAttrList *old_attrs = pango_layout_get_attributes(layout);
+ 	PangoAttrList *attrs = old_attrs ? pango_attr_list_copy(old_attrs) : pango_attr_list_new();
+-	if (!fallback_line_spacing) {
++	if (!fallback_line_spacing && !g_object_get_data(G_OBJECT(layout), "atl-span-metrics")) {
+ 		PangoContext *context = pango_layout_get_context(layout);
+ 		PangoFontMetrics *metrics = pango_context_get_metrics(context, android_paint->font, pango_context_get_language(context));
+ 		int height = pango_font_metrics_get_ascent(metrics) + pango_font_metrics_get_descent(metrics);
+@@ -353,3 +353,97 @@
+ 	gtk_snapshot_append_layout(snapshot, pango_layout, &android_paint->color);
+ 	gtk_snapshot_pop(snapshot);
+ }
++
++static void run_attr(PangoAttrList *attrs, PangoAttribute *attr, guint start, guint end)
++{
++	attr->start_index = start;
++	attr->end_index = end;
++	pango_attr_list_change(attrs, attr);
++}
++
++static void apply_run(JNIEnv *env, jclass clazz,
++		jlong ptr, jint start, jint end, jlong base_ptr, jlong measure_ptr, jlong draw_ptr,
++		jint background, jint shift, jboolean underline, jboolean strike)
++{
++	PangoLayout *layout = _PTR(ptr);
++	struct AndroidPaint *base = _PTR(base_ptr), *measure = _PTR(measure_ptr), *draw = _PTR(draw_ptr);
++	const char *text = pango_layout_get_text(layout);
++	guint from = utf16_to_byte(text, start), to = utf16_to_byte(text, end);
++	PangoAttrList *current = pango_layout_get_attributes(layout);
++	PangoAttrList *attrs = current ? pango_attr_list_copy(current) : pango_attr_list_new();
++	if (!gdk_rgba_equal(&base->color, &draw->color)) {
++		run_attr(attrs, pango_attr_foreground_new(draw->color.red * 65535, draw->color.green * 65535, draw->color.blue * 65535), from, to);
++		run_attr(attrs, pango_attr_foreground_alpha_new(draw->color.alpha * 65535), from, to);
++	}
++	if (background) {
++		run_attr(attrs, pango_attr_background_new(((background >> 16) & 255) * 257, ((background >> 8) & 255) * 257, (background & 255) * 257), from, to);
++		run_attr(attrs, pango_attr_background_alpha_new(((guint)background >> 24) * 257), from, to);
++	}
++	if (!pango_font_description_equal(base->font, measure->font) || !pango_font_description_equal(base->font, draw->font)) {
++		run_attr(attrs, pango_attr_font_desc_new(pango_font_description_equal(base->font, draw->font) ? measure->font : draw->font), from, to);
++		g_object_set_data(G_OBJECT(layout), "atl-span-metrics", GINT_TO_POINTER(1));
++	}
++	// Paint attributes carry app-defined letter spacing and font features.
++	PangoAttrList *run_attrs = pango_attr_list_equal(base->text_attrs, draw->text_attrs) ? measure->text_attrs : draw->text_attrs;
++	PangoAttrIterator *iter = pango_attr_list_get_iterator(run_attrs);
++	do {
++		GSList *list = pango_attr_iterator_get_attrs(iter);
++		for (GSList *node = list; node; node = node->next)
++			run_attr(attrs, node->data, from, to);
++		g_slist_free(list);
++	} while (pango_attr_iterator_next(iter));
++	pango_attr_iterator_destroy(iter);
++	run_attr(attrs, pango_attr_underline_new(underline ? PANGO_UNDERLINE_SINGLE : PANGO_UNDERLINE_NONE), from, to);
++	run_attr(attrs, pango_attr_strikethrough_new(strike), from, to);
++	if (shift) run_attr(attrs, pango_attr_rise_new(-shift * PANGO_SCALE), from, to);
++	pango_layout_set_attributes(layout, attrs);
++	pango_attr_list_unref(attrs);
++}
++
++JNIEXPORT void JNICALL Java_android_text_Layout_native_1set_1shape(JNIEnv *env, jclass clazz,
++		jlong ptr, jint start, jint end, jint width, jint ascent, jint descent)
++{
++	PangoLayout *layout = _PTR(ptr);
++	const char *text = pango_layout_get_text(layout);
++	PangoAttrList *current = pango_layout_get_attributes(layout);
++	PangoAttrList *attrs = current ? pango_attr_list_copy(current) : pango_attr_list_new();
++	PangoRectangle ink = {0, 0, 0, 0};
++	PangoRectangle logical = {0, ascent * PANGO_SCALE, width * PANGO_SCALE, (descent - ascent) * PANGO_SCALE};
++	g_object_set_data(G_OBJECT(layout), "atl-span-metrics", GINT_TO_POINTER(1));
++	// Shape attributes apply per character. Only the first character owns the width.
++	guint from = utf16_to_byte(text, start), to = utf16_to_byte(text, end);
++	guint next = g_utf8_next_char(text + from) - text;
++	run_attr(attrs, pango_attr_allow_breaks_new(FALSE), from, to);
++	run_attr(attrs, pango_attr_insert_hyphens_new(FALSE), from, to);
++	run_attr(attrs, pango_attr_shape_new(&ink, &logical), from, next);
++	logical.width = 0;
++	if (next < to) run_attr(attrs, pango_attr_shape_new(&ink, &logical), next, to);
++	pango_layout_set_attributes(layout, attrs);
++	pango_attr_list_unref(attrs);
++}
++
++JNIEXPORT jfloat JNICALL Java_android_text_Layout_native_1shape_1x(JNIEnv *env, jclass clazz, jlong ptr, jint start)
++{
++	PangoLayout *layout = _PTR(ptr);
++	PangoRectangle rect;
++	pango_layout_index_to_pos(layout, utf16_to_byte(pango_layout_get_text(layout), start), &rect);
++	return (float)(rect.width < 0 ? rect.x + rect.width : rect.x) / PANGO_SCALE;
++}
++
++JNIEXPORT void JNICALL Java_android_text_Layout_native_1set_1runs(JNIEnv *env, jclass clazz,
++		jlong layout, jlong base, jintArray runs_array, jlongArray paints_array)
++{
++	jsize count = (*env)->GetArrayLength(env, runs_array) / 5;
++	if ((*env)->GetArrayLength(env, paints_array) != count * 2) return;
++	jint *runs = (*env)->GetIntArrayElements(env, runs_array, NULL);
++	if (!runs) return;
++	jlong *paints = (*env)->GetLongArrayElements(env, paints_array, NULL);
++	if (!paints) { (*env)->ReleaseIntArrayElements(env, runs_array, runs, JNI_ABORT); return; }
++	for (jsize i = 0; i < count; i++) {
++		jint *run = runs + i * 5;
++		apply_run(env, clazz, layout, run[0], run[1], base,
++				paints[i * 2], paints[i * 2 + 1], run[2], run[3], (run[4] & 1) != 0, (run[4] & 2) != 0);
++	}
++	(*env)->ReleaseLongArrayElements(env, paints_array, paints, JNI_ABORT);
++	(*env)->ReleaseIntArrayElements(env, runs_array, runs, JNI_ABORT);
++}
+--- a/src/api-impl-jni/widgets/android_widget_TextView.c
++++ b/src/api-impl-jni/widgets/android_widget_TextView.c
+@@ -251,7 +251,7 @@
+ 	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
+ 	GtkLabel *label = GTK_IS_TEXT(widget) ? NULL : text_limits_find_label(widget);
+ 	if (!label && !GTK_IS_TEXT(widget)) return;
+-	PangoAttrList *current = label ? gtk_label_get_attributes(label) : gtk_text_get_attributes(GTK_TEXT(widget));
++	PangoAttrList *current = label ? g_object_get_data(G_OBJECT(label), "atl-span-base") : gtk_text_get_attributes(GTK_TEXT(widget));
+ 	PangoAttrList *attributes = current ? pango_attr_list_copy(current) : pango_attr_list_new();
+ 	const char *feature_string = features ? (*env)->GetStringUTFChars(env, features, NULL) : NULL;
+ 	const char *variation_string = variations ? (*env)->GetStringUTFChars(env, variations, NULL) : NULL;
+@@ -273,7 +273,10 @@
+ 		pango_attr_list_insert(attributes, pango_attr_line_height_new_absolute((int)CLAMP(height, 1, G_MAXINT)));
+ 		pango_font_metrics_unref(metrics);
+ 	}
+-	if (label) gtk_label_set_attributes(label, attributes);
++	if (label) {
++		g_object_set_data_full(G_OBJECT(label), "atl-span-base", pango_attr_list_copy(attributes), (GDestroyNotify)pango_attr_list_unref);
++		gtk_label_set_attributes(label, attributes);
++	}
+ 	else gtk_text_set_attributes(GTK_TEXT(widget), attributes);
+ 	pango_attr_list_unref(attributes);
+ 	if (feature_string) (*env)->ReleaseStringUTFChars(env, features, feature_string);
+@@ -354,3 +357,25 @@
+ 	g_object_unref(layout);
+ 	return baseline;
+ }
++
++JNIEXPORT jlong JNICALL Java_android_widget_TextView_native_1spanLayout(JNIEnv *env, jobject this)
++{
++	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++	GtkLabel *label = box_get_label(env, widget);
++	if (!label) return 0;
++	PangoLayout *layout = pango_layout_copy(gtk_label_get_layout(label));
++	PangoAttrList *base = g_object_get_data(G_OBJECT(label), "atl-span-base");
++	PangoAttrList *attrs = base ? pango_attr_list_copy(base) : pango_attr_list_new();
++	pango_layout_set_attributes(layout, attrs);
++	pango_attr_list_unref(attrs);
++	return _INTPTR(layout);
++}
++
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1commitSpans(JNIEnv *env, jobject this, jlong ptr)
++{
++	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++	GtkLabel *label = box_get_label(env, widget);
++	PangoLayout *layout = _PTR(ptr);
++	if (label) gtk_label_set_attributes(label, pango_layout_get_attributes(layout));
++	g_object_unref(layout);
++}

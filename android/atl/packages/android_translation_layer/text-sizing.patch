@@ -1,0 +1,111 @@
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -54,6 +54,7 @@
+ 	public TextView(Context context, AttributeSet attrs, int defStyleAttr, int defStyleRes) {
+ 		super(context, attrs, defStyleAttr, defStyleRes);
+ 
++		setTextSize(16);
+ 		TypedArray a = context.obtainStyledAttributes(attrs, com.android.internal.R.styleable.TextView, defStyleAttr, 0);
+ 		try {
+ 			if (a.hasValue(com.android.internal.R.styleable.TextView_text)) {
+@@ -70,7 +71,7 @@
+ 					setTextColor(aa.getColorStateList(com.android.internal.R.styleable.TextAppearance_textColor));
+ 				}
+ 				if (aa.hasValue(com.android.internal.R.styleable.TextAppearance_textSize)) {
+-					setTextSize(aa.getDimensionPixelSize(com.android.internal.R.styleable.TextAppearance_textSize, 10));
++					setTextSize(TypedValue.COMPLEX_UNIT_PX, aa.getDimensionPixelSize(com.android.internal.R.styleable.TextAppearance_textSize, 10));
+ 				}
+ 				aa.recycle();
+ 			}
+@@ -78,7 +79,7 @@
+ 				setTextColor(a.getColorStateList(com.android.internal.R.styleable.TextView_textColor));
+ 			}
+ 			if (a.hasValue(com.android.internal.R.styleable.TextView_textSize)) {
+-				setTextSize(a.getDimensionPixelSize(com.android.internal.R.styleable.TextView_textSize, 10));
++				setTextSize(TypedValue.COMPLEX_UNIT_PX, a.getDimensionPixelSize(com.android.internal.R.styleable.TextView_textSize, 10));
+ 			}
+ 
+ 			if (a.hasValue(com.android.internal.R.styleable.TextView_textStyle)) {
+@@ -137,11 +138,16 @@
+ 	public native final void native_setText(String text);
+ 
+ 	public void setTextSize(int unit, float size) {
+-		if (unit != TypedValue.COMPLEX_UNIT_SP)
+-			System.out.println("setTextSize called with non-SP unit (" + unit + "), we don't currently handle that");
+-		setTextSize(size);
+-	}
+-	public native void setTextSize(float size);
++		float pixels = TypedValue.applyDimension(unit, size, getResources().getDisplayMetrics());
++		if (pixels < 0 || Float.isNaN(pixels) || Float.isInfinite(pixels)) return;
++		paint.setTextSize(pixels);
++		native_setTextSize(pixels);
++		requestLayout();
++	}
++	public void setTextSize(float size) {
++		setTextSize(TypedValue.COMPLEX_UNIT_SP, size);
++	}
++	protected native void native_setTextSize(float pixels);
+ 
+ 	public native final void native_setTextColor(int color);
+ 	public void setTextColor(int color) {
+@@ -223,7 +229,7 @@
+ 
+ 	public Typeface getTypeface() { return null; }
+ 
+-	public float getTextSize() { return 10; }
++	public float getTextSize() { return paint.getTextSize(); }
+ 
+ 	public int getGravity() {
+ 		return gravity;
+--- a/src/api-impl/android/widget/EditText.java
++++ b/src/api-impl/android/widget/EditText.java
+@@ -42,8 +42,6 @@
+ 	public void setText(CharSequence text) {
+ 		native_setText(widget, text == null ? "" : text.toString());
+ 	}
+-	@Override
+-	public void setTextSize(float size) {}
+ 
+ 	@Override
+ 	public void removeTextChangedListener(TextWatcher watcher) {
+--- a/src/api-impl-jni/widgets/android_widget_TextView.c
++++ b/src/api-impl-jni/widgets/android_widget_TextView.c
+@@ -72,22 +72,23 @@
+ }
+ #pragma GCC diagnostic pop
+ 
+-JNIEXPORT void JNICALL Java_android_widget_TextView_setTextSize(JNIEnv *env, jobject this, jfloat size)
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setTextSize(JNIEnv *env, jobject this, jfloat size)
+ {
+-	GtkLabel *label = box_get_label(env, _PTR(_GET_LONG_FIELD(this, "widget")));
+-	PangoAttrList *attrs;
+-
+-	PangoAttrList *old_attrs = gtk_label_get_attributes(label);
+-	if (old_attrs)
+-		attrs = pango_attr_list_copy(old_attrs);
+-	else
+-		attrs = pango_attr_list_new();
+-
+-	PangoAttribute *size_attr = pango_attr_size_new(size * PANGO_SCALE);
+-	pango_attr_list_change(attrs, size_attr);
+-	gtk_label_set_attributes(label, attrs);
+-
+-	pango_attr_list_unref(attrs);
++	/* Android passes logical pixels after resolving SP/DP. CSS px preserve
++	 * that size for labels and GtkText, including its placeholder. */
++	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++	GtkStyleContext *context = gtk_widget_get_style_context(widget);
++	GtkCssProvider *old = g_object_get_data(G_OBJECT(widget), "text-size-provider");
++	if (old)
++		gtk_style_context_remove_provider(context, GTK_STYLE_PROVIDER(old));
++	GtkCssProvider *provider = gtk_css_provider_new();
++	char number[G_ASCII_DTOSTR_BUF_SIZE];
++	g_ascii_dtostr(number, sizeof(number), size);
++	char *css = g_strdup_printf("* { font-size: %spx; }", number);
++	gtk_css_provider_load_from_string(provider, css);
++	g_free(css);
++	gtk_style_context_add_provider(context, GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
++	g_object_set_data_full(G_OBJECT(widget), "text-size-provider", provider, g_object_unref);
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_widget_TextView_native_1set_1markup(JNIEnv *env, jobject this, jint value)

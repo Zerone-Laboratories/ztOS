@@ -1,0 +1,9 @@
+// Audio clients in the phone owner's user manager have no local login session.
+// Let RTKit apply its bounded scheduling policy even while the phone is unattended.
+polkit.addRule(function(action, subject) {
+    if (subject.user === "@USER@" &&
+        (action.id === "org.freedesktop.RealtimeKit1.acquire-real-time" ||
+         action.id === "org.freedesktop.RealtimeKit1.acquire-high-priority")) {
+        return polkit.Result.YES;
+    }
+});

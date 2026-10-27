@@ -4,8 +4,23 @@ set -eu
 
 dev=$(findmnt -no SOURCE /)
 [ -b "$dev" ] || { echo "Root filesystem source is not a block device: $dev" >&2; exit 1; }
-resize2fs "$dev"
+# Grow to the partition, less 1 MiB: Samsung keeps Android's crypto footer in the
+# last 16 KiB of USERDATA and TWRP/the bootloader write it, which corrupted the
+# filesystem's last blocks when it filled the partition.
+blocks=$(( $(blockdev --getsize64 "$dev") / 4096 - 256 ))
+resize2fs "$dev" "$blocks"
 pacman-key --init
 pacman-key --populate archlinuxarm
+# The phone's user: the installer names it in /etc/ztos/user.conf; an image
+# made without it (scripts/build-arch-root.sh) gets the user with UID 1000.
+# Then what cannot read the file (unit drop-ins, greetd, sudoers, polkit).
+# Neither stops the first boot: without a user there is nothing to name.
+. /usr/lib/ztos/user.sh
+if [ ! -s /etc/ztos/user.conf ] && [ -n "$ZTOS_USER" ]; then
+	mkdir -p /etc/ztos
+	printf 'ZTOS_USER=%s\nZTOS_UID=%s\nZTOS_GID=%s\nZTOS_HOME=%s\n' \
+		"$ZTOS_USER" "$ZTOS_UID" "$ZTOS_GID" "$ZTOS_HOME" > /etc/ztos/user.conf
+fi
+/usr/local/sbin/ztos-user-dropins || echo "zboot-firstboot: ztos-user-dropins failed" >&2
 # Leave the marker in place on failure so the next boot retries.
 rm -f /etc/zboot-firstboot

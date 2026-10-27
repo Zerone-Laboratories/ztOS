@@ -12,7 +12,12 @@ export PATH=$B/toolchain/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-g
 export LC_ALL=C ARCH=arm64 CROSS_COMPILE=aarch64-none-linux-gnu- KBUILD_MODPOST_WARN=1
 quiet() { grep -E "error|warning: [a-z]" || true; }
 
-if [ ! -f "$K/out-snd/.config" ]; then
+# out-snd follows out/.config: rebuilt whenever the kernel's configuration is
+# newer. A stale one (12 Oct, before CONFIG_COMPAT) gave snd.ko and the ABOX
+# driver another struct snd_card layout than the running kernel, and the first
+# SoC sleep oopsed in snd_power_change_state (2026-10-26).
+if [ ! -f "$K/out-snd/.config" ] || [ "$K/out/.config" -nt "$K/out-snd/.config" ]; then
+	rm -rf "$K/out-snd"
 	mkdir -p "$K/out-snd" && cp "$K/out/.config" "$K/out-snd/.config"
 	(cd "$K" && scripts/config --file out-snd/.config -m SOUND -m SND -m SND_DUMMY -e SND_DRIVERS \
 		-d SND_SOC -d SND_USB -d SND_HRTIMER -d SND_ALOOP -d SND_OSSEMUL -d SND_SEQUENCER -d SND_PCI \

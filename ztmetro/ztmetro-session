@@ -3,4 +3,10 @@
 log=${XDG_STATE_HOME:-$HOME/.local/state}/ztmetro.log
 mkdir -p "$(dirname "$log")"
 [ -f "$log" ] && mv "$log" "$log.1"
+# A Waydroid session left from the shell before this one lost its display (its
+# hwcomposer aborts and cannot restart): restart it once the new display exists.
+if systemctl --user -q is-active ztos-waydroid-session.service 2>/dev/null; then
+	(i=0; while [ ! -S "$XDG_RUNTIME_DIR/wayland-0" ] && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
+	 sleep 2; systemctl --user try-restart ztos-waydroid-session.service) >/dev/null 2>&1 &
+fi
 exec /usr/local/bin/ztmetro >"$log" 2>&1

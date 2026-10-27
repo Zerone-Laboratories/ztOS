@@ -1,0 +1,90 @@
+--- a/src/api-impl-jni/views/android_view_ViewGroup.c
++++ b/src/api-impl-jni/views/android_view_ViewGroup.c
+@@ -87,8 +87,41 @@
+ 		// don't self propagate if the widget already had its chance to handle the event
+ 		return false;
+ 	}
+-	int action = _GET_INT_FIELD(motion_event, "action");
+-	return view_dispatch_motionevent(env, wrapper, phase, motion_event, motion_event, action);
++	/* Synthetic dispatch starts in the parent view's coordinate space. Each
++	 * child must receive local coordinates, including nested custom ViewGroups.
++	 * Restore the caller's coordinates while preserving event identity/action
++	 * for interception and cancellation. Raw screen positions stay unchanged. */
++	jclass event_class = (*env)->GetObjectClass(env, motion_event);
++	jfieldID coords_field = (*env)->GetFieldID(env, event_class, "coords", "[F");
++	jfieldID action_field = (*env)->GetFieldID(env, event_class, "action", "I");
++	(*env)->DeleteLocalRef(env, event_class);
++	jfloatArray coordinates = (*env)->GetObjectField(env, motion_event, coords_field);
++	jsize length = (*env)->GetArrayLength(env, coordinates);
++	jfloat *saved = g_new(jfloat, length);
++	(*env)->GetFloatArrayRegion(env, coordinates, 0, length, saved);
++	jfloat *local_values = g_memdup2(saved, length * sizeof(jfloat));
++	bool transformed = true;
++	for (jsize i = 0; i + 3 < length; i += 4) {
++		graphene_point_t local;
++		if (!gtk_widget_compute_point(toplevel, GTK_WIDGET(wrapper),
++		        &GRAPHENE_POINT_INIT(saved[i], saved[i + 1]), &local)) {
++			transformed = false;
++			break;
++		}
++		local_values[i] = local.x;
++		local_values[i + 1] = local.y;
++	}
++	bool handled = false;
++	if (transformed) {
++		(*env)->SetFloatArrayRegion(env, coordinates, 0, length, local_values);
++		int action = (*env)->GetIntField(env, motion_event, action_field);
++		handled = view_dispatch_motionevent(env, wrapper, phase, motion_event, motion_event, action);
++		(*env)->SetFloatArrayRegion(env, coordinates, 0, length, saved);
++	}
++	g_free(local_values);
++	g_free(saved);
++	(*env)->DeleteLocalRef(env, coordinates);
++	return handled;
+ }
+ 
+ /* used by atl_propagate_synthetic_motionevent */
+@@ -175,6 +208,8 @@
+ {
+ 	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
+ 	GtkWidget *picked_child = gtk_widget_pick(widget, x, y, GTK_PICK_DEFAULT);
++	if (!picked_child)
++		return false;
+ 
+ 	return atl_propagate_synthetic_motionevent(picked_child, motion_event, widget);
+ }
+--- a/src/api-impl/android/util/DisplayMetrics.java
++++ b/src/api-impl/android/util/DisplayMetrics.java
+@@ -282,6 +282,13 @@
+ 		// when running in the emulator, allowing for dynamic configurations.
+ 		// The reason for this is that ro.sf.lcd_density is write-once and is
+ 		// set by the init process when it parses build.prop before anything else.
++		String configured = System.getenv("ATL_DISPLAY_DENSITY");
++		if (configured != null) {
++			try {
++				int density = Integer.parseInt(configured);
++				if (density >= 80 && density <= 640) return density;
++			} catch (NumberFormatException ignored) {}
++		}
+ 		return DENSITY_DEFAULT;
+ 	}
+ }
+--- a/src/api-impl-jni/content/android_content_Context.c
++++ b/src/api-impl-jni/content/android_content_Context.c
+@@ -27,8 +27,14 @@
+ 	if (!configuration)
+ 		configuration = _GET_STATIC_OBJ_FIELD(handle_cache.context.class, "sys_config", "Landroid/content/res/Configuration;");
+ 
+-	_SET_INT_FIELD(configuration, "screenWidthDp", geometry.width);
+-	_SET_INT_FIELD(configuration, "screenHeightDp", geometry.height);
++	jclass metrics_class = (*env)->FindClass(env, "android/util/DisplayMetrics");
++	jfieldID density_field = (*env)->GetStaticFieldID(env, metrics_class, "DENSITY_DEVICE", "I");
++	int density = (*env)->GetStaticIntField(env, metrics_class, density_field);
++	(*env)->DeleteLocalRef(env, metrics_class);
++	if (density <= 0) density = 160;
++	_SET_INT_FIELD(configuration, "densityDpi", density);
++	_SET_INT_FIELD(configuration, "screenWidthDp", geometry.width * 160 / density);
++	_SET_INT_FIELD(configuration, "screenHeightDp", geometry.height * 160 / density);
+ 	if (geometry.width >= 800 && geometry.height >= 800)
+ 		_SET_INT_FIELD(configuration, "screenLayout", /*SCREENLAYOUT_SIZE_LARGE*/ 0x03);
+ 	else

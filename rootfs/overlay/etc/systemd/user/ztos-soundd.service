@@ -1,0 +1,19 @@
+[Unit]
+Description=ztOS Sound: equalizer and spatial effects chain
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service pipewire-pulse.service wireplumber.service
+
+[Service]
+ExecStart=/usr/local/bin/ztos-soundd
+Restart=always
+RestartSec=2
+# the efficiency cores are enough (measured, see ztmetro/sound/SOUND.md)
+CPUAffinity=0-3
+# the chain is a real-time audio client like PipeWire itself
+LimitRTPRIO=95
+LimitNICE=-19
+LimitMEMLOCK=64M
+LimitRTTIME=200000
+
+[Install]
+WantedBy=default.target

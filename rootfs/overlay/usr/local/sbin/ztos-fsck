@@ -1,0 +1,61 @@
+#!/bin/bash
+# Run fsck without allowing systemd to send the phone to an interactive shell.
+set -u
+
+if [ "${1:-}" = --classify-rc ]; then
+	case "${2:-}" in
+		0) echo clean ;;
+		1) echo corrected ;;
+		2|3) echo reboot ;;
+		*) echo forced-repair ;;
+	esac
+	exit 0
+fi
+
+ROOT_DEVICE=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+DEVICE=${1:-$ROOT_DEVICE}
+[ -n "$DEVICE" ] || DEVICE=$ROOT_DEVICE
+[ -n "$DEVICE" ] || DEVICE=/dev/root
+
+mkdir -p /run/ztos-fsck
+LOG=/run/ztos-fsck/$(date +%Y%m%d-%H%M%S)-$(basename "$DEVICE").log
+run_check() {
+	set +e
+	e2fsck "$@" "$DEVICE" >"$LOG.part" 2>&1
+	rc=$?
+	set -e
+	cat "$LOG.part" >>"$LOG"
+	while IFS= read -r line || [ -n "$line" ]; do
+		printf '<6>ztos-fsck[%s]: %s\n' "$DEVICE" "$line" > /dev/kmsg 2>/dev/null || true
+	done < "$LOG.part"
+	rm -f "$LOG.part"
+	return "$rc"
+}
+
+set -e
+if run_check -p; then rc=0; else rc=$?; fi
+if [ "$rc" -ge 4 ]; then
+	printf '<3>ztos-fsck: preen returned %s for %s; running forced repair\n' "$rc" "$DEVICE" > /dev/kmsg 2>/dev/null || true
+	printf 'ztos-fsck: preen returned %s; running forced repair\n' "$rc" >> "$LOG"
+	if run_check -f -y; then rc=0; else rc=$?; fi
+fi
+
+ROOT_OPTIONS=$(findmnt -n -o OPTIONS / 2>/dev/null || true)
+if mount -o remount,rw / 2>/dev/null; then
+	install -d -m 0755 /var/log/ztos-fsck
+	cp -f "$LOG" "/var/log/ztos-fsck/$(basename "$LOG")" 2>/dev/null || true
+	case ",$ROOT_OPTIONS," in
+		*,ro,*) mount -o remount,ro / 2>/dev/null || true ;;
+	esac
+fi
+
+case "$rc" in
+2|3)
+	printf '<3>ztos-fsck: repair requires reboot (rc=%s); rebooting\n' "$rc" > /dev/kmsg 2>/dev/null || true
+	sync
+	systemctl reboot --no-block
+	;;
+esac
+printf '<6>ztos-fsck: finished %s rc=%s; log=%s\n' "$DEVICE" "$rc" "$LOG" > /dev/kmsg 2>/dev/null || true
+printf 'ztos-fsck: finished %s rc=%s\n' "$DEVICE" "$rc" >> "$LOG"
+exit 0

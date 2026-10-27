@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Install Android application
+Exec=ztos-android open %f
+Icon=applications-other
+Terminal=false
+NoDisplay=true
+MimeType=application/vnd.android.package-archive;
+Categories=Utility;

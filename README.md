@@ -1,13 +1,13 @@
 # ztOS
 
-**ALPHA-2** — Galaxy S9 (SM-G960N / starlte) build.
+**BETA-1** — the ztOS GSI (0.2.0) with ztOSIAL, and the Galaxy S9 (SM-G960N / starlte) device layer.
 
 ztOS is a phone operating system: the **ztMETRO** shell (Windows Phone 8.1's
 look and motion) on Arch Linux ARM and mainline Linux, with its own apps, an
 updater and an SDK for apps in Python and Qt. The ztMETRO Shell and its components are written in C, and accelerated with OpenGL. Currently its ported for a Samsung Galaxy
 S9 (starlte), and I am hoping to expand supports for more devices in the future :).
 
-> This ROM is in very much Alpha, The installer is not tested on real hardware, open a issue in this github repo if you have any issues with it
+> This ROM is in Beta, The installer is not tested on real hardware, open a issue in this github repo if you have any issues with it
 
 >Your warranty is now void. I am not responsible for bricked devices, dead SD cards, thermonuclear war, or you getting fired because the alarm app failed. Please do some research if you have any concerns about features included in this ROM before flashing it! YOU are choosing to make these modifications, and if you point the finger at me for messing up your device, I will laugh at you.
 
@@ -18,6 +18,22 @@ The installer lets you choose between:
 3. **Build image in this PC and store** (builds and exports the image without flashing)
 
 **Jump to:** [Screenshots](#screenshots) · [Status: what works](#status) · [**Known quirks**](#known-quirks) (read before flashing) · [What is where](#what-is-where) · [The SDK](sdk/README.md) · [License](#license)
+
+## Repositories
+
+Since BETA-1 ztOS is a generic system image (GSI) plus one device layer per
+phone, meeting at ztOSIAL, the Zerone Technologies Operating System Interface Abstraction Layer ([design/ztOSIAL.md](design/ztOSIAL.md)). Each part
+has its own repository in the organisation; this one keeps everything in one
+tree, and `scripts/split/split.py` cuts it into them.
+
+| Repository | What it holds |
+|---|---|
+| [ztos-core](https://github.com/Zerone-Laboratories/ztos-core) | ztMETRO, the apps, the SDK, Android support and the system files in the GSI |
+| [ztos-ial](https://github.com/Zerone-Laboratories/ztos-ial) | ztOSIAL: the interfaces, `ztos-iald`, the CLI, the C and Python clients, the porting guide (LGPL-2.1-or-later) |
+| [ztos-build](https://github.com/Zerone-Laboratories/ztos-build) | the installer and `ztos build --target gsi` |
+| [ztos-device-samsung-starlte](https://github.com/Zerone-Laboratories/ztos-device-samsung-starlte) | the Galaxy S9's device layer: kernel, firmware, drivers, ztOSIAL backends |
+| [ztos-devices](https://github.com/Zerone-Laboratories/ztos-devices) | ztConflo's registry of phones |
+| [ztconflo](https://github.com/Zerone-Laboratories/ztconflo) | builds ztOS for other phones, from the GSI (`--gsi`) |
 
 ## Screenshots
 
@@ -37,6 +53,8 @@ From a Galaxy S9 running ztOS (taken from the live display with `scripts/phone-g
 
 | | |
 |---|---|
+| `ial/` | ztOSIAL: the hardware interfaces between the GSI and a phone ([ial/README.md](ial/README.md)) |
+| `devices/` | device layers: `samsung-starlte` (the S9) and `qemu-virt` |
 | `installer/` | `ztos`, the installer: builds ztOS and installs it in QEMU or on the phone |
 | `os/` | what makes the system ztOS: its packages, files (identity, session, updater, default tiles, fonts) and apps (Welcome, Updates) |
 | `ztmetro/` | the shell, its toolkit (ZrnMetroCore), the apps written with it (Settings, ZrnDevTest, Phone, Messaging, People) and the system daemons |
@@ -75,7 +93,7 @@ notes say what. **Broken**: tried, does not work. **Not started**: nothing yet.
 | Category | Feature | Status | Notes |
 |---|---|---|---|
 | Boot | Booting from internal storage (UFS) | Works | Falls back to TWRP by itself after a crash or watchdog reset |
-| Boot | Charging while off | Partial | Off with a charger in, it stays in a minimal start until the battery reaches 10 %; written, and not yet tried from below 10 % |
+| Boot | Charging while off | Works | Off with a charger in, it stays in a minimal start until the battery reaches 10 %, then starts ztOS; tested |
 | Display | Panel, 1440x2960 | Works | DECON scanout |
 | Display | Brightness | Works | Manual, and automatic from the light sensor |
 | Display | Colour tone | Works | OpenTone in ztoscsf-sensord: the hub's light sensor reports the room's colour temperature, and the screen's white follows it part of the way (5000–6500 K); Settings > display |
@@ -88,7 +106,7 @@ notes say what. **Broken**: tried, does not work. **Not started**: nothing yet.
 | CPU | Suspend / Idle Power-Down | Works | Per-core C2 power-down active on efficiency cores via zrn-cpuidle with MCT hardware broadcast timer; big cores dynamically offlined via zrnperfd with Rapid Boost |
 | Power | Battery and charger | Works | MAX17042 gauge, MAX77705 charger |
 | Network | Wi-Fi | Works | BCM4361; join, forget, details and per-network signal in Settings; PCIe link and Wi-Fi reconnect passed two AP hardware-sleep cycles |
-| Network | Bluetooth | Not started | |
+| Network | Bluetooth | Works | Scanning and pairing tested |
 | Network | Mobile data (4G) | Works | Samsung IPC through ztOSCoreNetworking; access point set in Settings |
 | Network | USB networking to a computer | Works | 172.16.42.1 (the computer gets 172.16.42.2), plus a serial console |
 | Modem | SIM, registration, signal | Works | The modem runs exactly as stock does; EFS (IMEI, calibration) is never altered |

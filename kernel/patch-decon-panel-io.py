@@ -298,51 +298,79 @@ static void s9p_dsim_write_long(struct s9p_decon *priv, const u8 *data, size_t l
 		dev_warn_once(priv->drm.dev, "panel did not take DCS %02x\n", data[0]);
 }
 
-/* the level's packets, verbatim; caller holds panel_lock, panel enabled */
-static void s9p_panel_brightness_table(struct s9p_decon *priv, unsigned int level, bool whole)
+/*
+ * the level's packets, verbatim; caller holds panel_lock, panel enabled.
+ * False when nothing went: a frame was still on its way out.
+ */
+static bool s9p_panel_brightness_table(struct s9p_decon *priv, unsigned int level, bool whole)
 {
 	static int shown;
 	const u8 *e;
 	unsigned int n, len;
 	ktime_t t0;
+	u32 v;
 
 	if (level >= priv->bl_levels)
 		level = priv->bl_levels - 1;
 	e = priv->bl_table + (size_t)level * priv->bl_stride;
 	/*
-	 * With the frame trigger held off, as the AOR path sends: sent with
-	 * frames running, the panel came out of its next sleep dark. The hold
-	 * stays short because no packet is long (s9p-bl-table.py splits the
-	 * gamma and IRC into pieces of 10 bytes): a 35-byte command sent across
-	 * a frame jammed the DSIM, and a hold as long as a frame ran into its
-	 * 18 ms TE timeout; the whole set takes about 200 us.
+	 * Between two frames, with the frame trigger held off: the mask stops
+	 * the next frame, and the DECON going idle shows the one already on its
+	 * way has gone. Sent while a frame was going out, the packets waited
+	 * behind it (10 ms) and a B0 offset reset was lost now and then: the
+	 * panel's offset stays until changed, so the gamma after it landed in
+	 * the wrong place and black came out green. The set itself takes well
+	 * under a millisecond, so the hold stays inside the DSIM's 18 ms TE
+	 * timeout; the long gamma only goes when the level has settled (see
+	 * bl_update), the rest are 11 bytes or less.
 	 */
 	s9p_hw_trigger_mask(priv);
 	s9p_wait_shadow_idle(priv);
+	/* a frame still going out: send nothing. Packets sent across a frame
+	 * (a slider dragged while the screen redraws) broke into the pixels,
+	 * and the panel showed stripes until it slept. The caller tries again. */
+	if (readl_poll_timeout(priv->decon + DECON_GLOBAL_CONTROL, v,
+			       v & DECON_GLOBAL_IDLE_STATUS, 20, 17000)) {
+		s9p_hw_trigger_unmask(priv);
+		return false;
+	}
+	if (readl_poll_timeout_atomic(priv->dsim + DSIM_DPHY_STATUS, v,
+				      (v & DSIM_DPHY_STOP_STATE_DAT) == DSIM_DPHY_STOP_STATE_DAT,
+				      10, 5000)) {
+		s9p_hw_trigger_unmask(priv);
+		return false;
+	}
 	t0 = ktime_get();
 	for (n = 0; n < priv->bl_stride && e[n]; n += len + 1) {
 		len = e[n] & 0x7f;
 		if (n + 1 + len > priv->bl_stride)
 			break;
-		if (!whole && len > 11)
-			continue;	/* the gamma waits for the settle (see bl_update) */
+		/* while the level keeps changing (a slider dragged) only AOR goes,
+		 * between the keys and latched by F7 03, as the old AOR path sent
+		 * it: sent over and over, the ELVSS, VINT and ACL writes and their
+		 * B0 offsets left the panel's colours wrong (black came out green).
+		 * The whole set follows once the level has settled (bl_update). */
+		if (!whole && e[n + 1] != 0xF0 && e[n + 1] != 0xF7 &&
+		    !(e[n + 1] == 0xB1 && len == 3))
+			continue;
 		if (e[n] & 0x80)
 			s9p_dsim_write_long(priv, e + n + 1, len);
 		else
 			s9p_dsim_write(priv, e + n + 1, len);
-		if (!(readl_relaxed(priv->dsim + DSIM_FIFOCTRL) & DSIM_FIFOCTRL_EMPTY_PH_SFR)) {
-			dev_warn_ratelimited(priv->drm.dev,
-					     "brightness level %u: packet %02x stuck, rest not sent\n",
-					     level, e[n + 1]);
-			break;
-		}
+		readl_poll_timeout_atomic(priv->dsim + DSIM_DPHY_STATUS, v,
+					  (v & DSIM_DPHY_STOP_STATE_DAT) == DSIM_DPHY_STOP_STATE_DAT,
+					  10, 5000);
 	}
+	readl_poll_timeout_atomic(priv->dsim + DSIM_DPHY_STATUS, v,
+				  (v & DSIM_DPHY_STOP_STATE_DAT) == DSIM_DPHY_STOP_STATE_DAT,
+				  10, 5000);
 	s9p_hw_trigger_unmask(priv);
 	if (shown < 5) {
 		shown++;
 		dev_info(priv->drm.dev, "brightness level %u sent in %lld us\n", level,
 			 ktime_us_delta(ktime_get(), t0));
 	}
+	return true;
 }
 
 /* brightness has stopped changing: now the whole set, gamma included */
@@ -353,8 +381,10 @@ static void s9p_bl_settle(struct work_struct *work)
 
 	mutex_lock(&priv->panel_lock);
 	if (priv->enabled && priv->bl && priv->bl_table) {
-		s9p_panel_brightness_table(priv, priv->bl->props.brightness, true);
-		priv->bl_sent = priv->bl->props.brightness;
+		if (s9p_panel_brightness_table(priv, priv->bl->props.brightness, true))
+			priv->bl_sent = priv->bl->props.brightness;
+		else	/* the DECON was busy: again shortly */
+			mod_delayed_work(system_wq, &priv->bl_settle, msecs_to_jiffies(20));
 	}
 	mutex_unlock(&priv->panel_lock);
 }
@@ -460,16 +490,14 @@ edits = [
 				 * packets go, and the whole set follows 200 ms after
 				 * the last change.
 				 */
-				bool busy = time_before(jiffies, priv->bl_last + msecs_to_jiffies(200));
-
 				if (time_before(jiffies, ready))
 					msleep(jiffies_to_msecs(ready - jiffies) + 1);
-				s9p_panel_brightness_table(priv, bl->props.brightness, !busy);
-				priv->bl_sent = busy ? -1 : bl->props.brightness;
+				s9p_panel_brightness_table(priv, bl->props.brightness, false);
+
+				priv->bl_sent = -1;
 				priv->bl_last = jiffies;
-				if (busy)
-					mod_delayed_work(system_wq, &priv->bl_settle,
-							 msecs_to_jiffies(200));
+				mod_delayed_work(system_wq, &priv->bl_settle,
+						 msecs_to_jiffies(400));
 			}
 		} else {
 			s9p_panel_brightness(priv, bl->props.brightness);
@@ -481,8 +509,9 @@ edits = [
 		s9p_panel_brightness(priv, priv->bl->props.brightness);
 	s9p_panel_on(priv);""",
      """	if (priv->bl && priv->bl_table) {
-		s9p_panel_brightness_table(priv, priv->bl->props.brightness, true);
-		priv->bl_sent = priv->bl->props.brightness;
+		/* no frames before display-on: this one goes */
+		if (s9p_panel_brightness_table(priv, priv->bl->props.brightness, true))
+			priv->bl_sent = priv->bl->props.brightness;
 	} else if (priv->bl) {
 		s9p_panel_brightness(priv, priv->bl->props.brightness);
 	}

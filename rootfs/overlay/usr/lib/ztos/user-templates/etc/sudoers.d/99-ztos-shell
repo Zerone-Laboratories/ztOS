@@ -1,0 +1,5 @@
+# ztMETRO runs as the phone's user (named below from user.conf by
+# ztos-user-dropins). The sensor hub failure screen's two buttons need
+# root: these exact commands, and nothing else, without a password.
+@USER@ ALL=(root) NOPASSWD: /usr/bin/systemctl reboot --reboot-argument=recovery, \
+	/usr/bin/systemctl stop zrn-sensorhub.service ztoscsf-sensorhub.service zrnsensord.service ztoscsf-sensord.service

@@ -1,0 +1,13 @@
+diff --git a/src/api-impl/android/location/LocationManager.java b/src/api-impl/android/location/LocationManager.java
+index 8f6c312..b49e0f3 100644
+--- a/src/api-impl/android/location/LocationManager.java
++++ b/src/api-impl/android/location/LocationManager.java
+@@ -71,4 +71,8 @@ public class LocationManager {
+ 	public boolean isProviderEnabled(String provider) {
+ 		return System.getenv("ATL_UGLY_ENABLE_LOCATION") != null;
+ 	}
++
++	public boolean isLocationEnabled() {
++		return isProviderEnabled("xdgportal");
++	}
+ }

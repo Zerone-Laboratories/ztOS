@@ -1,0 +1,20 @@
+# ztOS ARM64 dependency for ART's ARM/ARM64 code generators.
+pkgname=vixl
+pkgver=8.0.0
+pkgrel=1
+pkgdesc='AArch32 and AArch64 runtime code generation library for ATL'
+arch=(aarch64)
+url='https://github.com/Linaro/vixl'
+license=('BSD-3-Clause')
+depends=(gcc-libs glibc)
+makedepends=(meson ninja)
+source=("vixl-$pkgver.tar.gz::https://github.com/Linaro/vixl/archive/refs/tags/$pkgver.tar.gz"
+        '0001-vixl-Meson-support.patch::https://raw.githubusercontent.com/alpinelinux/aports/master/testing/vixl/0001-vixl-Meson-support.patch')
+sha512sums=('9747166c808d1406fbd3d3cfe9a584b5837df368249c6f63acb754602c7ad7e70e668b0f21c1d917b100d653bd76172fbb5940685be1f38742f8a9a02f0d962c'
+            '158a3f3c34fe3b2a422c6cab2c98d6255f3c2f5a2c9c56401a992a01fa1943dd39a5cb8edcff39d9923f7c2498a8826062b0e5dceb002ed7355fd5ed2edea70d')
+prepare() { cd "vixl-$pkgver"; patch -Np1 -i ../0001-vixl-Meson-support.patch; }
+build() { arch-meson "vixl-$pkgver" build -Ddoc=disabled; meson compile -C build -j 8; }
+package() {
+    DESTDIR="$pkgdir" meson install -C build
+    install -Dm644 "vixl-$pkgver/LICENCE" "$pkgdir/usr/share/licenses/$pkgname/LICENCE"
+}

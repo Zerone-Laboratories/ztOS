@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Camera
+Comment=Photos and video, with Lumia Camera's manual dials
+Exec=ztcamera
+Terminal=false
+Type=Application
+Icon=ztcamera
+Categories=Graphics;Photography;

@@ -1,0 +1,347 @@
+--- a/src/api-impl/android/app/ActivityThread.java
++++ b/src/api-impl/android/app/ActivityThread.java
+@@ -101,6 +101,13 @@
+ 			.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\"", "\\\"");
+ 	}
+ 
++	private static String dumpBytes(byte[] data) {
++		if (data == null) return "-";
++		StringBuilder out = new StringBuilder();
++		for (int i = 0; i < Math.min(data.length, 96); i++) out.append(String.format(java.util.Locale.ROOT, "%02x", data[i] & 0xff));
++		return out.append("/").append(data.length).toString();
++	}
++
+ 	private static String dumpRect(android.graphics.Rect rect) {
+ 		return rect.left + "," + rect.top + "," + rect.right + "," + rect.bottom;
+ 	}
+@@ -147,6 +154,15 @@
+ 					.append(" intr=").append(background.getIntrinsicWidth()).append('x').append(background.getIntrinsicHeight());
+ 				android.graphics.Rect padding = new android.graphics.Rect();
+ 				if (background.getPadding(padding)) line.append(" bgpad=").append(dumpRect(padding));
++				// Containers (state lists, layers) draw a child: show what actually paints
++				android.graphics.drawable.Drawable current = background.getCurrent();
++				if (current != null && current != background)
++					line.append(" cur=").append(current.getClass().getName()).append(" cbounds=").append(dumpRect(current.getBounds()))
++						.append(" cintr=").append(current.getIntrinsicWidth()).append('x').append(current.getIntrinsicHeight())
++						.append(" cpaint=").append(current.paintable != 0);
++				if (current instanceof android.graphics.drawable.NinePatchDrawable)
++					line.append(" npsrc=").append(((android.graphics.drawable.NinePatchDrawable)current).atlSource)
++						.append(" chunk=").append(dumpBytes(((android.graphics.drawable.NinePatchDrawable)current).atlChunk));
+ 			}
+ 			if (view instanceof android.widget.ImageView) {
+ 				android.widget.ImageView image = (android.widget.ImageView)view;
+@@ -155,6 +171,32 @@
+ 				if (drawable != null) line.append(" intr=").append(drawable.getIntrinsicWidth()).append('x').append(drawable.getIntrinsicHeight());
+ 				line.append(" scale=").append(image.getScaleType());
+ 			}
++			// Views that draw a prebuilt Layout themselves (React Native text): show its text and spans
++			if (!(view instanceof android.widget.TextView)) {
++				for (Class<?> c = view.getClass(); c != null && c != android.view.View.class; c = c.getSuperclass()) {
++					for (java.lang.reflect.Field field : c.getDeclaredFields()) {
++						if (!android.text.Layout.class.isAssignableFrom(field.getType())) continue;
++						field.setAccessible(true);
++						android.text.Layout layout = (android.text.Layout)field.get(view);
++						if (layout == null) continue;
++						CharSequence t = layout.getText();
++						line.append(" layout{text=\"").append(dumpText(t)).append("\" w=").append(layout.getWidth())
++							.append(" h=").append(layout.getHeight()).append(" lines=").append(layout.getLineCount())
++							.append(" lw0=").append(layout.getLineCount() > 0 ? layout.getLineWidth(0) : 0)
++							.append(" pcolor=#").append(String.format(java.util.Locale.ROOT, "%08X", layout.getPaint().getColor()))
++							.append(" psize=").append(layout.getPaint().getTextSize());
++						if (t instanceof android.text.Spanned) {
++							android.text.Spanned sp = (android.text.Spanned)t;
++							for (Object span : sp.getSpans(0, sp.length(), Object.class)) {
++								line.append(' ').append(span.getClass().getName()).append('@').append(sp.getSpanStart(span)).append('-').append(sp.getSpanEnd(span));
++								if (span instanceof android.text.style.ForegroundColorSpan)
++									line.append("#").append(Integer.toHexString(((android.text.style.ForegroundColorSpan)span).getForegroundColor()));
++							}
++						}
++						line.append('}');
++					}
++				}
++			}
+ 			if (view.getAlpha() != 1) line.append(" alpha=").append(view.getAlpha());
+ 			if (view.getTranslationX() != 0) line.append(" translationX=").append(view.getTranslationX());
+ 			if (view.getTranslationY() != 0) line.append(" translationY=").append(view.getTranslationY());
+--- a/src/api-impl/android/graphics/drawable/NinePatchDrawable.java
++++ b/src/api-impl/android/graphics/drawable/NinePatchDrawable.java
+@@ -8,6 +8,9 @@
+ 	private final Rect mPadding = new Rect();
+ 	private int mWidth = -1, mHeight = -1;
+ 	private int mOpacity = android.graphics.PixelFormat.TRANSLUCENT;
++	/* where the patch came from, for the ATL_VIEW_DUMP inspector */
++	public String atlSource;
++	public byte[] atlChunk;
+ 
+ 	private void readInfo() {
+ 		if (paintable == 0)
+@@ -36,6 +39,8 @@
+ 
+ 
+ 	public NinePatchDrawable(Resources res, Bitmap bitmap, byte[] data, Rect padding, String name) {
++		atlSource = "chunk:" + name;
++		atlChunk = data;
+ 		if (bitmap != null && data != null) {
+ 			setPaintable(nativeCreate(data, bitmap.getTexture()));
+ 			readInfo();
+@@ -45,6 +50,7 @@
+ 	}
+ 
+ 	NinePatchDrawable(String path) {
++		atlSource = path;
+ 		setPaintable(nativeCreate(path));
+ 		readInfo();
+ 	}
+--- a/src/api-impl/android/text/Layout.java
++++ b/src/api-impl/android/text/Layout.java
+@@ -101,6 +101,11 @@
+ 	}
+ 
+ 	public static void applySpans(long layout, CharSequence text, TextPaint base) {
++		applySpans(layout, text, base, true);
++	}
++
++	/** @hide GtkLabel cannot invoke Java replacement drawing. */
++	public static void applySpans(long layout, CharSequence text, TextPaint base, boolean replacements) {
+ 		if (!(text instanceof Spanned)) return;
+ 		Spanned spanned = (Spanned)text;
+ 		java.util.ArrayList<TextPaint> paints = new java.util.ArrayList<>();
+@@ -131,6 +136,7 @@
+ 		try { native_set_runs(layout, base.paint, runs, handles); }
+ 		finally { for (TextPaint run : paints) run.releaseSpanPaint(); }
+ 		// Replacement spans are atomic even when character styles transition inside them.
++		if (!replacements) return;
+ 		for (ReplacementSpan span : spanned.getSpans(0, text.length(), ReplacementSpan.class)) {
+ 			int start = spanned.getSpanStart(span), end = spanned.getSpanEnd(span);
+ 			if (start >= end) continue;
+--- a/src/api-impl/android/view/ViewGroup.java
++++ b/src/api-impl/android/view/ViewGroup.java
+@@ -408,14 +408,18 @@
+ 		}
+ 	}
+ 
+-	protected void setChildrenDrawingOrderEnabled(boolean enabled) {}
++	private boolean childrenDrawingOrderEnabled;
++
++	protected void setChildrenDrawingOrderEnabled(boolean enabled) {
++		childrenDrawingOrderEnabled = enabled;
++	}
+ 
+ 	public void requestDisallowInterceptTouchEvent(boolean disallowIntercept) {
+ 		for (ViewGroup iter = this; iter != null; iter = iter.parent instanceof ViewGroup ? (ViewGroup)iter.parent : null)
+ 			iter.disallowIntercept = disallowIntercept;
+ 	}
+ 
+-	protected boolean isChildrenDrawingOrderEnabled() { return false; }
++	protected boolean isChildrenDrawingOrderEnabled() { return childrenDrawingOrderEnabled; }
+ 
+ 	@Override
+ 	public boolean onStartNestedScroll(View child, View target, int nestedScrollAxes) {
+@@ -490,6 +494,26 @@
+ 		this.transition = transition;
+ 	}
+ 
++	/* Only reached for groups on the Java draw path. Going through drawChild()
++	 * in drawing order, like AOSP, lets apps interleave their own drawing with
++	 * children (Litho draws backgrounds from drawChild, before the child). */
++	@Override
++	protected void dispatchDraw(Canvas canvas) {
++		if (!(canvas instanceof GskCanvas))
++			return;
++		final int count = children.size();
++		final boolean customOrder = isChildrenDrawingOrderEnabled();
++		final long drawingTime = getDrawingTime();
++		for (int i = 0; i < count; i++) {
++			int index = customOrder ? getChildDrawingOrder(count, i) : i;
++			if (index < 0 || index >= count)
++				index = i;
++			View child = children.get(index);
++			if (child.getVisibility() == VISIBLE || child.getAnimation() != null)
++				drawChild(canvas, child, drawingTime);
++		}
++	}
++
+ 	public boolean drawChild(Canvas canvas, View child, long drawingTime) {
+ 		if (canvas instanceof GskCanvas)
+ 			native_drawChild(widget, child.widget, ((GskCanvas)canvas).snapshot);
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -863,7 +863,7 @@
+ 			paint.linkColor = linkColors == null ? getCurrentTextColor() : linkColors.getColorForState(getDrawableState(), linkColors.getDefaultColor());
+ 			long target = native_spanLayout();
+ 			if (target != 0) {
+-				android.text.Layout.applySpans(target, text.length() == 0 && hint != null ? hint : text, paint);
++				android.text.Layout.applySpans(target, text.length() == 0 && hint != null ? hint : text, paint, false);
+ 				native_commitSpans(target);
+ 			}
+ 		}
+--- a/src/api-impl-jni/graphics/android_graphics_Paint.c
++++ b/src/api-impl-jni/graphics/android_graphics_Paint.c
+@@ -225,21 +225,54 @@
+ 	(*env)->ReleaseStringChars(env, text, chars);
+ 	PangoLayout *layout = pango_layout_new(gtk_widget_get_pango_context(window));
+ 	pango_layout_set_font_description(layout, paint->font);
+-	pango_layout_set_attributes(layout, paint->text_attrs);
++	PangoAttrList *attrs = pango_attr_list_copy(paint->text_attrs);
++	pango_layout_set_attributes(layout, attrs);
++	pango_attr_list_unref(attrs);
+ 	pango_layout_set_text(layout, utf8->str, utf8->len);
+ 	g_string_free(utf8, TRUE);
+ 	return layout;
+ }
+ 
++/* Pango trims edge tracking after breaking/ellipsizing. Android advances must
++ * retain it, or a layout sized to ceil(measureText()) can already ellipsize. */
++static int edge_tracking(PangoLayoutRun *run, const char *text, gboolean left)
++{
++	if (!run->glyphs->num_glyphs || text[run->item->offset] == '\t') return 0;
++	int spacing = 0;
++	for (GSList *node = run->item->analysis.extra_attrs; node; node = node->next) {
++		PangoAttribute *attr = node->data;
++		if (attr->klass->type == PANGO_ATTR_SHAPE) return 0;
++		if (attr->klass->type == PANGO_ATTR_LETTER_SPACING)
++			spacing = ((PangoAttrInt *)attr)->value;
++	}
++	int half = spacing / 2;
++	if ((spacing & (PANGO_SCALE - 1)) == 0) half = PANGO_UNITS_ROUND(half);
++	return left ? half : spacing - half;
++}
++
++float android_paint_get_line_advance(PangoLayoutLine *line)
++{
++	PangoRectangle logical;
++	pango_layout_line_get_extents(line, NULL, &logical);
++	int tracking = 0;
++	if (line->runs) {
++		const char *text = pango_layout_get_text(line->layout);
++		tracking += edge_tracking(line->runs->data, text, TRUE);
++		tracking += edge_tracking(g_slist_last(line->runs)->data, text, FALSE);
++	}
++	return (float)(logical.width + tracking) / PANGO_SCALE;
++}
++
+ JNIEXPORT jfloat JNICALL Java_android_graphics_Paint_native_1measure_1text(JNIEnv *env, jclass clazz, jlong paint_ptr, jstring text_ptr)
+ {
+ 	struct AndroidPaint *paint = _PTR(paint_ptr);
+ 	PangoLayout *layout = android_paint_create_text_layout(paint, env, text_ptr);
+ 	if (!layout) return 0;
+-	PangoRectangle logical_rect;
+-	pango_layout_get_extents(layout, NULL, &logical_rect);
++	float width = 0;
++	for (GSList *line = pango_layout_get_lines_readonly(layout); line; line = line->next)
++		width = MAX(width, android_paint_get_line_advance(line->data));
+ 	g_object_unref(layout);
+-	return (jfloat)logical_rect.width / PANGO_SCALE;
++	return width;
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_graphics_Paint_native_1get_1text_1bounds(JNIEnv *env, jclass clazz, jlong paint_ptr, jstring text_ptr, jobject bounds)
+--- a/src/api-impl-jni/graphics/AndroidPaint.h
++++ b/src/api-impl-jni/graphics/AndroidPaint.h
+@@ -20,3 +20,5 @@
+ PangoLayout *android_paint_create_text_layout(struct AndroidPaint *paint, JNIEnv *env, jstring text);
+ 
+ const char *android_default_font_family(void);
++
++float android_paint_get_line_advance(PangoLayoutLine *line);
+--- a/src/api-impl-jni/graphics/NinePatchPaintable.c
++++ b/src/api-impl-jni/graphics/NinePatchPaintable.c
+@@ -1,4 +1,5 @@
+ #include <arpa/inet.h>
++#include <stdbool.h>
+ #include <graphene.h>
+ #include <gtk/gtk.h>
+ 
+@@ -20,8 +21,14 @@
+ 		int32_t *xDivs = (int32_t *)((uint8_t *)chunk + chunk->xDivsOffset);
+ 		int32_t *yDivs = (int32_t *)((uint8_t *)chunk + chunk->yDivsOffset);
+ 		int32_t *color = (int32_t *)((uint8_t *)chunk + chunk->colorsOffset);
+-		float strech_factor_width = (width - (ninepatch->width - ninepatch->strechy_width)) / ninepatch->strechy_width;
+-		float strech_factor_height = (height - (ninepatch->height - ninepatch->strechy_height)) / ninepatch->strechy_height;
++		/* Empty stretch regions (e.g. xDivs {9, 9}) leave an axis with nothing to
++		 * stretch; Android drops such divs and then scales the whole axis. */
++		const bool scale_all_x = ninepatch->strechy_width <= 0;
++		const bool scale_all_y = ninepatch->strechy_height <= 0;
++		float strech_factor_width = scale_all_x ? width / ninepatch->width
++		                                        : (width - (ninepatch->width - ninepatch->strechy_width)) / ninepatch->strechy_width;
++		float strech_factor_height = scale_all_y ? height / ninepatch->height
++		                                         : (height - (ninepatch->height - ninepatch->strechy_height)) / ninepatch->strechy_height;
+ 
+ 		graphene_rect_t rect;
+ 		GdkRGBA rgba;
+@@ -42,9 +49,9 @@
+ 		for (j = 0, rect.origin.y = 0; j < chunk->numYDivs + 1; j++, rect.origin.y += rect.size.height) {
+ 			int ydiv_start = j ? yDivs[j - 1] : 0;
+ 			int ydiv_end = (j == chunk->numYDivs) ? ninepatch->height : yDivs[j];
+-			float actual_stretch_factor_height = (j % 2) ? strech_factor_height : 1;
++			float actual_stretch_factor_height = (scale_all_y || j % 2) ? strech_factor_height : 1;
+ 			float patch_height = ydiv_end - ydiv_start;
+-			if (j % 2) // odd sections are stretchable
++			if (scale_all_y || j % 2) // odd sections are stretchable
+ 				patch_height *= strech_factor_height;
+ 			rect.size.height = patch_height;
+ 			if (!patch_height) // skip empty sections
+@@ -52,9 +59,9 @@
+ 			for (i = 0, rect.origin.x = 0; i < chunk->numXDivs + 1; i++, rect.origin.x += rect.size.width) {
+ 				int xdiv_start = i ? xDivs[i - 1] : 0;
+ 				int xdiv_end = (i == chunk->numXDivs) ? ninepatch->width : xDivs[i];
+-				float actual_stretch_factor_width = (i % 2) ? strech_factor_width : 1;
++				float actual_stretch_factor_width = (scale_all_x || i % 2) ? strech_factor_width : 1;
+ 				float patch_width = xdiv_end - xdiv_start;
+-				if (i % 2) // odd sections are stretchable
++				if (scale_all_x || i % 2) // odd sections are stretchable
+ 					patch_width *= strech_factor_width;
+ 				rect.size.width = patch_width;
+ 				if (!patch_width) // skip empty sections
+@@ -149,11 +156,11 @@
+ 	int xsections = chunk->numXDivs + 1;
+ 	int ysections = chunk->numYDivs + 1;
+ 	for (i = 0; i < chunk->numXDivs; i++) {
+-		if (xDivs[i] < 0 || xDivs[i] > width || (i && xDivs[i] <= xDivs[i - 1]))
++		if (xDivs[i] < 0 || xDivs[i] > width || (i && xDivs[i] < xDivs[i - 1]))
+ 			return NULL;
+ 	}
+ 	for (i = 0; i < chunk->numYDivs; i++) {
+-		if (yDivs[i] < 0 || yDivs[i] > height || (i && yDivs[i] <= yDivs[i - 1]))
++		if (yDivs[i] < 0 || yDivs[i] > height || (i && yDivs[i] < yDivs[i - 1]))
+ 			return NULL;
+ 	}
+ 	xsections -= (xDivs[0] == 0) + (xDivs[chunk->numXDivs - 1] == width);
+--- a/src/api-impl-jni/text/android_text_Layout.c
++++ b/src/api-impl-jni/text/android_text_Layout.c
+@@ -44,7 +44,9 @@
+ 	PangoLayout *layout = pango_layout_new(context);
+ 	g_object_unref(context);
+ 	pango_layout_set_font_description(layout, android_paint->font);
+-	pango_layout_set_attributes(layout, android_paint->text_attrs);
++	PangoAttrList *attrs = pango_attr_list_copy(android_paint->text_attrs);
++	pango_layout_set_attributes(layout, attrs);
++	pango_attr_list_unref(attrs);
+ 	char *str = atl_jstring_to_utf8(env, text);
+ 	if (!str) { g_object_unref(layout); return 0; }
+ 	pango_layout_set_text(layout, str, -1);
+@@ -149,9 +151,7 @@
+ JNIEXPORT jfloat JNICALL Java_android_text_Layout_native_1get_1line_1width(JNIEnv *env, jobject object, jlong layout, jint line)
+ {
+ 	PangoLayoutLine *pango_line = pango_layout_get_line_readonly(PANGO_LAYOUT(_PTR(layout)), line);
+-	PangoRectangle logical_rect;
+-	pango_layout_line_get_extents(pango_line, NULL, &logical_rect);
+-	return (jfloat)logical_rect.width / PANGO_SCALE;
++	return android_paint_get_line_advance(pango_line);
+ }
+ 
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1baseline(JNIEnv *env, jobject object, jlong layout, jint line)
+@@ -275,9 +275,10 @@
+ JNIEXPORT jfloat JNICALL Java_android_text_Layout_native_1get_1desired_1width(JNIEnv *env, jclass class, jlong layout)
+ {
+ 	PangoLayout *pango_layout = _PTR(layout);
+-	int width;
+-	pango_layout_get_size(pango_layout, &width, NULL);
+-	return (jfloat)width / PANGO_SCALE;
++	float width = 0;
++	for (GSList *line = pango_layout_get_lines_readonly(pango_layout); line; line = line->next)
++		width = MAX(width, android_paint_get_line_advance(line->data));
++	return width;
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_text_Layout_native_1free(JNIEnv *env, jclass class, jlong layout)

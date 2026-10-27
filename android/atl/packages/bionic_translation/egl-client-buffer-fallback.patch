@@ -1,0 +1,26 @@
+--- a/linker/linker.c
++++ b/linker/linker.c
+@@ -59,6 +59,13 @@
+ 
+ /* eglGetProcAddress to import funny extensions that Android exports but Mesa sometimes doesn't */
+ #include <EGL/egl.h>
++
++/* CPU-backed AHardwareBuffer cannot be imported as a GPU EGL client buffer. */
++static EGLClientBuffer eglGetNativeClientBufferANDROID_stub(const void *buffer)
++{
++	(void)buffer;
++	return NULL;
++}
+ 
+ /* sigsetjmp may or may not be a macro; we can't wrap it, so we need to substitute it for the system version when linking */
+ #include <setjmp.h>
+@@ -1829,6 +1836,9 @@
+ 				if (strstr(sym_name, "pthread_"))
+ 					fprintf(stderr, "symbol may need to be wrapped: %s\n", sym_name);
+ 				LINKER_DEBUG_PRINTF("%s hooked symbol %s to %p\n", si->name, sym_name, (void *)sym_addr);
++			} else if (!strcmp(sym_name, "eglGetNativeClientBufferANDROID")) {
++				/* Resolve Android's import symbol without claiming GPU support. */
++				sym_addr = (uintptr_t)eglGetNativeClientBufferANDROID_stub;
+ 			} else if (!sym_addr && !strncmp(sym_name, "gl", 2)) {
+ 				LINKER_DEBUG_PRINTF("=======================================\n");
+ 				LINKER_DEBUG_PRINTF("%s symbol %s is an OpenGL extension?\n", si->name, sym_name);

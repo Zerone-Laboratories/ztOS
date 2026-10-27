@@ -1,2 +1,0 @@
-# Root is found by label, never by device node (zboot spec).
-LABEL=ZR_ARCH  /  ext4  rw,noatime  0  1

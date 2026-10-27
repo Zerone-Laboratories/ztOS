@@ -129,13 +129,11 @@ static struct bbd_device bbd;
  */
 static unsigned char bbd_patch[] = {
 #if defined(CONFIG_SENSORS_SSP_STAR)
-#if ANDROID_VERSION < 90000
-#include "p_os/bbd_patch_file_star.h"
-#elif ANDROID_VERSION < 100000
-#include "p_os/bbd_patch_file_star.h"
-#else
-#include "p_os/bbd_patch_file_star.h"
-#endif
+/* The Android 10 (Q) patch: the phone's own vendor lhd and firmware are Q
+ * (G960NKSU5FVA2); the P patch used before made the hub assert in its
+ * transport layer (MCU_BCM477X_transport_layer.c line 165) every so often.
+ * From xxmustafacooTR/exynos-linux-stable, bbdpl/q_os. */
+#include "q_os/bbd_patch_file_star.h"
 #elif defined(CONFIG_SENSORS_SSP_CROWN)
 #if ANDROID_VERSION < 90000
 #include "o_os/bbd_patch_file_crown.h"

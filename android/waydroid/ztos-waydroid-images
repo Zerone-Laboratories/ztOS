@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""ztos-waydroid-images: put the stripped Android in place, once, at first boot.
+
+The GSI ships the recipe, not the image (design/ztOSIAL.md, "Waydroid in every
+GSI"): the pinned Waydroid images are fetched from Waydroid's own OTA channel,
+checked against the hashes pinned here, unpacked, initialised, then stripped
+and patched by install.sh as on the Galaxy S9 (2026-10-24). A phone that
+already has its images (the S9 before the GSI) keeps them untouched.
+
+Runs as root from ztos-waydroid-images.service; safe to run again (each step
+is skipped when done). Exit 0 also when Waydroid cannot run here (no binder):
+Android apps then stay with ATL.
+"""
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tomllib
+import urllib.request
+import zipfile
+
+# The images ztOS's Waydroid work was done on (android/waydroid/README.md).
+PINNED = {
+    'system': {
+        'file': 'lineage-20.0-20260927-VANILLA-waydroid_arm64-system.zip',
+        'sha256': '5fb8179ed4455f45919c5a2bfbfdd1591619295994ad321217f03bb1dcfc53a7',
+        'channel': 'https://ota.waydro.id/system/lineage/waydroid_arm64/VANILLA.json',
+    },
+    'vendor': {
+        'file': 'lineage-20.0-20260927-MAINLINE-waydroid_arm64-vendor.zip',
+        'sha256': '20a49c11961a5ac7295320f578764eeab3c982b217f1bfde7473adfc22e747ae',
+        'channel': 'https://ota.waydro.id/vendor/waydroid_arm64/MAINLINE.json',
+    },
+}
+IMAGES = pathlib.Path('/usr/share/waydroid-extra/images')
+CACHE = pathlib.Path('/var/cache/ztos-waydroid')
+READY = pathlib.Path('/var/lib/ztos/waydroid-ready')
+RECIPE = pathlib.Path('/usr/share/ztos-waydroid')      # android/waydroid, installed
+MANIFEST = pathlib.Path('/vendor/ztos/manifest.toml')
+
+
+def say(text):
+    print('ztos-waydroid-images: ' + text, flush=True)
+
+
+def binder_allowed():
+    if MANIFEST.exists():
+        with MANIFEST.open('rb') as stream:
+            if tomllib.load(stream).get('android', {}).get('binder') == 'none':
+                return False
+    filesystems = pathlib.Path('/proc/filesystems').read_text()
+    return 'binder' in filesystems
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def fetch(kind):
+    pin = PINNED[kind]
+    CACHE.mkdir(parents=True, exist_ok=True)
+    target = CACHE / pin['file']
+    if target.exists() and sha256(target) == pin['sha256']:
+        return target
+    with urllib.request.urlopen(pin['channel'], timeout=60) as reply:
+        entries = json.load(reply)['response']
+    entry = next((e for e in entries if e['filename'] == pin['file']), None)
+    if entry is None:
+        raise SystemExit(f'{pin["file"]} is no longer in {pin["channel"]}')
+    if entry['id'] != pin['sha256']:
+        raise SystemExit(f'{pin["file"]}: the channel now gives another hash ({entry["id"]})')
+    partial = target.with_suffix('.part')
+    say(f'downloading {pin["file"]} ({entry["size"] // (1 << 20)} MB)')
+    # curl resumes an interrupted download; urllib does not
+    subprocess.run(['curl', '-L', '--fail', '--retry', '5', '-C', '-', '-o', str(partial), entry['url']], check=True)
+    if sha256(partial) != pin['sha256']:
+        partial.unlink()
+        raise SystemExit(f'{pin["file"]}: hash mismatch, deleted')
+    partial.replace(target)
+    return target
+
+
+def unpack(kind, archive):
+    name = f'{kind}.img'
+    with zipfile.ZipFile(archive) as z:
+        member = next(m for m in z.namelist() if m.endswith(name))
+        IMAGES.mkdir(parents=True, exist_ok=True)
+        with z.open(member) as source, open(IMAGES / (name + '.part'), 'wb') as out:
+            shutil.copyfileobj(source, out, 1 << 20)
+    (IMAGES / (name + '.part')).replace(IMAGES / name)
+
+
+def main():
+    if READY.exists():
+        return 0
+    if not binder_allowed():
+        say('no binder in this kernel: Waydroid stays off, ATL runs Android apps')
+        return 0
+    if (IMAGES / 'system.img').exists() and (IMAGES / 'vendor.img').exists() and \
+            pathlib.Path('/var/lib/waydroid/waydroid.cfg').exists():
+        say('images already in place: kept as they are')
+    else:
+        for kind in ('system', 'vendor'):
+            unpack(kind, fetch(kind))
+        say('initialising Waydroid')
+        subprocess.run(['waydroid', 'init', '-f', '-i', str(IMAGES)], check=True)
+        say('stripping and patching (install.sh)')
+        subprocess.run([str(RECIPE / 'install.sh'), '--strip'], check=True)
+        for kind in PINNED:
+            pathlib.Path(CACHE / PINNED[kind]['file']).unlink(missing_ok=True)
+    READY.parent.mkdir(parents=True, exist_ok=True)
+    READY.write_text('ready\n')
+    say('Android is ready')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

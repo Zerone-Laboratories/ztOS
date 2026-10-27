@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=OSIAL Management
+Comment=ztOSIAL on this phone: its interfaces, whether they are connected, and what the phone can do
+Exec=ztosial
+Terminal=false
+Type=Application
+Icon=ztosial
+Categories=System;Monitor;

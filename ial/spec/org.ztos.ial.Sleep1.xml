@@ -1,0 +1,24 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- org.ztos.ial.Sleep1: How the phone sleeps with the screen off, and who holds it awake.
+     Licence: LGPL-2.1-or-later. -->
+<node>
+  <interface name="org.ztos.ial.Sleep1">
+    <property name="Version" type="u" access="read"/>
+    <property name="Method" type="s" access="read"/>
+    <property name="Enabled" type="b" access="read"/>
+    <property name="State" type="s" access="read"/>
+    <property name="Inhibitors" type="as" access="read"/>
+    <method name="SetEnabled">
+      <arg direction="in" name="enabled" type="b"/>
+    </method>
+    <method name="Inhibit">
+      <arg direction="in" name="who" type="s"/>
+      <arg direction="in" name="why" type="s"/>
+      <arg direction="out" name="cookie" type="u"/>
+    </method>
+    <method name="Uninhibit">
+      <arg direction="in" name="cookie" type="u"/>
+    </method>
+  </interface>
+</node>

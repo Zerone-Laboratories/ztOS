@@ -1,0 +1,17 @@
+#!/bin/sh
+# Give snd-zrn-abox the speakers' factory calibration (Maxim DSM) from EFS:
+# rdc_cal (left), rdc_cal_r (right), temp_cal, hex text, as Samsung's
+# maxim_dsm_cal reads them. Without them the driver keeps DSM off.
+P=/sys/module/snd_zrn_abox/parameters
+# the module loads late (zrn-audio, after the DSP firmware): wait for it
+i=0; while [ ! -e $P/dsm_rdc ] && [ $i -lt 120 ]; do sleep 1; i=$((i+1)); done
+[ -e $P/dsm_rdc ] || { echo "snd-zrn-abox not loaded"; exit 0; }
+for d in /run/android/mnt/vendor/efs/maxim /efs/maxim; do
+	[ -r "$d/rdc_cal" ] && break
+done
+[ -r "$d/rdc_cal" ] && [ -r "$d/rdc_cal_r" ] && [ -r "$d/temp_cal" ] || { echo "no calibration in EFS"; exit 0; }
+l=$((0x$(tr -dc '0-9a-fA-F' < "$d/rdc_cal")))
+r=$((0x$(tr -dc '0-9a-fA-F' < "$d/rdc_cal_r")))
+t=$((0x$(tr -dc '0-9a-fA-F' < "$d/temp_cal")))
+echo "$l,$r" > $P/dsm_rdc && echo "$t" > $P/dsm_temp
+echo "speaker calibration: rdc $l / $r, temp $t"

@@ -1,0 +1,38 @@
+#!/bin/bash
+set -u
+CACHE_MOUNT=/run/ztos-fs-recovery-cache
+STATE_DIR=$CACHE_MOUNT/ztos-fs-recovery
+# the shell's control pipe; recovery must not need the helper to be there
+. /usr/lib/ztos/user.sh 2>/dev/null || ZTOS_RUNTIME_DIR=/run/user/1000
+CTL=$ZTOS_RUNTIME_DIR/ztmetro.ctl
+log() { printf '<6>ztos-fs-recovery-reset: %s\n' "$*" > /dev/kmsg 2>/dev/null || true; }
+cache_mount() {
+	[ -d "$CACHE_MOUNT" ] || mkdir -p "$CACHE_MOUNT"
+	if mountpoint -q "$CACHE_MOUNT"; then
+		mount -o remount,rw,nosuid,nodev,noexec "$CACHE_MOUNT" 2>/dev/null || return 1
+	else
+		device=$(findfs LABEL=cache 2>/dev/null || true)
+		[ -b "$device" ] || device=/dev/sda21
+		[ -b "$device" ] || return 1
+		mount -t ext4 -o rw,nosuid,nodev,noexec "$device" "$CACHE_MOUNT" 2>/dev/null || return 1
+	fi
+	install -d -o root -g root -m 0700 "$STATE_DIR"
+}
+for _ in $(seq 1 300); do
+	if pgrep -x ztmetro >/dev/null 2>&1; then
+		if [ -e /run/ztos-fs-recovery/notify ] && [ -p "$CTL" ]; then
+			printf 'notify System|Filesystem recovery|Boot continued after three recovery attempts. Check journalctl -b.\n' > "$CTL" 2>/dev/null || true
+		fi
+		if cache_mount; then
+			rm -f "$STATE_DIR/attempts" "$STATE_DIR/rollback-boot-id"
+			umount "$CACHE_MOUNT" 2>/dev/null || true
+			log "ztMETRO is running; cleared persistent recovery counter on CACHE"
+		else
+			log "ztMETRO is running; CACHE unavailable, recovery counter retained"
+		fi
+		rm -f /var/backups/fs-recovery/rollback.pending
+		exit 0
+	fi
+	sleep 1
+done
+exit 0

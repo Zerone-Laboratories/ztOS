@@ -1,0 +1,12 @@
+[Unit]
+Description=Start Waydroid early and report boot readiness
+
+[Service]
+Type=oneshot
+Environment=XDG_RUNTIME_DIR=%t
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/local/libexec/ztos-waydroid-boot
+TimeoutStartSec=50
+
+[Install]
+WantedBy=default.target

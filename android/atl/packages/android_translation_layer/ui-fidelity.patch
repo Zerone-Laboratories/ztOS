@@ -1,0 +1,1744 @@
+--- a/src/api-impl/android/content/res/AssetManager.java
++++ b/src/api-impl/android/content/res/AssetManager.java
+@@ -221,6 +221,8 @@
+ 		return getArrayStringResource(id);
+ 	}
+ 
++	static native int nativeAssetScale();
++
+ 	/*package*/ final boolean getResourceValue(int ident,
+ 	                                           int density,
+ 	                                           TypedValue outValue,
+--- a/src/api-impl/android/content/res/Resources.java
++++ b/src/api-impl/android/content/res/Resources.java
+@@ -790,7 +790,7 @@
+ 			}
+ 		}
+ 
+-		Drawable res = loadDrawable(value, id);
++		Drawable res = loadDrawable(value, id, null, false);
+ 		synchronized (mAccessLock) {
+ 			if (mTmpValue == null) {
+ 				mTmpValue = value;
+@@ -2131,6 +2131,19 @@
+ 	}
+ 
+ 	/*package*/ Drawable loadDrawable(TypedValue value, int id, Theme theme) throws NotFoundException {
++		return loadDrawable(value, id, theme, true);
++	}
++
++	private Drawable loadDrawable(TypedValue value, int id, Theme theme, boolean selectAssetDensity) throws NotFoundException {
++		if (selectAssetDensity && value.string != null && !value.string.toString().endsWith(".9.png")) {
++			int scale = AssetManager.nativeAssetScale();
++			if (scale > 1) {
++				TypedValue asset = new TypedValue();
++				if (mAssets.getResourceValue(id, Math.min(65534, mMetrics.densityDpi * scale), asset, true)
++				    && asset.string != null && !asset.string.toString().endsWith(".9.png"))
++					value = asset;
++			}
++		}
+ 
+ 		/*if (TRACE_FOR_PRELOAD) {
+ 			// Log only framework resources
+--- a/src/api-impl/android/graphics/BitmapFactory.java
++++ b/src/api-impl/android/graphics/BitmapFactory.java
+@@ -430,7 +430,10 @@
+ 			opts.inTargetDensity = res.getDisplayMetrics().densityDpi;
+ 		}
+ 
+-		return decodeStream(is, pad, opts);
++		Bitmap bitmap = decodeStream(is, pad, opts);
++		if (bitmap != null && value != null && value.density == TypedValue.DENSITY_NONE && opts.inDensity == 0)
++			bitmap.setDensity(Bitmap.DENSITY_NONE);
++		return bitmap;
+ 	}
+ 
+ 	/**
+@@ -510,7 +513,13 @@
+ 	/**
+ 	 * Set the newly decoded bitmap's density based on the Options.
+ 	 */
+-	private static void setDensityFromOptions(Bitmap outputBitmap, Options opts) { /*
++	private static void setDensityFromOptions(Bitmap outputBitmap, Options opts) {
++		if (outputBitmap != null && opts != null) {
++			// Keep source density: the texture retains its original pixels.
++			if (opts.inDensity != 0) outputBitmap.setDensity(opts.inDensity);
++			else if (opts.inBitmap != null) outputBitmap.setDensity(DisplayMetrics.DENSITY_DEFAULT);
++		}
++		/*
+ 	     if (outputBitmap == null || opts == null) return;
+ 
+ 	     final int density = opts.inDensity;
+--- a/src/api-impl/android/graphics/Bitmap.java
++++ b/src/api-impl/android/graphics/Bitmap.java
+@@ -39,6 +39,8 @@
+ 		WEBP_LOSSLESS,
+ 	}
+ 
++	public static final int DENSITY_NONE = 0;
++	private int density = DisplayMetrics.DENSITY_DEVICE;
+ 	private int width;
+ 	private int height;
+ 	private int stride;
+@@ -68,23 +70,28 @@
+ 	}
+ 
+ 	public static Bitmap createBitmap(DisplayMetrics metrics, int width, int height, Config config) {
+-		return new Bitmap(width, height, config);
++		Bitmap bitmap = new Bitmap(width, height, config);
++		if (metrics != null) bitmap.setDensity(metrics.densityDpi);
++		return bitmap;
+ 	}
+ 
+ 	public static Bitmap createBitmap(DisplayMetrics metrics, int width, int height, Config config, boolean hasAlpha, ColorSpace colorSpace) {
+ 		Bitmap bitmap = new Bitmap(width, height, config);
+ 		bitmap.hasAlpha = hasAlpha;
++		if (metrics != null) bitmap.setDensity(metrics.densityDpi);
+ 		return bitmap;
+ 	}
+ 
+ 	public static Bitmap createBitmap(Bitmap src, int x, int y, int width, int height) {
+ 		Bitmap dest = new Bitmap(width, height, src.getConfig());
++		dest.density = src.density;
+ 		new Canvas(dest).drawBitmap(src, new Rect(x, y, x + width, y + height), new Rect(0, 0, width, height), null);
+ 		return dest;
+ 	}
+ 
+ 	public static Bitmap createBitmap(Bitmap src, int x, int y, int width, int height, Matrix matrix, boolean filter) {
+ 		Bitmap dest = new Bitmap(width, height, src.getConfig());
++		dest.density = src.density;
+ 		Canvas canvas = new Canvas(dest);
+ 		canvas.concat(matrix);
+ 		canvas.drawBitmap(src, new Rect(x, y, x + width, y + height), new Rect(0, 0, width, height), null);
+@@ -96,11 +103,14 @@
+ 	}
+ 
+ 	public static Bitmap createBitmap(Bitmap src) {
+-		return new Bitmap(native_ref_texture(src.getTexture()));
++		Bitmap bitmap = new Bitmap(native_ref_texture(src.getTexture()));
++		bitmap.density = src.density;
++		return bitmap;
+ 	}
+ 
+ 	public static Bitmap createScaledBitmap(Bitmap src, int dstWidth, int dstHeight, boolean filter) {
+ 		Bitmap dest = new Bitmap(dstWidth, dstHeight, src.getConfig());
++		dest.density = src.density;
+ 		new Canvas(dest).drawBitmap(src, new Rect(0, 0, src.getWidth(), src.getHeight()), new Rect(0, 0, dstWidth, dstHeight), null);
+ 		return dest;
+ 	}
+@@ -167,6 +177,7 @@
+ 		this.config = src.config;
+ 		this.hasAlpha = src.hasAlpha;
+ 		this.mutable = src.mutable;
++		this.density = src.density;
+ 		this.recycled = false;
+ 		src.texture = 0;
+ 		src.snapshot = 0;
+@@ -181,16 +192,30 @@
+ 		getTexture();
+ 	}
+ 
+-	public void setDensity(int density) {}
++	public void setDensity(int density) { this.density = density; }
++
++	public int getDensity() { return density; }
++
++	public static int scaleFromDensity(int size, int source, int target) {
++		return source == 0 || target == 0 || source == target ? size : (int)(((long)size * target + (source >> 1)) / source);
++	}
+ 
+ 	public int getScaledWidth(int density) {
+-		return width;
++		return scaleFromDensity(width, this.density, density);
+ 	}
+ 
+ 	public int getScaledHeight(int density) {
+-		return height;
++		return scaleFromDensity(height, this.density, density);
+ 	}
+ 
++	public int getScaledWidth(DisplayMetrics metrics) { return getScaledWidth(metrics.densityDpi); }
++
++	public int getScaledHeight(DisplayMetrics metrics) { return getScaledHeight(metrics.densityDpi); }
++
++	public int getScaledWidth(Canvas canvas) { return getScaledWidth(canvas.getDensity()); }
++
++	public int getScaledHeight(Canvas canvas) { return getScaledHeight(canvas.getDensity()); }
++
+ 	public boolean isRecycled() {
+ 		return recycled;
+ 	}
+@@ -206,6 +231,7 @@
+ 	public Bitmap copy(Bitmap.Config config, boolean isMutable) {
+ 		Bitmap bitmap = new Bitmap(width, height, config);
+ 		bitmap.texture = native_ref_texture(getTexture());
++		bitmap.density = density;
+ 		return bitmap;
+ 	}
+ 
+--- a/src/api-impl/android/graphics/drawable/BitmapDrawable.java
++++ b/src/api-impl/android/graphics/drawable/BitmapDrawable.java
+@@ -22,11 +22,18 @@
+ public class BitmapDrawable extends Drawable {
+ 
+ 	private Bitmap bitmap;
+-	/* JavaPaintable that renders through draw(Canvas) so tint/alpha reach
++	private int targetDensity = android.util.DisplayMetrics.DENSITY_DEFAULT;
++	private int layoutDirection;
++	private int gravity = android.view.Gravity.FILL;
++	/* JavaPaintable used for gravity, tint or alpha through draw(Canvas) so tint/alpha reach
+ 	 * GskCanvas.drawBitmap. The base native_constructor() returns 0 for
+ 	 * classes that override draw(), so we create one lazily and keep our own
+ 	 * ref, because setPaintable() unrefs the previous paintable. */
+ 	private long javaPaintable;
++	private long texturePaintable;
++	private Bitmap textureBitmap;
++	private long textureHandle;
++	private int textureWidth, textureHeight, textureDensity, bitmapDensity;
+ 	private int alpha = 255;
+ 	private ColorFilter colorFilter;
+ 
+@@ -35,31 +42,44 @@
+ 
+ 	public BitmapDrawable(Resources res, Bitmap bitmap) {
+ 		this.bitmap = bitmap;
++		targetDensity = resolveDensity(res, targetDensity);
+ 		if (bitmap != null)
+-			setPaintable(bitmap.getTexture());
++			applyChanges();
+ 	}
+ 
+ 	public BitmapDrawable(Bitmap bitmap) {
+ 		this.bitmap = bitmap;
+ 		if (bitmap != null)
+-			setPaintable(bitmap.getTexture());
+-	}
+-
+-	private boolean needsJavaPaintable() {
+-		return colorFilter != null || alpha != 255;
++			applyChanges();
+ 	}
+ 
+ 	private void applyChanges() {
+ 		long target = 0;
+ 		if (bitmap != null) {
+-			if (needsJavaPaintable()) {
+-				if (javaPaintable == 0) {
+-					javaPaintable = native_new_java_paintable();
+-					native_ref(javaPaintable);
++			// Java drawing preserves gravity and logical intrinsic size in GTK snapshots.
++			if (gravity == android.view.Gravity.FILL && colorFilter == null && alpha == 255) {
++				long texture = bitmap.getTexture();
++				int width = getIntrinsicWidth(), height = getIntrinsicHeight();
++				if (texturePaintable == 0 || textureBitmap != bitmap || textureHandle != texture
++						|| textureWidth != width || textureHeight != height
++						|| textureDensity != targetDensity || bitmapDensity != bitmap.getDensity()) {
++					long replacement = native_new_texture_paintable(texture, width, height);
++					if (texturePaintable != 0)
++						native_unref(texturePaintable);
++					texturePaintable = replacement;
++					textureBitmap = bitmap;
++					textureHandle = texture;
++					textureWidth = width;
++					textureHeight = height;
++					textureDensity = targetDensity;
++					bitmapDensity = bitmap.getDensity();
+ 				}
++				target = texturePaintable;
++			} else {
++				if (javaPaintable == 0)
++					javaPaintable = native_new_java_paintable();
+ 				target = javaPaintable;
+-			} else
+-				target = bitmap.getTexture();
++			}
+ 		}
+ 		if (target != paintable)
+ 			setPaintable(target);
+@@ -72,7 +92,8 @@
+ 			super.draw(canvas);
+ 			return;
+ 		}
+-		Rect bounds = getBounds();
++		Rect bounds = new Rect();
++		android.view.Gravity.apply(gravity, getIntrinsicWidth(), getIntrinsicHeight(), getBounds(), bounds, getLayoutDirection());
+ 		if (bounds.isEmpty())
+ 			return;
+ 		Paint paint = new Paint();
+@@ -125,12 +146,16 @@
+ 		return new ConstantState() {
+ 			@Override
+ 			public Drawable newDrawable(Resources res) {
+-				return new BitmapDrawable(res, bitmap);
++				BitmapDrawable result = new BitmapDrawable(res, bitmap);
++				result.setGravity(gravity);
++				return result;
+ 			}
+ 
+ 			@Override
+ 			public Drawable newDrawable() {
+-				return new BitmapDrawable(null, bitmap);
++				BitmapDrawable result = (BitmapDrawable)newDrawable(null);
++				result.setTargetDensity(targetDensity);
++				return result;
+ 			}
+ 
+ 			@Override
+@@ -145,6 +170,8 @@
+ 		try {
+ 			if (javaPaintable != 0)
+ 				native_unref(javaPaintable);
++			if (texturePaintable != 0)
++				native_unref(texturePaintable);
+ 		} finally {
+ 			super.finalize();
+ 		}
+@@ -156,7 +183,9 @@
+ 
+ 	public void inflate(Resources r, XmlPullParser parser, AttributeSet attrs, Theme theme)
+ 	    throws XmlPullParserException, IOException {
++		targetDensity = resolveDensity(r, targetDensity);
+ 		final TypedArray a = obtainAttributes(r, theme, attrs, R.styleable.BitmapDrawable);
++		gravity = a.getInt(R.styleable.BitmapDrawable_gravity, android.view.Gravity.FILL);
+ 		if (a.hasValue(R.styleable.BitmapDrawable_src)) {
+ 			BitmapDrawable dr = null;
+ 			try {
+@@ -179,14 +208,14 @@
+ 	public int getIntrinsicWidth() {
+ 		if (bitmap == null)
+ 			return 0;
+-		return bitmap.getWidth();
++		return bitmap.getScaledWidth(targetDensity);
+ 	}
+ 
+ 	@Override
+ 	public int getIntrinsicHeight() {
+ 		if (bitmap == null)
+ 			return 0;
+-		return bitmap.getHeight();
++		return bitmap.getScaledHeight(targetDensity);
+ 	}
+ 
+ 	public void setTileModeX(Shader.TileMode mode) {}
+@@ -195,5 +224,29 @@
+ 		return new Paint();
+ 	}
+ 
+-	public void setGravity(int g) {}
++	public void setGravity(int g) { gravity = g; applyChanges(); }
++
++	@Override
++	public int getLayoutDirection() { return layoutDirection; }
++
++	@Override
++	public boolean setLayoutDirection(int direction) {
++		if (layoutDirection == direction) return false;
++		layoutDirection = direction;
++		invalidateSelf();
++		return true;
++	}
++
++	public void setTargetDensity(int density) {
++		targetDensity = density == 0 ? android.util.DisplayMetrics.DENSITY_DEFAULT : density;
++		applyChanges();
++	}
++
++	public void setTargetDensity(android.util.DisplayMetrics metrics) { setTargetDensity(metrics.densityDpi); }
++
++	public void setTargetDensity(Canvas canvas) { setTargetDensity(canvas.getDensity()); }
++
++	private native long native_new_texture_paintable(long texture, int width, int height);
++
++	public int getGravity() { return gravity; }
+ }
+--- a/src/api-impl/android/graphics/drawable/DrawableContainer.java
++++ b/src/api-impl/android/graphics/drawable/DrawableContainer.java
+@@ -2,11 +2,33 @@
+ 
+ import android.content.res.Resources;
+ import android.graphics.Canvas;
++import android.graphics.Rect;
+ 
+ public class DrawableContainer extends Drawable {
+ 
+ 	private DrawableContainerState state;
+ 	private int curIndex = -1;
++	protected boolean mVariablePadding;
++
++	@Override
++	public boolean getPadding(Rect padding) {
++		if (mVariablePadding)
++			return curIndex >= 0 ? state.drawables[curIndex].getPadding(padding) : super.getPadding(padding);
++		padding.set(0, 0, 0, 0);
++		Rect child = new Rect();
++		if (state != null) {
++			for (int i = 0; i < state.childCount; i++) {
++				if (state.drawables[i] != null && state.drawables[i].getPadding(child)) {
++					padding.left = Math.max(padding.left, child.left);
++					padding.top = Math.max(padding.top, child.top);
++					padding.right = Math.max(padding.right, child.right);
++					padding.bottom = Math.max(padding.bottom, child.bottom);
++				}
++			}
++		}
++		return (padding.left | padding.top | padding.right | padding.bottom) != 0;
++	}
++
+ 
+ 	protected native long native_constructor();
+ 	protected native void native_selectChild(long container, long child);
+--- a/src/api-impl/android/graphics/drawable/Drawable.java
++++ b/src/api-impl/android/graphics/drawable/Drawable.java
+@@ -331,7 +331,8 @@
+ 	public static Drawable createFromResourceStream(Resources resources, TypedValue value, InputStream is, String file,
+ 	                                                Object object) {
+ 		if (!file.endsWith(".9.png")) {
+-			final Bitmap bm = BitmapFactory.decodeStream(is);
++			final Bitmap bm = BitmapFactory.decodeResourceStream(resources, value, is, null,
++				object instanceof BitmapFactory.Options ? (BitmapFactory.Options)object : null);
+ 			if (bm == null)
+ 				return null;
+ 			return new BitmapDrawable(resources, bm);
+@@ -367,6 +368,7 @@
+ 	public void setAlpha(int alpha) {}
+ 
+ 	public boolean getPadding(Rect padding) {
++		padding.set(0, 0, 0, 0);
+ 		return false;
+ 	}
+ 
+--- a/src/api-impl/android/graphics/drawable/DrawableWrapper.java
++++ b/src/api-impl/android/graphics/drawable/DrawableWrapper.java
+@@ -244,7 +244,7 @@
+ 
+ 	@Override
+ 	public boolean getPadding(@NonNull Rect padding) {
+-		return mDrawable != null && mDrawable.getPadding(padding);
++		return mDrawable != null ? mDrawable.getPadding(padding) : super.getPadding(padding);
+ 	}
+ 
+ 	/*@Override
+--- a/src/api-impl/android/graphics/drawable/InsetDrawable.java
++++ b/src/api-impl/android/graphics/drawable/InsetDrawable.java
+@@ -1,23 +1,71 @@
+ package android.graphics.drawable;
+ 
+ import android.content.res.Resources;
++import android.content.res.TypedArray;
++import android.util.AttributeSet;
++import android.util.TypedValue;
++import java.io.IOException;
++import org.xmlpull.v1.XmlPullParser;
++import org.xmlpull.v1.XmlPullParserException;
+ import android.graphics.Rect;
+ 
+ public class InsetDrawable extends DrawableWrapper {
++	private int mInsetLeft, mInsetTop, mInsetRight, mInsetBottom;
++	private float mFractionLeft, mFractionTop, mFractionRight, mFractionBottom;
+ 
+ 	public InsetDrawable(Drawable drawable, int insetLeft, int insetTop, int insetRight, int insetBottom) {
+ 		super(drawable);
++		mInsetLeft = insetLeft;
++		mInsetTop = insetTop;
++		mInsetRight = insetRight;
++		mInsetBottom = insetBottom;
+ 	}
+ 
+ 	public InsetDrawable(Drawable drawable, int inset) {
+-		super(drawable);
++		this(drawable, inset, inset, inset, inset);
+ 	}
+ 
+ 	InsetDrawable() {
+ 		super(new InsetState(null, null), null);
+ 	}
+ 
+-	public boolean getPadding(Rect padding) { return false; }
++	@Override
++	public void inflate(Resources r, XmlPullParser parser, AttributeSet attrs, Resources.Theme theme)
++		throws XmlPullParserException, IOException {
++		TypedArray a = obtainAttributes(r, theme, attrs, com.android.internal.R.styleable.InsetDrawable);
++		int all = com.android.internal.R.styleable.InsetDrawable_inset;
++		int left = a.hasValue(com.android.internal.R.styleable.InsetDrawable_insetLeft) ? com.android.internal.R.styleable.InsetDrawable_insetLeft : all;
++		int top = a.hasValue(com.android.internal.R.styleable.InsetDrawable_insetTop) ? com.android.internal.R.styleable.InsetDrawable_insetTop : all;
++		int right = a.hasValue(com.android.internal.R.styleable.InsetDrawable_insetRight) ? com.android.internal.R.styleable.InsetDrawable_insetRight : all;
++		int bottom = a.hasValue(com.android.internal.R.styleable.InsetDrawable_insetBottom) ? com.android.internal.R.styleable.InsetDrawable_insetBottom : all;
++		mFractionLeft = fraction(a, left);
++		mFractionTop = fraction(a, top);
++		mFractionRight = fraction(a, right);
++		mFractionBottom = fraction(a, bottom);
++		mInsetLeft = dimension(a, left);
++		mInsetTop = dimension(a, top);
++		mInsetRight = dimension(a, right);
++		mInsetBottom = dimension(a, bottom);
++		a.recycle();
++		super.inflate(r, parser, attrs, theme);
++	}
++
++	private static float fraction(TypedArray a, int index) {
++		return a.getType(index) == TypedValue.TYPE_FRACTION ? a.getFraction(index, 1, 1, 0) : 0;
++	}
++
++	private static int dimension(TypedArray a, int index) {
++		return a.getType(index) == TypedValue.TYPE_FRACTION ? 0 : a.getDimensionPixelOffset(index, 0);
++	}
++
++	public boolean getPadding(Rect padding) {
++		boolean result = super.getPadding(padding);
++		padding.left += mInsetLeft + (int)(getBounds().width() * mFractionLeft);
++		padding.top += mInsetTop + (int)(getBounds().height() * mFractionTop);
++		padding.right += mInsetRight + (int)(getBounds().width() * mFractionRight);
++		padding.bottom += mInsetBottom + (int)(getBounds().height() * mFractionBottom);
++		return result || (padding.left | padding.top | padding.right | padding.bottom) != 0;
++	}
+ 
+ 	static final class InsetState extends DrawableWrapper.DrawableWrapperState {
+ 
+--- a/src/api-impl/android/graphics/drawable/LayerDrawable.java
++++ b/src/api-impl/android/graphics/drawable/LayerDrawable.java
+@@ -26,6 +26,7 @@
+ import android.graphics.Rect;
+ import android.util.AttributeSet;
+ import android.view.View;
++import android.view.Gravity;
+ import java.io.IOException;
+ import org.xmlpull.v1.XmlPullParser;
+ import org.xmlpull.v1.XmlPullParserException;
+@@ -57,6 +58,7 @@
+ 
+ 	private final Rect mTmpRect = new Rect();
+ 	private boolean mMutated;
++	private int mLayoutDirection;
+ 
+ 	/**
+ 	 * Create a new layer drawable with the list of specified layers.
+@@ -124,6 +126,7 @@
+ 
+ 		//setAutoMirrored(a.getBoolean(com.android.internal.R.styleable.LayerDrawable_autoMirrored, false));
+ 
++		mLayerState.mPaddingMode = a.getInt(com.android.internal.R.styleable.LayerDrawable_paddingMode, 0);
+ 		a.recycle();
+ 
+ 		final int innerDepth = parser.getDepth() + 1;
+@@ -148,6 +151,11 @@
+ 			    com.android.internal.R.styleable.LayerDrawableItem_right, 0);
+ 			int bottom = a.getDimensionPixelOffset(
+ 			    com.android.internal.R.styleable.LayerDrawableItem_bottom, 0);
++			int width = a.getDimensionPixelSize(com.android.internal.R.styleable.LayerDrawableItem_width, -1);
++			int height = a.getDimensionPixelSize(com.android.internal.R.styleable.LayerDrawableItem_height, -1);
++			int gravity = a.getInt(com.android.internal.R.styleable.LayerDrawableItem_gravity, Gravity.NO_GRAVITY);
++			int start = a.getDimensionPixelOffset(com.android.internal.R.styleable.LayerDrawableItem_start, Integer.MIN_VALUE);
++			int end = a.getDimensionPixelOffset(com.android.internal.R.styleable.LayerDrawableItem_end, Integer.MIN_VALUE);
+ 			int drawableRes = a.getResourceId(
+ 			    com.android.internal.R.styleable.LayerDrawableItem_drawable, 0);
+ 			int id = a.getResourceId(com.android.internal.R.styleable.LayerDrawableItem_id,
+@@ -168,12 +176,21 @@
+ 				dr = Drawable.createFromXmlInner(r, parser, attrs, theme);
+ 			}
+ 
+-			if (dr != null)
++			if (dr != null) {
+ 				addLayer(dr, id, left, top, right, bottom);
++				ChildDrawable child = mLayerState.mChildren[mLayerState.mNum - 1];
++				child.mWidth = width;
++				child.mHeight = height;
++				child.mGravity = gravity;
++				child.mInsetS = start;
++				child.mInsetE = end;
++			}
+ 		}
+ 
+ 		ensurePadding();
++		for (int i = 0; i < mLayerState.mNum; i++) reapplyPadding(i, mLayerState.mChildren[i]);
+ 		onStateChange(getState());
++		onBoundsChange(getBounds());
+ 	}
+ 
+ 	/**
+@@ -326,6 +343,7 @@
+ 		childDrawable.mInsetT = t;
+ 		childDrawable.mInsetR = r;
+ 		childDrawable.mInsetB = b;
++		onBoundsChange(getBounds());
+ 	}
+ 
+ 	// overrides from Drawable.Callback
+@@ -380,12 +398,19 @@
+ 		final int N = mLayerState.mNum;
+ 		for (int i = 0; i < N; i++) {
+ 			reapplyPadding(i, array[i]);
+-			padding.left += mPaddingL[i];
+-			padding.top += mPaddingT[i];
+-			padding.right += mPaddingR[i];
+-			padding.bottom += mPaddingB[i];
++			if (mLayerState.mPaddingMode == 0) {
++				padding.left += mPaddingL[i];
++				padding.top += mPaddingT[i];
++				padding.right += mPaddingR[i];
++				padding.bottom += mPaddingB[i];
++			} else {
++				padding.left = Math.max(padding.left, mPaddingL[i]);
++				padding.top = Math.max(padding.top, mPaddingT[i]);
++				padding.right = Math.max(padding.right, mPaddingR[i]);
++				padding.bottom = Math.max(padding.bottom, mPaddingB[i]);
++			}
+ 		}
+-		return true;
++		return padding.left != 0 || padding.top != 0 || padding.right != 0 || padding.bottom != 0;
+ 	}
+ 
+ 	@Override
+@@ -530,14 +555,29 @@
+ 		int padL = 0, padT = 0, padR = 0, padB = 0;
+ 		for (int i = 0; i < N; i++) {
+ 			final ChildDrawable r = array[i];
+-			r.mDrawable.setBounds(bounds.left + r.mInsetL + padL,
+-			                      bounds.top + r.mInsetT + padT,
+-			                      bounds.right - r.mInsetR - padR,
+-			                      bounds.bottom - r.mInsetB - padB);
+-			padL += mPaddingL[i];
+-			padR += mPaddingR[i];
+-			padT += mPaddingT[i];
+-			padB += mPaddingB[i];
++			boolean rtl = getLayoutDirection() == 1;
++			int left = rtl ? r.mInsetE : r.mInsetS;
++			int right = rtl ? r.mInsetS : r.mInsetE;
++			if (left == Integer.MIN_VALUE) left = r.mInsetL;
++			if (right == Integer.MIN_VALUE) right = r.mInsetR;
++			Rect container = new Rect(bounds.left + left + padL, bounds.top + r.mInsetT + padT,
++				bounds.right - right - padR, bounds.bottom - r.mInsetB - padB);
++			int iw = r.mDrawable.getIntrinsicWidth(), ih = r.mDrawable.getIntrinsicHeight();
++			int gravity = r.mGravity;
++			if (!Gravity.isHorizontal(gravity)) gravity |= r.mWidth < 0 ? Gravity.FILL_HORIZONTAL : Gravity.START;
++			if (!Gravity.isVertical(gravity)) gravity |= r.mHeight < 0 ? Gravity.FILL_VERTICAL : Gravity.TOP;
++			if (r.mWidth < 0 && iw < 0) gravity |= Gravity.FILL_HORIZONTAL;
++			if (r.mHeight < 0 && ih < 0) gravity |= Gravity.FILL_VERTICAL;
++			Rect out = new Rect();
++			Gravity.apply(gravity, r.mWidth < 0 ? iw : r.mWidth, r.mHeight < 0 ? ih : r.mHeight,
++				container, out, getLayoutDirection());
++			r.mDrawable.setBounds(out);
++			if (mLayerState.mPaddingMode == 0) {
++				padL += mPaddingL[i];
++				padR += mPaddingR[i];
++				padT += mPaddingT[i];
++				padB += mPaddingB[i];
++			}
+ 		}
+ 	}
+ 
+@@ -549,12 +589,19 @@
+ 		int padL = 0, padR = 0;
+ 		for (int i = 0; i < N; i++) {
+ 			final ChildDrawable r = array[i];
+-			int w = r.mDrawable.getIntrinsicWidth() + r.mInsetL + r.mInsetR + padL + padR;
++			int left = getLayoutDirection() == 1 ? r.mInsetE : r.mInsetS;
++			int right = getLayoutDirection() == 1 ? r.mInsetS : r.mInsetE;
++			if (left == Integer.MIN_VALUE) left = r.mInsetL;
++			if (right == Integer.MIN_VALUE) right = r.mInsetR;
++			int minWidth = r.mWidth < 0 ? r.mDrawable.getIntrinsicWidth() : r.mWidth;
++			int w = minWidth < 0 ? -1 : minWidth + left + right + padL + padR;
+ 			if (w > width) {
+ 				width = w;
+ 			}
+-			padL += mPaddingL[i];
+-			padR += mPaddingR[i];
++			if (mLayerState.mPaddingMode == 0) {
++				padL += mPaddingL[i];
++				padR += mPaddingR[i];
++			}
+ 		}
+ 		return width;
+ 	}
+@@ -567,18 +614,22 @@
+ 		int padT = 0, padB = 0;
+ 		for (int i = 0; i < N; i++) {
+ 			final ChildDrawable r = array[i];
+-			int h = r.mDrawable.getIntrinsicHeight() + r.mInsetT + r.mInsetB + +padT + padB;
++			int minHeight = r.mHeight < 0 ? r.mDrawable.getIntrinsicHeight() : r.mHeight;
++			int h = minHeight < 0 ? -1 : minHeight + r.mInsetT + r.mInsetB + padT + padB;
+ 			if (h > height) {
+ 				height = h;
+ 			}
+-			padT += mPaddingT[i];
+-			padB += mPaddingB[i];
++			if (mLayerState.mPaddingMode == 0) {
++				padT += mPaddingT[i];
++				padB += mPaddingB[i];
++			}
+ 		}
+ 		return height;
+ 	}
+ 
+ 	private boolean reapplyPadding(int i, ChildDrawable r) {
+ 		final Rect rect = mTmpRect;
++		rect.set(0, 0, 0, 0);
+ 		r.mDrawable.getPadding(rect);
+ 		if (rect.left != mPaddingL[i] || rect.top != mPaddingT[i]
+ 		    || rect.right != mPaddingR[i] || rect.bottom != mPaddingB[i]) {
+@@ -600,6 +651,7 @@
+ 		mPaddingT = new int[N];
+ 		mPaddingR = new int[N];
+ 		mPaddingB = new int[N];
++		for (int i = 0; i < N; i++) reapplyPadding(i, mLayerState.mChildren[i]);
+ 	}
+ 
+ 	/*@Override
+@@ -638,22 +690,39 @@
+ 		super.setLayoutDirection(layoutDirection);
+ 	}*/
+ 
+-	public void setLayerWidth(int index, int width) {}
++	@Override
++	public int getLayoutDirection() { return mLayoutDirection; }
++
++	@Override
++	public boolean setLayoutDirection(int direction) {
++		if (mLayoutDirection == direction) return false;
++		mLayoutDirection = direction;
++		for (int i = 0; i < mLayerState.mNum; i++)
++			mLayerState.mChildren[i].mDrawable.setLayoutDirection(direction);
++		onBoundsChange(getBounds());
++		invalidateSelf();
++		return true;
++	}
++
++	public void setLayerWidth(int index, int width) { mLayerState.mChildren[index].mWidth = width; onBoundsChange(getBounds()); }
+ 
+-	public void setLayerHeight(int index, int height) {}
++	public void setLayerHeight(int index, int height) { mLayerState.mChildren[index].mHeight = height; onBoundsChange(getBounds()); }
+ 
+-	public void setLayerGravity(int index, int gravity) {}
++	public void setLayerGravity(int index, int gravity) { mLayerState.mChildren[index].mGravity = gravity; onBoundsChange(getBounds()); }
+ 
+-	public void setPaddingMode(int paddingMode) {}
++	public void setPaddingMode(int paddingMode) { mLayerState.mPaddingMode = paddingMode; onBoundsChange(getBounds()); }
+ 
+ 	static class ChildDrawable {
+ 		public Drawable mDrawable;
+ 		public int mInsetL, mInsetT, mInsetR, mInsetB;
+ 		public int mId;
++		int mWidth = -1, mHeight = -1, mGravity;
++		int mInsetS = Integer.MIN_VALUE, mInsetE = Integer.MIN_VALUE;
+ 	}
+ 
+ 	static class LayerState extends ConstantState {
+ 		int mNum;
++		int mPaddingMode;
+ 		ChildDrawable[] mChildren;
+ 
+ 		int mChangingConfigurations;
+@@ -676,6 +745,7 @@
+ 				final int N = orig.mNum;
+ 
+ 				mNum = N;
++				mPaddingMode = orig.mPaddingMode;
+ 				mChildren = new ChildDrawable[N];
+ 
+ 				mChangingConfigurations = orig.mChangingConfigurations;
+@@ -696,6 +766,11 @@
+ 					r.mInsetR = or.mInsetR;
+ 					r.mInsetB = or.mInsetB;
+ 					r.mId = or.mId;
++					r.mWidth = or.mWidth;
++					r.mHeight = or.mHeight;
++					r.mGravity = or.mGravity;
++					r.mInsetS = or.mInsetS;
++					r.mInsetE = or.mInsetE;
+ 				}
+ 
+ 				mHaveOpacity = orig.mHaveOpacity;
+--- a/src/api-impl/android/graphics/drawable/NinePatchDrawable.java
++++ b/src/api-impl/android/graphics/drawable/NinePatchDrawable.java
+@@ -5,14 +5,48 @@
+ import android.graphics.Rect;
+ 
+ public class NinePatchDrawable extends Drawable {
++	private final Rect mPadding = new Rect();
++	private int mWidth = -1, mHeight = -1;
++	private int mOpacity = android.graphics.PixelFormat.TRANSLUCENT;
++
++	private void readInfo() {
++		if (paintable == 0)
++			return;
++		int[] info = nativeGetInfo(paintable);
++		mWidth = info[0];
++		mHeight = info[1];
++		mPadding.set(info[2], info[3], info[4], info[5]);
++		mOpacity = info[6];
++	}
++
++	@Override
++	public boolean getPadding(Rect padding) {
++		padding.set(mPadding);
++		return (padding.left | padding.top | padding.right | padding.bottom) != 0;
++	}
++
++	@Override
++	public int getIntrinsicWidth() { return mWidth; }
++
++	@Override
++	public int getIntrinsicHeight() { return mHeight; }
++
++	@Override
++	public int getOpacity() { return mOpacity; }
++
+ 
+ 	public NinePatchDrawable(Resources res, Bitmap bitmap, byte[] data, Rect padding, String name) {
+-		if (bitmap != null && data != null)
++		if (bitmap != null && data != null) {
+ 			setPaintable(nativeCreate(data, bitmap.getTexture()));
++			readInfo();
++		}
++		if (padding != null)
++			mPadding.set(padding);
+ 	}
+ 
+ 	NinePatchDrawable(String path) {
+ 		setPaintable(nativeCreate(path));
++		readInfo();
+ 	}
+ 
+ 	@Override
+@@ -20,6 +54,7 @@
+ 		nativeSetTint(paintable, tint);
+ 	}
+ 
++	private native int[] nativeGetInfo(long paintable);
+ 	private native long nativeCreate(byte[] data, long texture);
+ 	private native long nativeCreate(String path);
+ 	private native void nativeSetTint(long paintable, int tint);
+--- a/src/api-impl/android/graphics/drawable/RippleDrawable.java
++++ b/src/api-impl/android/graphics/drawable/RippleDrawable.java
+@@ -1,17 +1,41 @@
+ package android.graphics.drawable;
+ 
+ import android.content.res.ColorStateList;
++import android.content.res.Resources;
+ import android.graphics.Canvas;
+ import com.android.internal.R;
+ 
+ public class RippleDrawable extends LayerDrawable {
+ 
+ 	public RippleDrawable(ColorStateList colorStateList, Drawable drawable, Drawable drawable2) {
+-		super(drawable == null ? new Drawable[] {} : new Drawable[] {drawable});
++		super(drawable == null ? (drawable2 == null ? new Drawable[] {} : new Drawable[] {drawable2})
++			: (drawable2 == null ? new Drawable[] {drawable} : new Drawable[] {drawable, drawable2}));
++		if (drawable2 != null) setId(drawable == null ? 0 : 1, R.id.mask);
+ 	}
+ 
+ 	RippleDrawable() {}
+ 
++	private RippleDrawable(LayerState state, Resources res) {
++		super(state, res);
++	}
++
++	@Override
++	LayerState createConstantState(LayerState state, Resources res) {
++		return new RippleState(state, this, res);
++	}
++
++	static class RippleState extends LayerState {
++		RippleState(LayerState state, RippleDrawable owner, Resources res) {
++			super(state, owner, res);
++		}
++
++		@Override
++		public Drawable newDrawable() { return new RippleDrawable(this, null); }
++
++		@Override
++		public Drawable newDrawable(Resources res) { return new RippleDrawable(this, res); }
++	}
++
+ 	public void setColor(ColorStateList colorStateList) {}
+ 
+ 	public void setRadius(int radius) {}
+--- a/src/api-impl/android/graphics/drawable/StateListDrawable.java
++++ b/src/api-impl/android/graphics/drawable/StateListDrawable.java
+@@ -105,6 +105,7 @@
+ 	public void inflate(Resources r, XmlPullParser parser, AttributeSet attrs, Theme theme)
+ 	    throws XmlPullParserException, IOException {
+ 		final TypedArray a = r.obtainAttributes(attrs, R.styleable.StateListDrawable);
++		mVariablePadding = a.getBoolean(R.styleable.StateListDrawable_variablePadding, false);
+ 		a.recycle();
+ 
+ 		inflateChildElements(r, parser, attrs, theme);
+--- a/src/api-impl/android/view/View.java
++++ b/src/api-impl/android/view/View.java
+@@ -976,6 +976,7 @@
+ 	private int minWidth = 0;
+ 	private int minHeight = 0;
+ 
++	private boolean mPaddingLeftDefined, mPaddingTopDefined, mPaddingRightDefined, mPaddingBottomDefined;
+ 	protected int paddingLeft = 0;
+ 	protected int paddingTop = 0;
+ 	protected int paddingRight = 0;
+@@ -1098,16 +1099,16 @@
+ 				paddingTop = paddingVertical;
+ 				paddingBottom = paddingVertical;
+ 			} else {
+-				paddingTop = a.getDimensionPixelSize(com.android.internal.R.styleable.View_paddingTop, 0);
+-				paddingBottom = a.getDimensionPixelSize(com.android.internal.R.styleable.View_paddingBottom, 0);
++				paddingTop = a.getDimensionPixelSize(com.android.internal.R.styleable.View_paddingTop, paddingTop);
++				paddingBottom = a.getDimensionPixelSize(com.android.internal.R.styleable.View_paddingBottom, paddingBottom);
+ 			}
+ 
+ 			if (paddingHorizontal >= 0) {
+ 				paddingLeft = paddingHorizontal;
+ 				paddingRight = paddingHorizontal;
+ 			} else {
+-				paddingLeft = a.getDimensionPixelSize(com.android.internal.R.styleable.View_paddingLeft, 0);
+-				paddingRight = a.getDimensionPixelSize(com.android.internal.R.styleable.View_paddingRight, 0);
++				paddingLeft = a.getDimensionPixelSize(com.android.internal.R.styleable.View_paddingLeft, paddingLeft);
++				paddingRight = a.getDimensionPixelSize(com.android.internal.R.styleable.View_paddingRight, paddingRight);
+ 
+ 				if (paddingStart >= 0)
+ 					paddingLeft = paddingStart;
+@@ -1117,6 +1118,10 @@
+ 			}
+ 		}
+ 
++		mPaddingLeftDefined = padding >= 0 || paddingHorizontal >= 0 || a.hasValue(com.android.internal.R.styleable.View_paddingLeft) || paddingStart >= 0;
++		mPaddingRightDefined = padding >= 0 || paddingHorizontal >= 0 || a.hasValue(com.android.internal.R.styleable.View_paddingRight) || paddingEnd >= 0;
++		mPaddingTopDefined = padding >= 0 || paddingVertical >= 0 || a.hasValue(com.android.internal.R.styleable.View_paddingTop);
++		mPaddingBottomDefined = padding >= 0 || paddingVertical >= 0 || a.hasValue(com.android.internal.R.styleable.View_paddingBottom);
+ 		native_setPadding(widget, paddingLeft, paddingTop, paddingRight, paddingBottom);
+ 
+ 		if (a.hasValue(com.android.internal.R.styleable.View_tag))
+@@ -1434,6 +1439,11 @@
+ 	}
+ 
+ 	public void setPadding(int left, int top, int right, int bottom) {
++		mPaddingLeftDefined = mPaddingTopDefined = mPaddingRightDefined = mPaddingBottomDefined = true;
++		internalSetPadding(left, top, right, bottom);
++	}
++
++	private void internalSetPadding(int left, int top, int right, int bottom) {
+ 		paddingLeft = left;
+ 		paddingTop = top;
+ 		paddingRight = right;
+@@ -1740,6 +1750,15 @@
+ 
+ 	public void setBackgroundDrawable(Drawable backgroundDrawable) {
+ 		this.background = backgroundDrawable;
++		if (backgroundDrawable != null) {
++			Rect padding = new Rect();
++			if (backgroundDrawable.getPadding(padding)) {
++				internalSetPadding(mPaddingLeftDefined ? paddingLeft : padding.left,
++					mPaddingTopDefined ? paddingTop : padding.top,
++					mPaddingRightDefined ? paddingRight : padding.right,
++					mPaddingBottomDefined ? paddingBottom : padding.bottom);
++			}
++		}
+ 		if (backgroundDrawable instanceof ColorDrawable) {
+ 			native_setBackgroundColor(widget, ((ColorDrawable)backgroundDrawable).getColor());
+ 			return;
+@@ -2160,7 +2179,12 @@
+ 		postInvalidate();
+ 	}
+ 
+-	public void setPaddingRelative(int start, int top, int end, int bottom) {}
++	public void setPaddingRelative(int start, int top, int end, int bottom) {
++		if (getLayoutDirection() == LAYOUT_DIRECTION_RTL)
++			setPadding(end, top, start, bottom);
++		else
++			setPadding(start, top, end, bottom);
++	}
+ 
+ 	private native boolean nativeIsAttachedToWindow(long widget);
+ 	public boolean isAttachedToWindow() {
+--- a/src/api-impl/android/widget/Button.java
++++ b/src/api-impl/android/widget/Button.java
+@@ -15,7 +15,7 @@
+ 	}
+ 
+ 	public Button(Context context, AttributeSet attributeSet) {
+-		this(context, attributeSet, 0);
++		this(context, attributeSet, com.android.internal.R.attr.buttonStyle);
+ 	}
+ 
+ 	public Button(Context context, AttributeSet attrs, int defStyleAttr) {
+@@ -25,7 +25,7 @@
+ 	public Button(Context context, AttributeSet attrs, int defStyleAttr, int defStyleRes) {
+ 		super(context, attrs, defStyleAttr, defStyleRes);
+ 
+-		TypedArray a = context.obtainStyledAttributes(attrs, com.android.internal.R.styleable.TextView, 0, 0);
++		TypedArray a = context.obtainStyledAttributes(attrs, com.android.internal.R.styleable.TextView, defStyleAttr, defStyleRes);
+ 		if (a.hasValue(com.android.internal.R.styleable.TextView_text)) {
+ 			setText(a.getText(com.android.internal.R.styleable.TextView_text));
+ 		}
+@@ -50,11 +50,12 @@
+ 
+ 	@Override
+ 	public void setText(CharSequence text) {
+-		native_setText(widget, String.valueOf(text));
++		if (this instanceof CompoundButton) native_setText(widget, text == null ? "" : text.toString());
++		super.setText(text);
+ 	}
+ 
+ 	@Override
+-	public native CharSequence getText();
++	public CharSequence getText() { return super.getText(); }
+ 
+ 
+ 	@Override
+--- a/src/api-impl/android/widget/EditText.java
++++ b/src/api-impl/android/widget/EditText.java
+@@ -9,11 +9,15 @@
+ 
+ public class EditText extends TextView {
+ 	public EditText(Context context) {
+-		super(context);
++		this(context, null);
+ 	}
+ 
+ 	public EditText(Context context, AttributeSet attrs) {
+-		super(context, attrs);
++		this(context, attrs, com.android.internal.R.attr.editTextStyle);
++	}
++
++	public EditText(Context context, AttributeSet attrs, int defStyle) {
++		this(context, attrs, defStyle, 0);
+ 	}
+ 
+ 	public EditText(Context context, AttributeSet attrs, int defStyle, int defStyleRes) {
+@@ -40,7 +44,7 @@
+ 
+ 	@Override
+ 	public void setText(CharSequence text) {
+-		native_setText(widget, text == null ? "" : text.toString());
++		super.setText(text);
+ 	}
+ 
+ 	@Override
+@@ -63,12 +67,12 @@
+ 
+ 	@Override
+ 	public void setHint(CharSequence s) {
+-		native_setHint(widget, s == null ? "" : s.toString());
++		super.setHint(s);
+ 	}
+ 
+ 	@Override
+ 	public CharSequence getHint() {
+-		return native_getHint(widget);
++		return super.getHint();
+ 	}
+ 
+ 	public void selectAll() {}
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -45,8 +45,9 @@
+ 	private float shadowDx;
+ 	private float shadowDy;
+ 	private int shadowColor;
+-	private ColorStateList colors = new ColorStateList(new int[][] {new int[0]}, new int[1]);
++	private ColorStateList colors = ColorStateList.valueOf(Color.BLACK);
+ 	private CharSequence text = "";
++	private CharSequence hint;
+ 	private TextPaint paint = new TextPaint();
+ 	private boolean include_padding = false;
+ 	private int break_strategy = 0 /*BREAK_STRATEGY_SIMPLE*/;
+@@ -85,7 +86,7 @@
+ 		super(context, attrs, defStyleAttr, defStyleRes);
+ 
+ 		setTextSize(16);
+-		TypedArray a = context.obtainStyledAttributes(attrs, com.android.internal.R.styleable.TextView, defStyleAttr, 0);
++		TypedArray a = context.obtainStyledAttributes(attrs, com.android.internal.R.styleable.TextView, defStyleAttr, defStyleRes);
+ 		try {
+ 			if (a.hasValue(com.android.internal.R.styleable.TextView_text)) {
+ 				setText(a.getText(com.android.internal.R.styleable.TextView_text));
+@@ -103,11 +104,15 @@
+ 				if (aa.hasValue(com.android.internal.R.styleable.TextAppearance_textSize)) {
+ 					setTextSize(TypedValue.COMPLEX_UNIT_PX, aa.getDimensionPixelSize(com.android.internal.R.styleable.TextAppearance_textSize, 10));
+ 				}
++				if (aa.hasValue(com.android.internal.R.styleable.TextAppearance_textColorHint))
++					setHintTextColor(aa.getColorStateList(com.android.internal.R.styleable.TextAppearance_textColorHint));
+ 				aa.recycle();
+ 			}
+ 			if (a.hasValue(com.android.internal.R.styleable.TextView_textColor)) {
+ 				setTextColor(a.getColorStateList(com.android.internal.R.styleable.TextView_textColor));
+ 			}
++			if (a.hasValue(com.android.internal.R.styleable.TextView_textColorHint))
++				setHintTextColor(a.getColorStateList(com.android.internal.R.styleable.TextView_textColorHint));
+ 			if (a.hasValue(com.android.internal.R.styleable.TextView_textSize)) {
+ 				setTextSize(TypedValue.COMPLEX_UNIT_PX, a.getDimensionPixelSize(com.android.internal.R.styleable.TextView_textSize, 10));
+ 			}
+@@ -160,11 +165,11 @@
+ 
+ 	public void setText(CharSequence text, BufferType type) {
+ 		this.text = text == null ? "" : text;
+-		native_setText(text != null ? text.toString() : null);
++		if (this instanceof EditText) native_setText(this.text.toString());
++		updateDisplayedText();
+         fitAutoSizeText();
+ 
+-		if (text instanceof android.text.Spanned)
+-			native_set_markup(1);
++		native_set_markup(0);
+ 		if (!isLayoutRequested())
+ 			requestLayout();
+ 	}
+@@ -201,12 +206,12 @@
+ 	public native final void native_setTextColor(int color);
+ 	public void setTextColor(int color) {
+         colors = ColorStateList.valueOf(color);
+-		native_setTextColor(color);
++		updateDisplayedText();
+ 	}
+ 	public void setTextColor(ColorStateList colors) {
+ 		if (colors != null) {
+ 			this.colors = colors;
+-			native_setTextColor(colors.getDefaultColor()); // TODO: do this properly
++			updateDisplayedText();
+ 		}
+ 	}
+ 	public void setTypeface(Typeface tf, int style) {
+@@ -253,8 +258,10 @@
+ 		return null;
+ 	}
+ 
+-	public void setHintTextColor(ColorStateList colors) { if (colors != null) hintColors = colors; }
+-	public void setHintTextColor(int color) { hintColors = ColorStateList.valueOf(color); }
++	public void setHintTextColor(ColorStateList colors) {
++		if (colors != null) { hintColors = colors; updateDisplayedText(); }
++	}
++	public void setHintTextColor(int color) { setHintTextColor(ColorStateList.valueOf(color)); }
+ 	public void setLinkTextColor(ColorStateList colorStateList) {}
+ 
+ 	public void setSingleLine() { setSingleLine(true); }
+@@ -449,7 +456,7 @@
+ 		return new BaseMovementMethod();
+ 	}
+ 
+-	public CharSequence getHint() { return "HINT"; }
++	public CharSequence getHint() { return hint; }
+ 
+ 	public int getMinHeight() { return 0; }
+ 	public int getMinWidth() { return 0; }
+@@ -508,7 +515,33 @@
+ 
+ 	public void setCompoundDrawablesWithIntrinsicBounds(Drawable left, Drawable top, Drawable right, Drawable bottom) {}
+ 
+-	public void setHint(CharSequence s) {}
++	public void setHint(CharSequence s) {
++		hint = s;
++		updateDisplayedText();
++		requestLayout();
++		invalidate();
++	}
++
++	private void updateDisplayedText() {
++		if (colors == null || hintColors == null) return;
++		boolean showingHint = text.length() == 0 && hint != null;
++		if (!(this instanceof EditText)) native_setText(text.toString());
++		native_setHint(hint == null ? null : hint.toString(), getCurrentHintTextColor(), showingHint);
++		native_setTextColor(this instanceof EditText || !showingHint ? getCurrentTextColor() : getCurrentHintTextColor());
++	}
++
++	private native void native_setHint(String hint, int color, boolean showingHint);
++
++	@Override
++	protected void drawableStateChanged() {
++		super.drawableStateChanged();
++		updateDisplayedText();
++	}
++
++	@Override
++	public int getBaseline() { return native_getBaseline(getMeasuredWidth(), getMeasuredHeight()); }
++
++	private native int native_getBaseline(int width, int height);
+ 
+ 	public Drawable[] getCompoundDrawablesRelative() { return new Drawable[4]; }
+ 
+--- a/src/api-impl-jni/android_content_res_AssetManager.c
++++ b/src/api-impl-jni/android_content_res_AssetManager.c
+@@ -185,6 +185,7 @@
+ 		                                       &outSpecFlags, &ref);
+ 	}
+ 	if (cookie >= 0) {
++		_SET_INT_FIELD(outValue, "density", outConfig.density);
+ 		_SET_INT_FIELD(outValue, "type", value.dataType);
+ 		_SET_INT_FIELD(outValue, "data", value.data);
+ 		_SET_INT_FIELD(outValue, "resourceId", resId);
+@@ -673,3 +674,21 @@
+ 	free(locales);
+ 	return array;
+ }
++
++extern GtkWindow *window;
++JNIEXPORT jint JNICALL Java_android_content_res_AssetManager_nativeAssetScale(JNIEnv *env, jclass clazz)
++{
++	if (window)
++		return MAX(1, gtk_widget_get_scale_factor(GTK_WIDGET(window)));
++	GdkDisplay *display = gdk_display_get_default();
++	if (display) {
++		GListModel *monitors = gdk_display_get_monitors(display);
++		GdkMonitor *monitor = g_list_model_get_item(monitors, 0);
++		if (monitor) {
++			int scale = MAX(1, gdk_monitor_get_scale_factor(monitor));
++			g_object_unref(monitor);
++			return scale;
++		}
++	}
++	return 1;
++}
+--- a/src/api-impl-jni/generated_headers/android_content_res_AssetManager.h
++++ b/src/api-impl-jni/generated_headers/android_content_res_AssetManager.h
+@@ -387,6 +387,14 @@
+ JNIEXPORT void JNICALL Java_android_content_res_AssetManager_native_1setApkAssets
+   (JNIEnv *, jobject, jobjectArray, jint);
+ 
++/*
++ * Class:     android_content_res_AssetManager
++ * Method:    nativeAssetScale
++ * Signature: ()I
++ */
++JNIEXPORT jint JNICALL Java_android_content_res_AssetManager_nativeAssetScale
++  (JNIEnv *, jclass);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/src/api-impl-jni/generated_headers/android_graphics_drawable_BitmapDrawable.h
++++ b/src/api-impl-jni/generated_headers/android_graphics_drawable_BitmapDrawable.h
+@@ -0,0 +1,21 @@
++/* DO NOT EDIT THIS FILE - it is machine generated */
++#include <jni.h>
++/* Header for class android_graphics_drawable_BitmapDrawable */
++
++#ifndef _Included_android_graphics_drawable_BitmapDrawable
++#define _Included_android_graphics_drawable_BitmapDrawable
++#ifdef __cplusplus
++extern "C" {
++#endif
++/*
++ * Class:     android_graphics_drawable_BitmapDrawable
++ * Method:    native_new_texture_paintable
++ * Signature: (JII)J
++ */
++JNIEXPORT jlong JNICALL Java_android_graphics_drawable_BitmapDrawable_native_1new_1texture_1paintable
++  (JNIEnv *, jobject, jlong, jint, jint);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- a/src/api-impl-jni/generated_headers/android_graphics_drawable_NinePatchDrawable.h
++++ b/src/api-impl-jni/generated_headers/android_graphics_drawable_NinePatchDrawable.h
+@@ -9,6 +9,14 @@
+ #endif
+ /*
+  * Class:     android_graphics_drawable_NinePatchDrawable
++ * Method:    nativeGetInfo
++ * Signature: (J)[I
++ */
++JNIEXPORT jintArray JNICALL Java_android_graphics_drawable_NinePatchDrawable_nativeGetInfo
++  (JNIEnv *, jobject, jlong);
++
++/*
++ * Class:     android_graphics_drawable_NinePatchDrawable
+  * Method:    nativeCreate
+  * Signature: ([BJ)J
+  */
+--- a/src/api-impl-jni/generated_headers/android_widget_TextView.h
++++ b/src/api-impl-jni/generated_headers/android_widget_TextView.h
+@@ -259,6 +259,22 @@
+ JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setCompoundDrawables
+   (JNIEnv *, jobject, jlong, jlong, jlong, jlong, jlong);
+ 
++/*
++ * Class:     android_widget_TextView
++ * Method:    native_setHint
++ * Signature: (Ljava/lang/String;IZ)V
++ */
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setHint
++  (JNIEnv *, jobject, jstring, jint, jboolean);
++
++/*
++ * Class:     android_widget_TextView
++ * Method:    native_getBaseline
++ * Signature: (II)I
++ */
++JNIEXPORT jint JNICALL Java_android_widget_TextView_native_1getBaseline
++  (JNIEnv *, jobject, jint, jint);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/src/api-impl-jni/graphics/android_graphics_drawable_Drawable.c
++++ b/src/api-impl-jni/graphics/android_graphics_drawable_Drawable.c
+@@ -1,8 +1,9 @@
+-#include <gdk/gdk.h>
++#include <gtk/gtk.h>
+ 
+ #include "../defines.h"
+ #include "../util.h"
+ #include "../generated_headers/android_graphics_drawable_Drawable.h"
++#include "../generated_headers/android_graphics_drawable_BitmapDrawable.h"
+ 
+ JNIEXPORT jlong JNICALL Java_android_graphics_drawable_Drawable_native_1paintable_1from_1path(JNIEnv *env, jclass class, jstring pathStr)
+ {
+@@ -127,3 +128,76 @@
+ {
+ 	g_object_unref(G_OBJECT(_PTR(paintable_ptr)));
+ }
++
++struct _TexturePaintable {
++	GObject parent_instance;
++	GdkTexture *texture;
++	int width, height;
++};
++G_DECLARE_FINAL_TYPE(TexturePaintable, texture_paintable, TEXTURE, PAINTABLE, GObject)
++
++static void texture_paintable_snapshot(GdkPaintable *paintable, GdkSnapshot *snapshot, double width, double height)
++{
++	TexturePaintable *self = TEXTURE_PAINTABLE(paintable);
++	gtk_snapshot_append_texture(GTK_SNAPSHOT(snapshot), self->texture, &GRAPHENE_RECT_INIT(0, 0, width, height));
++}
++
++static int texture_paintable_get_intrinsic_width(GdkPaintable *paintable)
++{
++	return TEXTURE_PAINTABLE(paintable)->width;
++}
++
++static int texture_paintable_get_intrinsic_height(GdkPaintable *paintable)
++{
++	return TEXTURE_PAINTABLE(paintable)->height;
++}
++
++static double texture_paintable_get_intrinsic_aspect_ratio(GdkPaintable *paintable)
++{
++	TexturePaintable *self = TEXTURE_PAINTABLE(paintable);
++	return self->width > 0 && self->height > 0 ? (double)self->width / self->height : 0;
++}
++
++static GdkPaintableFlags texture_paintable_get_flags(GdkPaintable *paintable)
++{
++	return GDK_PAINTABLE_STATIC_SIZE | GDK_PAINTABLE_STATIC_CONTENTS;
++}
++
++static void texture_paintable_init(TexturePaintable *self)
++{
++}
++
++static void texture_paintable_paintable_init(GdkPaintableInterface *iface)
++{
++	iface->snapshot = texture_paintable_snapshot;
++	iface->get_intrinsic_width = texture_paintable_get_intrinsic_width;
++	iface->get_intrinsic_height = texture_paintable_get_intrinsic_height;
++	iface->get_intrinsic_aspect_ratio = texture_paintable_get_intrinsic_aspect_ratio;
++	iface->get_flags = texture_paintable_get_flags;
++}
++
++static void texture_paintable_dispose(GObject *object);
++
++static void texture_paintable_class_init(TexturePaintableClass *class)
++{
++	G_OBJECT_CLASS(class)->dispose = texture_paintable_dispose;
++}
++
++G_DEFINE_TYPE_WITH_CODE(TexturePaintable, texture_paintable, G_TYPE_OBJECT,
++                        G_IMPLEMENT_INTERFACE(GDK_TYPE_PAINTABLE, texture_paintable_paintable_init))
++
++static void texture_paintable_dispose(GObject *object)
++{
++	TexturePaintable *self = TEXTURE_PAINTABLE(object);
++	g_clear_object(&self->texture);
++	G_OBJECT_CLASS(texture_paintable_parent_class)->dispose(object);
++}
++
++JNIEXPORT jlong JNICALL Java_android_graphics_drawable_BitmapDrawable_native_1new_1texture_1paintable(JNIEnv *env, jobject this, jlong texture, jint width, jint height)
++{
++	TexturePaintable *paintable = g_object_new(texture_paintable_get_type(), NULL);
++	paintable->texture = g_object_ref(GDK_TEXTURE(_PTR(texture)));
++	paintable->width = width;
++	paintable->height = height;
++	return _INTPTR(paintable);
++}
+--- a/src/api-impl-jni/graphics/android_graphics_drawable_NinePatchDrawable.c
++++ b/src/api-impl-jni/graphics/android_graphics_drawable_NinePatchDrawable.c
+@@ -10,7 +10,11 @@
+ {
+ 	GdkTexture *texture = GDK_TEXTURE(_PTR(texture_ptr));
+ 	int size = (*env)->GetArrayLength(env, chunk_array);
++	if (size < sizeof(struct Res_png_9patch))
++		return 0;
+ 	struct Res_png_9patch *chunk = malloc(size);
++	if (!chunk)
++		return 0;
+ 	(*env)->GetByteArrayRegion(env, chunk_array, 0, size, (jbyte *)chunk);
+ 	GdkPaintable *paintable = ninepatch_paintable_new(chunk, size, g_object_ref(texture));
+ 	return _INTPTR(paintable);
+@@ -80,3 +84,33 @@
+ 	NinePatchPaintable *paintable = NINEPATCH_PAINTABLE(_PTR(paintable_ptr));
+ 	paintable->tint = color;
+ }
++
++JNIEXPORT jintArray JNICALL Java_android_graphics_drawable_NinePatchDrawable_nativeGetInfo(JNIEnv *env, jobject this, jlong paintable_ptr)
++{
++	NinePatchPaintable *paintable = NINEPATCH_PAINTABLE(_PTR(paintable_ptr));
++	struct Res_png_9patch *chunk = paintable->chunk;
++	jint values[7] = { paintable->width, paintable->height, 0, 0, 0, 0, -1 };
++	values[2] = chunk->wasDeserialized ? chunk->paddingLeft : (int32_t)ntohl(chunk->paddingLeft);
++	values[3] = chunk->wasDeserialized ? chunk->paddingTop : (int32_t)ntohl(chunk->paddingTop);
++	values[4] = chunk->wasDeserialized ? chunk->paddingRight : (int32_t)ntohl(chunk->paddingRight);
++	values[5] = chunk->wasDeserialized ? chunk->paddingBottom : (int32_t)ntohl(chunk->paddingBottom);
++	// GDK downloads native-endian premultiplied ARGB pixels.
++	gsize stride = (gsize)paintable->width * 4;
++	guint32 *pixels = g_try_malloc_n(stride, paintable->height);
++	if (pixels) {
++		gdk_texture_download(paintable->texture, (guchar *)pixels, stride);
++		for (gsize i = 0; i < (gsize)paintable->width * paintable->height; i++) {
++			if ((pixels[i] >> 24) != 255) {
++				values[6] = -3;
++				break;
++			}
++		}
++		g_free(pixels);
++	} else {
++		values[6] = -3;
++	}
++	jintArray result = (*env)->NewIntArray(env, 7);
++	if (result)
++		(*env)->SetIntArrayRegion(env, result, 0, 7, values);
++	return result;
++}
+--- a/src/api-impl-jni/text/android_text_Layout.c
++++ b/src/api-impl-jni/text/android_text_Layout.c
+@@ -9,6 +9,24 @@
+ 
+ extern GtkWidget *window;
+ 
++static int byte_to_utf16(const char *text, int bytes)
++{
++	int units = 0;
++	for (const char *p = text; p < text + bytes && *p; p = g_utf8_next_char(p))
++		units += g_utf8_get_char(p) > 0xffff ? 2 : 1;
++	return units;
++}
++
++static int utf16_to_byte(const char *text, int units)
++{
++	const char *p = text;
++	while (*p && units > 0) {
++		units -= g_utf8_get_char(p) > 0xffff ? 2 : 1;
++		p = g_utf8_next_char(p);
++	}
++	return p - text;
++}
++
+ JNIEXPORT jlong JNICALL Java_android_text_Layout_native_1constructor(JNIEnv *env, jobject object, jstring text, jlong paint, jint width)
+ {
+ 	struct AndroidPaint *android_paint = _PTR(paint);
+@@ -22,9 +40,11 @@
+ 	PangoLayout *layout = pango_layout_new(context);
+ 	g_object_unref(context);
+ 	pango_layout_set_font_description(layout, android_paint->font);
+-	const char *str = (*env)->GetStringUTFChars(env, text, NULL);
++	char *str = atl_jstring_to_utf8(env, text);
++	if (!str) { g_object_unref(layout); return 0; }
+ 	pango_layout_set_text(layout, str, -1);
+-	(*env)->ReleaseStringUTFChars(env, text, str);
++	g_free(str);
++	pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+ 	pango_layout_set_width(layout, width == -1 ? -1 : width * PANGO_SCALE);
+ 	return _INTPTR(layout);
+ }
+@@ -60,7 +80,7 @@
+ 	PangoLayout *pango_layout = _PTR(layout);
+ 	PangoLayoutLine *pango_line = pango_layout_get_line_readonly(pango_layout, line);
+ 	int byte_index = pango_layout_line_get_start_index(pango_line);
+-	return g_utf8_strlen(pango_layout_get_text(pango_layout), byte_index);
++	return byte_to_utf16(pango_layout_get_text(pango_layout), byte_index);
+ }
+ 
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1end(JNIEnv *env, jobject object, jlong layout, jint line)
+@@ -68,7 +88,7 @@
+ 	PangoLayout *pango_layout = _PTR(layout);
+ 	PangoLayoutLine *pango_line = pango_layout_get_line_readonly(pango_layout, line);
+ 	int byte_index = pango_layout_line_get_start_index(pango_line) + pango_layout_line_get_length(pango_line);
+-	return g_utf8_strlen(pango_layout_get_text(pango_layout), byte_index);
++	return byte_to_utf16(pango_layout_get_text(pango_layout), byte_index);
+ }
+ 
+ static void get_line_metrics(PangoLayout *pango_layout, jint line, int *baseline, PangoRectangle *logical_rect)
+@@ -196,12 +216,17 @@
+ 	do {
+ 		PangoLayoutLine *pango_line = pango_layout_iter_get_line_readonly(pango_iter);
+ 
+-		jstring text_jstr = (*env)->NewStringUTF(env, text + pango_line->start_index);
+-		jint end = (*env)->GetStringLength(env, text_jstr);
+-		if (pango_line->length < end)
+-			end = pango_line->length;
++		glong units;
++		gunichar2 *chars = g_utf8_to_utf16(text + pango_line->start_index, pango_line->length, NULL, &units, NULL);
++		if (!chars) break;
++		jstring text_jstr = (*env)->NewString(env, (const jchar *)chars, (jsize)units);
++		g_free(chars);
++		if (!text_jstr) break;
+ 		jfloat y = (float)pango_layout_iter_get_baseline(pango_iter) / PANGO_SCALE;
+-		(*env)->CallVoidMethod(env, canvas, handle_cache.canvas.drawText, text_jstr, (jint)0, end, (jfloat)0, y, paint);
++		PangoRectangle logical;
++		pango_layout_iter_get_line_extents(pango_iter, NULL, &logical);
++		(*env)->CallVoidMethod(env, canvas, handle_cache.canvas.drawText, text_jstr, (jint)0, (jint)units,
++			(jfloat)logical.x / PANGO_SCALE, y, paint);
+ 		(*env)->DeleteLocalRef(env, text_jstr);
+ 	} while (pango_layout_iter_next_line(pango_iter));
+ 
+@@ -212,7 +237,7 @@
+ {
+ 	PangoLayout *pango_layout = _PTR(layout);
+ 	int line;
+-	pango_layout_index_to_line_x(pango_layout, offset, FALSE, &line, NULL);
++	pango_layout_index_to_line_x(pango_layout, utf16_to_byte(pango_layout_get_text(pango_layout), offset), FALSE, &line, NULL);
+ 	return line;
+ }
+ 
+@@ -220,7 +245,7 @@
+ {
+ 	PangoLayout *pango_layout = _PTR(layout);
+ 	PangoRectangle cursor_rect;
+-	pango_layout_get_cursor_pos(pango_layout, offset, &cursor_rect, NULL);
++	pango_layout_get_cursor_pos(pango_layout, utf16_to_byte(pango_layout_get_text(pango_layout), offset), &cursor_rect, NULL);
+ 	return (jfloat)cursor_rect.x / PANGO_SCALE;
+ }
+ 
+@@ -228,7 +253,7 @@
+ {
+ 	PangoLayout *pango_layout = _PTR(layout);
+ 	PangoRectangle cursor_rect;
+-	pango_layout_get_cursor_pos(pango_layout, offset, NULL, &cursor_rect);
++	pango_layout_get_cursor_pos(pango_layout, utf16_to_byte(pango_layout_get_text(pango_layout), offset), NULL, &cursor_rect);
+ 	return (jfloat)cursor_rect.x / PANGO_SCALE;
+ }
+ 
+@@ -236,9 +261,12 @@
+ {
+ 	PangoLayout *pango_layout = _PTR(layout);
+ 	PangoLayoutLine *pango_line = pango_layout_get_line_readonly(pango_layout, line);
+-	int index;
+-	pango_layout_line_x_to_index(pango_line, x * PANGO_SCALE, &index, NULL);
+-	return index;
++	int index, trailing;
++	pango_layout_line_x_to_index(pango_line, x * PANGO_SCALE, &index, &trailing);
++	const char *text = pango_layout_get_text(pango_layout);
++	const char *cursor = text + index;
++	while (trailing-- > 0 && *cursor) cursor = g_utf8_next_char(cursor);
++	return byte_to_utf16(text, cursor - text);
+ }
+ 
+ JNIEXPORT jfloat JNICALL Java_android_text_Layout_native_1get_1desired_1width(JNIEnv *env, jclass class, jlong layout)
+--- a/src/api-impl-jni/util.c
++++ b/src/api-impl-jni/util.c
+@@ -367,3 +367,38 @@
+ 			return NULL;
+ 	}
+ }
++
++/* JNI modified UTF-8 encodes surrogate halves separately; Pango needs Unicode UTF-8. */
++char *atl_jstring_to_utf8(JNIEnv *env, jstring text)
++{
++	if (!text) return g_strdup("");
++	const jchar *chars = (*env)->GetStringChars(env, text, NULL);
++	if (!chars) return NULL;
++	jsize length = (*env)->GetStringLength(env, text);
++	GString *utf8 = g_string_sized_new(length);
++	for (jsize i = 0; i < length; i++) {
++		gunichar codepoint = chars[i];
++		if (codepoint >= 0xd800 && codepoint <= 0xdbff && i + 1 < length &&
++		    chars[i + 1] >= 0xdc00 && chars[i + 1] <= 0xdfff) {
++			codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (chars[++i] - 0xdc00);
++		} else if (codepoint >= 0xd800 && codepoint <= 0xdfff) {
++			codepoint = 0xfffd;
++		}
++		char encoded[6];
++		int bytes = g_unichar_to_utf8(codepoint, encoded);
++		g_string_append_len(utf8, encoded, bytes);
++	}
++	(*env)->ReleaseStringChars(env, text, chars);
++	return g_string_free(utf8, FALSE);
++}
++
++jstring atl_utf8_to_jstring(JNIEnv *env, const char *text)
++{
++	if (!text) return NULL;
++	glong length;
++	gunichar2 *chars = g_utf8_to_utf16(text, -1, NULL, &length, NULL);
++	if (!chars) return NULL;
++	jstring result = (*env)->NewString(env, (const jchar *)chars, (jsize)length);
++	g_free(chars);
++	return result;
++}
+--- a/src/api-impl-jni/util.h
++++ b/src/api-impl-jni/util.h
+@@ -11,6 +11,8 @@
+ extern JavaVM *jvm;
+ 
+ JNIEnv *get_jni_env(void);
++char *atl_jstring_to_utf8(JNIEnv *env, jstring text);
++jstring atl_utf8_to_jstring(JNIEnv *env, const char *text);
+ 
+ const char *attribute_set_get_string(JNIEnv *env, jobject attrs, char *attribute, char *schema);
+ int attribute_set_get_int(JNIEnv *env, jobject attrs, char *attribute, char *schema, int default_value);
+--- a/src/api-impl-jni/widgets/android_widget_EditText.c
++++ b/src/api-impl-jni/widgets/android_widget_EditText.c
+@@ -21,7 +21,7 @@
+ {
+ 	GtkText *gtk_text = GTK_TEXT(_PTR(widget_ptr));
+ 	const char *text = gtk_entry_buffer_get_text(gtk_text_get_buffer(gtk_text));
+-	return _JSTRING(text);
++	return atl_utf8_to_jstring(env, text);
+ }
+ 
+ struct changed_callback_data {
+@@ -108,22 +108,23 @@
+ 
+ JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setText(JNIEnv *env, jobject this, jlong widget_ptr, jstring text_jstr)
+ {
+-	const char *gtk_text = (*env)->GetStringUTFChars(env, text_jstr, NULL);
+-	jsize length = (*env)->GetStringUTFLength(env, text_jstr);
+-	gtk_entry_buffer_set_text(gtk_text_get_buffer(GTK_TEXT(_PTR(widget_ptr))), gtk_text, length);
+-	(*env)->ReleaseStringUTFChars(env, text_jstr, gtk_text);
++	char *gtk_text = atl_jstring_to_utf8(env, text_jstr);
++	if (!gtk_text) return;
++	gtk_entry_buffer_set_text(gtk_text_get_buffer(GTK_TEXT(_PTR(widget_ptr))), gtk_text, -1);
++	g_free(gtk_text);
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_widget_EditText_native_1setHint(JNIEnv *env, jobject this, jlong widget_ptr, jstring text_jstr)
+ {
+-	const char *text = (*env)->GetStringUTFChars(env, text_jstr, NULL);
++	char *text = atl_jstring_to_utf8(env, text_jstr);
++	if (!text) return;
+ 	gtk_text_set_placeholder_text(GTK_TEXT(_PTR(widget_ptr)), text);
+-	(*env)->ReleaseStringUTFChars(env, text_jstr, text);
++	g_free(text);
+ }
+ 
+ JNIEXPORT jstring JNICALL Java_android_widget_EditText_native_1getHint(JNIEnv *env, jobject this, jlong widget_ptr)
+ {
+ 	GtkText *gtk_text = GTK_TEXT(_PTR(widget_ptr));
+ 	const char *text = gtk_text_get_placeholder_text(gtk_text);
+-	return _JSTRING(text);
++	return atl_utf8_to_jstring(env, text);
+ }
+--- a/src/api-impl-jni/widgets/android_widget_TextView.c
++++ b/src/api-impl-jni/widgets/android_widget_TextView.c
+@@ -37,6 +37,7 @@
+ 	gtk_widget_set_vexpand(box, TRUE);
+ 	GtkWidget *label = gtk_label_new(text);
+ 	gtk_label_set_wrap(GTK_LABEL(label), TRUE);
++	gtk_label_set_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
+ 	gtk_label_set_xalign(GTK_LABEL(label), 0.f);
+ 	gtk_label_set_yalign(GTK_LABEL(label), 0.f);
+ 	gtk_widget_set_hexpand(label, TRUE);
+@@ -55,10 +56,16 @@
+ 
+ JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setText(JNIEnv *env, jobject this, jobject charseq)
+ {
+-	const char *text = charseq ? (*env)->GetStringUTFChars(env, charseq, NULL) : NULL;
+-	atl_safe_gtk_label_set_text(box_get_label(env, _PTR(_GET_LONG_FIELD(this, "widget"))), text ?: "");
+-	if (text)
+-		(*env)->ReleaseStringUTFChars(env, charseq, text);
++	char *text = atl_jstring_to_utf8(env, charseq);
++	if (!text) return;
++	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++	if (GTK_IS_TEXT(widget)) {
++		gtk_editable_set_text(GTK_EDITABLE(widget), text);
++	} else {
++		GtkLabel *label = box_get_label(env, widget);
++		if (label) atl_safe_gtk_label_set_text(label, text);
++	}
++	g_free(text);
+ }
+ 
+ /* we kinda need per-widget css */
+@@ -81,7 +88,7 @@
+ 	g_free(css_string);
+ 
+ 	gtk_style_context_add_provider(style_context, GTK_STYLE_PROVIDER(css_provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+-	g_object_set_data(G_OBJECT(widget), "color_style_provider", css_provider);
++	g_object_set_data_full(G_OBJECT(widget), "color_style_provider", css_provider, g_object_unref);
+ }
+ #pragma GCC diagnostic pop
+ 
+@@ -108,7 +115,7 @@
+ {
+ 	GtkLabel *label = box_get_label(env, _PTR(_GET_LONG_FIELD(this, "widget")));
+ 
+-	gtk_label_set_use_markup(label, value);
++	if (label) gtk_label_set_use_markup(label, value);
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setAlign(JNIEnv *env, jobject this, jfloat xalign, jfloat yalign)
+@@ -297,3 +304,70 @@
+     if (variations)
+         (*env)->ReleaseStringUTFChars(env, variations_ptr, variations);
+ }
++
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setHint(JNIEnv *env, jobject this, jstring hint, jint color, jboolean showing_hint)
++{
++	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++	char *text = atl_jstring_to_utf8(env, hint);
++	if (!text) return;
++	if (GTK_IS_TEXT(widget)) {
++		gtk_text_set_placeholder_text(GTK_TEXT(widget), hint ? text : NULL);
++		GtkStyleContext *context = gtk_widget_get_style_context(widget);
++		GtkCssProvider *old = g_object_get_data(G_OBJECT(widget), "hint-color-provider");
++		if (old) gtk_style_context_remove_provider(context, GTK_STYLE_PROVIDER(old));
++		GtkCssProvider *provider = gtk_css_provider_new();
++		char *css = g_strdup_printf("text > placeholder { color: #%06x%02x; opacity: 1; }",
++			color & 0xffffff, (color >> 24) & 0xff);
++		gtk_css_provider_load_from_string(provider, css);
++		g_free(css);
++		gtk_style_context_add_provider(context, GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
++		g_object_set_data_full(G_OBJECT(widget), "hint-color-provider", provider, g_object_unref);
++	} else {
++		GtkLabel *label = box_get_label(env, widget);
++		if (label && showing_hint) atl_safe_gtk_label_set_text(label, text);
++	}
++	g_free(text);
++}
++
++JNIEXPORT jint JNICALL Java_android_widget_TextView_native_1getBaseline(JNIEnv *env, jobject this, jint width, jint height)
++{
++	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++	GtkLabel *label = box_get_label(env, widget);
++	if (!label) {
++		if (GTK_IS_TEXT(widget)) {
++			int baseline;
++			gtk_widget_measure(widget, GTK_ORIENTATION_VERTICAL, width, NULL, NULL, NULL, &baseline);
++			return baseline;
++		}
++		return -1;
++	}
++	if (width > 0 && gtk_widget_get_allocated_width(widget) == width &&
++	    gtk_widget_get_allocated_height(widget) == height) {
++		graphene_point_t origin = GRAPHENE_POINT_INIT(0, 0), offset;
++		if (gtk_widget_compute_point(GTK_WIDGET(label), widget, &origin, &offset)) {
++			int x, y;
++			gtk_label_get_layout_offsets(label, &x, &y);
++			return (jint)(offset.y + y + PANGO_PIXELS_CEIL(pango_layout_get_baseline(gtk_label_get_layout(label))));
++		}
++	}
++	int left = 0, right = 0, top = 0, bottom = 0;
++	for (GtkWidget *child = GTK_WIDGET(label); child; child = gtk_widget_get_parent(child)) {
++		GtkBorder padding, border;
++		GtkStyleContext *context = gtk_widget_get_style_context(child);
++		gtk_style_context_get_padding(context, &padding);
++		gtk_style_context_get_border(context, &border);
++		left += padding.left + border.left;
++		right += padding.right + border.right;
++		top += padding.top + border.top;
++		bottom += padding.bottom + border.bottom;
++		if (child == widget) break;
++	}
++	PangoLayout *layout = pango_layout_copy(gtk_label_get_layout(label));
++	pango_layout_set_width(layout, gtk_label_get_wrap(label) ? MAX(0, width - left - right) * PANGO_SCALE : -1);
++	int text_height;
++	pango_layout_get_pixel_size(layout, NULL, &text_height);
++	int baseline = top + (int)(MAX(0, height - top - bottom - text_height) * gtk_label_get_yalign(label))
++		+ PANGO_PIXELS_CEIL(pango_layout_get_baseline(layout));
++	g_object_unref(layout);
++	return baseline;
++}

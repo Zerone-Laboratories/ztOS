@@ -6,6 +6,7 @@
     ztos install --target starlte   ztOS on a Galaxy S9
     ztos emulator                start the emulator with the ztOS installed there
     ztos build --target T        only build the system (for qemu: the disk too)
+    ztos build --target gsi      the generic system image alone, for ztConflo (--gsi)
     ztos guide                   how installing on the phone goes, step by step
     ztos doctor                  is this computer ready to build ztOS?
 """
@@ -65,6 +66,8 @@ def valid_timezone(name: str):
 def wizard(args) -> b.Settings:
     print(BANNER)
     print("This installs ztOS: ztMETRO's phone shell on Arch Linux ARM, with its apps and the SDK.\n")
+    if args.target == "gsi":
+        sys.exit("the GSI is built, not installed: ztos build --target gsi")
     if args.target:
         target = args.target
     else:
@@ -210,7 +213,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command")
 
     def with_settings(p):
-        p.add_argument("--target", choices=["qemu", "starlte"])
+        p.add_argument("--target", choices=["qemu", "starlte", "gsi"])
         p.add_argument("--user")
         p.add_argument("--password", help="(else asked; never stored)")
         p.add_argument("--hostname")

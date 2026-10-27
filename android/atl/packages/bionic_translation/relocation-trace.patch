@@ -1,0 +1,23 @@
+--- a/linker/linker.c
++++ b/linker/linker.c
+@@ -2411,6 +2411,8 @@
+ static inline bool apkenv_apply_packed_relocs(soinfo *si, const uint8_t* packed_relocs, const size_t packed_relocs_size) {
+ 	const uint8_t *current = packed_relocs;
+ 	const uint8_t *end = packed_relocs + packed_relocs_size;
++	const char *trace_setting = getenv("BIONIC_TRACE_RELOCATIONS");
++	const bool trace_relocations = trace_setting && strcmp(trace_setting, "0") != 0;
+ 	const size_t num_relocs = sleb128_decoder_pop_front(&current, end);
+ 
+ 	rel_t reloc = {
+@@ -2468,9 +2470,9 @@
+ 			// FIXME: clean up apkenv_reloc_library so we don't need to do this
+ 			// (this function expects an array, and will probably be extra slow like this)
+ #if defined(USE_RELA)
+-			fprintf(stderr, "calling apkenv_reloc_library with packed reloc: {.offset = 0x%lx, .r_info = 0x%lx, .r_addend = 0x%lx}\n", reloc.r_offset, reloc.r_info, reloc.r_addend);
++			if (trace_relocations) fprintf(stderr, "calling apkenv_reloc_library with packed reloc: {.offset = 0x%lx, .r_info = 0x%lx, .r_addend = 0x%lx}\n", reloc.r_offset, reloc.r_info, reloc.r_addend);
+ #else
+-			fprintf(stderr, "calling apkenv_reloc_library with packed reloc: {.offset = 0x%lx, .r_info = 0x%lx}\n", reloc.r_offset, reloc.r_info);
++			if (trace_relocations) fprintf(stderr, "calling apkenv_reloc_library with packed reloc: {.offset = 0x%lx, .r_info = 0x%lx}\n", reloc.r_offset, reloc.r_info);
+ #endif
+ 			ret = apkenv_reloc_library(si, &reloc, 1);
+ 			if (unlikely(ret))

@@ -1,0 +1,18 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- org.ztos.ial.Display1: The panel's brightness. Brightness is 0..1 on a perceptual scale; Mode says how a shell drives the node on a hot path: linear, table (the node takes every level of a per-panel table, NitsPath lists them) or aor (Samsung AOR register, with picture dimming below its floor).
+     Licence: LGPL-2.1-or-later. -->
+<node>
+  <interface name="org.ztos.ial.Display1">
+    <property name="Version" type="u" access="read"/>
+    <property name="Brightness" type="d" access="read"/>
+    <property name="Node" type="s" access="read"/>
+    <property name="Mode" type="s" access="read"/>
+    <property name="MaxLevel" type="u" access="read"/>
+    <property name="Curve" type="s" access="read"/>
+    <property name="NitsPath" type="s" access="read"/>
+    <method name="SetBrightness">
+      <arg direction="in" name="value" type="d"/>
+    </method>
+  </interface>
+</node>

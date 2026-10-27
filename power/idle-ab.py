@@ -11,10 +11,14 @@ import os
 from pathlib import Path
 import signal
 import time
+import sys
+
+sys.path.insert(0, '/usr/lib/ztos/python')
+import ztos_user
 
 BATTERY = Path("/sys/class/power_supply/max170xx_battery")
 STATUS = Path("/run/zrnperfd.status")
-CTL = Path("/run/user/1000/ztmetro.ctl")
+CTL = ztos_user.runtime('ztmetro.ctl')
 
 
 def read(path):

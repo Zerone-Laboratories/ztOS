@@ -1,0 +1,12 @@
+[Unit]
+Description=Reset filesystem recovery count after ztMETRO starts
+After=greetd.service zboot-usb-gadget.service
+Wants=zboot-usb-gadget.service
+IgnoreOnIsolate=yes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ztos-fs-recovery-reset
+
+[Install]
+WantedBy=graphical.target

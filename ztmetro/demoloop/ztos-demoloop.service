@@ -1,0 +1,12 @@
+[Unit]
+Description=ztOS DemoLoop
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ztos-demoloop
+Restart=no
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

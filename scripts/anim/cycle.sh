@@ -1,6 +1,6 @@
 #!/bin/bash
 # cycle.sh NAME [on|off]: build ztmetro on the phone, install, restart, record a launch and return, fetch
-cd /home/zerone/Documents/Projects/ztOSMobile
+cd "$(dirname "$0")/../.."
 S=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PHONE=172.16.42.1 HOST=172.16.42.2 timeout 400 scripts/ztmetro-push.sh 2>&1 | grep -E " error" | head -3
 timeout 300 scripts/ssh-pw.py alarm "${ZT_PW:-alarm}" 172.16.42.1 'cd ~/ztmetro && touch ztmetro.c core/*.c && make 2>&1 | grep -E "error|(ztmetro|zrnmetrocore).c.*warning" | head -3' 2>&1 | tail -3

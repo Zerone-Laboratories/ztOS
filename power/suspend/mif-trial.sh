@@ -19,6 +19,7 @@
 # laptop to collect it. zrn-lastlog keeps a copy that survives TWRP: see
 # below.
 set -eu
+. /usr/lib/ztos/user.sh
 MODE=${1:?ap or mif}
 case "$MODE" in ap) TARGET=--allow-ap-only ;; mif|mif-cp) TARGET=--allow-mif-sleep ;; *) exit 2 ;; esac
 D=$(cd "$(dirname -- "$0")" && pwd)
@@ -65,8 +66,7 @@ finish() {
 	echo Y > /sys/module/printk/parameters/console_suspend
 	printf '%s' "$CONTROLLER" > "$UDC"
 	modprobe snd-zrn-abox || true
-	runuser -u zerone -- env XDG_RUNTIME_DIR=/run/user/1000 \
-		systemctl --user start pipewire.socket pipewire.service wireplumber.service || true
+	ztos_as_user systemctl --user start pipewire.socket pipewire.service wireplumber.service || true
 	systemctl start ztoscorenetworking-modem.service ztoscorenetworking.service || true
 	echo "mif-trial $MODE finished"
 	sync
@@ -82,10 +82,9 @@ fcntl.ioctl(fd, 0x6f20, 0)  # modem power off
 os.close(fd)
 PY
 fi
-runuser -u zerone -- env XDG_RUNTIME_DIR=/run/user/1000 \
-	systemctl --user stop wireplumber.service pipewire.service pipewire.socket
+ztos_as_user systemctl --user stop wireplumber.service pipewire.service pipewire.socket
 rmmod snd_zrn_abox
-printf 'screen off\n' > /run/user/1000/ztmetro.ctl
+printf 'screen off\n' > "$ZTOS_RUNTIME_DIR/ztmetro.ctl"
 sleep 2
 echo 0 > $P/dry_run
 # every message up to the firmware call into the console log, and into

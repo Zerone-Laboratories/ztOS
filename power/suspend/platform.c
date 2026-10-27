@@ -31,6 +31,13 @@ module_param(enable_deep, bool, 0444);
 module_param(probe_save, bool, 0444);
 module_param(suspend_enter, ulong, 0400);
 module_param(resume, ulong, 0400);
+/* On: PSCI 1.0 SYSTEM_SUSPEND (0xc400000e, x1 = physical resume address),
+ * which stock's psci_system_suspend issues (found with REA). This phone's
+ * firmware is PSCI 0.1 (the DT lists cpu_suspend 0xc4000001 and no
+ * system_suspend) and answers it NOT_SUPPORTED (-1). Off, the default:
+ * CPU_SUSPEND with the SYS_SLEEP state 0x03000000, as stock's index 133. */
+static bool psci_system;
+module_param(psci_system, bool, 0444);
 module_param(eint_wake, uint, 0600);
 MODULE_PARM_DESC(enable_deep, "register the platform backend (pins module until reboot)");
 MODULE_PARM_DESC(dry_run, "refuse the firmware call and leave PMUCAL registers untouched");
@@ -89,10 +96,56 @@ module_param_array(pending_after, uint, &pending_count, 0444);
 static const unsigned int eint_offset[] = { 0, 4, 8, 12, 36 };
 static unsigned int eint_before[5];
 static unsigned int eint_pending[5];
+/* PERIC1's UART_BT gates and the UART's USI_OPTION, read at the firmware
+ * call: what Bluetooth left open (mapped at load; no ioremap in suspend) */
+static void __iomem *dbg_peric1, *dbg_uartbt, *dbg_mct;
+static u32 dbg_gate[4], dbg_option, dbg_qch, dbg_uart[6], dbg_mct_regs[3];
 static unsigned int eint_before_count = 5;
 module_param_array(eint_before, uint, &eint_before_count, 0444);
 static unsigned int eint_pending_count = ARRAY_SIZE(eint_pending);
 module_param_array(eint_pending, uint, &eint_pending_count, 0444);
+
+/* The TOP-domain pin controllers lose their registers in SYS_SLEEP and come
+ * back at reset values (input, pull-down). The exit table releases pad
+ * retention right after the firmware call, but mainline pinctrl only restores
+ * the banks in noirq resume, some 200 ms later: in between every output pin
+ * drops. The PCAL6524's RESETn (gpg3-6) did, and the expander came back
+ * reset, Bluetooth's BT_EN with it. Stock restores pinctrl in syscore resume,
+ * before PMUCAL releases the pads; do the same here: CON, DAT, PUD and DRV of
+ * each bank back before the release. */
+static const struct { u32 base; unsigned int banks; } gpio_banks[] = {
+	{ 0x10430000, 7 },	/* PERIC0: gpp0-3, gpg0-2 */
+	{ 0x10830000, 7 },	/* PERIC1: gpp4-6, gpc0-1, gpd0, gpg3 */
+	{ 0x11050000, 1 },	/* FSYS0: gpf0 */
+	{ 0x11430000, 2 },	/* FSYS1: gpf1-2 */
+};
+static u32 saved_gpio[ARRAY_SIZE(gpio_banks)][7][4];
+static bool restore_gpio = true;
+module_param(restore_gpio, bool, 0644);
+
+static void __iomem *mapped_base(u32 base);
+
+static void gpio_save(void)
+{
+	for (int c = 0; c < ARRAY_SIZE(gpio_banks); c++)
+		for (int b = 0; b < gpio_banks[c].banks; b++)
+			for (int r = 0; r < 4; r++)
+				saved_gpio[c][b][r] = readl_relaxed(mapped_base(gpio_banks[c].base) + b * 0x20 + r * 4);
+}
+
+static void gpio_restore(void)
+{
+	/* DAT before CON, so a pin that turns back into an output starts at its
+	 * level rather than at the reset value's 0 */
+	static const int order[] = { 1, 2, 3, 0 };
+
+	for (int c = 0; c < ARRAY_SIZE(gpio_banks); c++)
+		for (int b = 0; b < gpio_banks[c].banks; b++)
+			for (int i = 0; i < 4; i++)
+				writel_relaxed(saved_gpio[c][b][order[i]],
+					       mapped_base(gpio_banks[c].base) + b * 0x20 + order[i] * 4);
+	wmb();
+}
 
 static void __iomem *mapped_base(u32 base)
 {
@@ -148,6 +201,8 @@ static void restore_platform(void)
 	int ret, i;
 	if (!prepared)
 		return;
+	if (restore_gpio && !early)
+		gpio_restore();	/* before the exit table lets the pads go */
 	ret = run_table(early ? 3 : 2, ZRN_HANDLE);
 	last_restore_error = run_table(1, ZRN_RESTORE);
 	if (!last_restore_error)
@@ -182,6 +237,7 @@ static int prepare_platform(void)
 		return -EBUSY;
 	for (i = 0; i < ARRAY_SIZE(usi_base); i++)
 		saved_usi[i] = readl_relaxed(mapped_base(usi_base[i]) + usi_offset[i]);
+	gpio_save();
 	for (i = 0; i < 3; i++)
 		saved_wdt0[i] = readl_relaxed(mapped_base(0x10050000) + i * 4);
 	for (i = 0; i < ARRAY_SIZE(eint_offset); i++) {
@@ -264,12 +320,17 @@ static int sleep_finisher(unsigned long state)
 	for (i = 0; i < 16; i++)
 		pending_before[i] = readl_relaxed(mapped_base(0x10100000) + 0x1200 + i * 4) & readl_relaxed(mapped_base(0x10100000) + 0x1100 + i * 4);
 	mif_requests_before = (readl_relaxed(mapped_base(0x02040000) + 0xf8ac) >> 16) & 0xff;
+	/* Keep this before enabling the MIF gate: retained console records must
+	 * distinguish a missing AP request from corruption of earlier log text. */
+	pr_info("zrn-system-sleep: handoff mif_sleep=%u requests=%02x gate=%u\n",
+		mif_sleep, mif_requests_before,
+		readl_relaxed(mapped_base(0x02040000) + 0xf95c));
 	/* Keep the enable/SMC/abort-disable instructions in one cache line.
 	 * x19 is preserved by the secure-call ABI. Do not call or delay in
 	 * the interval where ACPM is permitted to remove DRAM power. */
-	a0 = 0xc4000001;
-	a1 = state;
-	a2 = resume;
+	a0 = psci_system ? 0xc400000eUL : 0xc4000001UL;
+	a1 = psci_system ? resume : state;
+	a2 = psci_system ? 0 : resume;
 	a3 = a4 = a5 = a6 = a7 = 0;
 	asm volatile(
 		"mov x19, %8\n"
@@ -303,6 +364,24 @@ static int enter_sleep_state(suspend_state_t state)
 	if (ret)
 		goto cpu_exit;
 	attempts++;
+	if (dbg_peric1 && dbg_uartbt) {
+		static const u32 g[] = { 0x20c4, 0x20c8, 0x201c, 0x2034 };
+		for (i = 0; i < 4; i++)
+			dbg_gate[i] = readl_relaxed(dbg_peric1 + g[i]);
+		dbg_qch = readl_relaxed(dbg_peric1 + 0x3028);
+		dbg_option = readl_relaxed(dbg_uartbt + 0xc8);
+		dbg_uart[0] = readl_relaxed(dbg_uartbt + 0x0);	/* ULCON */
+		dbg_uart[1] = readl_relaxed(dbg_uartbt + 0x4);	/* UCON */
+		dbg_uart[2] = readl_relaxed(dbg_uartbt + 0xc);	/* UMCON */
+		dbg_uart[3] = readl_relaxed(dbg_uartbt + 0x18);	/* UFSTAT */
+		dbg_uart[4] = readl_relaxed(dbg_uartbt + 0x30);	/* UINTP */
+		dbg_uart[5] = readl_relaxed(dbg_uartbt + 0x38);	/* UINTM */
+	}
+	if (dbg_mct) {	/* the broadcast comparator: a pending G0 refuses the sleep */
+		dbg_mct_regs[0] = readl_relaxed(dbg_mct + 0x240);	/* G_TCON */
+		dbg_mct_regs[1] = readl_relaxed(dbg_mct + 0x248);	/* G_INT_ENB */
+		dbg_mct_regs[2] = readl_relaxed(dbg_mct + 0x244);	/* G_INT_CSTAT */
+	}
 	ret = suspend_fn(0x03000000, sleep_finisher);
 	hold_mif();
 	last_error = ret;
@@ -317,6 +396,21 @@ static int enter_sleep_state(suspend_state_t state)
 	early = ret != 0;
 	if (!ret)
 		entries++;
+	/* Into the console log at once: a device resume that hangs afterward
+	 * (UFS did) loses the module parameters, ramoops keeps this. */
+	pr_info("zrn-system-sleep: smc=%d wake=%08x/%08x/%08x bid=%08x eint=%08x %08x %08x %08x %08x\n",
+		ret, wake_stat, wake_stat2, wake_stat3, bid_pending,
+		eint_pending[0], eint_pending[1], eint_pending[2], eint_pending[3], eint_pending[4]);
+	pr_info("zrn-system-sleep: at entry: UART_BT gates %08x %08x %08x %08x qch %08x option %08x\n",
+		dbg_gate[0], dbg_gate[1], dbg_gate[2], dbg_gate[3], dbg_qch, dbg_option);
+	pr_info("zrn-system-sleep: at entry: UART_BT ULCON %08x UCON %08x UMCON %08x UFSTAT %08x UINTP %08x UINTM %08x\n",
+		dbg_uart[0], dbg_uart[1], dbg_uart[2], dbg_uart[3], dbg_uart[4], dbg_uart[5]);
+	pr_info("zrn-system-sleep: at entry: MCT tcon %08x int_enb %08x cstat %08x\n",
+		dbg_mct_regs[0], dbg_mct_regs[1], dbg_mct_regs[2]);
+	for (i = 0; i < 16; i++)
+		if (pending_after[i])
+			pr_info("zrn-system-sleep: GIC pending word %d = %08x (SPI %d..)\n",
+				i, pending_after[i], i * 32 - 32);
 	/* Undo PMUCAL before CPU PM notifiers touch restored clocks. */
 	restore_platform();
 	cpu_cluster_pm_exit();
@@ -391,6 +485,9 @@ static int __init system_sleep_init(void)
 		return -EINVAL;
 	if (resume >= 0xffff000000000000UL)
 		resume = __pa_symbol(resume);
+	dbg_peric1 = ioremap(0x10800000, 0x4000);
+	dbg_uartbt = ioremap(0x10840000, 0x100);
+	dbg_mct = ioremap(0x10040000, 0x800);
 	for (mode = 0; mode < ARRAY_SIZE(modes); mode++)
 		for (table = 0; table < ARRAY_SIZE(modes[0]); table++)
 			for (index = 0; index < modes[mode][table].count; index++) {
@@ -428,6 +525,11 @@ static int __init system_sleep_init(void)
 	ret = map_base(0x14050000);
 	if (ret)
 		goto fail;
+	for (index = 0; index < ARRAY_SIZE(gpio_banks); index++) {
+		ret = map_base(gpio_banks[index].base);
+		if (ret)
+			goto fail;
+	}
 	pr_info("zrn-system-sleep: validated sleep tables, mapped %u regions; enabled=%d dry_run=%d\n",
 		region_count, enable_deep, dry_run);
 	if (probe_save) {
@@ -455,7 +557,16 @@ fail:
 	unmap_all();
 	return ret;
 }
-static void __exit system_sleep_exit(void) { unmap_all(); }
+static void __exit system_sleep_exit(void)
+{
+	if (dbg_peric1)
+		iounmap(dbg_peric1);
+	if (dbg_uartbt)
+		iounmap(dbg_uartbt);
+	if (dbg_mct)
+		iounmap(dbg_mct);
+	unmap_all();
+}
 module_init(system_sleep_init);
 module_exit(system_sleep_exit);
 MODULE_LICENSE("GPL");

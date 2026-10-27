@@ -1,0 +1,165 @@
+# Maintainer: txtsd <aur.archlinux@ihavea.quest>
+
+pkgname=android_translation_layer
+_upstream_pkgname=${pkgname//-/_}
+pkgver=20261021.d658957d
+pkgrel=48
+_commit=d658957d9fc45cabc2584eecdba1156dbb7ecc95
+pkgdesc='A translation layer for running Android apps on a Linux system'
+url='https://gitlab.com/android_translation_layer/android_translation_layer'
+arch=(x86_64 aarch64 armv7h)
+license=('GPL-3.0-or-later' 'Apache-2.0')
+# Upstream does not publish tags or releases; pin the current default-branch
+# snapshot instead of tracking a moving checkout in this non -git package.
+depends=(
+  alsa-lib
+  art_standalone
+  bionic_translation
+  ffmpeg
+  fontconfig
+  gcc-libs
+  glibc
+  gtk4
+  java-runtime
+  libdrm
+  libglvnd
+  libgudev
+  libopensles-standalone
+  libportal
+  libsecret
+  sqlite
+  vulkan-icd-loader
+  wayland
+  webkitgtk-6.0
+)
+makedepends=(
+  cmake
+  glib2-devel
+  java-runtime-common
+  jdk8-openjdk
+  meson
+  openxr
+  vulkan-headers
+  wayland-protocols
+)
+source=("${_upstream_pkgname}-${_commit}.tar.gz::${url}/-/archive/${_commit}/${_upstream_pkgname}-${_commit}.tar.gz"
+        keystore-aes.patch CryptoProvider.java sizef.patch display-touch.patch text-sizing.patch rendering.patch input-actions.patch compatibility.patch graphics-quality.patch audio-safety.patch sdk-consistency.patch widget-alignment.patch sharedmem.patch
+         hardware-buffer-compat.patch resources-constructor-dispatch.patch resources-classloader-compat.patch context-telecom-service.patch keygen-randomization-compat.patch context-main-executor.patch textview-soft-input-focus.patch touch-longpress-cancel.patch textview-line-limits.patch runtime-ui-timers.patch touch-sequence-lifecycle.patch audio-playback-callback.patch inflater-image-state.patch textview-autosize.patch textview-typography.patch subscription-defaults.patch longpress-allocation.patch bitmap-rendering.patch apk-signing-v2-v3.patch location-enabled.patch view-get-focusable.patch typeface-style-italic.patch view-focusable-mode.patch font-rendering.patch static-layout-builder.patch textpaint-copy.patch apk-signing-platform-level.patch view-outline-shadow-color.patch aosp-api-batch1.patch ui-fidelity.patch ui-fidelity-2.patch ui-fidelity-3.patch ui-fidelity-4.patch apksig-8.9.1.jar::https://dl.google.com/dl/android/maven2/com/android/tools/build/apksig/8.9.1/apksig-8.9.1.jar apksig-8.9.1-d8.jar)
+sha256sums=('18f08765ec8930a1296b9132da87a633dfafbba2d4f2fb2301d91b39926deb2c'
+            '88cb63c4c766e3edbe632aab74b875ebe583a48276775654dcdc9f6a974ea981'
+            '2e336221dc7169e66d2d9c40d312f3f4e5cf52281fad91889e5ca2b7c33691d3'
+            'f73de72dd14f5e8df436c720800d55a4201d05bda7a3e3601a2f735ba944da46'
+            '8606b651063eed28cb87d8d9d2eb9dce870825450646c3ffaa806cd80a74e9f3'
+            '846959ae477c26a47290fc5dcbe3c9c3a6724d28d0e9d2195201d874ccfc3bb9'
+            '1b779f380f991710528467a972ccc92661e6aee816ce61e00a05c83d3d786423'
+            '2b86c62a5a3b503964899289e372077f45a56e72153b5719c9a057542ea573eb'
+            '808ea9b7368601c96237546510c3f45e44e59d0b8d91a2c4fc3f6e7b67417b21'
+            '91fe317619b71fbfdd9cde1eca7d1339aa8190bb8f0b519a4b0ca0782d3e4049'
+            '58bf556809281574b0dd44659386bcd1de120f3f167f560e031ee6571da67195'
+            '99083f5b8cac6d974c8a9aed31c5a0fa95b1ce255ca13bed6e65d481781557f5'
+            '4d8cc066b2352d0becf265e6cdd1ff3d013a1ac2450b9959afb71770dedc420b'
+            '7dfbd3396cac41555f77bebd26df05a6bb3018a4eca7e17684ebdb63372cfa34'
+            '932eff82d3ef09837f64c1fc6d49bf4fae53af9c9fcfce2b73107a3b9155f512'
+            '56dd858dade543d1f17110313828902f593b5595ffd1e6b26336ece63b3056e8'
+            'f2dfab008bf4746e039b3527e9fc9fb7dfdc520d43612c0305df7c9b54689fad'
+            '573174b928f4bf2350e0d90604a98fcffbc0029b78b8985f063c2ef003d19442'
+            'b6788dc892f2412df358659de7bddd0f26fe065886ea0fe908fd0e7a9745734a'
+            'a594b39b3bab8e91dbfb2c10a15e632b7fb05b7a0746d3fe3ddbb356b8efcfad'
+            '6896a99d6abd763eb872524b7cf022fca039dae0a6791961ebcd5be3fa8c9b03'
+            '17e8107c67fe1bcbba125043b6c4c85be33f0d7b248642f94c93ffee9e97dc83'
+            'a10d2d3f731c7f25f976ed27856acb69f9c1676fed5c91d787297f65aa85bd77'
+            '430ac061e17a36acd9f20b4970787666192498e284d7ff34dd6c47538ef04b59'
+            '9372adbe99289f8e70e212e6108b0327cf978933690fd8d2d1b81346a217c244'
+            '1391babe3559c1f751f4c6479129c2fa693914480ae51a97d3e9e2d5be213e72'
+            'e647105afe51ee9493454e891277f57e974a573c4d9fa16217256359652155b9'
+            'd2f6396e4d44cbc91ddab53efabe7395dd301dc4a0545ae50f87a48a2623ea37'
+            'e506fb1e069c2318f69394b18dd5056f612035fc8c792b9c522ca59e8bc75670'
+            'b9a040fe7d4273556f12d8cdae2e9017a6f1b47f4b6ccf271f34f80b511f96b7'
+            'cdc1754c2dc74f455f2ed5a648b4e41f7f8c1e7daa915ba71147114658fb27b5'
+            '02eb31bd9e9ecd02e87fa65798c3cf8dc5f96bce96ed317a2e3e6fd3b418f858'
+            '674d2cb12c6a649e8f1a75fb24800830adedbe01ea0f9bda68cb981f082cba75'
+            'a991019c814e9dd7e4ce9a11164706125e33be42f3cf343a77120991ab14cca8'
+            'd335708ba4f3037473cf6869e91296f4f376071b03089234fbf9891e261250c5'
+            '0028775eb139ae5401172d4e1298aadfc01b6f001190cfa90a8f144fc05bfec7'
+            '19f103fc7ac29db5a1206317a3ab6c999b4d2edaab0e2929edfcea7709fbcb7f'
+            'c3a2c7e74490a4f2aa29b2819e76904b6729664a79d14017c8773776bf5f9552'
+            'c47b94b07e769b47fad91b5d087c0c9f8d1250d37abdd23bf6364ad7c30518f9'
+            'beb0c4bc577148318b4490ec2c41a685ba8d42e22bb7537a2daf5d03aded41fb'
+            '28ba21c83f48e6a6fd308bf601685bcf9eab89604673c4321d9612dd9cc86042'
+            '08c9b6647b5fac67abec7873b606a8a43c076ae2932127cb59ad021b6d365b8c'
+            '22f7fa5cb82a87e565c5052de64e3684cb18220abfb271ea486a379b254d155c'
+            '4eb2c598625fd13b09a1dfd74ad552a8bcd9f8c4c22eadf9d4ecfac58050df0c'
+            '0f5ad0275fb6d8ce4c557529cd97ad43891da0fc8c2a6e10522f9a2a1945bf5a'
+            'ed54cc36882e0237c6815ab82ec02d626cf635bb595bdb69a323be807025f54d'
+            '93067974419b3d0de296d2a94b142d7d03ea2595a4b8c64a3305bf8dd9b4f37a'
+            'c070ed1394629d74641aa0906f60b2ffa1ee77e6366a1f93437f59717b1aeb89'
+            '305104bfa756dc6d5578615d8089d08dff4bf47c6f90787482dc963184892d2c')
+
+prepare() {
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/keystore-aes.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/sizef.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/display-touch.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/text-sizing.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/rendering.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/input-actions.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/compatibility.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/graphics-quality.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/audio-safety.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/sdk-consistency.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/widget-alignment.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/sharedmem.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/hardware-buffer-compat.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/resources-constructor-dispatch.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/resources-classloader-compat.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/context-telecom-service.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/keygen-randomization-compat.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/context-main-executor.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/textview-soft-input-focus.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/touch-longpress-cancel.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/textview-line-limits.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/runtime-ui-timers.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/touch-sequence-lifecycle.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/audio-playback-callback.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/inflater-image-state.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/textview-autosize.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/textview-typography.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/subscription-defaults.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/longpress-allocation.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/bitmap-rendering.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/apk-signing-v2-v3.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/location-enabled.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/view-get-focusable.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/typeface-style-italic.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/view-focusable-mode.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/font-rendering.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/static-layout-builder.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/textpaint-copy.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/apk-signing-platform-level.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/view-outline-shadow-color.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/aosp-api-batch1.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/ui-fidelity.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/ui-fidelity-2.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/ui-fidelity-3.patch"
+  patch -d "${_upstream_pkgname}-${_commit}" -Np1 -i "$srcdir/ui-fidelity-4.patch"
+  cp "$srcdir/CryptoProvider.java" "${_upstream_pkgname}-${_commit}/src/api-impl/android/security/CryptoProvider.java"
+  # ztMETRO supplies its own OSK through text-input-v3, not layer-shell.
+  sed -i "s/layer_shell_dep = dependency('gtk4-layer-shell-0', required : false)/layer_shell_dep = disabler()/" "${_upstream_pkgname}-${_commit}/meson.build"
+  meson subprojects download --sourcedir="${_upstream_pkgname}-${_commit}"
+}
+
+build() {
+  arch-meson "${_upstream_pkgname}-${_commit}" build
+  meson compile -C build
+}
+
+check() {
+  meson test --no-rebuild --print-errorlogs -C build
+}
+
+package() {
+  meson install --no-rebuild -C build --destdir "${pkgdir}"
+  install -Dm644 "$srcdir/apksig-8.9.1-d8.jar" "${pkgdir}/usr/lib/java/dex/android_translation_layer/apksig.jar"
+  install -d "${pkgdir}/usr/share/licenses/${pkgname}"
+  bsdtar -xOf "$srcdir/apksig-8.9.1.jar" LICENSE > "${pkgdir}/usr/share/licenses/${pkgname}/apksig-LICENSE"
+  chown -R root:root "${pkgdir}"
+}

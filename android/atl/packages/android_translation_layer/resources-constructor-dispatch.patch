@@ -1,0 +1,33 @@
+--- a/src/api-impl/android/content/res/Resources.java
++++ b/src/api-impl/android/content/res/Resources.java
+@@ -223,7 +223,7 @@
+ 			mCompatibilityInfo = compatInfo;
+ 		}
+ 		mToken = new WeakReference<IBinder>(token);
+-		updateConfiguration(config, metrics);
++		updateConfigurationInternal(config, metrics, null);
+ 		//        assets.ensureStringBlocks();
+ 	}
+ 
+@@ -1647,7 +1647,7 @@
+ 	 */
+ 	public void updateConfiguration(Configuration config,
+ 	                                DisplayMetrics metrics) {
+-		updateConfiguration(config, metrics, null);
++		updateConfigurationInternal(config, metrics, null);
+ 	}
+ 
+ 	/**
+@@ -1655,6 +1655,12 @@
+ 	 */
+ 	public void updateConfiguration(Configuration config,
+ 	                                DisplayMetrics metrics, CompatibilityInfo compat) {
++		updateConfigurationInternal(config, metrics, compat);
++	}
++
++	/* Keep constructor updates from dispatching into an uninitialized subclass. */
++	private void updateConfigurationInternal(Configuration config,
++	                                         DisplayMetrics metrics, CompatibilityInfo compat) {
+ 		synchronized (mAccessLock) {
+ 			if (DEBUG_CONFIG) {
+ 				Slog.i(TAG, "**** Updating config of " + this + ": old config is " + mConfiguration + " old compat is " + mCompatibilityInfo);

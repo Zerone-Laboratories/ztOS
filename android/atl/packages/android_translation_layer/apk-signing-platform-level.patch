@@ -1,0 +1,23 @@
+--- a/src/api-impl/android/content/pm/PackageParser.java
++++ b/src/api-impl/android/content/pm/PackageParser.java
+@@ -467,6 +467,7 @@
+ 	}
+ 
+ 
++	private static final int APK_SIGNATURE_PLATFORM_SDK = 28;
+ 	private static ClassLoader apkSignatureClassLoader;
+ 
+ 	private static synchronized ClassLoader getApkSignatureClassLoader(File verifierJar) throws Exception {
+@@ -494,6 +495,12 @@
+ 			ClassLoader loader = getApkSignatureClassLoader(verifierJar);
+ 			Class<?> builderClass = Class.forName("com.android.apksig.ApkVerifier$Builder", true, loader);
+ 			Object builder = builderClass.getConstructor(File.class).newInstance(new File(mArchiveSourcePath));
++			/* Android verifies an APK against the platform it is installed on, not
++			 * against the app's minSdk. ATL reports minSdk as SDK_INT, so apksig would
++			 * otherwise reject valid v1 signatures (for example SHA-384) that old
++			 * platforms could not check. ATL implements the API 28 signing APIs. */
++			builderClass.getMethod("setMinCheckedPlatformVersion", int.class)
++			    .invoke(builder, Math.max(Build.VERSION.SDK_INT, APK_SIGNATURE_PLATFORM_SDK));
+ 			Object verifier = builderClass.getMethod("build").invoke(builder);
+ 			Object result = verifier.getClass().getMethod("verify").invoke(verifier);
+ 			boolean verified = (Boolean)result.getClass().getMethod("isVerified").invoke(result);

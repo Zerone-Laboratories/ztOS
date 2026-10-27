@@ -37,8 +37,13 @@ echo "=== unpack ==="
 fakeroot -s "$STATE" -- bsdtar -xpf "$TAR" -C "$R" --no-xattrs --no-acls --no-fflags
 
 echo "=== configure ==="
-fakeroot -i "$STATE" -s "$STATE" -- bash -euo pipefail -s "$R" "$OVERLAY" "$KEY" <<'EOS'
-R=$1 OVERLAY=$2 KEY=$3
+fakeroot -i "$STATE" -s "$STATE" -- bash -euo pipefail -s "$R" "$OVERLAY" "$KEY" "$ROOT" <<'EOS'
+R=$1 OVERLAY=$2 KEY=$3 ROOT=$4
+# the user helpers (user.sh, ztos_user.py, ztos-user-dropins) are ztOS's, not
+# the phone overlay's; the overlay's own templates go over them
+install -d "$R/usr/lib/ztos"
+cp -a --no-preserve=ownership "$ROOT/os/overlay/usr/lib/ztos/." "$R/usr/lib/ztos/"
+install -Dm755 "$ROOT/os/overlay/usr/local/sbin/ztos-user-dropins" "$R/usr/local/sbin/ztos-user-dropins"
 cp -a --no-preserve=ownership "$OVERLAY/." "$R/"
 chown -R 0:0 "$R/etc/systemd" "$R/usr/local/sbin" "$R/etc/fstab" "$R/etc/hostname"
 chmod 755 "$R"/usr/local/sbin/zboot-*
@@ -61,12 +66,22 @@ for t in sleep suspend hibernate hybrid-sleep suspend-then-hibernate; do
 done
 touch "$R/etc/zboot-firstboot"
 
+# the stock image's user, alarm, is the phone's (zboot-firstboot fills in
+# the unit drop-ins, greetd and sudoers from this)
+IFS=: read -r _ _ uid gid _ home _ < <(grep '^alarm:' "$R/etc/passwd")
+install -Dm644 /dev/stdin "$R/etc/ztos/user.conf" <<USERCONF
+ZTOS_USER=alarm
+ZTOS_UID=$uid
+ZTOS_GID=$gid
+ZTOS_HOME=$home
+USERCONF
+
 if [ -s "$KEY" ]; then
 	for home in "$R/root" "$R/home/alarm"; do
 		install -d -m 700 "$home/.ssh"
 		install -m 600 "$KEY" "$home/.ssh/authorized_keys"
 	done
-	chown -R 1000:1000 "$R/home/alarm/.ssh"
+	chown -R "$uid:$gid" "$R/home/alarm/.ssh"
 	chown -R 0:0 "$R/root/.ssh"
 fi
 EOS

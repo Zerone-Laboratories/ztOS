@@ -1,0 +1,202 @@
+--- /dev/null
++++ b/src/api-impl/android/text/method/ReplacementTransformationMethod.java
+@@ -0,0 +1,59 @@
++package android.text.method;
++
++import android.graphics.Rect;
++import android.text.Spanned;
++import android.view.View;
++
++/** A live character substitution view that preserves source spans and indices. */
++public abstract class ReplacementTransformationMethod implements TransformationMethod {
++    protected abstract char[] getOriginal();
++    protected abstract char[] getReplacement();
++
++    public CharSequence getTransformation(CharSequence source, View view) {
++        if (source == null) return null;
++        char[] original = getOriginal(), replacement = getReplacement();
++        return source instanceof Spanned
++                ? new SpannedReplacement((Spanned) source, original, replacement)
++                : new Replacement(source, original, replacement);
++    }
++
++    public void onFocusChanged(View view, CharSequence source, boolean focused,
++                               int direction, Rect previouslyFocusedRect) {}
++
++    private static class Replacement implements CharSequence {
++        final CharSequence source;
++        final char[] original, replacement;
++        Replacement(CharSequence source, char[] original, char[] replacement) {
++            this.source = source; this.original = original; this.replacement = replacement;
++        }
++        public int length() { return source.length(); }
++        public char charAt(int index) {
++            char c = source.charAt(index);
++            for (int i = 0; i < original.length; i++)
++                if (c == original[i]) return replacement[i];
++            return c;
++        }
++        public CharSequence subSequence(int start, int end) {
++            CharSequence sub = source.subSequence(start, end);
++            return sub instanceof Spanned
++                    ? new SpannedReplacement((Spanned) sub, original, replacement)
++                    : new Replacement(sub, original, replacement);
++        }
++        public String toString() {
++            StringBuilder out = new StringBuilder(length());
++            for (int i = 0; i < length(); i++) out.append(charAt(i));
++            return out.toString();
++        }
++    }
++    private static final class SpannedReplacement extends Replacement implements Spanned {
++        final Spanned spanned;
++        SpannedReplacement(Spanned source, char[] original, char[] replacement) {
++            super(source, original, replacement); spanned = source;
++        }
++        public <T> T[] getSpans(int start, int end, Class<T> type) { return spanned.getSpans(start, end, type); }
++        public int getSpanStart(Object tag) { return spanned.getSpanStart(tag); }
++        public int getSpanEnd(Object tag) { return spanned.getSpanEnd(tag); }
++        public int getSpanFlags(Object tag) { return spanned.getSpanFlags(tag); }
++        public int nextSpanTransition(int start, int limit, Class type) { return spanned.nextSpanTransition(start, limit, type); }
++    }
++}
+--- /dev/null
++++ b/src/api-impl/android/text/method/SingleLineTransformationMethod.java
+@@ -0,0 +1,11 @@
++package android.text.method;
++
++/** Keep single-line display text the same length as its editable source. */
++public class SingleLineTransformationMethod extends ReplacementTransformationMethod {
++    private static final SingleLineTransformationMethod INSTANCE = new SingleLineTransformationMethod();
++    private static final char[] ORIGINAL = {'\n', '\r'};
++    private static final char[] REPLACEMENT = {' ', '\uFEFF'};
++    protected char[] getOriginal() { return ORIGINAL; }
++    protected char[] getReplacement() { return REPLACEMENT; }
++    public static SingleLineTransformationMethod getInstance() { return INSTANCE; }
++}
+--- a/src/api-impl/meson.build
++++ b/src/api-impl/meson.build
+@@ -527,6 +527,8 @@
+ 	'android/text/method/ScrollingMovementMethod.java',
+ 	'android/text/method/TextKeyListener.java',
+ 	'android/text/method/TransformationMethod.java',
++	'android/text/method/ReplacementTransformationMethod.java',
++	'android/text/method/SingleLineTransformationMethod.java',
+ 	'android/text/style/AbsoluteSizeSpan.java',
+ 	'android/text/style/AlignmentSpan.java',
+ 	'android/text/style/BackgroundColorSpan.java',
+--- a/src/api-impl/android/app/AlarmManager.java
++++ b/src/api-impl/android/app/AlarmManager.java
+@@ -9,6 +9,37 @@
+ 
+ public class AlarmManager {
+ 	private static final String TAG = "AlarmManager";
++    private static final java.util.Map<PendingIntent, Runnable> scheduled = new java.util.HashMap<>();
++    private static Handler scheduler;
++
++    private static Handler scheduler() {
++        if (scheduler == null) scheduler = new Handler(Looper.getMainLooper());
++        return scheduler;
++    }
++
++    private void schedule(int type, long triggerTime, final long interval, final PendingIntent operation) {
++        if (operation == null) throw new NullPointerException("operation");
++        long now = type == ELAPSED_REALTIME || type == ELAPSED_REALTIME_WAKEUP
++                ? SystemClock.elapsedRealtime() : System.currentTimeMillis();
++        synchronized (scheduled) {
++            cancel(operation);
++            Runnable task = new Runnable() {
++                public void run() {
++                    synchronized (scheduled) {
++                        if (scheduled.get(operation) != this) return;
++                        if (interval == 0) scheduled.remove(operation);
++                    }
++                    operation.send();
++                    synchronized (scheduled) {
++                        if (interval > 0 && scheduled.get(operation) == this)
++                            scheduler().postDelayed(this, interval);
++                    }
++                }
++            };
++            scheduled.put(operation, task);
++            scheduler().postDelayed(task, Math.max(0, triggerTime - now));
++        }
++    }
+ 
+ 	public static final int RTC = 1;
+ 	public static final int RTC_WAKEUP = 0;
+@@ -21,7 +52,10 @@
+ 	}
+ 
+ 	public void cancel(PendingIntent operation) {
+-		Slog.i(TAG, "cancel(" + operation + ") called");
++		synchronized (scheduled) {
++            Runnable task = scheduled.remove(operation);
++            if (task != null) scheduler().removeCallbacks(task);
++        }
+ 	}
+ 
+ 	public void cancel(OnAlarmListener listener) {
+@@ -30,31 +64,13 @@
+ 
+ 	public void setInexactRepeating(int type, long triggerTime, long interval, PendingIntent operation) {
+ 		Slog.i(TAG, "setInexactRepeating(" + type + ", " + triggerTime + ", " + interval + ", " + operation + ") called");
+-		long delay = triggerTime - ((type == 2 || type == 3) ? SystemClock.elapsedRealtime() : System.currentTimeMillis());
+-		Slog.i(TAG, "setInexactRepeating() delay: " + DateUtils.formatElapsedTime(delay) + " interval: " + DateUtils.formatElapsedTime(interval));
+-		Handler handler = new Handler(Looper.getMainLooper());
+-		handler.postDelayed(new Runnable() {
+-			@Override
+-			public void run() {
+-				Slog.i(TAG, "delivering repeating alarm: " + operation);
+-				operation.send();
+-				handler.postDelayed(this, interval);
+-			}
+-		}, delay);
+-	}
++        if (interval <= 0) throw new IllegalArgumentException("interval must be positive");
++        schedule(type, triggerTime, interval, operation);
++    }
+ 
+-	public void setExact(int type, long triggerTime, PendingIntent operation) {
+-		Slog.i(TAG, "setExact(" + type + ", " + triggerTime + ", " + operation + ") called");
+-		long delay = triggerTime - ((type == 2 || type == 3) ? SystemClock.elapsedRealtime() : System.currentTimeMillis());
+-		Slog.i(TAG, "setExact() delay: " + DateUtils.formatElapsedTime(delay));
+-		new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+-			@Override
+-			public void run() {
+-				Slog.i(TAG, "delivering alarm: " + operation);
+-				operation.send();
+-			}
+-		}, delay);
+-	}
++    public void setExact(int type, long triggerTime, PendingIntent operation) {
++        schedule(type, triggerTime, 0, operation);
++    }
+ 
+ 	public void set(int type, long triggerTime, PendingIntent operation) {
+ 		setExact(type, triggerTime, operation);
+--- a/src/api-impl/android/app/PendingIntent.java
++++ b/src/api-impl/android/app/PendingIntent.java
+@@ -57,7 +57,21 @@
+ 		     + new String[] {"activity", "service", "broadcast"}[type] + "]";
+ 	}
+ 
+-	public void cancel() {}
++    @Override
++    public boolean equals(Object other) {
++        if (this == other) return true;
++        if (!(other instanceof PendingIntent)) return false;
++        PendingIntent that = (PendingIntent) other;
++        return requestCode == that.requestCode && type == that.type
++                && intent.filterEquals(that.intent);
++    }
++
++    @Override
++    public int hashCode() {
++        return 31 * (31 * type + requestCode) + intent.filterHashCode();
++    }
++
++    public void cancel() { new AlarmManager().cancel(this); }
+ 
+ 	public class CanceledException extends Exception {
+ 	}

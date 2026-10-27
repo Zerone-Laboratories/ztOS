@@ -1,0 +1,38 @@
+#!/bin/bash
+set -u
+BACKUP=/var/backups/fs-recovery
+PENDING=$BACKUP/rollback.pending
+[ -f "$PENDING" ] || exit 0
+read -r marker < "$PENDING" || marker=
+current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+case "$marker" in
+install:*)
+	printf 'trial:%s\n' "$current_boot" > "$PENDING"
+	chmod 0600 "$PENDING"
+	exit 0
+;;
+trial:*)
+	previous_boot=${marker#trial:}
+	if [ "$previous_boot" != "$current_boot" ]; then
+		# Previous trial boot failed to reach ztMETRO and clear this marker.
+		:
+	else
+		exit 0
+	fi
+;;
+*) exit 0 ;;
+esac
+
+while IFS= read -r path; do
+	[ -n "$path" ] || continue
+	if [ -f "$BACKUP/absent/$path" ]; then
+		rm -f "/$path"
+	elif [ -e "$BACKUP/files/$path" ] || [ -L "$BACKUP/files/$path" ]; then
+		rm -f "/$path"
+		mkdir -p "$(dirname "/$path")"
+		cp -a "$BACKUP/files/$path" "/$path"
+	fi
+done < "$BACKUP/manifest"
+rm -f "$PENDING"
+systemctl daemon-reload 2>/dev/null || true
+printf '<3>ztos-fs-recovery-rollback: restored previous filesystem recovery files after failed boot\n' > /dev/kmsg 2>/dev/null || true

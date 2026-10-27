@@ -1,0 +1,12 @@
+[Unit]
+Description=Phone sleep: SoC sleep while the screen is off and nothing plays
+After=zrn-cpuidle.service zrnperfd.service ztoscorenetworking.service zrn-bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/zrn-sleepd
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical.target

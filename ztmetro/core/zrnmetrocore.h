@@ -32,8 +32,8 @@
 #define ZMC_TILT_DEG	14.0
 #define ZMC_TILT_LIFT	40.0
 #define ZMC_PRESS_SINK	0.045
-#define ZMC_TILT_IN_MS	70
-#define ZMC_TILT_OUT_MS	160
+#define ZMC_TILT_IN_MS	90
+#define ZMC_TILT_OUT_MS	200
 #define ZMC_MARGIN	16	/* left edge of everything: 20 px on a 450 px wide reference */
 #define ZMC_HEADER_H	104	/* the title stays; the list moves under it */
 #define ZMC_ACT_BACK	(-1)	/* the title: up a page */
@@ -85,6 +85,8 @@ struct zmc_app {
 	bool (*touch)(int phase, int id, double x, double y, uint32_t time);
 	/* the page never scrolls or rubber-bands under a drag */
 	bool fixed;
+	/* the overlay may cover the header: draw the cached header before overlay */
+	bool overlay_above_header;
 };
 
 struct zmc_buffer {
@@ -117,6 +119,7 @@ struct zmc_state {
 	int scale;
 	int width, height;	/* points */
 	bool configured, running, dirty;
+	bool active;		/* the shell has this app in front (XDG activated) */
 	uint32_t accent;	/* 0xRRGGBB */
 
 	int page;
@@ -185,6 +188,8 @@ struct zmc_state {
 };
 
 extern struct zmc_state zmc;
+/* ZTMETRO_PERFLOG=1: frame and page timings on stderr (off by default) */
+bool zmc_perflog(void);
 
 /* ---- running ---- */
 int zmc_run(const struct zmc_app *app, int first_page);
@@ -193,6 +198,7 @@ int zmc_render_png(const struct zmc_app *app, int page, int height, const char *
 void zmc_redraw(void);			/* something on the page changed */
 void zmc_scroll_end(void);		/* at the next drawing, show the end of the page (a conversation) */
 void zmc_go(int page, int dir);		/* turn to a page: dir > 0 deeper, < 0 back */
+void zmc_turn(int dir);			/* this page's content changes: its rows swivel out and in */
 void zmc_back(void);
 void zmc_quit(void);
 void zmc_busy(bool busy);		/* the dots across the top, while something loads */
@@ -243,6 +249,9 @@ void zmc_text_centred(cairo_t *cr, const char *s, const char *font, double size,
 /* For an overlay: a Cairo surface (in pixels) as a quad whose corners, top
  * left, top right, bottom left, bottom right, are points with z toward the
  * viewer (the shell's own perspective); a solid rectangle; another frame. */
+/* A pixel region of an atlas, mapped to the same projected quad. */
+void zmc_gpu_quad_region(cairo_surface_t *source, unsigned revision, double x, double y,
+		double w, double h, const double corners[4][3], double alpha);
 void zmc_gpu_quad(cairo_surface_t *source, unsigned revision, const double corners[4][3], double alpha);
 void zmc_gpu_rect(double x, double y, double w, double h, double r, double g, double b);
 /* A GPU buffer from elsewhere (a DMA-BUF: a video frame, a web page) drawn with

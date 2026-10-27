@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Files
+Comment=Browse and open files
+Exec=ztfiles
+Terminal=false
+Type=Application
+Icon=ztfiles
+Categories=System;FileManager;

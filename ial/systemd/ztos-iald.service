@@ -1,0 +1,17 @@
+[Unit]
+Description=ztOSIAL: the phone's hardware interfaces (org.ztos.ial)
+Documentation=file:///usr/share/doc/ztos-ial/README.md
+After=dbus.service
+Before=greetd.service
+
+[Service]
+Type=dbus
+BusName=org.ztos.ial
+ExecStart=/usr/bin/ztos-iald
+Restart=on-failure
+RestartSec=2
+# a backend that hangs must not hold the shell's start
+TimeoutStartSec=20
+
+[Install]
+WantedBy=multi-user.target

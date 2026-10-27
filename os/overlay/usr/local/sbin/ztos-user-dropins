@@ -1,0 +1,79 @@
+#!/bin/sh
+# ztOS: (re)write everything that names the phone's user but cannot read
+# /etc/ztos/user.conf itself. Run by the installer and zboot-firstboot; run it
+# once by hand to move a phone set up before user.conf existed. Idempotent:
+# a file is written only when its content changes.
+#
+#   systemd units    a drop-in /etc/systemd/system/<unit>.d/ztos-user.conf for
+#                    each unit in dropins() below; drop-ins of that name no
+#                    longer listed (a unit for another UID) are removed
+#   other config     each file under /usr/lib/ztos/user-templates is copied to
+#                    the same path under /, with @USER@, @UID@, @GID@ and
+#                    @HOME@ filled in (greetd, sudoers, polkit)
+set -eu
+. /usr/lib/ztos/user.sh
+[ -n "$ZTOS_USER" ] || { echo "ztos-user-dropins: no user (no /etc/ztos/user.conf, no UID 1000)" >&2; exit 1; }
+
+UNITS=/etc/systemd/system
+TEMPLATES=/usr/lib/ztos/user-templates
+changed=0 written=
+
+# Every unit that needs the user, in one place: add one here.
+dropins() {
+	# the user manager must inherit these hard limits before user units
+	# (pipewire, pipewire-pulse) can use them
+	dropin "user@$ZTOS_UID.service" <<-CONF
+	[Service]
+	LimitRTPRIO=95
+	LimitNICE=-19
+	LimitMEMLOCK=64M
+	CONF
+}
+
+# put FILE MODE: stdin to FILE, only if it differs
+put() {
+	tmp=$(mktemp "$1.XXXXXX")
+	cat > "$tmp"
+	chmod "$2" "$tmp"
+	if cmp -s "$tmp" "$1"; then rm -f "$tmp"; return; fi
+	case $1 in
+	/etc/sudoers.d/*) ! command -v visudo > /dev/null || visudo -cqf "$tmp" || { rm -f "$tmp"; echo "ztos-user-dropins: $1: not valid sudoers" >&2; exit 1; } ;;
+	esac
+	mv -f "$tmp" "$1"
+	echo "ztos-user-dropins: wrote $1"
+	changed=1
+}
+
+dropin() {
+	mkdir -p "$UNITS/$1.d"
+	body=$(cat)
+	# not a pipe: put has to set changed here, not in a subshell
+	put "$UNITS/$1.d/ztos-user.conf" 644 <<-CONF
+	# Written by ztos-user-dropins from /etc/ztos/user.conf: edit that, not this.
+	$body
+	CONF
+	written="$written $UNITS/$1.d/ztos-user.conf "
+}
+
+dropins
+for f in "$UNITS"/*.d/ztos-user.conf; do
+	[ -e "$f" ] || continue
+	case $written in *" $f "*) continue ;; esac
+	rm -f "$f"; rmdir "${f%/*}" 2> /dev/null || true
+	echo "ztos-user-dropins: removed $f"
+	changed=1
+done
+
+if [ -d "$TEMPLATES" ]; then
+	find "$TEMPLATES" -type f | while read -r t; do
+		dest=${t#"$TEMPLATES"}
+		case $dest in /etc/sudoers.d/*) mode=440 ;; *) mode=$(stat -c %a "$t") ;; esac
+		mkdir -p "${dest%/*}"
+		sed -e "s|@USER@|$ZTOS_USER|g" -e "s|@UID@|$ZTOS_UID|g" \
+			-e "s|@GID@|$ZTOS_GID|g" -e "s|@HOME@|$ZTOS_HOME|g" "$t" | put "$dest" "$mode"
+	done
+fi
+
+if [ "$changed" = 1 ] && [ -d /run/systemd/system ]; then
+	systemctl daemon-reload
+fi

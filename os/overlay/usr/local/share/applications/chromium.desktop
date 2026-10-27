@@ -1,0 +1,7 @@
+[Desktop Entry]
+# Chromium is installed only as the engine the WhatsApp app drives headless:
+# this copy shadows the package's own entry, so it is not offered as an app
+Type=Application
+Name=Chromium
+Exec=/usr/bin/chromium
+NoDisplay=true

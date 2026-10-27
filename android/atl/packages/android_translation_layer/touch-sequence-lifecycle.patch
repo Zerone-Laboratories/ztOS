@@ -1,0 +1,126 @@
+--- a/src/api-impl-jni/views/android_view_View.c
++++ b/src/api-impl-jni/views/android_view_View.c
+@@ -35,6 +35,7 @@
+ #define MAX_POINTERS         50
+ 
+ struct pointer {
++	GdkEventSequence *sequence;
+ 	int id;
+ 	int index;
+ 	float coord_x;
+@@ -201,6 +202,10 @@
+ }
+ 
+ static bool action_up_already_handled = false;
++/* Keep ended pointers until every capture/bubble controller sees the event. */
++static GdkEvent *pointer_dispatch_event;
++static int ended_pointer_id = -1;
++static bool cancel_all_pointers;
+ 
+ // TODO: find a way to reconcile this with libandroid/input.c?
+ static gboolean on_pointer_event(GtkEventControllerLegacy *event_controller, GdkEvent *event, gpointer user_data)
+@@ -208,18 +213,40 @@
+ 	double x;
+ 	double y;
+ 
+-	if ((gdk_event_get_event_type(event) == GDK_TOUCH_END || gdk_event_get_event_type(event) == GDK_BUTTON_RELEASE) && action_up_already_handled) {
+-		action_up_already_handled = false;
+-		return true;
+-	}
+-
+-	uintptr_t id = (uintptr_t)gdk_event_get_event_sequence(event);
+-	if (id > MAX_POINTERS - 1) // sequence id is a real pointer for drag and drop events
+-		return false;
+-
+-	/* FIXME: this will clash with touchscreen */
+-	if (id == 0)
+-		id = 1;
++	if (pointer_dispatch_event != event) {
++		if (cancel_all_pointers) {
++			while (pointer_indices->len)
++				remove_pointer_fast(pointer_indices, g_ptr_array_index(pointer_indices, pointer_indices->len - 1));
++		} else if (ended_pointer_id >= 0 && pointers[ended_pointer_id].id) {
++			remove_pointer_fast(pointer_indices, &pointers[ended_pointer_id]);
++		}
++		ended_pointer_id = -1;
++		cancel_all_pointers = false;
++		if (pointer_dispatch_event) gdk_event_unref(pointer_dispatch_event);
++		pointer_dispatch_event = gdk_event_ref(event);
++	}
++
++	GdkEventType event_type = gdk_event_get_event_type(event);
++	GdkEventSequence *sequence = gdk_event_get_event_sequence(event);
++	/* GdkEventSequence is opaque. Map it to a bounded Android pointer ID. */
++	int id = 0;
++	int free_id = 0;
++	for (int slot = 1; slot < MAX_POINTERS; slot++) {
++		if (pointers[slot].id && pointers[slot].sequence == sequence) {
++			id = slot;
++			break;
++		}
++		if (!pointers[slot].id && !free_id) free_id = slot;
++	}
++	if (!id) {
++		if (event_type != GDK_TOUCH_BEGIN && event_type != GDK_BUTTON_PRESS) return false;
++		id = free_id;
++		if (!id) return false;
++	}
++
++	bool skip_up = (event_type == GDK_TOUCH_END || event_type == GDK_BUTTON_RELEASE)
++	        && action_up_already_handled;
++	if (skip_up) action_up_already_handled = false;
+ 
+ 	int pointer_index;
+ 
+@@ -231,7 +258,6 @@
+ 	}
+ 
+ 	int action;
+-	GdkEventType event_type = gdk_event_get_event_type(event);
+ 	switch (event_type) {
+ 		case GDK_BUTTON_PRESS:
+ 		case GDK_TOUCH_BEGIN:
+@@ -241,6 +267,9 @@
+ 		case GDK_TOUCH_END:
+ 			action = pointer_index > 0 ? (ACTION_POINTER_UP | (pointer_index << 8)) : ACTION_UP;
+ 			break;
++		case GDK_TOUCH_CANCEL:
++			action = ACTION_CANCEL;
++			break;
+ 		case GDK_MOTION_NOTIFY:
+ 			if (!(gdk_event_get_modifier_state(event) & GDK_BUTTON1_MASK))
+ 				return false;
+@@ -273,6 +302,7 @@
+ 		/* we appended a single element, so it must be at pointer_index */
+ 		pointers[id].index = pointer_index;
+ 		pointers[id].id = id;
++		pointers[id].sequence = sequence;
+ 	}
+ 
+ 	pointers[id].coord_x = x;
+@@ -284,11 +314,13 @@
+ 		action = ACTION_CANCEL;
+ 	}
+ 
+-	gboolean ret = call_ontouch_callback(wrapper, action, pointers, pointer_indices, phase, timestamp, event);
++	gboolean ret = skip_up || call_ontouch_callback(wrapper, action, pointers, pointer_indices, phase, timestamp, event);
+ 	if (event_type == GDK_BUTTON_RELEASE || event_type == GDK_TOUCH_END) {
+-		remove_pointer_fast(pointer_indices, &pointers[id]);
+-	}
+-	if (pointer_indices->len == 0 && wrapper->hover_exit_pending) {
++		ended_pointer_id = id;
++	}
++	if (event_type == GDK_TOUCH_CANCEL) cancel_all_pointers = true;
++	if ((pointer_indices->len == 0 || (pointer_indices->len == 1 && ended_pointer_id >= 0)
++	     || cancel_all_pointers) && wrapper->hover_exit_pending) {
+ 		wrapper->hover_exit_pending = FALSE;
+ 		call_hover_callback(wrapper->jobj, ACTION_HOVER_EXIT, x, y, raw_x, raw_y);
+ 	}
+@@ -303,6 +335,7 @@
+ 		case GDK_TOUCH_BEGIN:
+ 		case GDK_BUTTON_RELEASE:
+ 		case GDK_TOUCH_END:
++		case GDK_TOUCH_CANCEL:
+ 		case GDK_MOTION_NOTIFY:
+ 		case GDK_TOUCH_UPDATE:
+ 			return on_pointer_event(event_controller, event, user_data);

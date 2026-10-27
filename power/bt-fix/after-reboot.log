@@ -1,0 +1,42 @@
+ 13:43:43 up 0 min,  2 users,  load average: 1.03, 0.23, 0.08
+d81715c4-de60-4c8f-85f4-0cc61a59c395
+○ bluetooth.service - Bluetooth service
+     Loaded: loaded (/usr/lib/systemd/system/bluetooth.service; enabled; preset: disabled)
+    Drop-In: /etc/systemd/system/bluetooth.service.d
+             └─10-zrn-controller.conf
+     Active: inactive (dead)
+        Job: 390
+       Docs: man:bluetoothd(8)
+
+● zrn-bluetooth.service - Galaxy S9 Bluetooth (BCM4361 on UART_BT)
+     Loaded: loaded (/etc/systemd/system/zrn-bluetooth.service; enabled; preset: disabled)
+     Active: active (running) since Sat 2026-10-24 13:43:28 UTC; 15s ago
+ Invocation: ba5ace311e454091a3684a0d707c77f3
+   Main PID: 385 (btattach)
+      Tasks: 1 (limit: 4646)
+     Memory: 708K (peak: 2.9M)
+        CPU: 78ms
+     CGroup: /system.slice/zrn-bluetooth.service
+             └─385 btattach -B /dev/ttySAC0 -P bcm -S 115200
+
+Oct 24 13:43:28 starlte systemd[1]: Started Galaxy S9 Bluetooth (BCM4361 on UART_BT).
+
+● zrn-bluetooth-addr.service - Galaxy S9 Bluetooth: the phone's own address
+     Loaded: loaded (/etc/systemd/system/zrn-bluetooth-addr.service; static)
+     Active: activating (start) since Sat 2026-10-24 13:43:28 UTC; 15s ago
+        Job: 138
+ Invocation: 43fd22dea268491ab867765dd30a8ed0
+   Main PID: 386 (zrn-bluetooth-a)
+      Tasks: 2 (limit: 4646)
+     Memory: 3.2M (peak: 4.6M)
+        CPU: 845ms
+     CGroup: /system.slice/zrn-bluetooth-addr.service
+             ├─ 386 /bin/sh /usr/local/sbin/zrn-bluetooth-addr
+             └─1020 sleep 5
+
+Oct 24 13:43:28 starlte systemd[1]: Starting Galaxy S9 Bluetooth: the phone's own address...
+No default controller available
+[   15.667655] Bluetooth: hci0: BCM: features 0x0f
+[   15.669023] Bluetooth: hci0: BCM4361B2 Crown E32A ANT1 [Version: 0110.0232]
+[   15.669040] Bluetooth: hci0: BCM (002.003.009) build 0232
+[   15.669518] Bluetooth: hci0: HCI Read Transmit Power Level command is advertised, but not supported.

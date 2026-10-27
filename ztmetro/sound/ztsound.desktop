@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Sound
+Comment=Equalizer and sound effects
+Exec=ztsound %u
+Terminal=false
+Type=Application
+Icon=ztsound
+Categories=AudioVideo;Audio;Settings;

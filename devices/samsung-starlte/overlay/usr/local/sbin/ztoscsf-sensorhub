@@ -1,0 +1,53 @@
+#!/bin/sh
+# Bring the sensor hub up: load its transport driver (zrn-bbd) and build the
+# Android root that Broadcom's own daemon, lhd, runs in. lhd itself is started
+# by ztoscsf-sensorhub.service after this.
+#
+# Like the sound driver, this one drives hardware the kernel knows nothing
+# about (a SPI controller, a regulator, pins), so it is not in modules-load.d:
+# a mark is left before loading and removed after. If loading ever stops the
+# kernel, the phone restarts and finds the mark, and does not try again.
+# Remove /var/lib/ztoscsf-sensorhub/loading to retry.
+if [ "${1:-}" = --run ]; then
+	# lhd must run to download firmware, but gets only 30 seconds to do so.
+	# Once ready, a lost hub ends this attempt instead of burning a core.
+	/usr/bin/chroot /run/android /vendor/bin/hw/lhd /vendor/etc/sensor/lhd.conf &
+	lhd_pid=$!
+	# systemd also kills the entire control group, including unresponsive lhd.
+	trap 'kill "$lhd_pid" 2>/dev/null' EXIT
+	trap 'exit 0' TERM INT
+	ready=0
+	for attempt in $(seq 30); do
+		kill -0 "$lhd_pid" 2>/dev/null || exit 1
+		if [ "$(cat /sys/class/sec/sensorhub/ready 2>/dev/null)" = 1 ]; then
+			ready=1
+			break
+		fi
+		sleep 1
+	done
+	if [ "$ready" != 1 ]; then
+		echo "ztoscsf-sensorhub: firmware not ready after 30 seconds; stopping lhd"
+		exit 1
+	fi
+	while kill -0 "$lhd_pid" 2>/dev/null; do
+		sleep 2
+		if [ "$(cat /sys/class/sec/sensorhub/ready 2>/dev/null)" != 1 ]; then
+			echo "ztoscsf-sensorhub: firmware lost readiness; stopping lhd"
+			exit 1
+		fi
+	done
+	exit 1
+fi
+MARK=/var/lib/ztoscsf-sensorhub/loading
+mkdir -p /var/lib/ztoscsf-sensorhub
+if [ ! -e /dev/zrn_ssp ]; then
+	if [ -e "$MARK" ]; then
+		echo "ztoscsf-sensorhub: the last attempt did not finish; not loading. Remove $MARK to retry."
+		exit 1
+	fi
+	touch "$MARK"; sync
+	modprobe zrn-bbd || { echo "ztoscsf-sensorhub: the driver did not load"; rm -f "$MARK"; exit 1; }
+	sleep 2		# long enough for a fault to show
+	rm -f "$MARK"; sync
+fi
+/usr/local/sbin/zrn-android-root up

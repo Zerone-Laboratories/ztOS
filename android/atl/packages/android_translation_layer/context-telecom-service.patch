@@ -1,0 +1,32 @@
+--- a/src/api-impl/android/app/ContextImpl.java
++++ b/src/api-impl/android/app/ContextImpl.java
+@@ -27,6 +27,7 @@
+ import android.os.*;
+ import android.os.storage.StorageManager;
+ import android.telephony.TelephonyManager;
++import android.telecom.TelecomManager;
+ import android.util.Log;
+ import android.util.Slog;
+ import android.view.Display;
+@@ -157,6 +158,8 @@
+ 				return new AudioManager();
+ 			case "activity":
+ 				return new ActivityManager();
++			case "telecom":
++				return new TelecomManager();
+ 			case "usb":
+ 				return new UsbManager();
+ 			case "vibrator":
+--- a/src/api-impl/android/telecom/TelecomManager.java
++++ b/src/api-impl/android/telecom/TelecomManager.java
+@@ -1,4 +1,10 @@
+ package android.telecom;
+ 
+ public class TelecomManager {
++	public TelecomManager() {
++	}
++
++	public String getDefaultDialerPackage() {
++		return null;
++	}
+ }

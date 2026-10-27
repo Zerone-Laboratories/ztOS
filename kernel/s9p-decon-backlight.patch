@@ -76,7 +76,7 @@
  	if (s9p_panel_sleep) {
  		s9p_decon_dcs(priv, MIPI_DCS_EXIT_SLEEP_MODE);
  		msleep(PANEL_SLEEP_DELAY_MS);
-@@ -385,6 +411,228 @@
+@@ -385,6 +411,227 @@
  	s9p_decon_dcs(priv, MIPI_DCS_SET_DISPLAY_ON);
  }
  
@@ -101,11 +101,10 @@
 +		return;
 +
 +	writel_relaxed(DSIM_INTSRC_PH_FIFO_EMPTY, priv->dsim + DSIM_INTSRC);
-+	if (len <= 2) {
-+		writel_relaxed(DSIM_PKTHDR_ID(len == 1 ? MIPI_DCS_SHORT_WRITE :
-+						 MIPI_DCS_SHORT_WRITE_PARAM) |
++	if (len == 1) {
++		writel_relaxed(DSIM_PKTHDR_ID(MIPI_DCS_SHORT_WRITE) |
 +			       DSIM_PKTHDR_DATA0(data[0]) |
-+			       DSIM_PKTHDR_DATA1(len == 2 ? data[1] : 0),
++			       DSIM_PKTHDR_DATA1(0),
 +			       priv->dsim + DSIM_PKTHDR);
 +	} else {
 +		for (i = 0; i < len; i++) {

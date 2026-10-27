@@ -1,0 +1,10 @@
+[Unit]
+Description=Apply soft memory policy when Waydroid creates its cgroup
+
+[Timer]
+OnBootSec=30
+OnUnitInactiveSec=60
+Unit=ztos-memory-policy.service
+
+[Install]
+WantedBy=timers.target

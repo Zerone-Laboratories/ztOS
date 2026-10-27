@@ -1,2 +1,0 @@
-# ztOS on the Galaxy S9 (starlte): the kernel is ztOS's own boot image, not a
-# package (see scripts/build-boot.sh); the phone's firmware comes from firmware/.

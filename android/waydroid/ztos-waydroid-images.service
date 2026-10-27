@@ -1,0 +1,18 @@
+[Unit]
+Description=ztOS: put the stripped Android (Waydroid) in place
+Documentation=file:///usr/share/ztos-waydroid/README.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=!/var/lib/ztos/waydroid-ready
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/ztos/ztos-waydroid-images
+# no network yet, or a download cut: try again later, never in a loop
+Restart=on-failure
+RestartSec=10min
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

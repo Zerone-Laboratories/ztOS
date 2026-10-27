@@ -1,0 +1,12 @@
+diff --git a/src/api-impl-jni/views/android_view_View.c b/src/api-impl-jni/views/android_view_View.c
+index b3f7f58..836caf9 100644
+--- a/src/api-impl-jni/views/android_view_View.c
++++ b/src/api-impl-jni/views/android_view_View.c
+@@ -912,6 +912,7 @@ static void on_long_click_update(GtkGesture *gesture, GdkEventSequence *sequence
+ JNIEXPORT void JNICALL Java_android_view_View_nativeSetOnLongClickListener(JNIEnv *env, jobject this, jlong widget_ptr)
+ {
+ 	GtkWidget *widget = GTK_WIDGET(_PTR(widget_ptr));
++	widget_set_needs_allocation(widget);
+ 	GtkEventController *old_controller = g_object_get_data(G_OBJECT(widget), "on_long_click_listener");
+ 	if (old_controller)
+ 		return;

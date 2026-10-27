@@ -1,0 +1,145 @@
+#!/bin/bash
+set -u
+
+runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+state="$HOME/.local/state"
+shots="$state/ztos-demoloop"
+ctl="$runtime/ztmetro.ctl"
+active="$runtime/ztos-demoloop.active"
+screen="$runtime/ztos-demoloop.screen"
+log="$state/ztos-demoloop.log"
+mkdir -p "$state" "$shots"
+touch "$active"
+
+say() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$log"; }
+cmd() {
+  say "ctl: $1"
+  timeout -k 1 2 bash -c 'printf "%s\n" "$1" > "$2"' _ "$1" "$ctl" || say "ctl timed out: $1"
+}
+wait_ctl() {
+  for _ in $(seq 1 40); do
+    if [ -p "$ctl" ] && pgrep -x ztmetro >/dev/null &&
+       timeout -k 1 1 bash -c 'printf "state\n" > "$1"' _ "$ctl"; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+shot() {
+  local name=$1 path
+  path="$shots/$(date '+%Y%m%d-%H%M%S')-$name.png"
+  if [ -p "$ctl" ] && [ "$(cat "$screen" 2>/dev/null || echo on)" = on ]; then
+    timeout -k 2 20 grim -o DSI-1 "$path" 2>/dev/null || true
+    [ -s "$path" ] && say "screenshot saved: $name" || say "screenshot failed: $name"
+  fi
+}
+wait_awake() {
+  while [ -e "$active" ] && { [ ! -e "$screen" ] || [ "$(cat "$screen" 2>/dev/null)" != on ]; }; do sleep 1; done
+  [ -e "$active" ]
+}
+dwell() {
+  local left=$1
+  while [ "$left" -gt 0 ] && [ -e "$active" ]; do
+    wait_awake || return 1
+    sleep 1
+    left=$((left - 1))
+  done
+}
+step() { say "step: $1"; }
+wait_front() {
+  local id=$1 seconds=$2
+  for _ in $(seq 1 "$seconds"); do
+    [ -e "$active" ] || return 1
+    wait_awake || return 1
+    cmd state
+    if grep -Fq "state: front=$id " "$state/ztmetro.log"; then return 0; fi
+    dwell 1 || return 1
+  done
+  say "front timeout: $id"
+  return 1
+}
+ensure_live_tile() {
+  local name=$1 content=$2 path
+  path="$runtime/ztos-live/$name"
+  mkdir -p "$runtime/ztos-live"
+  printf '%s\n' "$content" > "$path"
+}
+ensure_live_tiles() {
+  ensure_live_tile ztsettings $'title=Settings\nline=Display and sound\nline=Accounts and apps\nline=Personalize your phone\ncount=0'
+  ensure_live_tile superscan $'title=Superscan\nline=Search and browse\nline=Private tabs\nline=Your bookmarks\ncount=0'
+}
+
+if ! wait_ctl; then say "shell unavailable at startup"; exit 1; fi
+cmd "demoloop on"
+cmd "screen on"
+printf 'on\n' > "$screen"
+ensure_live_tiles
+
+cleanup() {
+  local timeout
+  local wd_policy=idle
+  [ "$(cat "$screen" 2>/dev/null)" = off ] && wd_policy=screen-off
+  timeout=$(awk -F= '$1 ~ /^[[:space:]]*timeout[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.config/ztmetro/config" 2>/dev/null)
+  rm -f "$active" "$screen"
+  [ -p "$ctl" ] && printf 'demoloop off %s\n' "${timeout:-60}" > "$ctl" || true
+  ztos-waydroid-power "$wd_policy" >/dev/null 2>&1 || true
+  rm -f "$runtime/ztos-waydroid-launching"
+  say "stopped; normal screen timeout restored"
+}
+trap 'exit 0' INT TERM
+trap cleanup EXIT
+
+step "preload Waydroid session and WhatsApp"
+ztos-waydroid-power active >/dev/null 2>&1 || true
+systemctl --user start ztos-waydroid-session.service || say "Waydroid session start failed"
+for _ in $(seq 1 60); do waydroid status 2>/dev/null | grep -q RUNNING && break; sleep 1; done
+cmd "tile ztos-android-com.whatsapp"
+dwell 25 || true
+timeout -k 2 15 ztos-waydroid-recover close com.whatsapp >/dev/null 2>&1 || true
+cmd home
+
+failures=0
+loop=0
+while [ -e "$active" ]; do
+  wait_awake || break
+  loop=$((loop + 1)); start=$(date +%s)
+  step "loop $loop restart shell to lock screen"
+  rm -f "$runtime/ztmetro-logo-unlocked" "$screen"
+  pkill -x ztmetro || true
+  if ! wait_ctl; then
+    failures=$((failures + 1)); say "shell failed to return ($failures/2)"
+    [ "$failures" -ge 2 ] && break
+    continue
+  fi
+  failures=0
+  printf 'on\n' > "$screen"
+  cmd "demoloop on"
+  ensure_live_tiles
+  dwell 7; shot "$loop-lock"
+  step "unlock and boot logo"
+  cmd "down 11 180 680"; dwell 1; cmd "move 11 180 360"; dwell 1; cmd "move 11 180 160"; cmd "up 11"
+  dwell 1 || break; shot "$loop-logo"
+  dwell 4 || break; shot "$loop-start"
+  step "Start live tiles: Settings"
+  ensure_live_tile ztsettings $'title=Settings\nline=Display and sound\nline=Accounts and apps\nline=Personalize your phone\ncount=0'
+  shot "$loop-settings-live-before"; cmd "flip ztsettings"; dwell 2 || break; shot "$loop-settings-live-after"
+  step "Start live tiles: Superscan"
+  ensure_live_tile superscan $'title=Superscan\nline=Search and browse\nline=Private tabs\nline=Your bookmarks\ncount=0'
+  shot "$loop-superscan-live-before"; cmd "flip superscan"; dwell 2 || break; shot "$loop-superscan-live-after"
+  step "open WhatsApp"
+  cmd "tile ztos-android-com.whatsapp"
+  wait_front waydroid.com.whatsapp 45 || true
+  dwell 3 || break; shot "$loop-whatsapp"
+  step "close WhatsApp task"
+  timeout -k 2 15 ztos-waydroid-recover close com.whatsapp >/dev/null 2>&1 || true
+  cmd close_front; dwell 2 || break; shot "$loop-whatsapp-closed"
+  step "open app list"
+  cmd applist
+  for _ in $(seq 1 8); do cmd state; grep -q 'page=1\.00' "$state/ztmetro.log" && break; dwell 1 || break; done
+  shot "$loop-applist"
+  step "open Files from app list"
+  cmd "item ztfiles"; wait_front ztfiles 25 || true; dwell 2 || break; shot "$loop-files"
+  step "return home"
+  cmd home; dwell 2 || break; shot "$loop-home"
+  say "loop $loop duration $(($(date +%s)-start))s"
+done
+exit 0

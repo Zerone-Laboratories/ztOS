@@ -100,22 +100,67 @@ clear (2 each), integration time, gain. Numbers and sizes are in
    notifier behind on unload, which crashed the kernel on the next load; all
    three are released now.
 
-### Open: the hub does not start from a cold boot
+### Cold-boot start: verified
 
-After a forced reboot (Power + Volume Down, from a frozen system) the chip
-answered nothing on SPI: lhd loops on `FD_TIMEOUT_SYNC`, `bcm_ssi_tx` writes
-0 bytes. Pulsing the enable pin, reloading zrn-bbd and cutting LDO37 for 2 s
-did not help. One pass through TWRP (whose Samsung kernel holds the hub's
-supply on and sets up its pins at boot) and back to Arch: the hub came up at
-once. So Samsung's kernel does something at boot that our driver does not.
-`hub-snapshot.sh` dumps pins, SPI controller, clock gates and LDO37;
-`stock-state/arch-hub-working-after-twrp.txt` is the working state. The next
-time it fails, run it and compare. Until then, the way back is
-`systemctl reboot --reboot-argument=recovery`, then `adb shell reboot`.
+The failing boot had LDO37 on but `gpg0-2` (GPS_PWR_EN) low. `zrn-bbd` now
+sets LDO37 on at each probe, holds GPS_PWR_EN low for 100 ms, then drives it
+high. The same sequence is exposed at
+`/sys/class/sec/sensorhub/reset` for recovery retries. No boot image change is
+needed.
+
+Samsung's device tree configures `gpg0-2` as the GPS power output.
+`gpg0-4` is an unpulled input assigned to the USB PHY's `phy-port` with
+`used_phy_port = <0>`; its sampled DAT bit varies and is not an enable output.
+The driver leaves it alone. `gph0-4` is MCU_RESP input with pulls disabled;
+`gpa0-5` (AP_SLEEP) is held high; `gpa1-7` and `gpa4-0` remain inputs.
+
+`ztoscsf` no longer has a recovery reboot command. On hub failure it stops
+sensord, pulses the driver reset sequence, restarts lhd, and tries twice.
+It shows the failure dialog only after both retries fail.
+
+Three normal `systemctl reboot` checks on 2026-10-24 passed. On each boot,
+`/sys/class/sec/sensorhub/ready` reached 1 within 28 seconds, sensord was
+active by 11 seconds, `gpg0-2` was high (`gpg0 DAT = 0x27`), SPI status was
+`0x03000000`, and LDO37 read `ec`. Snapshots:
+
+- `stock-state/arch-hub-normal-reboot-1-20261024.txt`
+- `stock-state/arch-hub-normal-reboot-2-20261024.txt`
+- `stock-state/arch-hub-normal-reboot-3-20261024.txt`
+
+The earlier failing and TWRP-working snapshots remain in `stock-state/` for
+comparison. A synced SysRq-b reboot was attempted; the phone's control endpoint
+did not return, so its sensor state could not be verified.
 
 ### Not done
+
+User-space failure containment follow-up (2026-10-25): the sensorhub helper now
+supervises lhd with a 30-second firmware startup deadline and two-second checks
+after readiness. The service does not automatically restart failed firmware;
+ztoscsf owns the two recovery attempts and stops both units when those fail.
+`python sensors/test-sensorhub-watch.py` exercises the supervisor with mocks,
+without touching hardware. The helper, unit, and CSF binary are now deployed. A live failed startup stopped
+lhd after 30 seconds and left zero automatic restarts; no lhd survived. The
+CSF exhaustion test also verifies stop ordering with mocked hardware commands.
+Details and evidence are in `ztmetro/csf/POLISH.md` and `~/swarm/polish-report.md`.
 
 - Auto rotation from the accelerometer, proximity for calls, the compass.
 - GNSS: the same chip and daemon, `gpsd` from VENDOR on top of lhd.
 - The Settings brightness slider and the action centre tile still move the
   screen while auto brightness is on; the next change in the room overrides them.
+
+## Hub firmware patch: Android 10, not 9 (2026-10-25)
+
+`zrn-bbd` embedded the Android 9 (`p_os`) hub patch while the phone's vendor `lhd` and firmware
+are Android 10 (G960NKSU5FVA2). With it the hub asserted in its transport layer
+(`Assert=MCU_BCM477X_transport_layer.c line=0165`, then `ESW:CRASHED`) every few minutes to
+hours, more under load. `driver/q_os/bbd_patch_file_star.h` is the Android 10 patch from
+xxmustafacooTR/exynos-linux-stable (`drivers/sensorhub/brcm/bbdpl/q_os`), now the one built in.
+Previous module on the phone: `zrn-bbd.ko.before-qpatch`. That kernel tree's modem_v1 is an
+older revision of the same Samsung source we use; nothing to take from it.
+
+The patch alone did not stop the asserts. They came within a second of `ztoscsf-sensord`
+sending the AP-state commands 0xd2 (SLEEP, at every screen-off) and 0xd1 (WAKEUP, at its start).
+Samsung's ssp driver on this phone never sends either: they belong to early suspend, which its
+kernel does not build; it only sends 0xd4/0xd3 (SUSPEND/RESUME) around system suspend.
+`ztoscsf-sensord` no longer sends them and only takes its sensors off while the screen is off.
+After that: no assert at start and none in four screen off/on cycles (2026-10-25).

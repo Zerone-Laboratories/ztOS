@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""ztos-ial: look at and test ztOSIAL on this phone.
+
+    ztos-ial status                 what this phone serves, and through which backend
+    ztos-ial dump                   all of it as JSON: every interface, its backend,
+                                    whether it answers, and its properties (for apps)
+    ztos-ial get Power1 [Capacity]  one property, or all of an interface
+    ztos-ial call Haptics1 Play tap a method (arguments as JSON or plain words)
+    ztos-ial check [--root DIR]     the manifest against this GSI (no daemon needed)
+    ztos-ial test [--interactive]   call every interface the phone declares
+
+Exit codes: 0 fine, 1 a check or test failed, 2 usage, 3 the daemon is not there.
+"""
+import argparse
+import json
+import os
+import sys
+
+for candidate in ('/usr/lib/ztos-ial', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')):
+    if os.path.isdir(os.path.join(candidate, 'ztos_ial')):
+        sys.path.insert(0, os.path.abspath(candidate))
+        break
+
+from ztos_ial import INTERFACES, manifest  # noqa: E402
+
+
+def plain(value):
+    return json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict, tuple)) else str(value)
+
+
+def argument(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def cmd_check(args):
+    problems, notes = manifest.check(args.root)
+    for note in notes:
+        print('note: ' + note)
+    for problem in problems:
+        print('PROBLEM: ' + problem)
+    print('ok' if not problems else f'{len(problems)} problem(s)')
+    return 1 if problems else 0
+
+
+def cmd_status(args):
+    from ztos_ial import client
+    device = client.get_all('Device1')
+    print(f'{device["Name"]} ({device["Codename"]}), GSI {device["GsiVersion"]}')
+    print('manifest: ' + device['ManifestPath'])
+    for name in INTERFACES:
+        if name in device['Interfaces']:
+            print(f'  {name:13} v{device["Interfaces"][name]}  {device["Backends"].get(name, "")}')
+        elif name in device['Missing']:
+            print(f'  {name:13} -   none')
+    return 0
+
+
+def cmd_dump(args):
+    """One JSON object for OSIAL Management: the device, then every interface
+    ztOSIAL knows, served or not, with what it answered."""
+    from ztos_ial import client
+    out = {'daemon': True, 'device': {}, 'interfaces': []}
+    try:
+        device = client.get_all('Device1')
+    except client.Error as error:
+        out['daemon'] = False
+        out['error'] = f'{error.name}: {error}'
+        print(json.dumps(out))
+        return 0
+    out['device'] = device
+    for name in INTERFACES:
+        entry = {'name': name, 'required': INTERFACES[name], 'served': name in device['Interfaces'],
+                 'version': device['Interfaces'].get(name, 0),
+                 'backend': device['Backends'].get(name, 'none'),
+                 'answers': False, 'error': '', 'properties': {}}
+        if entry['served']:
+            try:
+                entry['properties'] = client.get_all(name)
+                entry['answers'] = True
+            except client.Error as error:
+                entry['error'] = f'{error.name}: {error}'
+        out['interfaces'].append(entry)
+    print(json.dumps(out, default=str))
+    return 0
+
+
+def cmd_get(args):
+    from ztos_ial import client
+    if args.prop:
+        print(plain(client.get(args.interface, args.prop)))
+    else:
+        for key, value in sorted(client.get_all(args.interface).items()):
+            print(f'{key} = {plain(value)}')
+    return 0
+
+
+def cmd_call(args):
+    from ztos_ial import client
+    result = client.call(args.interface, args.method, *[argument(a) for a in args.args])
+    if result is not None:
+        print(plain(result))
+    return 0
+
+
+def ask(question):
+    try:
+        return input(question + ' [y/n] ').strip().lower().startswith('y')
+    except EOFError:
+        return False
+
+
+def cmd_test(args):
+    """Every declared interface answers, and its values make sense. Nothing is
+    changed for good: a brightness set is put back."""
+    from ztos_ial import client
+    device = client.get_all('Device1')
+    failures = 0
+
+    def result(name, ok, detail=''):
+        nonlocal failures
+        failures += 0 if ok else 1
+        print(f'{"PASS" if ok else "FAIL"}  {name}{"  " + detail if detail else ""}', flush=True)
+
+    for name in device['Interfaces']:
+        try:
+            values = client.get_all(name)
+            result(name + ' answers', True, f'{len(values)} properties')
+        except client.Error as error:
+            result(name + ' answers', False, error.name)
+            continue
+        if name == 'Power1':
+            result('Power1 capacity 0..100', 0 <= values['Capacity'] <= 100, str(values['Capacity']))
+            result('Power1 voltage reported', values['VoltageNow'] > 0, str(values['VoltageNow']))
+        if name == 'Perf1':
+            topology = json.loads(values['Topology'])
+            result('Perf1 has clusters', bool(topology['clusters']), str(len(topology['clusters'])))
+        if name == 'Display1' and values['Node']:
+            before = values['Brightness']
+            try:
+                client.call('Display1', 'SetBrightness', max(0.05, before * 0.8))
+                client.call('Display1', 'SetBrightness', before)
+                result('Display1 brightness moves', True)
+            except client.Error as error:
+                result('Display1 brightness moves', False, str(error))
+        if name == 'Haptics1' and values['Device'] and args.interactive:
+            client.call('Haptics1', 'Play', 'notify')
+            result('Haptics1 pulse felt', ask('Did the phone vibrate?'))
+        if name == 'Sensors1':
+            for sensor in values['Available']:
+                try:
+                    result(f'Sensors1 reads {sensor}', True, plain(client.call('Sensors1', 'Read', sensor)))
+                except client.Error as error:
+                    result(f'Sensors1 reads {sensor}', False, error.name)
+        if name == 'Modem1' and values['Present']:
+            result('Modem1 SIM', values['SimState'] != 'absent', values['SimState'])
+    print('all passed' if not failures else f'{failures} failed')
+    return 1 if failures else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='command', required=True)
+    item = sub.add_parser('check'); item.add_argument('--root', default=None)
+    sub.add_parser('status')
+    sub.add_parser('dump')
+    item = sub.add_parser('get'); item.add_argument('interface'); item.add_argument('prop', nargs='?')
+    item = sub.add_parser('call'); item.add_argument('interface'); item.add_argument('method')
+    item.add_argument('args', nargs='*')
+    item = sub.add_parser('test'); item.add_argument('--interactive', action='store_true')
+    args = parser.parse_args()
+    if args.command == 'check':
+        return cmd_check(args)
+    from ztos_ial import client
+    try:
+        return {'status': cmd_status, 'dump': cmd_dump, 'get': cmd_get, 'call': cmd_call, 'test': cmd_test}[args.command](args)
+    except client.Error as error:
+        print(f'{error.name}: {error}', file=sys.stderr)
+        return 3 if 'ServiceUnknown' in error.name or 'NameHasNoOwner' in error.name else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

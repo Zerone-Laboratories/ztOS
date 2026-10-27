@@ -1,0 +1,30 @@
+--- a/src/api-impl/android/content/res/Resources.java
++++ b/src/api-impl/android/content/res/Resources.java
+@@ -138,6 +138,7 @@
+ 	/*package*/ final AssetManager mAssets;
+ 	private final Configuration mConfiguration = new Configuration();
+ 	/*package*/ final DisplayMetrics mMetrics = new DisplayMetrics();
++	final ClassLoader mClassLoader;
+ 	private PluralRules mPluralRule;
+ 
+ 	private CompatibilityInfo mCompatibilityInfo = CompatibilityInfo.DEFAULT_COMPATIBILITY_INFO;
+@@ -218,6 +219,7 @@
+ 	public Resources(AssetManager assets, DisplayMetrics metrics, Configuration config,
+ 	                 CompatibilityInfo compatInfo, IBinder token) {
+ 		mAssets = assets;
++		mClassLoader = ClassLoader.getSystemClassLoader();
+ 		mMetrics.setToDefaults();
+ 		if (compatInfo != null) {
+ 			mCompatibilityInfo = compatInfo;
+@@ -2032,6 +2034,11 @@
+ 		return mAssets;
+ 	}
+ 
++	/** @hide */
++	public ClassLoader getClassLoader() {
++		return mClassLoader;
++	}
++
+ 	/**
+ 	 * Call this to remove all cached loaded layout resources from the
+ 	 * Resources object.  Only intended for use with performance testing

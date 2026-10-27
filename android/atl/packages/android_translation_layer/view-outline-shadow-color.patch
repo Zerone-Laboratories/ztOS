@@ -1,0 +1,30 @@
+--- a/src/api-impl/android/view/View.java
++++ b/src/api-impl/android/view/View.java
+@@ -2117,6 +2117,27 @@
+ 	public ViewOutlineProvider getOutlineProvider() { return new ViewOutlineProvider(); }
+ 	public void setOutlineProvider(ViewOutlineProvider provider) {}
+ 
++	// API 28 shadow tints. ATL draws no elevation shadows yet, so the colors
++	// are only stored; Android's default for both is opaque black.
++	private int outlineAmbientShadowColor = 0xFF000000;
++	private int outlineSpotShadowColor = 0xFF000000;
++
++	public void setOutlineAmbientShadowColor(int color) {
++		outlineAmbientShadowColor = color;
++	}
++
++	public int getOutlineAmbientShadowColor() {
++		return outlineAmbientShadowColor;
++	}
++
++	public void setOutlineSpotShadowColor(int color) {
++		outlineSpotShadowColor = color;
++	}
++
++	public int getOutlineSpotShadowColor() {
++		return outlineSpotShadowColor;
++	}
++
+ 	public void setStateListAnimator(StateListAnimator stateListAnimator) {
+ 		if (stateListAnimator != null && stateListAnimator.enabledAnimator != null) {
+ 			stateListAnimator.enabledAnimator.setTarget(this);

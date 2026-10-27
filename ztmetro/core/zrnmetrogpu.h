@@ -18,6 +18,8 @@ bool zmg_end(void);
 void zmg_clip(double x, double y, double w, double h);
 void zmg_rect(double x, double y, double w, double h, float r, float g, float b);
 void zmg_prepare(cairo_surface_t *source, unsigned revision);
+/* drop the GPU's copy of a picture the app has released (not the live cache) */
+void zmg_forget(cairo_surface_t *source);
 /* Pixel coordinates in the Cairo source; out-of-bounds parts are clipped.
  * A source is uploaded only when its identity or revision changes. */
 void zmg_surface(cairo_surface_t *source, unsigned revision,

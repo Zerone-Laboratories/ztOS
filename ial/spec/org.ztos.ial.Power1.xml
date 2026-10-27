@@ -1,0 +1,27 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- org.ztos.ial.Power1: Battery and charger. CurrentNow is in uA, positive while charging and negative while the battery is drained; VoltageNow in uV; Temperature in degrees C.
+     Licence: LGPL-2.1-or-later. -->
+<node>
+  <interface name="org.ztos.ial.Power1">
+    <property name="Version" type="u" access="read"/>
+    <property name="Capacity" type="i" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="CurrentNow" type="i" access="read"/>
+    <property name="VoltageNow" type="i" access="read"/>
+    <property name="Temperature" type="d" access="read"/>
+    <property name="ChargerOnline" type="b" access="read"/>
+    <property name="ChargerType" type="s" access="read"/>
+    <property name="InputCurrentLimit" type="i" access="read"/>
+    <property name="ChargeLimit" type="i" access="read"/>
+    <property name="CapacityNode" type="s" access="read"/>
+    <property name="CurrentNode" type="s" access="read"/>
+    <property name="StatusNode" type="s" access="read"/>
+    <method name="SetInputCurrentLimit">
+      <arg direction="in" name="microamps" type="i"/>
+    </method>
+    <method name="SetChargeLimit">
+      <arg direction="in" name="percent" type="i"/>
+    </method>
+  </interface>
+</node>

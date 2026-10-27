@@ -19,3 +19,7 @@ void tickle_ready(const struct pollfd *fds, int n);	/* after poll() */
 int tickle_timeout(void);			/* ms to the next pulse, -1 none */
 bool tickle_run(void);				/* do what is due; true: the status changed */
 void tickle_status(FILE *f);
+
+void tickle_background_reload(void);
+int tickle_background_count(void);
+bool tickle_audio_playing(void);		/* a stream is playing, Android's included */

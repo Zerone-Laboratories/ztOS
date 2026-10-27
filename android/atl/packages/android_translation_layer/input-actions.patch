@@ -1,0 +1,71 @@
+--- a/src/api-impl-jni/widgets/android_widget_EditText.c
++++ b/src/api-impl-jni/widgets/android_widget_EditText.c
+@@ -77,14 +77,14 @@
+ 	g_object_set_data(G_OBJECT(gtk_text), "text_changed_listeners", listeners);
+ }
+ 
+-#define IME_ACTION_SEARCH 3
++#define ACTION_DOWN       0
+ #define KEYCODE_ENTER     66
+ 
+ static void on_activate(GtkText *gtk_text, struct changed_callback_data *d)
+ {
+ 	JNIEnv *env = get_jni_env();
+ 
+-	jobject key_event = (*env)->NewObject(env, handle_cache.key_event.class, handle_cache.key_event.constructor, (jlong)0, (jlong)0, IME_ACTION_SEARCH, KEYCODE_ENTER, 0, 0);
++	jobject key_event = (*env)->NewObject(env, handle_cache.key_event.class, handle_cache.key_event.constructor, (jlong)0, (jlong)0, ACTION_DOWN, KEYCODE_ENTER, 0, 0);
+ 	(*env)->CallBooleanMethod(env, d->listener, d->listener_method, d->this, 0, key_event);
+ 	if ((*env)->ExceptionCheck(env))
+ 		(*env)->ExceptionDescribe(env);
+--- a/src/api-impl-jni/widgets/android_widget_Button.c
++++ b/src/api-impl-jni/widgets/android_widget_Button.c
+@@ -21,6 +21,8 @@
+ 
+ 	GtkWidget *wrapper = g_object_ref(wrapper_widget_new());
+ 	GtkWidget *button = gtk_button_new();
++	/* Android touch clicks do not transfer keyboard focus from the editor. */
++	gtk_widget_set_focus_on_click(button, FALSE);
+ 	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+ 	gtk_button_set_child(GTK_BUTTON(button), box);
+ 	gtk_box_append(GTK_BOX(box), gtk_label_new(text));
+--- a/src/api-impl-jni/widgets/android_widget_ImageButton.c
++++ b/src/api-impl-jni/widgets/android_widget_ImageButton.c
+@@ -11,6 +11,8 @@
+ {
+ 	GtkWidget *wrapper = g_object_ref(wrapper_widget_new());
+ 	GtkWidget *button = gtk_button_new();
++	/* Android touch clicks do not transfer keyboard focus from the editor. */
++	gtk_widget_set_focus_on_click(button, FALSE);
+ 	GtkWidget *image = gtk_picture_new_for_resource("/org/gtk/libgtk/icons/16x16/status/image-missing.png"); // show "broken image" icon
+ 	gtk_button_set_child(GTK_BUTTON(button), image);
+ 	wrapper_widget_set_child(WRAPPER_WIDGET(wrapper), button);
+--- a/src/main-executable/main.c
++++ b/src/main-executable/main.c
+@@ -332,6 +332,16 @@
+ 	g_string_free(service_file, TRUE);
+ 	g_free(service_path);
+ 
++	return TRUE;
++}
++
++/* The shell's Back button arrives as Escape, including when decorations are hidden. */
++static gboolean android_back_key(GtkEventControllerKey *controller, guint keyval,
++                                guint keycode, GdkModifierType state, gpointer data)
++{
++	if (keyval != GDK_KEY_Escape && keyval != GDK_KEY_Back)
++		return FALSE;
++	current_activity_back_pressed();
+ 	return TRUE;
+ }
+ 
+@@ -693,6 +703,10 @@
+ 		gtk_window_set_title(GTK_WINDOW(window), package_name);
+ 	gtk_window_set_default_size(GTK_WINDOW(window), d->window_width, d->window_height);
+ 	g_signal_connect(window, "close-request", G_CALLBACK(app_exit), env);
++	GtkEventController *back_keys = gtk_event_controller_key_new();
++	gtk_event_controller_set_propagation_phase(back_keys, GTK_PHASE_CAPTURE);
++	g_signal_connect(back_keys, "key-pressed", G_CALLBACK(android_back_key), NULL);
++	gtk_widget_add_controller(window, back_keys);
+ 
+ 	GtkWidget *header_bar = gtk_header_bar_new();
+ 	GtkWidget *back_button = back_button_new();

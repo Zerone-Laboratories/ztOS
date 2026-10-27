@@ -1,3 +1,36 @@
+# Current-install AP sleep verification — 2026-10-22
+
+Kernel #55 (`7.1.0-zboot`) completed two consecutive AP-only RTC suspend
+cycles using the installed `zrn-sleepd once 10` path. AP and SoC sequence
+counts advanced 0 -> 1 -> 2; kernel suspend successes reached 2. Both wakes
+reported `wake_stat=0x80000002`, sensorhub ready stayed 1, and
+`last_restore_error=0`. The difference between boottime and monotonic grew
+by 6.424 and 6.011 seconds respectively, showing time spent suspended.
+The ten-second RTC interval includes sleep preparation, not ten seconds
+of hardware sleep.
+
+The temporary corrected watchdog diagnostic armed once per cycle and
+reported zero reset-route errors; it was unloaded after each trial.
+This verifies suspend-time route setup and normal restoration, not a
+watchdog-triggered reset or clock continuity through full MIF shutdown.
+USB returned automatically. Wi-Fi was detached/rebound by the daemon;
+this does not establish native firmware D3 support. MIF sequencing remained
+disabled, with MIF sleep count zero. Full MIF sleep remains unresolved.
+Evidence: `build/power-analysis/ap-wake-20261022.log`.
+
+Two subsequent watchdog-counter diagnostic cycles also woke by RTC,
+bringing AP/SoC sequence counts and kernel suspend successes to 4. The
+watchdog ticks before handoff but its count is reloaded across suspend;
+entry/exit counter equality therefore proves neither a stopped clock nor
+continuous protection. See [watchdog diagnostics](watchdog-test/README.md).
+
+A fifth AP-only cycle intentionally placed the RTC alarm at 45 seconds,
+beyond the watchdog's 30-second timeout. It resumed by RTC without a reset
+or boot-ID change, despite verified route unmasking and pre-handoff timer
+ticks. This watchdog configuration does not enforce that timeout through
+AP sleep and cannot serve as the full-MIF hang recovery guarantee. The
+phone recovered normally with sensorhub ready=1 and restore errors=0.
+
 # Full MIF sleep: stock works on this phone, ours does not — 2026-10-18 (later)
 
 Samsung's kernel sleeps with MIF down on this exact phone and boot chain.
@@ -38,6 +71,12 @@ in ztOS: `dmc-ztos-awake.json` (TWRP has no /dev/mem).
 Stock's suspend does what ours does not, from its log: Trustonic TEE core
 switch to CPU0 before hotplug, fingerprint (etspi) suspend SMC, modem
 suspend with pda_active 0, every devfreq to its suspend frequency.
+
+The [secure-world handoff audit](secure-handoff-audit.md) traces those
+secure calls to the pinned vendor source. The PSCI sleep encoding already
+matches stock. Trustonic's logged CPU index is translated to a full MPIDR
+before the SMC; fingerprint suspend also has no paired resume SMC in its
+callback. These are investigation constraints, not verified MIF fixes.
 
 # Full MIF sleep: what the hang is — 2026-10-18
 

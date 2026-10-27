@@ -1,0 +1,10 @@
+# ztOS on the Galaxy S9 (starlte): the kernel is ztOS's own boot image, not a
+# package (see scripts/build-boot.sh); the phone's firmware comes from firmware/.
+
+# Bluetooth controller, UART attachment, management and scan tools.
+bluez
+bluez-utils
+
+# Charger type from the MUIC over I2C (zrn-charge): without i2cget it exits and the
+# input stays at the driver default, so a wall charger charged at USB speed.
+i2c-tools

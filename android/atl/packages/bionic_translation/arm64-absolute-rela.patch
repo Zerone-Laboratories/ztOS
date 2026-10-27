@@ -1,0 +1,12 @@
+--- a/linker/linker.c
++++ b/linker/linker.c
+@@ -2178,7 +2178,8 @@
+ 			MARK(rel->r_offset);
+ 			TRACE_TYPE(RELO, "RELO ABS64 %p <- %p %s\n",
+ 				   (void *)reloc, (void *)(sym_addr + get_addend(rel)), sym_name);
+-			*((ElfW(Addr) *)reloc) += (sym_addr + get_addend(rel));
++			/* RELA has an explicit addend; stale slot bytes must be ignored. */
++			*((ElfW(Addr) *)reloc) = sym_addr + get_addend(rel);
+ 			break;
+ 		case R_AARCH64_ABS32:
+ 			COUNT_RELOC(RELOC_ABSOLUTE);

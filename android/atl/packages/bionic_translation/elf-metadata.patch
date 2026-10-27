@@ -1,0 +1,226 @@
+--- a/linker/linker.c
++++ b/linker/linker.c
+@@ -419,6 +419,199 @@
+ /* Here, we only have to provide a callback to iterate across all the
+  * loaded libraries. gcc_eh does the rest. We also use this ourselves,
+  * so compile this even on 32bit arm */
++
++struct bionic_host_dl_iterate_ctx {
++	int (*cb)(struct dl_phdr_info *info, size_t size, void *data);
++	void *data;
++};
++
++/*
++ * Callback memory lifetime:
++ * The shadow program header table (shadow_phdrs) and shadow dynamic table
++ * (shadow_dyn) allocated during host dl_iterate_phdr interception have their
++ * lifetime strictly bounded to the execution of the user callback `cb`.
++ * Memory is allocated on the heap prior to invoking `cb` and unconditionally
++ * freed immediately after `cb` returns. The caller must not retain pointers
++ * to the shadow program headers or shadow dynamic section beyond the scope
++ * of the callback.
++ */
++static int bionic_host_dl_iterate_cb_wrapper(struct dl_phdr_info *info, size_t size, void *data)
++{
++	struct bionic_host_dl_iterate_ctx *ctx = (struct bionic_host_dl_iterate_ctx *)data;
++	if (info == NULL || info->dlpi_phdr == NULL || info->dlpi_phnum == 0) {
++		return ctx->cb(info, size, ctx->data);
++	}
++
++	/* Bound check phnum to prevent unreasonable allocations */
++	if ((size_t)info->dlpi_phnum > 4096) {
++		errno = EOVERFLOW;
++		return -EOVERFLOW;
++	}
++
++	const ElfW(Phdr) *pt_dyn_phdr = NULL;
++	size_t dyn_index = 0;
++
++	for (size_t i = 0; i < info->dlpi_phnum; i++) {
++		const ElfW(Phdr) *p = &info->dlpi_phdr[i];
++		if (p->p_type == PT_DYNAMIC) {
++			pt_dyn_phdr = p;
++			dyn_index = i;
++			break;
++		}
++	}
++
++	/* Leave host modules without PT_DYNAMIC table unchanged */
++	if (pt_dyn_phdr == NULL || pt_dyn_phdr->p_memsz < sizeof(ElfW(Dyn))) {
++		return ctx->cb(info, size, ctx->data);
++	}
++
++	/* Check addition overflow for dynamic table mapping */
++	ElfW(Addr) dyn_start = 0;
++	if (__builtin_add_overflow(info->dlpi_addr, pt_dyn_phdr->p_vaddr, &dyn_start)) {
++		return ctx->cb(info, size, ctx->data);
++	}
++	ElfW(Addr) dyn_end = 0;
++	if (__builtin_add_overflow(dyn_start, pt_dyn_phdr->p_memsz, &dyn_end)) {
++		return ctx->cb(info, size, ctx->data);
++	}
++
++	/* Verify dynamic range lies entirely within an actual readable PT_LOAD segment */
++	bool dyn_inside_readable_load = false;
++	for (size_t i = 0; i < info->dlpi_phnum; i++) {
++		const ElfW(Phdr) *p = &info->dlpi_phdr[i];
++		if (p->p_type == PT_LOAD && (p->p_flags & PF_R)) {
++			ElfW(Addr) load_start = 0;
++			if (__builtin_add_overflow(info->dlpi_addr, p->p_vaddr, &load_start))
++				continue;
++			ElfW(Addr) load_end = 0;
++			if (__builtin_add_overflow(load_start, p->p_memsz, &load_end))
++				continue;
++
++			if (dyn_start >= load_start && dyn_end <= load_end) {
++				dyn_inside_readable_load = true;
++				break;
++			}
++		}
++	}
++
++	if (!dyn_inside_readable_load) {
++		return ctx->cb(info, size, ctx->data);
++	}
++
++	size_t dyn_bytes = pt_dyn_phdr->p_memsz;
++	if (dyn_bytes > (1024 * 1024)) { /* Reasonable bound on dynamic table size (1MB) */
++		errno = EOVERFLOW;
++		return -EOVERFLOW;
++	}
++
++	/* Allocate short-lived shadow program-header and dynamic tables */
++	ElfW(Phdr) *shadow_phdrs = malloc(info->dlpi_phnum * sizeof(ElfW(Phdr)));
++	if (shadow_phdrs == NULL) {
++		errno = ENOMEM;
++		return -ENOMEM;
++	}
++	memcpy(shadow_phdrs, info->dlpi_phdr, info->dlpi_phnum * sizeof(ElfW(Phdr)));
++
++	ElfW(Dyn) *shadow_dyn = malloc(dyn_bytes);
++	if (shadow_dyn == NULL) {
++		free(shadow_phdrs);
++		errno = ENOMEM;
++		return -ENOMEM;
++	}
++	/* Copy the entire validated PT_DYNAMIC p_memsz table */
++	const ElfW(Dyn) *host_dyn = (const ElfW(Dyn) *)dyn_start;
++	memcpy(shadow_dyn, host_dyn, dyn_bytes);
++
++	size_t num_dyn_entries = dyn_bytes / sizeof(ElfW(Dyn));
++
++	/* Normalize pointer tags only if value falls within an individual real PT_LOAD range */
++	for (size_t d = 0; d < num_dyn_entries; d++) {
++		ElfW(Dyn) *dyn_entry = &shadow_dyn[d];
++		if (dyn_entry->d_tag == DT_NULL) {
++			/* Found terminator within table */
++			break;
++		}
++
++		bool is_ptr_tag = false;
++		switch (dyn_entry->d_tag) {
++		case DT_PLTGOT:
++		case DT_HASH:
++		case DT_STRTAB:
++		case DT_SYMTAB:
++		case DT_RELA:
++		case DT_REL:
++		case DT_INIT:
++		case DT_FINI:
++		case DT_JMPREL:
++		case DT_INIT_ARRAY:
++		case DT_FINI_ARRAY:
++		case DT_PREINIT_ARRAY:
++		case DT_GNU_HASH:
++		case DT_VERNEED:
++		case DT_VERSYM:
++		case DT_VERDEF:
++#if defined(DT_RELR)
++		case DT_RELR:
++#endif
++#if defined(DT_ANDROID_REL)
++		case DT_ANDROID_REL:
++#endif
++#if defined(DT_ANDROID_RELA)
++		case DT_ANDROID_RELA:
++#endif
++			is_ptr_tag = true;
++			break;
++		default:
++			is_ptr_tag = false;
++			break;
++		}
++
++		if (is_ptr_tag) {
++			ElfW(Addr) ptr_val = (ElfW(Addr))dyn_entry->d_un.d_ptr;
++
++			/* Check if ptr_val falls within an individual real PT_LOAD range */
++			for (size_t i = 0; i < info->dlpi_phnum; i++) {
++				const ElfW(Phdr) *p = &info->dlpi_phdr[i];
++				if (p->p_type == PT_LOAD) {
++					ElfW(Addr) l_start = 0;
++					if (__builtin_add_overflow(info->dlpi_addr, p->p_vaddr, &l_start))
++						continue;
++					ElfW(Addr) l_end = 0;
++					if (__builtin_add_overflow(l_start, p->p_memsz, &l_end))
++						continue;
++
++					if (ptr_val >= l_start && ptr_val < l_end) {
++						/* Value is an absolute pointer within this real PT_LOAD segment */
++						dyn_entry->d_un.d_ptr = (ElfW(Addr))(ptr_val - info->dlpi_addr);
++						break;
++					}
++				}
++			}
++		}
++	}
++
++	/* Repoint shadow PT_DYNAMIC.p_vaddr to shadow table relative to original dlpi_addr */
++	shadow_phdrs[dyn_index].p_vaddr = (ElfW(Addr))((uintptr_t)shadow_dyn - info->dlpi_addr);
++	shadow_phdrs[dyn_index].p_filesz = dyn_bytes;
++	shadow_phdrs[dyn_index].p_memsz = dyn_bytes;
++
++	/* Safely copy host info up to MIN(size, sizeof(struct dl_phdr_info)) */
++	struct dl_phdr_info shadow_info;
++	memset(&shadow_info, 0, sizeof(shadow_info));
++	size_t copy_size = size < sizeof(struct dl_phdr_info) ? size : sizeof(struct dl_phdr_info);
++	memcpy(&shadow_info, info, copy_size);
++	shadow_info.dlpi_phdr = shadow_phdrs;
++	shadow_info.dlpi_phnum = info->dlpi_phnum;
++
++	int res = ctx->cb(&shadow_info, copy_size, ctx->data);
++
++	/* Bounded allocations freed immediately after callback returns */
++	free(shadow_dyn);
++	free(shadow_phdrs);
++
++	return res;
++}
++
+ int bionic_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *info, size_t size, void *data),
+ 			   void *data)
+ {
+@@ -426,6 +619,7 @@
+ 	struct dl_phdr_info dl_info;
+ 	int rv = 0;
+ 	for (si = apkenv_solist; si != NULL; si = si->next) {
++		memset(&dl_info, 0, sizeof(dl_info));
+ 		dl_info.dlpi_addr = si->linkmap.l_addr;
+ 		dl_info.dlpi_name = si->linkmap.l_name;
+ 		dl_info.dlpi_phdr = (void *)si->phdr;
+@@ -435,8 +629,13 @@
+ 	}
+ 	if (rv)
+ 		return rv;
+-	else
+-		return dl_iterate_phdr(cb, data);
++	else {
++		struct bionic_host_dl_iterate_ctx ctx = {
++			.cb = cb,
++			.data = data
++		};
++		return dl_iterate_phdr(bionic_host_dl_iterate_cb_wrapper, &ctx);
++	}
+ }
+ 
+ static inline bool is_gnu_hash(soinfo *si)

@@ -4,10 +4,11 @@
 # Wi-Fi radio, sensor hub, airplane mode, UFS runtime power management, the touch
 # controller, the USB controller and the Wi-Fi chip's PCIe link. Run as root, detached.
 # Result: /var/tmp/power-ab2.log. Everything is restored; the blue light shows when done.
+. /usr/lib/ztos/user.sh
 LOG=/var/tmp/power-ab2.log
 CHG=/sys/class/power_supply/max77705-charger/online
 BAT=/sys/class/power_supply/max170xx_battery
-CTL=/run/user/1000/ztmetro.ctl
+CTL=$ZTOS_RUNTIME_DIR/ztmetro.ctl
 UFS=/sys/devices/platform/soc@0/11120000.ufs
 : > "$LOG"
 say() { echo "$*" >> "$LOG"; }

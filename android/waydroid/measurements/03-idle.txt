@@ -1,0 +1,88 @@
+UTC: 2026-10-23T20:36:18Z
+Session:	RUNNING
+Container:	FROZEN
+Vendor type:	MAINLINE
+IP address:	192.168.240.112
+Session user:	zerone(1000)
+Wayland display:	wayland-0
+/sys/fs/cgroup/lxc.payload.waydroid/memory.current
+1536876544
+/sys/fs/cgroup/lxc.payload.waydroid/memory.max
+max
+/sys/fs/cgroup/lxc.payload.waydroid/memory.events
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+sock_throttled 17
+/sys/fs/cgroup/lxc.payload.waydroid/memory.stat
+anon 558145536
+file 892256256
+kernel 83750912
+kernel_stack 13271040
+pagetables 29466624
+sec_pagetables 0
+percpu 34800
+sock 8192
+vmalloc 5718016
+shmem 293130240
+file_mapped 330641408
+file_dirty 32768
+file_writeback 0
+swapcached 0
+anon_thp 153092096
+file_thp 10485760
+shmem_thp 8388608
+inactive_anon 556351488
+active_anon 1466368
+inactive_file 247668736
+active_file 348442624
+unevictable 299188224
+slab_reclaimable 7362632
+slab_unreclaimable 27866688
+slab 35229320
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 176300
+workingset_activate_anon 0
+workingset_activate_file 75210
+workingset_restore_anon 0
+workingset_restore_file 29301
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgsteal_kswapd 182175
+pgsteal_direct 25105
+pgsteal_khugepaged 56
+pgsteal_proactive 0
+pgscan_kswapd 1511322
+pgscan_direct 5526328
+pgscan_khugepaged 56
+pgscan_proactive 0
+pgrefill 158682
+pgscan 7037706
+pgsteal 207336
+pswpin 0
+pswpout 0
+pgfault 708771
+pgmajfault 7897
+pgactivate 97253
+pgdeactivate 86304
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+thp_fault_alloc 449
+thp_collapse_alloc 19
+thp_swpout 0
+thp_swpout_fallback 0
+               total        used        free      shared  buff/cache   available
+Mem:            3516        1800         364         399        1955        1716
+Swap:              0           0           0
+/usr/share/waydroid-extra/images/system.img 1950093312 bytes
+/usr/share/waydroid-extra/images/system.img.stock 1994985472 bytes
+/usr/share/waydroid-extra/images/vendor.img 421634048 bytes

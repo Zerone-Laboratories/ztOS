@@ -1,0 +1,250 @@
+{
+  "id": "samsung-starlte",
+  "name": "Samsung Galaxy S9",
+  "maker": "Samsung",
+  "model": "SM-G960N",
+  "codename": "starlte",
+  "maintainer": "Ometh Abeyrathne",
+  "contact": "https://github.com/Zerone-Laboratories/ztos-device-samsung-starlte",
+  "added": "2026-10-26",
+  "summary": "ztOS's first phone, and the reference port. Mainline Linux 7.1 with the Exynos 9810 drivers, booting from the phone's internal storage, with TWRP left in RECOVERY. Runs ztOS daily.",
+  "photo": "photo.jpg",
+  "photo_caption": "ztOS on a Galaxy S9",
+  "specs": [
+    [
+      "SoC",
+      "Samsung Exynos 9810"
+    ],
+    [
+      "CPU",
+      "4× Mongoose M3 at 2.7 GHz, 4× Cortex-A55 at 1.8 GHz"
+    ],
+    [
+      "GPU",
+      "Mali-G72 MP18 (Panfrost, OpenGL ES 3.1)"
+    ],
+    [
+      "RAM",
+      "4 GB"
+    ],
+    [
+      "Storage",
+      "64 GB UFS 2.1"
+    ],
+    [
+      "Display",
+      "5.8 in, 1440×2960 Super AMOLED"
+    ],
+    [
+      "Battery",
+      "3000 mAh"
+    ],
+    [
+      "Kernel",
+      "Mainline Linux 7.1, modules for the phone's hardware"
+    ],
+    [
+      "Released",
+      "2018"
+    ],
+    [
+      "Device layer",
+      "[ztos-device-samsung-starlte](https://github.com/Zerone-Laboratories/ztos-device-samsung-starlte)"
+    ]
+  ],
+  "install": {
+    "markdown": "> **This erases the phone.** Android and everything in its storage are replaced. The IMEI and modem calibration (EFS) are never touched, and the stock Android partitions stay, because the modem needs them.\n>\n> **Only the Exynos Galaxy S9 works:** SM-G960F or SM-G960N (`starlte`). The US Snapdragon S9 (SM-G960U) does not.\n\n## What you need\n\n- A Linux computer (x86-64 or ARM) with **15 GB free** and an internet connection\n- A USB-C **data** cable (some only charge)\n- The phone charged above **50%**\n- About **2 hours**, mostly waiting\n\n## 1. Install the tools on your computer\n\nArch Linux:\n\n```sh\nsudo pacman -S --needed git util-linux libarchive dosfstools mtools e2fsprogs \\\n    qemu-user-static qemu-user-static-binfmt android-tools heimdall socat\n```\n\nDebian / Ubuntu (not yet tested):\n\n```sh\nsudo apt install git uidmap libarchive-tools dosfstools mtools e2fsprogs \\\n    qemu-user-static binfmt-support adb heimdall-flash socat\n```\n\nThe build runs as you, without `sudo`, so your account needs a range of user IDs. Check:\n\n```sh\ngrep $USER /etc/subuid\n```\n\nIf that prints nothing, add one, then **log out and back in**:\n\n```sh\nsudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER\n```\n\n## 2. Get ztOS\n\n```sh\ngit clone --recurse-submodules https://github.com/Zerone-Laboratories/ztOS.git\ncd ztOS\ninstaller/ztos doctor\n```\n\n`doctor` should end with **this computer can build ztOS**. Install anything it says is missing, then run it again.\n\n## 3. Unlock the bootloader\n\n1. Back up the phone. Unlocking erases it.\n2. In Android: **Settings > About phone > Software information**, tap **Build number** seven times.\n3. **Settings > Developer options > OEM unlocking**: on.\n   No such switch? Connect to Wi-Fi and wait: Samsung shows it up to 7 days after setup.\n4. Turn the phone off. Hold **Volume Down + Bixby** and plug in the USB cable.\n5. On the warning screen, **long-press Volume Up** to unlock. The phone erases itself and restarts.\n6. Go through Android's setup quickly, and check **OEM unlocking** is still on.\n\n## 4. Put TWRP in RECOVERY\n\nDownload the TWRP image for the Galaxy S9 (`starlte`) from [twrp.me](https://twrp.me/samsung/samsunggalaxys9.html), and save it as `twrp-starlte.img`.\n\n1. Turn the phone off. Hold **Volume Down + Bixby + Power**, then press **Volume Up** for download mode.\n2. On the computer:\n\n   ```sh\n   heimdall flash --RECOVERY twrp-starlte.img --no-reboot\n   ```\n\n   (On Windows, Odin: TWRP in the **AP** slot, **Auto Reboot** off.)\n3. Hold **Volume Down + Power** to leave download mode, and **the moment the screen goes black**, switch to **Volume Up + Bixby + Power**. If Android starts instead, it puts its own recovery back: repeat this step.\n4. In TWRP, swipe to allow changes.\n\n## 5. Connect the phone in TWRP\n\nPlug the phone in and check the computer sees it:\n\n```sh\nadb devices\n```\n\nYou should see one device, as `recovery`. (Later, to start TWRP: power off, then hold **Volume Up + Bixby + Power**.)\n\n## 6. Build and install ztOS\n\n```sh\ninstaller/ztos install --target starlte --mode build-install\n```\n\nIt asks, in order:\n\n| Question | Answer |\n|---|---|\n| Go on? (after the phone guide) | `y` |\n| user name | the name you'll log in with |\n| password, then again | at least 4 characters; for logging in and `sudo` |\n| the phone's name | anything, e.g. `ztos` |\n| time zone | e.g. `Asia/Colombo` |\n| Start? | `y` |\n\nThen **wait 30 to 60 minutes** the first time while it builds the system. The S9's boot image comes ready-made from `prebuilts/boot/`.\n\nWhen it asks:\n\n1. **Write ztOS's boot image to BOOT?** Answer `y`. It is read back and checked.\n2. **Type ERASE to go on.** Type `ERASE`. The phone restarts into ztOS's rescue shell, and the system is written over USB in checked 256 MiB pieces: **10 to 20 minutes**.\n\nIf the cable comes out or it stops, run the same `installer/ztos install` command again: it carries on where it stopped.\n\n## 7. Start ztOS\n\nWhen the installer says **done**, hold **Power + Volume Up + Volume Down** until the phone restarts.\n\nThe first start takes **about a minute** while the system grows to fill the storage. Then log in with your user and password, and the Welcome app shows how ztOS works. With internet, Android apps set themselves up in the background on the first start (Waydroid downloads about 1 GB once).\n\n## If something goes wrong\n\n| What you see | What to do |\n|---|---|\n| `the phone is not in TWRP over adb` | Start TWRP (step 5), try another cable or USB port, then `adb devices` |\n| It waits for the phone on `172.16.42.1` | The phone hands your computer `172.16.42.2` over USB. If `ip addr` doesn't show it, set that USB network connection to **automatic (DHCP)**, then run the install again |\n| The phone is stuck in **ztOS Rescue** | `installer/ztos`, then choose **3** |\n| The phone goes back to TWRP by itself | ztOS didn't start and fell back safely. Run the install again from step 5 |\n| Back to Android | Flash Samsung's stock firmware for your model with Odin or Heimdall from download mode |"
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage",
+      "status": "working",
+      "notes": "Falls back to TWRP by itself after a crash or watchdog reset"
+    },
+    {
+      "category": "Boot",
+      "feature": "Charging while off",
+      "status": "working",
+      "notes": "Charges in a minimal start and starts ztOS once the battery reaches 10%; tested"
+    },
+    {
+      "category": "Display",
+      "feature": "Panel, 1440×2960",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": "Manual, and automatic from the light sensor"
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": "Mali-G72 MP18 through Panfrost, OpenGL ES 3.1"
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": "S6SY761, multi-touch"
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "working",
+      "notes": "Strength per kind of touch in Settings > haptics"
+    },
+    {
+      "category": "Input",
+      "feature": "Notification light",
+      "status": "working",
+      "notes": "Charging, charged, low battery"
+    },
+    {
+      "category": "Power",
+      "feature": "CPU, all 8 cores",
+      "status": "working",
+      "notes": "Frequency scaling; big cores powered down when idle and capped to stay under 1 A"
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charger",
+      "status": "working",
+      "notes": "MAX17042 gauge, MAX77705 charger"
+    },
+    {
+      "category": "Power",
+      "feature": "Sleep (SoC suspend)",
+      "status": "partial",
+      "notes": "Works, but a sleep that never wakes switches it off for safety, and Wi-Fi doesn't come back after it"
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": "BCM4361; join, forget and details in Settings"
+    },
+    {
+      "category": "Network",
+      "feature": "Mobile data (4G), SIM, signal",
+      "status": "working",
+      "notes": "Samsung IPC through ztOSCoreNetworking"
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "working",
+      "notes": "Scanning and pairing tested"
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking to a computer",
+      "status": "working",
+      "notes": "172.16.42.1, plus a serial console"
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "partial",
+      "notes": "Sending works; receiving is untested"
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "partial",
+      "notes": "Calls connect, but their sound is not routed yet"
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "working",
+      "notes": "The audio DSP and Cirrus amplifiers, through ztOSCirrusAudio"
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphone, headphones",
+      "status": "broken",
+      "notes": "No support yet"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient light",
+      "status": "working",
+      "notes": "Through the sensor hub; sometimes needs a pass through TWRP after a forced reboot"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, gyroscope",
+      "status": "partial",
+      "notes": "Readable; nothing in the shell uses them yet"
+    },
+    {
+      "category": "Camera",
+      "feature": "Cameras",
+      "status": "broken",
+      "notes": "No driver yet"
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "broken",
+      "notes": "No driver yet"
+    },
+    {
+      "category": "Other",
+      "feature": "NFC, fingerprint",
+      "status": "broken",
+      "notes": "No driver yet"
+    },
+    {
+      "category": "Software",
+      "feature": "ztMETRO and the built-in apps",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "Android apps (Waydroid)",
+      "status": "working",
+      "notes": "WhatsApp and Play Store apps; only the apps you pick run in the background"
+    },
+    {
+      "category": "Software",
+      "feature": "ztOSIAL",
+      "status": "working",
+      "notes": "All 13 interfaces pass `ztos-ial test`"
+    }
+  ],
+  "notes": [
+    {
+      "title": "The modem or sensor hub doesn't come up",
+      "text": "It tends to follow a forced reboot or a crash. One pass through TWRP brings them back: `systemctl reboot --reboot-argument=recovery`, then `adb shell reboot` once TWRP is up. A full power-off also works."
+    },
+    {
+      "title": "A driver that crashed while loading is skipped at the next boot",
+      "text": "So a crash can't become a boot loop. Remove its mark file under `/var/lib` to try it again."
+    },
+    {
+      "title": "Reboot rather than unload a driver",
+      "text": "A failed module unload has left the phone unable to shut down."
+    },
+    {
+      "title": "Keep the stock Android partitions",
+      "text": "The installer writes only BOOT and USERDATA; the modem needs the rest."
+    },
+    {
+      "title": "Getting back in",
+      "text": "If Arch doesn't come up, the initramfs opens a rescue shell on the USB network. If the kernel hangs, a watchdog resets the phone into TWRP after 30 seconds. Download mode, which can't be overwritten, can always put the stock firmware back."
+    }
+  ]
+}

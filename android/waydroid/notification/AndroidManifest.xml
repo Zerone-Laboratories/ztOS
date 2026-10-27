@@ -1,0 +1,12 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.ztos.notificationbridge">
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="28" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application android:label="ztOS notification bridge" android:usesCleartextTraffic="true" android:allowBackup="false">
+        <service android:name=".Listener" android:label="ztOS notification bridge" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" android:exported="true">
+            <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
+        </service>
+        <activity android:name=".Probe" android:label="Notification probe" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+        </activity>
+    </application>
+</manifest>

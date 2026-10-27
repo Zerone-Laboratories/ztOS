@@ -1,0 +1,24 @@
+#!/bin/sh
+# Keep GPU allocations away from expensive shmem THP compaction on the S9.
+set -eu
+thp=/sys/kernel/mm/transparent_hugepage/shmem_enabled
+if [ -w "$thp" ] && ! grep -q '\[deny\]' "$thp"; then
+    echo deny > "$thp"
+fi
+
+# This kernel provides lzo-rle, not lz4. Do not reset an existing swap device.
+if [ -e /sys/block/zram0/disksize ] && [ "$(cat /sys/block/zram0/disksize)" = 0 ]; then
+    echo lzo-rle > /sys/block/zram0/comp_algorithm
+    echo 1610612736 > /sys/block/zram0/disksize
+    mkswap /dev/zram0
+fi
+if [ -b /dev/zram0 ] && ! awk '$1 == "/dev/zram0" { found=1 } END { exit !found }' /proc/swaps; then
+    swapon -p 100 /dev/zram0
+fi
+
+# LXC puts Android outside the container service's cgroup. Reclaim softly;
+# leave memory.max unlimited so this policy never imposes an Android OOM cap.
+high=/sys/fs/cgroup/lxc.payload.waydroid/memory.high
+if [ -w "$high" ] && [ "$(cat "$high")" != 1610612736 ]; then
+    echo 1610612736 > "$high"
+fi

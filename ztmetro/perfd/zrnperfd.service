@@ -1,5 +1,9 @@
 [Unit]
 Description=zrnperfd (minimal): power profiles and screen-off low power for ztMETRO
+# the phone's CPU topology and limits come from ztOSIAL (Perf1); without it,
+# the Galaxy S9's built-in ones
+Wants=ztos-iald.service
+After=ztos-iald.service
 
 [Service]
 ExecStart=/usr/local/sbin/zrnperfd

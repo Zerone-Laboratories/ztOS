@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "ztos-hw.h"
 #include "zrnmetrocore.h"
 
 enum page { PAGE_HUB, PAGE_SYSTEM, PAGE_SENSORS, PAGE_JOURNAL, PAGE_KERNEL, PAGE_SHELL, PAGE_HARDWARE,
@@ -27,8 +28,6 @@ enum action { ACT_OPEN = 1, ACT_PLAY };
 
 #define MAX_LINES	70	/* of a log, newest first */
 #define LINE_LEN	240
-#define BATTERY		"/sys/class/power_supply/max170xx_battery/"
-#define CHARGER		"/sys/class/power_supply/max77705-charger/"
 
 static struct {
 	char lines[MAX_LINES][LINE_LEN];
@@ -189,19 +188,19 @@ static long read_long(const char *path) {
 static double draw_sensors(cairo_t *cr) {
 	char value[256], a[64], b[64];
 	double y = zmc_header(cr, "sensors");
-	zmc_read_file(BATTERY "status", a, sizeof(a));
-	snprintf(value, sizeof(value), "%ld %%, %s", read_long(BATTERY "capacity"), a);
+	zmc_read_file(hw_file(hw_battery(), "status"), a, sizeof(a));
+	snprintf(value, sizeof(value), "%ld %%, %s", read_long(hw_file(hw_battery(), "capacity")), a);
 	y = zmc_field(cr, y, "Battery", value);
 	snprintf(value, sizeof(value), "%.3f V, %+.0f mA now, %+.0f mA average",
-		read_long(BATTERY "voltage_now") / 1e6, read_long(BATTERY "current_now") / 1e3,
-		read_long(BATTERY "current_avg") / 1e3);
+		read_long(hw_file(hw_battery(), "voltage_now")) / 1e6, read_long(hw_file(hw_battery(), "current_now")) / 1e3,
+		read_long(hw_file(hw_battery(), "current_avg")) / 1e3);
 	y = zmc_field(cr, y, "Cell", value);
-	snprintf(value, sizeof(value), "%.1f C", read_long(BATTERY "temp") / 10.0);
+	snprintf(value, sizeof(value), "%.1f C", read_long(hw_file(hw_battery(), "temp")) / 10.0);
 	y = zmc_field(cr, y, "Battery temperature", value);
-	zmc_read_file(CHARGER "status", a, sizeof(a));
-	zmc_read_file(CHARGER "charge_type", b, sizeof(b));
+	zmc_read_file(hw_file(hw_charger(), "status"), a, sizeof(a));
+	zmc_read_file(hw_file(hw_charger(), "charge_type"), b, sizeof(b));
 	snprintf(value, sizeof(value), "%s (%s), input limit %ld mA, charge %ld mA", a, b,
-		read_long(CHARGER "input_current_limit") / 1000, read_long(CHARGER "constant_charge_current") / 1000);
+		read_long(hw_file(hw_charger(), "input_current_limit")) / 1000, read_long(hw_file(hw_charger(), "constant_charge_current")) / 1000);
 	y = zmc_field(cr, y, "Charger", value);
 
 	for (int zone = 0; zone < 12; zone++) {
@@ -222,8 +221,8 @@ static double draw_sensors(cairo_t *cr) {
 		read_long("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq") / 1000,
 		read_long("/sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq") / 1000, a);
 	y = zmc_field(cr, y, "Processor clocks", value);
-	zmc_read_file("/sys/class/devfreq/17500000.gpu/governor", a, sizeof(a));
-	snprintf(value, sizeof(value), "%ld MHz (%s)", read_long("/sys/class/devfreq/17500000.gpu/cur_freq") / 1000000, a);
+	zmc_read_file(hw_file(hw_gpu(), "governor"), a, sizeof(a));
+	snprintf(value, sizeof(value), "%ld MHz (%s)", read_long(hw_file(hw_gpu(), "cur_freq")) / 1000000, a);
 	y = zmc_field(cr, y, "GPU clock", value);
 
 	/* whatever the kernel has under IIO: light, motion, pressure */
@@ -279,24 +278,24 @@ static bool check_part(size_t index) {
 	case 0: /* Display */
 		return exists("/sys/class/drm/card0-DSI-1") || exists("/sys/class/drm/card1-DSI-1") || exists("/sys/class/graphics/fb0");
 	case 1: /* GPU */
-		return exists("/sys/class/devfreq/17500000.gpu") || exists("/sys/bus/platform/drivers/panfrost");
+		return exists(hw_gpu()) || exists("/sys/bus/platform/drivers/panfrost");
 	case 2: /* Touch */
 		return exists("/sys/bus/i2c/drivers/s6sy761") || exists("/sys/class/input/input1") || exists("/sys/class/input/input0");
 	case 3: /* Wi-Fi */
 		return exists("/sys/class/net/wlp1s0") || exists("/sys/class/net/wlan0") || exists("/sys/module/brcmfmac");
 	case 4: /* Battery gauge */
-		return exists("/sys/class/power_supply/max170xx_battery") || exists("/sys/class/power_supply/battery");
+		return hw_has("power") == 1 || exists(hw_battery()) || exists("/sys/class/power_supply/battery");
 	case 5: /* Sound card */
 		return exists("/proc/asound/ZrnAbox") || exists("/proc/asound/card0");
 	case 6: /* Backlight device */
 		/* the folder exists even when no driver registered a device */
-		return exists("/sys/class/backlight/s9p-panel/brightness");
+		return hw_has("display") == 1 || exists(hw_file(hw_backlight(), "brightness"));
 	case 7: /* Light and motion sensors */
-		return exists("/sys/bus/iio/devices/iio:device0") || exists("/sys/module/zrn_bbd") || exists("/run/ztoscsf/sensord.sock");
+		return hw_has("sensors") == 1 || exists("/sys/bus/iio/devices/iio:device0") || exists("/sys/module/zrn_bbd") || exists("/run/ztoscsf/sensord.sock");
 	case 8: /* Vibrator */
-		return exists("/sys/module/zrn_haptic") || exists("/sys/bus/platform/drivers/zrn-haptic") || exists("/sys/class/leds/vibrator");
+		return hw_has("haptics") == 1 || exists("/sys/module/zrn_haptic") || exists("/sys/bus/platform/drivers/zrn-haptic") || exists("/sys/class/leds/vibrator");
 	case 9: /* Modem */
-		return exists("/dev/umts_ipc0") || exists("/sys/class/net/rmnet0") || exists("/sys/module/zrn_modem") || exists("/sys/class/net/wwan0");
+		return hw_has("modem") == 1 || exists("/dev/umts_ipc0") || exists("/sys/class/net/rmnet0") || exists("/sys/module/zrn_modem") || exists("/sys/class/net/wwan0");
 	case 10: /* Bluetooth */
 		return exists("/sys/class/bluetooth/hci0");
 	case 11: /* Camera */

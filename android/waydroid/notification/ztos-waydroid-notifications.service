@@ -1,0 +1,16 @@
+[Unit]
+Description=ztOS optional Waydroid notification fallback
+After=ztos-waydroid-session.service
+PartOf=ztos-waydroid-session.service
+
+[Service]
+Type=simple
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart=/usr/bin/python3 /usr/local/libexec/ztos-waydroid-notifications --token-file %h/.config/ztos/notification-bridge.token
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+# No Install section: enable only after checking native forwarding is absent.

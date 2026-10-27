@@ -17,6 +17,7 @@
 #     --wlan                     BCM4361 over the PCIe root complex, with this
 #                                phone's own firmware from firmware/
 #     --pm-debug                 suspend stage tests and device PM diagnostics
+#     --lockup                   soft/hard lockup detectors that panic (backtrace in ramoops)
 #     --cmdline "..."            extra kernel command line (zboot.rescue=1 ...)
 #
 # Output: out/<name>.img (+ .config, .dts, .sha256). Runs unprivileged; the
@@ -35,7 +36,7 @@ shift
 FALLBACK=boot
 DTS_FLAGS=()
 EXTRA=
-UFS=1 ACPM= CPUFREQ= GPU= DECON= WLAN= PMDEBUG=
+UFS=1 ACPM= CPUFREQ= GPU= DECON= WLAN= PMDEBUG= LOCKUP=
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--fallback) FALLBACK=$2; shift ;;
@@ -46,6 +47,7 @@ while [ $# -gt 0 ]; do
 	--decon) DTS_FLAGS+=(--decon); DECON=1 ;;
 	--wlan) DTS_FLAGS+=(--wlan); WLAN=1 ;;
 	--pm-debug) PMDEBUG=1 ;;
+	--lockup) LOCKUP=1 ;;
 	--acpm) ACPM=1 ;;
 	--cpufreq) CPUFREQ=1; ACPM=1 ;;
 	--cmdline) EXTRA=$2; shift ;;
@@ -85,6 +87,12 @@ grep -q exynos9810_pcie_pm_ops "$SRC/drivers/pci/controller/dwc/pcie-exynos9810.
 	patch -d "$SRC" -p1 --forward --no-backup-if-mismatch < "$ROOT/kernel/s9p-pcie-pm.patch"
 grep -q exynos9810_pcie_pm_ops "$SRC/drivers/pci/controller/dwc/pcie-exynos9810.c" ||
 	{ echo "pcie-exynos9810.c has no suspend/resume PM ops after patching" >&2; exit 1; }
+# a link that fails to train after sleep is tried again, and config accesses
+# while it is down are answered as an absent device instead of hanging the SoC
+grep -q exynos9810_pcie_guard_cfg "$SRC/drivers/pci/controller/dwc/pcie-exynos9810.c" ||
+	patch -d "$SRC" -p1 --forward --no-backup-if-mismatch < "$ROOT/kernel/s9p-pcie-resume-retry.patch"
+grep -q exynos9810_pcie_guard_cfg "$SRC/drivers/pci/controller/dwc/pcie-exynos9810.c" ||
+	{ echo "pcie-exynos9810.c has no resume retry after patching" >&2; exit 1; }
 python3 "$ROOT/kernel/patch-decon-wake.py" "$SRC"
 python3 "$ROOT/kernel/patch-decon-flip.py" "$SRC"
 python3 "$ROOT/kernel/patch-decon-panel-lock.py" "$SRC"
@@ -173,6 +181,15 @@ done
 if [ -n "$PMDEBUG" ]; then
 	cfg --enable PM_DEBUG
 	cfg --enable PM_ADVANCED_DEBUG
+fi
+# A CPU stuck with interrupts on or off panics with its backtrace (into
+# ramoops) instead of hanging silently until the hardware watchdog.
+if [ -n "$LOCKUP" ]; then
+	cfg --enable SOFTLOCKUP_DETECTOR
+	cfg --enable BOOTPARAM_SOFTLOCKUP_PANIC
+	cfg --enable HARDLOCKUP_DETECTOR
+	cfg --enable HARDLOCKUP_DETECTOR_PREFER_BUDDY
+	cfg --enable BOOTPARAM_HARDLOCKUP_PANIC
 fi
 # Everything below this line is a block that hangs the bus when it is read
 # while gated or unpowered, so each one is a switch, off by default.

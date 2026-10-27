@@ -1,5 +1,5 @@
 #!/bin/sh
-cd /home/zerone/Documents/Projects/ztOSMobile
+cd "$(dirname "$0")/../.."
 export ZT_PW=${ZT_PW:?set ZT_PW to the phone user's password}
 PHONE=172.16.42.1 HOST=172.16.42.2 audio/push.sh build/rec3.sh
 timeout 60 python3 scripts/ssh-pw.py alarm "$ZT_PW" 172.16.42.1 "pgrep -a ztmetro | head -1; sh /tmp/zrn/rec3.sh" < /dev/null

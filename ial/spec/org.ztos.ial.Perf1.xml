@@ -1,0 +1,13 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- org.ztos.ial.Perf1: CPU and GPU topology and the limits a policy must respect. Topology is JSON (schema in ial/README.md) so a policy daemon can read it once; TopologyPath is the same JSON in a file, for daemons without D-Bus.
+     Licence: LGPL-2.1-or-later. -->
+<node>
+  <interface name="org.ztos.ial.Perf1">
+    <property name="Version" type="u" access="read"/>
+    <property name="Topology" type="s" access="read"/>
+    <property name="TopologyPath" type="s" access="read"/>
+    <property name="Thermal" type="a{si}" access="read"/>
+    <property name="GpuDevfreq" type="s" access="read"/>
+  </interface>
+</node>

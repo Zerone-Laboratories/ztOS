@@ -48,8 +48,7 @@
 #define STATE	"/var/lib/ztoscsf-sensord/state"
 
 enum { AP2HUB_READ, AP2HUB_WRITE, HUB2AP_WRITE };
-enum { CMD_ADD = 0xa1, CMD_REMOVE = 0xa2, CMD_TIMESTAMP = 0xa7, CMD_WAKEUP = 0xd1,
-	CMD_SLEEP = 0xd2 };
+enum { CMD_ADD = 0xa1, CMD_REMOVE = 0xa2, CMD_TIMESTAMP = 0xa7 };
 enum { REC_DEBUG = 0x03, REC_META = 0x05, REC_TIME_SYNC = 0x06, REC_INIT_DONE = 0x0a,
 	REC_DATA = 0x37 };
 
@@ -130,24 +129,13 @@ static void sensor_set(struct sensor *s, bool on) {
 }
 
 /*
- * The hub is also told whether the phone is awake: while it believes so it
- * sends a status report every few seconds, asleep it goes nearly quiet
- * (measured: 7 packets in 20 s down to 1).
+ * The hub is not told the AP is asleep or awake (0xd2 / 0xd1): Samsung's
+ * driver on this phone never sends either (they belong to early suspend, not
+ * built), and the hub's firmware asserted in its transport layer
+ * (MCU_BCM477X_transport_layer.c line 165) within a second of each, at every
+ * start and every screen-off. Taking the sensors off is enough.
  */
 static void sensors_apply(void) {
-	static int told = -1;
-	if (!screen_on && told != 0) {
-		for (int i = 0; i < N_SENSORS; i++) {
-			sensor_set(&sensors[i], false);
-		}
-		hub_write(CMD_SLEEP, "", 0);
-		told = 0;
-		return;
-	}
-	if (screen_on && told != 1) {
-		hub_write(CMD_WAKEUP, "", 0);
-		told = 1;
-	}
 	for (int i = 0; i < N_SENSORS; i++) {
 		sensor_set(&sensors[i], screen_on && sensors[i].wanted);
 	}
@@ -573,9 +561,12 @@ int main(void) {
 	}
 	stream_len = 0;
 	hub_time();
-	for (int i = 0; i < N_SENSORS; i++) {	/* whatever an earlier run left streaming */
-		sensors[i].on = true;
-	}
+	/*
+	 * No blanket REMOVE of every sensor here: removing one the hub never
+	 * added (pressure, id 5) made its firmware assert (transport_layer.c
+	 * line 165, Arg2=5) at every boot and every restart of this daemon. An
+	 * earlier run takes its sensors off as it stops; a fresh hub has none on.
+	 */
 	sensors[0].wanted = true;
 	sensors_apply();
 	status();

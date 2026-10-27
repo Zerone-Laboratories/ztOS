@@ -1,0 +1,11 @@
+[Unit]
+Description=ztOS GPU memory pressure policy
+After=systemd-modules-load.service
+Before=greetd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ztos-memory-policy
+
+[Install]
+WantedBy=multi-user.target

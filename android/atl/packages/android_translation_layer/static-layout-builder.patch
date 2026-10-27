@@ -1,0 +1,414 @@
+--- a/src/api-impl/android/text/Layout.java
++++ b/src/api-impl/android/text/Layout.java
+@@ -32,13 +32,17 @@
+ 			for (ReplacementSpan span : spanned.getSpans(0, spanned.length(), ReplacementSpan.class))
+ 				span.getSize(paint, text, spanned.getSpanStart(span), spanned.getSpanEnd(span), paint.getFontMetricsInt());
+ 		}
+-		String str = text != null ? text.toString() : "";
+-		this.text = str;
++		// text is kept as the original CharSequence so isSpanned() and span access still work
++		this.text = text != null ? text : "";
+ 		this.paint = paint;
+ 		this.spacing_mult = spacingMult;
+ 		this.spacing_add = spacingAdd;
+ 		this.align = align;
+-		layout = native_constructor(str, paint.paint, width);
++		layout = native_constructor(this.text.toString(), paint.paint, width);
++	}
++
++	protected void setAlign(Alignment align) {
++		this.align = align;
+ 	}
+ 
+ 	public int getLineCount() {
+--- a/src/api-impl/android/text/StaticLayout.java
++++ b/src/api-impl/android/text/StaticLayout.java
+@@ -1,6 +1,55 @@
+ package android.text;
+ 
++import android.graphics.Canvas;
++import android.atl.GskCanvas;
++
+ public class StaticLayout extends Layout {
++
++	private int maxLines;
++	private int outerWidth;
++	private int ellipsizedWidth;
++	private boolean fallbackLineSpacing;
++
++	// private full constructor; the public constructors delegate to it
++	private StaticLayout(CharSequence source, TextPaint paint, int outerwidth,
++	                     Alignment align, TextDirectionHeuristic textDir,
++	                     float spacingmult, float spacingadd,
++	                     boolean includepad,
++	                     TextUtils.TruncateAt ellipsize, int ellipsizedWidth, int maxLines,
++	                     boolean fallbackLineSpacing) {
++		super(source, paint, outerwidth, align, spacingmult, spacingadd);
++		this.outerWidth = outerwidth;
++		if (align == null)
++			align = Alignment.ALIGN_NORMAL;
++		setAlign(align);
++		apply(textDir, ellipsize, ellipsizedWidth, maxLines, fallbackLineSpacing);
++	}
++
++	private StaticLayout(CharSequence source, int start, int end, TextPaint paint, int outerwidth,
++	                     Alignment align, TextDirectionHeuristic textDir,
++	                     float spacingmult, float spacingadd,
++	                     boolean includepad,
++	                     TextUtils.TruncateAt ellipsize, int ellipsizedWidth, int maxLines,
++	                     boolean fallbackLineSpacing) {
++		// subSequence keeps Spanned sources (and their spans) intact for the selected range
++		this(source != null && (start != 0 || end != source.length())
++		             ? source.subSequence(start, end) : source,
++		     paint, outerwidth, align, textDir, spacingmult, spacingadd, includepad,
++		     ellipsize, ellipsizedWidth, maxLines, fallbackLineSpacing);
++	}
++
++	private void apply(TextDirectionHeuristic textDir, TextUtils.TruncateAt ellipsize,
++	                   int ellipsizedWidth, int maxLines, boolean fallbackLineSpacing) {
++		this.maxLines = (maxLines <= 0 || maxLines == Integer.MAX_VALUE) ? Integer.MAX_VALUE : maxLines;
++		this.ellipsizedWidth = ellipsizedWidth >= 0 ? ellipsizedWidth : getWidth();
++		this.fallbackLineSpacing = fallbackLineSpacing;
++		if (textDir != null)
++			native_set_base_dir(layout, textDir.isRtl(getText(), 0, getText().length()));
++		native_configure(layout, getPaint().paint, getAlignment().ordinal(), getSpacingMultiplier(), getSpacingAdd(),
++				this.maxLines == Integer.MAX_VALUE ? -1 : this.maxLines,
++				ellipsize == null ? 0 : ellipsize.ordinal() + 1,
++				this.ellipsizedWidth, fallbackLineSpacing);
++	}
+ 
+ 	public StaticLayout(CharSequence source, int bufstart, int bufend,
+ 	                    TextPaint paint, int outerwidth,
+@@ -8,45 +57,154 @@
+ 	                    float spacingmult, float spacingadd,
+ 	                    boolean includepad,
+ 	                    TextUtils.TruncateAt ellipsize, int ellipsizedWidth, int maxLines) {
+-		super(source, paint, outerwidth, align, spacingmult, spacingadd);
++		this(source, bufstart, bufend, paint, outerwidth, align, textDir, spacingmult, spacingadd,
++		     includepad, ellipsize, ellipsizedWidth, maxLines, /*fallback*/ true);
+ 	}
+ 
+ 	public StaticLayout(CharSequence source, TextPaint paint, int outerwidth, Alignment align, float spacingmult, float spacingadd, boolean includepad) {
+-		super(source, paint, outerwidth, align, spacingmult, spacingadd);
++		this(source, 0, source == null ? 0 : source.length(), paint, outerwidth, align, null,
++		     spacingmult, spacingadd, includepad, null, outerwidth, Integer.MAX_VALUE);
+ 	}
+ 
+ 	public StaticLayout(CharSequence source, int start, int end, TextPaint paint, int outerwidth, Alignment align, float spacingmult, float spacingadd, boolean includepad, TextUtils.TruncateAt ellipsize, int ellipsizedWidth) {
+-		super(source, paint, outerwidth, align, spacingmult, spacingadd);
+-		if (ellipsize != null)
+-			native_set_ellipsize(layout, ellipsize == null ? 0 : ellipsize.ordinal() + 1, ellipsizedWidth);
++		this(source, start, end, paint, outerwidth, align, null, spacingmult, spacingadd,
++		     includepad, ellipsize, ellipsizedWidth, Integer.MAX_VALUE);
+ 	}
+ 
+ 	public StaticLayout(CharSequence source, int start, int end, TextPaint paint, int outerwidth, Alignment align, float spacingmult, float spacingadd, boolean includepad) {
+-		super(source, paint, outerwidth, align, spacingmult, spacingadd);
+-	}
++		this(source, start, end, paint, outerwidth, align, null, spacingmult, spacingadd,
++		     includepad, null, outerwidth, Integer.MAX_VALUE);
++	}
++
++	@Override
++	public int getLineCount() {
++		return Math.min(super.getLineCount(), maxLines);
++	}
++
++	@Override
++	public int getHeight() {
++		if (maxLines < super.getLineCount())
++			return Math.min(super.getHeight(), getLineBottom(maxLines - 1));
++		return super.getHeight();
++	}
++
++	@Override
++	public void draw(Canvas canvas) {
++		if (maxLines < super.getLineCount() && canvas instanceof GskCanvas)
++			native_draw_capped(layout, ((GskCanvas)canvas).snapshot, getPaint().paint, getHeight());
++		else if (maxLines < super.getLineCount()) {
++			int saved = canvas.save();
++			try {
++				canvas.clipRect(0, 0, getWidth(), getHeight());
++				super.draw(canvas);
++			} finally {
++				canvas.restoreToCount(saved);
++			}
++		} else
++			super.draw(canvas);
++	}
++
++	@Override
++	public int getWidth() { return outerWidth; }
++
++	// Pango's line extents already include the resolved font ascenders and descenders.
++	@Override
++	public int getTopPadding() { return 0; }
++
++	@Override
++	public int getBottomPadding() { return 0; }
++
++	@Override
++	public int getEllipsizedWidth() {
++		return ellipsizedWidth;
++	}
++
++	public boolean isFallbackLineSpacingEnabled() {
++		return fallbackLineSpacing;
++	}
++
++	private native void native_set_base_dir(long layout, boolean rtl);
++	private native void native_configure(long layout, long paint, int align, float spacingMult, float spacingAdd, int maxLines, int ellipsizeMode, int ellipsizedWidth, boolean fallbackLineSpacing);
++	private native void native_draw_capped(long layout, long snapshot, long paint, int height);
+ 
+ 	public static class Builder {
+-		private StaticLayout layout;
++		private CharSequence source;
++		private int bufstart;
++		private int bufend;
++		private TextPaint paint;
++		private int width;
++		private Alignment align;
++		private TextDirectionHeuristic textDir;
++		private float spacingMult = 1;
++		private float spacingAdd = 0;
++		private boolean includePad = true;
++		private int maxLines = Integer.MAX_VALUE;
++		private TextUtils.TruncateAt ellipsize;
++		private int ellipsizedWidth = -1;
++		private boolean useFallbackLineSpacing;
+ 
+ 		public static Builder obtain(CharSequence source, int bufstart, int bufend, TextPaint paint, int outerwidth) {
++			if (source == null || paint == null)
++				throw new NullPointerException();
++			if (bufstart < 0 || bufstart > bufend || bufend > source.length())
++				throw new IndexOutOfBoundsException("bufstart=" + bufstart + " bufend=" + bufend + " length=" + source.length());
++			if (outerwidth < 0)
++				throw new IllegalArgumentException("width must be >= 0");
+ 			Builder builder = new Builder();
+-			builder.layout = new StaticLayout(source, bufstart, bufend, paint, outerwidth, null, null, 0, 0, false, null, 0, 0);
++			builder.source = source;
++			builder.bufstart = bufstart;
++			builder.bufend = bufend;
++			builder.paint = paint;
++			builder.width = outerwidth;
+ 			return builder;
+ 		}
+ 
+-		public Builder setTextDirection(TextDirectionHeuristic textDir) { return this; }
+-
+-		public Builder setAlignment(Alignment align) { return this; }
+-
+-		public Builder setMaxLines(int maxLines) { return this; }
+-
+-		public Builder setEllipsize(TextUtils.TruncateAt ellipsize) { return this; }
+-
+-		public Builder setEllipsizedWidth(int ellipsizedWidth) { return this; }
+-
+-		public Builder setLineSpacing(float add, float mult) { return this; }
+-
+-		public Builder setIncludePad(boolean includepad) { return this; }
++		public Builder setTextDirection(TextDirectionHeuristic textDir) {
++			this.textDir = textDir;
++			return this;
++		}
++
++		public Builder setAlignment(Alignment align) {
++			this.align = align;
++			return this;
++		}
++
++		public Builder setMaxLines(int maxLines) {
++			if (maxLines <= 0)
++				throw new IllegalArgumentException("maxLines must be > 0");
++			this.maxLines = maxLines;
++			return this;
++		}
++
++		public Builder setEllipsize(TextUtils.TruncateAt ellipsize) {
++			this.ellipsize = ellipsize;
++			return this;
++		}
++
++		public Builder setEllipsizedWidth(int ellipsizedWidth) {
++			if (ellipsizedWidth < 0)
++				throw new IllegalArgumentException("ellipsizedWidth must be >= 0");
++			this.ellipsizedWidth = ellipsizedWidth;
++			return this;
++		}
++
++		public Builder setLineSpacing(float add, float mult) {
++			if (mult <= 0 || Float.isNaN(mult) || Float.isInfinite(mult) || Float.isNaN(add) || Float.isInfinite(add))
++				throw new IllegalArgumentException("spacing multiplier must be > 0");
++			this.spacingAdd = add;
++			this.spacingMult = mult;
++			return this;
++		}
++
++		public Builder setIncludePad(boolean includepad) {
++			this.includePad = includepad;
++			return this;
++		}
++
++		public Builder setUseLineSpacingFromFallbacks(boolean useFallbackLineSpacing) {
++			this.useFallbackLineSpacing = useFallbackLineSpacing;
++			return this;
++		}
+ 
+ 		public Builder setBreakStrategy(int strategy) { return this; }
+ 
+@@ -56,6 +214,13 @@
+ 
+ 		public Builder setJustificationMode(int mode) { return this; }
+ 
+-		public StaticLayout build() { return layout; }
++		// actual StaticLayout creation is deferred until here
++		public StaticLayout build() {
++			return new StaticLayout(source, bufstart, bufend, paint, width,
++					align != null ? align : Alignment.ALIGN_NORMAL, textDir,
++					spacingMult, spacingAdd, includePad,
++					ellipsize, ellipsizedWidth >= 0 ? ellipsizedWidth : width,
++					maxLines, useFallbackLineSpacing);
++		}
+ 	}
+ }
+--- a/src/api-impl-jni/text/android_text_Layout.c
++++ b/src/api-impl-jni/text/android_text_Layout.c
+@@ -1,5 +1,6 @@
+ #include <gtk/gtk.h>
+ #include <pango/pango.h>
++#include <string.h>
+ 
+ #include "../defines.h"
+ #include "../util.h"
+@@ -11,7 +12,15 @@
+ JNIEXPORT jlong JNICALL Java_android_text_Layout_native_1constructor(JNIEnv *env, jobject object, jstring text, jlong paint, jint width)
+ {
+ 	struct AndroidPaint *android_paint = _PTR(paint);
+-	PangoLayout *layout = pango_layout_new(gtk_widget_get_pango_context(window));
++	// private context (same font map as the window's) so per-layout base direction doesn't leak
++	PangoContext *widget_context = gtk_widget_get_pango_context(window);
++	PangoContext *context = pango_context_new();
++	pango_context_set_font_map(context, pango_context_get_font_map(widget_context));
++	pango_context_set_font_description(context, pango_context_get_font_description(widget_context));
++	pango_context_set_language(context, pango_context_get_language(widget_context));
++	pango_context_set_base_dir(context, pango_context_get_base_dir(widget_context));
++	PangoLayout *layout = pango_layout_new(context);
++	g_object_unref(context);
+ 	pango_layout_set_font_description(layout, android_paint->font);
+ 	const char *str = (*env)->GetStringUTFChars(env, text, NULL);
+ 	pango_layout_set_text(layout, str, -1);
+@@ -88,19 +97,27 @@
+ 	return baseline + PANGO_DESCENT(logical_rect) / PANGO_SCALE;
+ }
+ 
++// pango_layout_line_get_extents is not alignment-aware; the iterator's extents are layout-relative
++static void get_line_extents(PangoLayout *pango_layout, jint line, PangoRectangle *logical_rect)
++{
++	PangoLayoutIter *pango_iter = pango_layout_get_iter(pango_layout);
++	while (line--)
++		pango_layout_iter_next_line(pango_iter);
++	pango_layout_iter_get_line_extents(pango_iter, NULL, logical_rect);
++	pango_layout_iter_free(pango_iter);
++}
++
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1left(JNIEnv *env, jobject object, jlong layout, jint line)
+ {
+-	PangoLayoutLine *pango_line = pango_layout_get_line_readonly(PANGO_LAYOUT(_PTR(layout)), line);
+-	PangoRectangle logical_rect;
+-	pango_layout_line_get_extents(pango_line, NULL, &logical_rect);
++	PangoRectangle logical_rect;
++	get_line_extents(PANGO_LAYOUT(_PTR(layout)), line, &logical_rect);
+ 	return logical_rect.x / PANGO_SCALE;
+ }
+ 
+ JNIEXPORT jint JNICALL Java_android_text_Layout_native_1get_1line_1right(JNIEnv *env, jobject object, jlong layout, jint line)
+ {
+-	PangoLayoutLine *pango_line = pango_layout_get_line_readonly(PANGO_LAYOUT(_PTR(layout)), line);
+-	PangoRectangle logical_rect;
+-	pango_layout_line_get_extents(pango_line, NULL, &logical_rect);
++	PangoRectangle logical_rect;
++	get_line_extents(PANGO_LAYOUT(_PTR(layout)), line, &logical_rect);
+ 	return (logical_rect.x + logical_rect.width) / PANGO_SCALE;
+ }
+ 
+@@ -151,7 +168,7 @@
+ JNIEXPORT void JNICALL Java_android_text_Layout_native_1set_1ellipsize(JNIEnv *env, jobject object, jlong layout, jint ellipsize_mode, jfloat ellipsize_width)
+ {
+ 	PangoLayout *pango_layout = _PTR(layout);
+-	pango_layout_set_ellipsize(pango_layout, (PangoEllipsizeMode)ellipsize_mode);
++	pango_layout_set_ellipsize(pango_layout, (PangoEllipsizeMode)(ellipsize_mode <= 3 ? ellipsize_mode : PANGO_ELLIPSIZE_END));
+ 	pango_layout_set_width(pango_layout, ellipsize_width * PANGO_SCALE);
+ }
+ 
+@@ -237,3 +254,71 @@
+ 	PangoLayout *pango_layout = _PTR(layout);
+ 	g_object_unref(pango_layout);
+ }
++
++JNIEXPORT void JNICALL Java_android_text_StaticLayout_native_1set_1base_1dir(JNIEnv *env, jobject object, jlong layout, jboolean rtl)
++{
++	PangoLayout *pango_layout = PANGO_LAYOUT(_PTR(layout));
++	PangoContext *context = pango_layout_get_context(pango_layout);
++	pango_layout_set_auto_dir(pango_layout, FALSE);
++	pango_context_set_base_dir(context, rtl ? PANGO_DIRECTION_RTL : PANGO_DIRECTION_LTR);
++	pango_layout_context_changed(pango_layout);
++}
++
++JNIEXPORT void JNICALL Java_android_text_StaticLayout_native_1configure(JNIEnv *env, jobject object, jlong layout_ptr, jlong paint, jint align, jfloat spacing_mult, jfloat spacing_add, jint max_lines, jint ellipsize_mode, jint ellipsized_width, jboolean fallback_line_spacing)
++{
++	PangoLayout *layout = PANGO_LAYOUT(_PTR(layout_ptr));
++	struct AndroidPaint *android_paint = _PTR(paint);
++
++	// With automatic direction enabled Pango resolves NORMAL/OPPOSITE per paragraph.
++	// With an explicit text direction the physical alignment must be resolved here.
++	gboolean rtl = !pango_layout_get_auto_dir(layout)
++		&& pango_context_get_base_dir(pango_layout_get_context(layout)) == PANGO_DIRECTION_RTL;
++	PangoAlignment alignment = PANGO_ALIGN_LEFT;
++	if (align == 2) alignment = PANGO_ALIGN_CENTER;
++	else if (align == 4 || (align == 1 && !rtl) || (align == 0 && rtl)) alignment = PANGO_ALIGN_RIGHT;
++	if (align == 3 || align == 4) pango_layout_set_auto_dir(layout, FALSE);
++	pango_layout_set_alignment(layout, alignment);
++
++	// Pango's line-spacing factor ignores additive spacing. Line-height attributes
++	// allow both settings to participate in the measured and rendered line positions.
++	PangoAttrList *old_attrs = pango_layout_get_attributes(layout);
++	PangoAttrList *attrs = old_attrs ? pango_attr_list_copy(old_attrs) : pango_attr_list_new();
++	if (!fallback_line_spacing) {
++		PangoContext *context = pango_layout_get_context(layout);
++		PangoFontMetrics *metrics = pango_context_get_metrics(context, android_paint->font, pango_context_get_language(context));
++		int height = pango_font_metrics_get_ascent(metrics) + pango_font_metrics_get_descent(metrics);
++		pango_font_metrics_unref(metrics);
++		pango_attr_list_change(attrs, pango_attr_line_height_new_absolute((int)(height * spacing_mult)));
++	} else if (spacing_mult != 1.0f) {
++		pango_attr_list_change(attrs, pango_attr_line_height_new(spacing_mult));
++	}
++	pango_layout_set_attributes(layout, attrs);
++	pango_attr_list_unref(attrs);
++	pango_layout_set_spacing(layout, (int)(spacing_add * PANGO_SCALE));
++
++	if (ellipsize_mode != 0) {
++		pango_layout_set_ellipsize(layout, (PangoEllipsizeMode)(ellipsize_mode <= 3 ? ellipsize_mode : PANGO_ELLIPSIZE_END));
++		pango_layout_set_width(layout, ellipsized_width * PANGO_SCALE);
++	}
++
++	// a negative set_height limits lines per paragraph and only takes effect together
++	// with ellipsization, so use it only for a single-paragraph, ellipsized layout;
++	// other finite max_lines cases are capped on the Java side
++	if (max_lines > 0 && ellipsize_mode != 0 && strchr(pango_layout_get_text(layout), '\n') == NULL)
++		pango_layout_set_height(layout, -max_lines);
++	else if (ellipsize_mode != 0)
++		pango_layout_set_height(layout, G_MAXINT);
++}
++
++JNIEXPORT void JNICALL Java_android_text_StaticLayout_native_1draw_1capped(JNIEnv *env, jobject object, jlong layout, jlong snapshot_ptr, jlong paint_ptr, jint height)
++{
++	PangoLayout *pango_layout = PANGO_LAYOUT(_PTR(layout));
++	GtkSnapshot *snapshot = GTK_SNAPSHOT(_PTR(snapshot_ptr));
++	struct AndroidPaint *android_paint = _PTR(paint_ptr);
++
++	graphene_rect_t bounds = GRAPHENE_RECT_INIT(0.f, 0.f,
++			(float)pango_layout_get_width(pango_layout) / PANGO_SCALE, (float)height);
++	gtk_snapshot_push_clip(snapshot, &bounds);
++	gtk_snapshot_append_layout(snapshot, pango_layout, &android_paint->color);
++	gtk_snapshot_pop(snapshot);
++}

@@ -1,0 +1,3 @@
+# Root is found by label, never by device node (zboot spec).
+LABEL=ZR_ARCH  /  ext4  rw,noatime,errors=remount-ro  0  1
+binder  /dev/binderfs  binder  defaults,nofail  0  0

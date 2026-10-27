@@ -1,0 +1,150 @@
+diff --git a/src/api-impl/android/content/pm/PackageManager.java b/src/api-impl/android/content/pm/PackageManager.java
+index 82e5453..e3c8246 100644
+--- a/src/api-impl/android/content/pm/PackageManager.java
++++ b/src/api-impl/android/content/pm/PackageManager.java
+@@ -117,6 +117,12 @@ public class PackageManager {
+ 	 */
+ 	public static final int GET_SIGNATURES = 0x00000040;
+ 
++	/**
++	 * {@link PackageInfo} flag: return information about the
++	 * certificates used to sign the package (API 28+).
++	 */
++	public static final int GET_SIGNING_CERTIFICATES = 0x08000000;
++
+ 	/**
+ 	 * {@link ResolveInfo} flag: return the IntentFilter that
+ 	 * was matched for a particular ResolveInfo in
+diff --git a/src/api-impl/android/content/pm/PackageParser.java b/src/api-impl/android/content/pm/PackageParser.java
+index 4304c94..0041403 100644
+--- a/src/api-impl/android/content/pm/PackageParser.java
++++ b/src/api-impl/android/content/pm/PackageParser.java
+@@ -451,7 +451,7 @@ public class PackageParser {
+ 				}
+ 			}
+ 		}
+-		if ((flags & PackageManager.GET_SIGNATURES) != 0) {
++		if ((flags & (PackageManager.GET_SIGNATURES | PackageManager.GET_SIGNING_CERTIFICATES)) != 0) {
+ 			int N = (p.mSignatures != null) ? p.mSignatures.length : 0;
+ 			if (N > 0) {
+ 				pi.signatures = new Signature[N];
+@@ -460,9 +460,57 @@ public class PackageParser {
+ 				pi.signatures = new Signature[0];
+ 			}
+ 		}
++		if ((flags & PackageManager.GET_SIGNING_CERTIFICATES) != 0) {
++			pi.signingInfo = new SigningInfo(pi.signatures);
++		}
+ 		return pi;
+ 	}
+ 
++
++	private static ClassLoader apkSignatureClassLoader;
++
++	private static synchronized ClassLoader getApkSignatureClassLoader(File verifierJar) throws Exception {
++		if (apkSignatureClassLoader == null) {
++			File optimizedDirectory = new File(System.getProperty("user.home"), ".cache/ztos/atl-apksig");
++			if (!optimizedDirectory.isDirectory() && !optimizedDirectory.mkdirs()) {
++				throw new IOException("Cannot create apksig cache directory " + optimizedDirectory);
++			}
++			Class<?> dexLoaderClass = Class.forName("dalvik.system.DexClassLoader");
++			Object loader = dexLoaderClass.getConstructor(String.class, String.class, String.class, ClassLoader.class)
++			    .newInstance(verifierJar.getAbsolutePath(), optimizedDirectory.getAbsolutePath(), null,
++			                PackageParser.class.getClassLoader());
++			apkSignatureClassLoader = (ClassLoader)loader;
++		}
++		return apkSignatureClassLoader;
++	}
++
++	private Certificate[] collectApkSigningBlockCertificates() {
++		File verifierJar = new File("/usr/lib/java/dex/android_translation_layer/apksig.jar");
++		if (!verifierJar.isFile()) {
++			Slog.w(TAG, "APK has no JAR certificates and apksig is unavailable: " + mArchiveSourcePath);
++			return null;
++		}
++		try {
++			ClassLoader loader = getApkSignatureClassLoader(verifierJar);
++			Class<?> builderClass = Class.forName("com.android.apksig.ApkVerifier$Builder", true, loader);
++			Object builder = builderClass.getConstructor(File.class).newInstance(new File(mArchiveSourcePath));
++			Object verifier = builderClass.getMethod("build").invoke(builder);
++			Object result = verifier.getClass().getMethod("verify").invoke(verifier);
++			boolean verified = (Boolean)result.getClass().getMethod("isVerified").invoke(result);
++			if (!verified) {
++				Slog.e(TAG, "APK v2/v3 signature verification failed: " + mArchiveSourcePath);
++				return null;
++			}
++			@SuppressWarnings("unchecked")
++			List<Certificate> signers = (List<Certificate>)result.getClass().getMethod("getSignerCertificates").invoke(result);
++			Slog.i(TAG, "Verified APK v2/v3 signature for " + mArchiveSourcePath + "; signers=" + signers.size());
++			return signers.toArray(new Certificate[signers.size()]);
++		} catch (Exception e) {
++			Slog.w(TAG, "Unable to verify APK v2/v3 signature: " + mArchiveSourcePath, e);
++			return null;
++		}
++	}
++
+ 	private Certificate[] loadCertificates(JarFile jarFile, JarEntry je,
+ 	                                       byte[] readBuffer) {
+ 		try {
+@@ -641,10 +689,7 @@ public class PackageParser {
+ 				JarEntry jarEntry = jarFile.getJarEntry(ANDROID_MANIFEST_FILENAME);
+ 				certs = loadCertificates(jarFile, jarEntry, readBuffer);
+ 				if (certs == null) {
+-					Slog.e(TAG, "Package " + pkg.packageName + " has no certificates at entry " + jarEntry.getName() + "; ignoring!");
+-					jarFile.close();
+-					mParseError = PackageManager.INSTALL_PARSE_FAILED_NO_CERTIFICATES;
+-					return false;
++					Slog.w(TAG, "Package " + pkg.packageName + " has no JAR certificates at entry " + jarEntry.getName() + "; trying APK signing block.");
+ 				}
+ 				if (DEBUG_JAR) {
+ 					Slog.i(TAG, "File " + mArchiveSourcePath + ": entry=" + jarEntry + " certs=" + (certs != null ? certs.length : 0));
+@@ -707,6 +752,11 @@ public class PackageParser {
+ 			}
+ 			jarFile.close();
+ 
++			/* APK v2/v3 signatures are stored outside JAR entries. */
++			if (certs == null || certs.length == 0) {
++				certs = collectApkSigningBlockCertificates();
++			}
++
+ 			synchronized (mSync) {
+ 				mReadBuffer = readBufferRef;
+ 			}
+diff --git a/src/api-impl/android/content/pm/SigningInfo.java b/src/api-impl/android/content/pm/SigningInfo.java
+index 11e1c30..40d57e6 100644
+--- a/src/api-impl/android/content/pm/SigningInfo.java
++++ b/src/api-impl/android/content/pm/SigningInfo.java
+@@ -1,16 +1,30 @@
+ package android.content.pm;
+ 
+ public final class SigningInfo {
++	private final Signature[] mCurrentSigners;
++
++	public SigningInfo() {
++		this.mCurrentSigners = null;
++	}
++
++	public SigningInfo(Signature[] signers) {
++		this.mCurrentSigners = (signers != null) ? signers.clone() : new Signature[0];
++	}
++
+ 	public Signature[] getApkContentsSigners() {
+-		return null;
++		return (mCurrentSigners != null) ? mCurrentSigners.clone() : null;
+ 	}
+ 
+ 	public boolean hasMultipleSigners() {
+-		return false;
++		return (mCurrentSigners != null) && mCurrentSigners.length > 1;
+ 	}
+ 
+ 	public Signature[] getSigningCertificateHistory() {
+-		return null;
++		if (mCurrentSigners == null) {
++			return null;
++		}
++		// No rotation history is available; the history is just the current signer(s).
++		return mCurrentSigners.clone();
+ 	}
+ 
+ 	public boolean hasPastSigningCertificates() {

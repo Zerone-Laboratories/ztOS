@@ -1,0 +1,188 @@
+--- a/src/api-impl/android/graphics/Paint.java
++++ b/src/api-impl/android/graphics/Paint.java
+@@ -105,14 +105,38 @@
+ 		return -getTextSize();
+ 	}
+ 
+-	public float measureText(char[] text, int index, int count) { return 10; }
++	public float measureText(char[] text, int index, int count) {
++		if (text == null)
++			throw new NullPointerException("text is null");
++		if (index < 0 || count < 0 || index > text.length || count > text.length - index)
++			throw new ArrayIndexOutOfBoundsException();
++		if (count == 0)
++			return 0.0f;
++		return measureText(new String(text, index, count));
++	}
+ 	public float measureText(String text, int start, int end) {
+-		return (end - start) * getTextSize() * .6f;
++		if (text == null)
++			throw new NullPointerException("text is null");
++		if (start < 0 || end < 0 || start > end || end > text.length())
++			throw new IndexOutOfBoundsException();
++		if (start == end)
++			return 0.0f;
++		return native_measure_text(paint, text.substring(start, end));
+ 	}
+ 	public float measureText(String text) {
+-		return measureText(text, 0, text.length());
++		if (text == null)
++			throw new NullPointerException("text is null");
++		if (text.isEmpty())
++			return 0.0f;
++		return native_measure_text(paint, text);
+ 	}
+ 	public float measureText(CharSequence text, int start, int end) {
++		if (text == null)
++			throw new NullPointerException("text is null");
++		if (start < 0 || end < 0 || start > end || end > text.length())
++			throw new IndexOutOfBoundsException();
++		if (start == end)
++			return 0.0f;
+ 		return measureText(text.toString(), start, end);
+ 	}
+ 
+@@ -423,6 +447,7 @@
+ 	private static native void native_set_text_size(long paint, float size);
+ 	private static native float native_get_text_size(long paint);
+ 	private static native void native_set_color_filter(long paint, int mode, int color);
++	private static native float native_measure_text(long paint, String text);
+ 	private static native void native_get_text_bounds(long paint, String text, Rect bounds);
+ 	private static native void native_set_text_align(long paint, int align);
+ 	private static native float native_get_font_metrics(long paint, FontMetrics metrics);
+--- a/src/api-impl/android/graphics/Path.java
++++ b/src/api-impl/android/graphics/Path.java
+@@ -194,7 +194,28 @@
+ 	}
+ 
+ 	public void addCircle(float x, float y, float radius, Direction direction) {
+-		Log.w("Path", "STUB: addCircle");
++		if (direction == null) throw new NullPointerException("direction");
++		if (radius <= 0)
++			return;
++		// Circle approximation via four cubic Bézier curves using kappa = 4/3 * (sqrt(2) - 1)
++		final float k = 0.5522847498307936f * radius;
++		if (direction == Direction.CCW) {
++			// Counter-clockwise: Right (x+r, y) -> Top (x, y-r) -> Left (x-r, y) -> Bottom (x, y+r) -> Right
++			moveTo(x + radius, y);
++			cubicTo(x + radius, y - k, x + k, y - radius, x, y - radius);
++			cubicTo(x - k, y - radius, x - radius, y - k, x - radius, y);
++			cubicTo(x - radius, y + k, x - k, y + radius, x, y + radius);
++			cubicTo(x + k, y + radius, x + radius, y + k, x + radius, y);
++			close();
++		} else {
++			// Clockwise: Right (x+r, y) -> Bottom (x, y+r) -> Left (x-r, y) -> Top (x, y-r) -> Right
++			moveTo(x + radius, y);
++			cubicTo(x + radius, y + k, x + k, y + radius, x, y + radius);
++			cubicTo(x - k, y + radius, x - radius, y + k, x - radius, y);
++			cubicTo(x - radius, y - k, x - k, y - radius, x, y - radius);
++			cubicTo(x + k, y - radius, x + radius, y - k, x + radius, y);
++			close();
++		}
+ 	}
+ 
+ 	public void transform(Matrix matrix) {
+--- a/src/api-impl-jni/graphics/AndroidPaint.h
++++ b/src/api-impl-jni/graphics/AndroidPaint.h
+@@ -1,3 +1,4 @@
++#include <jni.h>
+ #include "pango/pango-layout.h"
+ #include <gdk/gdk.h>
+ #include <gsk/gsk.h>
+@@ -14,3 +15,5 @@
+ 	bool is_stroke : 1;
+ 	bool use_color_filter : 1;
+ };
++
++PangoLayout *android_paint_create_text_layout(struct AndroidPaint *paint, JNIEnv *env, jstring text);
+--- a/src/api-impl-jni/graphics/android_atl_GskCanvas.c
++++ b/src/api-impl-jni/graphics/android_atl_GskCanvas.c
+@@ -127,11 +127,8 @@
+ {
+ 	GdkSnapshot *snapshot = GTK_SNAPSHOT(_PTR(snapshot_ptr));
+ 	struct AndroidPaint *paint = _PTR(paint_ptr);
+-	PangoLayout *layout = pango_layout_new(gtk_widget_get_pango_context(window));
+-	pango_layout_set_font_description(layout, paint->font);
+-	const char *str = (*env)->GetStringUTFChars(env, text, NULL);
+-	pango_layout_set_text(layout, str, -1);
+-	(*env)->ReleaseStringUTFChars(env, text, str);
++	PangoLayout *layout = android_paint_create_text_layout(paint, env, text);
++	if (!layout) return;
+ 	PangoRectangle rect;
+ 	pango_layout_get_pixel_extents(layout, NULL, &rect);
+ 	y -= (float)pango_layout_get_baseline(layout) / PANGO_SCALE;
+--- a/src/api-impl-jni/graphics/android_graphics_Paint.c
++++ b/src/api-impl-jni/graphics/android_graphics_Paint.c
+@@ -14,6 +14,7 @@
+ 	paint->color.alpha = 1.f;
+ 	paint->gsk_stroke = gsk_stroke_new(1);
+ 	paint->font = pango_font_description_new();
++	pango_font_description_set_absolute_size(paint->font, 16 * PANGO_SCALE);
+ 	paint->is_fill = true;
+ 	return _INTPTR(paint);
+ }
+@@ -155,16 +156,57 @@
+ 
+ extern GtkWidget *window;
+ 
+-JNIEXPORT void JNICALL Java_android_graphics_Paint_native_1get_1text_1bounds(JNIEnv *env, jclass clazz, jlong paint_ptr, jstring text_ptr, jobject bounds)
+-{
+-	struct AndroidPaint *paint = _PTR(paint_ptr);
++/* JNI modified UTF-8 encodes supplementary characters as surrogate pairs.
++ * Pango expects Unicode UTF-8; share the conversion between drawing and metrics. */
++PangoLayout *android_paint_create_text_layout(struct AndroidPaint *paint, JNIEnv *env, jstring text)
++{
++	if (!text) {
++		jclass exception = (*env)->FindClass(env, "java/lang/NullPointerException");
++		if (exception) (*env)->ThrowNew(env, exception, "text");
++		return NULL;
++	}
++	const jchar *chars = (*env)->GetStringChars(env, text, NULL);
++	if (!chars) return NULL;
++	jsize length = (*env)->GetStringLength(env, text);
++	GString *utf8 = g_string_sized_new(length);
++	for (jsize i = 0; i < length; i++) {
++		gunichar codepoint = chars[i];
++		if (codepoint >= 0xd800 && codepoint <= 0xdbff && i + 1 < length &&
++		    chars[i + 1] >= 0xdc00 && chars[i + 1] <= 0xdfff) {
++			codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (chars[++i] - 0xdc00);
++		} else if (codepoint >= 0xd800 && codepoint <= 0xdfff) {
++			codepoint = 0xfffd;
++		}
++		char encoded[6];
++		int bytes = g_unichar_to_utf8(codepoint, encoded);
++		g_string_append_len(utf8, encoded, bytes);
++	}
++	(*env)->ReleaseStringChars(env, text, chars);
+ 	PangoLayout *layout = pango_layout_new(gtk_widget_get_pango_context(window));
+ 	pango_layout_set_font_description(layout, paint->font);
+-	const char *str = (*env)->GetStringUTFChars(env, text_ptr, NULL);
+-	pango_layout_set_text(layout, str, -1);
+-	(*env)->ReleaseStringUTFChars(env, text_ptr, str);
++	pango_layout_set_text(layout, utf8->str, utf8->len);
++	g_string_free(utf8, TRUE);
++	return layout;
++}
++
++JNIEXPORT jfloat JNICALL Java_android_graphics_Paint_native_1measure_1text(JNIEnv *env, jclass clazz, jlong paint_ptr, jstring text_ptr)
++{
++	struct AndroidPaint *paint = _PTR(paint_ptr);
++	PangoLayout *layout = android_paint_create_text_layout(paint, env, text_ptr);
++	if (!layout) return 0;
++	PangoRectangle logical_rect;
++	pango_layout_get_extents(layout, NULL, &logical_rect);
++	g_object_unref(layout);
++	return (jfloat)logical_rect.width / PANGO_SCALE;
++}
++
++JNIEXPORT void JNICALL Java_android_graphics_Paint_native_1get_1text_1bounds(JNIEnv *env, jclass clazz, jlong paint_ptr, jstring text_ptr, jobject bounds)
++{
++	struct AndroidPaint *paint = _PTR(paint_ptr);
++	PangoLayout *layout = android_paint_create_text_layout(paint, env, text_ptr);
++	if (!layout) return;
+ 	PangoRectangle rect;
+-	pango_layout_get_pixel_extents(layout, NULL, &rect);
++	pango_layout_get_pixel_extents(layout, &rect, NULL);
+ 	rect.y -= (float)pango_layout_get_baseline(layout) / PANGO_SCALE;
+ 	if (paint->alignment == PANGO_ALIGN_CENTER)
+ 		rect.x -= rect.width / 2.f;

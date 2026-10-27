@@ -1,0 +1,133 @@
+--- a/libc/libc-misc.c
++++ b/libc/libc-misc.c
+@@ -1,43 +1,113 @@
+ #include <errno.h>
+ #include <locale.h>
+ #include <stdbool.h>
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#define PROP_NAME_MAX  32
++#define PROP_VALUE_MAX 92
++
++/*
++ * Stable native property handles.
++ * TikTok and native Android runtimes look up properties via __system_property_find
++ * and inspect them using read, read_callback, and serial.
++ */
+ // this seems to not be a stable ABI, so hopefully nobody treats it as such
+ // FIXME: move this out into it's own file whenever we get to implementing it more properly
+ struct prop_info {
+-	const char *name;
++	char name[PROP_NAME_MAX];
++	uint32_t serial;
+ };
+ 
+-#define PROP_NAME_MAX  32
+-#define PROP_VALUE_MAX 92
++extern int __system_property_get(const char *name, char *value);
++
++static struct prop_info g_prop_sdk = {
++	.name = "ro.build.version.sdk",
++	.serial = 0
++};
++
++static struct prop_info g_prop_fingerprint = {
++	.name = "ro.build.fingerprint",
++	.serial = 0
++};
+ 
+ const struct prop_info *bionic___system_property_find(const char *name)
+ {
+-	struct prop_info *ret = malloc(sizeof(struct prop_info));
+-	ret->name = name;
++	if (!name)
++		return NULL;
+ 
+-	return ret;
++	if (strcmp(name, "ro.build.version.sdk") == 0)
++		return &g_prop_sdk;
++
++	if (strcmp(name, "ro.build.fingerprint") == 0)
++		return &g_prop_fingerprint;
++
++	return NULL;
+ }
+ 
+-int bionic___system_property_read(const struct prop_info *prop_info, char *name, char *value)
++int bionic___system_property_read(const struct prop_info *pi, char *name, char *value)
+ {
+-	if (name)
+-		strncpy(name, prop_info->name, PROP_NAME_MAX);
+-
+-	if (!value)
++	if (!pi)
+ 		return 0;
+ 
+-	if (!strcmp(prop_info->name, "ro.build.fingerprint")) {
+-		strncpy(value, "", PROP_VALUE_MAX); // there is no good reason that apps should need this, so just return an empty string
+-	} else {
+-		printf("__system_property_find: >%s< not handled yet\n", prop_info->name);
+-		strncpy(value, "", PROP_VALUE_MAX);
++	if (name) {
++		strncpy(name, pi->name, PROP_NAME_MAX - 1);
++		name[PROP_NAME_MAX - 1] = '\0';
+ 	}
+ 
+-	return strlen(value);
++	char val_buf[PROP_VALUE_MAX];
++	val_buf[0] = '\0';
++	__system_property_get(pi->name, val_buf);
++	val_buf[PROP_VALUE_MAX - 1] = '\0';
++
++	if (value) {
++		strncpy(value, val_buf, PROP_VALUE_MAX - 1);
++		value[PROP_VALUE_MAX - 1] = '\0';
++	}
++
++	return (int)strlen(val_buf);
++}
++
++void bionic___system_property_read_callback(const struct prop_info *pi,
++					   void (*callback)(void *cookie,
++							    const char *name,
++							    const char *value,
++							    uint32_t serial),
++					   void *cookie)
++{
++	if (!pi || !callback)
++		return;
++
++	char name_buf[PROP_NAME_MAX];
++	char val_buf[PROP_VALUE_MAX];
++
++	strncpy(name_buf, pi->name, PROP_NAME_MAX - 1);
++	name_buf[PROP_NAME_MAX - 1] = '\0';
++
++	val_buf[0] = '\0';
++	__system_property_get(pi->name, val_buf);
++	val_buf[PROP_VALUE_MAX - 1] = '\0';
++
++	size_t val_len = strlen(val_buf);
++	uint32_t serial = (pi->serial & 0x00ffffff) | ((uint32_t)(val_len & 0xff) << 24);
++
++	callback(cookie, name_buf, val_buf, serial);
++}
++
++uint32_t bionic___system_property_serial(const struct prop_info *pi)
++{
++	if (!pi)
++		return 0;
++
++	char val_buf[PROP_VALUE_MAX];
++	val_buf[0] = '\0';
++	__system_property_get(pi->name, val_buf);
++	val_buf[PROP_VALUE_MAX - 1] = '\0';
++
++	size_t val_len = strlen(val_buf);
++	return (pi->serial & 0x00ffffff) | ((uint32_t)(val_len & 0xff) << 24);
+ }
+ 
+ // actually misc stuff

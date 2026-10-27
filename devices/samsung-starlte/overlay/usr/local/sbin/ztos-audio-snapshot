@@ -1,0 +1,11 @@
+out=${1:-/var/tmp/snap-$(date +%H%M%S).txt}
+{
+find /proc/sys -type f -readable 2>/dev/null | sort | while read f; do printf '%s=%s\n' "$f" "$(head -c 300 "$f" 2>/dev/null | tr '\n' ' ')"; done
+for f in /sys/devices/system/cpu/online /sys/devices/system/cpu/cpufreq/policy*/scaling_* /sys/devices/system/cpu/cpufreq/policy*/schedutil/* /sys/module/*/parameters/* /sys/kernel/mm/transparent_hugepage/enabled /sys/power/*; do [ -f "$f" ] && [ -r "$f" ] && printf '%s=%s\n' "$f" "$(head -c 300 "$f" 2>/dev/null | tr '\n' ' ')"; done
+for i in /proc/irq/*/smp_affinity_list; do printf '%s=%s\n' "$i" "$(cat $i)"; done
+cat /proc/interrupts | awk '{print "irq " $0}' | grep -i -E "abox|mct|dwc3|ipi" 
+ps -eLo cls,rtprio,ni,psr,comm | sort | uniq -c | sort -rn | head -60 | sed 's/^/thr /'
+find /sys/fs/cgroup -maxdepth 2 -name cgroup.subtree_control | while read f; do echo "$f=$(cat $f)"; done
+lsmod | sed 's/^/mod /'
+} > $out 2>/dev/null
+wc -l $out

@@ -1,0 +1,14 @@
+diff --git a/src/api-impl/android/graphics/Typeface.java b/src/api-impl/android/graphics/Typeface.java
+index 7bc8ca2..0c39e13 100644
+--- a/src/api-impl/android/graphics/Typeface.java
++++ b/src/api-impl/android/graphics/Typeface.java
+@@ -49,6 +49,10 @@ public class Typeface {
+ 	public static Typeface create(Typeface typeface, int style) {
+ 		return typeface != null ? typeface : DEFAULT;
+ 	}
++
++	public static Typeface create(Typeface typeface, int style, boolean isItalic) {
++		return create(typeface, isItalic ? (style | ITALIC) : (style & ~ITALIC));
++	}
+ 
+ 	public static Typeface createFromFile(String path) {

@@ -421,11 +421,12 @@ static void test_without_dev(enum mcu_ipc_region id)
 }
 #endif
 
+static int mcu_ipc_irq;	/* the CP-to-AP interrupt, made a wake source in suspend */
+
 static int mcu_ipc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct resource *res = NULL;
-	int mcu_ipc_irq;
 	int err = 0;
 	u32 id = 0;
 
@@ -477,6 +478,12 @@ static int mcu_ipc_probe(struct platform_device *pdev)
 
 	mcu_ipc_clear_all_interrupt(id);
 
+	/* The CP's mailbox is what an incoming call or SMS arrives on: it has to
+	 * wake the AP from system sleep (PMU WAKEUP_MASK bit 24, left open). As
+	 * a wake IRQ it also stays live through suspend entry, so a message then
+	 * aborts the suspend instead of waiting for the next resume. */
+	device_init_wakeup(&pdev->dev, true);
+
 	/* set argos irq affinity */
 	err = mcu_ipc_set_affinity(id, dev, mcu_ipc_irq);
 	if (err)
@@ -501,13 +508,15 @@ static void mcu_ipc_remove(struct platform_device *pdev)
 #ifdef CONFIG_PM
 static int mcu_ipc_suspend(struct device *dev)
 {
-	/* TODO */
+	if (device_may_wakeup(dev))
+		enable_irq_wake(mcu_ipc_irq);
 	return 0;
 }
 
 static int mcu_ipc_resume(struct device *dev)
 {
-	/* TODO */
+	if (device_may_wakeup(dev))
+		disable_irq_wake(mcu_ipc_irq);
 #ifdef CONFIG_ARGOS
 	set_irq_affinity(dev);
 #endif

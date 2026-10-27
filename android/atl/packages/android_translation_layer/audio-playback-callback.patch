@@ -1,0 +1,66 @@
+--- a/src/api-impl/android/media/AudioManager.java
++++ b/src/api-impl/android/media/AudioManager.java
+@@ -3,6 +3,28 @@
+ import android.os.Handler;
+ 
+ public class AudioManager {
++    /** Observer API for clients that monitor Android-managed playback. */
++    public static abstract class AudioPlaybackCallback {
++        public void onPlaybackConfigChanged(java.util.List<AudioPlaybackConfiguration> configurations) {}
++    }
++    private final java.util.concurrent.CopyOnWriteArrayList<AudioPlaybackCallback> playbackCallbacks =
++            new java.util.concurrent.CopyOnWriteArrayList<>();
++
++    public void registerAudioPlaybackCallback(AudioPlaybackCallback callback, Handler handler) {
++        if (callback == null) throw new IllegalArgumentException("callback must not be null");
++        playbackCallbacks.addIfAbsent(callback);
++    }
++
++    public void unregisterAudioPlaybackCallback(AudioPlaybackCallback callback) {
++        if (callback == null) throw new IllegalArgumentException("callback must not be null");
++        playbackCallbacks.remove(callback);
++    }
++
++    public java.util.List<AudioPlaybackConfiguration> getActivePlaybackConfigurations() {
++        // ATL native audio has no Android player registry yet.
++        return java.util.Collections.emptyList();
++    }
++
+ 	public static final String PROPERTY_OUTPUT_FRAMES_PER_BUFFER = "android.media.property.OUTPUT_FRAMES_PER_BUFFER";
+ 	public static final String PROPERTY_OUTPUT_SAMPLE_RATE = "android.media.property.OUTPUT_SAMPLE_RATE";
+ 
+--- a/src/api-impl/meson.build
++++ b/src/api-impl/meson.build
+@@ -343,6 +343,7 @@
+ 	'android/media/AudioFocusRequest.java',
+ 	'android/media/AudioFormat.java',
+ 	'android/media/AudioManager.java',
++	'android/media/AudioPlaybackConfiguration.java',
+ 	'android/media/AudioRecord.java',
+ 	'android/media/AudioTimestamp.java',
+ 	'android/media/AudioTrack.java',
+--- /dev/null
++++ b/src/api-impl/android/media/AudioPlaybackConfiguration.java
+@@ -0,0 +1,22 @@
++package android.media;
++
++import android.os.Parcelable;
++
++/** Immutable metadata for an Android-managed audio player. */
++public final class AudioPlaybackConfiguration implements Parcelable {
++    private final AudioAttributes attributes;
++    private final int sessionId, playerState, clientUid, clientPid, playerType;
++
++    AudioPlaybackConfiguration(AudioAttributes attributes, int sessionId, int playerState,
++                               int clientUid, int clientPid, int playerType) {
++        this.attributes = attributes; this.sessionId = sessionId; this.playerState = playerState;
++        this.clientUid = clientUid; this.clientPid = clientPid; this.playerType = playerType;
++    }
++    public AudioAttributes getAudioAttributes() { return attributes; }
++    public int getAudioSessionId() { return sessionId; }
++    public int getPlayerState() { return playerState; }
++    public int getClientUid() { return clientUid; }
++    public int getClientPid() { return clientPid; }
++    public int getPlayerType() { return playerType; }
++    public boolean isActive() { return playerState == 2; }
++}

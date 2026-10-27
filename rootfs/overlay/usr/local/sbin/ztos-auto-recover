@@ -1,0 +1,74 @@
+#!/bin/bash
+set -u
+CACHE_MOUNT=/run/ztos-fs-recovery-cache
+STATE_DIR=$CACHE_MOUNT/ztos-fs-recovery
+STATE=$STATE_DIR/attempts
+cache_mount() {
+	[ -d "$CACHE_MOUNT" ] || mkdir -p "$CACHE_MOUNT"
+	if mountpoint -q "$CACHE_MOUNT"; then
+		mount -o remount,rw,nosuid,nodev,noexec "$CACHE_MOUNT" 2>/dev/null || return 1
+	else
+		device=$(findfs LABEL=cache 2>/dev/null || true)
+		[ -b "$device" ] || device=/dev/sda21
+		[ -b "$device" ] || return 1
+		mount -t ext4 -o rw,nosuid,nodev,noexec "$device" "$CACHE_MOUNT" 2>/dev/null || return 1
+	fi
+	install -d -o root -g root -m 0700 "$STATE_DIR"
+}
+log() { printf '<3>ztos-auto-recover: %s\n' "$*" > /dev/kmsg 2>/dev/null || true; }
+
+if [ "${1:-}" = --dry-run ]; then
+	printf '%s\n' 'dry-run: emit failed units and last 100 journal lines to kmsg' \
+		'remount / read-only; run e2fsck -f -y on findmnt source for /' \
+		'mount CACHE read-write and persist attempt count outside root; save e2fsck log' \
+	'reboot for attempts 1-2; on attempt 3 isolate graphical.target and mark ztMETRO notification'
+	exit 0
+fi
+
+log "entered $*; failed units follow"
+systemctl --failed --no-legend 2>&1 | while IFS= read -r line; do log "$line"; done
+journalctl -b -n 100 --no-pager 2>&1 | while IFS= read -r line; do log "$line"; done
+
+if ! cache_mount; then
+	log "CACHE counter mount failed; refusing unbounded recovery reboot"
+	count=3
+else
+	count=0
+[ -r "$STATE" ] && read -r count < "$STATE" || true
+case "$count" in ''|*[!0-9]*) count=0 ;; esac
+count=$((count + 1))
+	printf '%s\n' "$count" > "$STATE" || count=3
+fi
+log "recovery attempt $count of 3"
+
+ROOT_DEVICE=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+mount -o remount,ro / 2>/dev/null || true
+if [ -n "$ROOT_DEVICE" ]; then
+	e2fsck -f -y "$ROOT_DEVICE" > /run/ztos-auto-recover.fsck.log 2>&1
+	rc=$?
+	while IFS= read -r line || [ -n "$line" ]; do log "$line"; done < /run/ztos-auto-recover.fsck.log
+else
+	rc=8
+	log "cannot identify root block device"
+fi
+
+if [ "$count" -lt 3 ] && mount -o remount,rw / 2>/dev/null; then
+	install -d -m 0755 /var/log/ztos-fsck
+	cp -f /run/ztos-auto-recover.fsck.log "/var/log/ztos-fsck/recovery-$count.log" 2>/dev/null || true
+	mount -o remount,ro / 2>/dev/null || true
+fi
+
+if [ "$count" -ge 3 ]; then
+	log "three recoveries attempted; continuing to graphical target with dependency failures ignored"
+	mkdir -p /run/ztos-fs-recovery 2>/dev/null || true
+	touch /run/ztos-fs-recovery/notify 2>/dev/null || true
+	systemctl --no-block start greetd.service --job-mode=ignore-dependencies || true
+	systemctl --no-block start ztos-fs-recovery-reset.service --job-mode=ignore-dependencies || true
+	systemctl --no-block isolate graphical.target --job-mode=ignore-dependencies
+	exit 0
+fi
+
+log "recovery fsck rc=$rc; rebooting"
+sync
+systemctl reboot --no-block
+sleep infinity

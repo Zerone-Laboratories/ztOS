@@ -1,0 +1,110 @@
+Sat Oct 24 01:45:08 PM UTC 2026
+Failed to stop discovery: org.bluez.Error.Failed
+Controller 50:77:05:8E:75:B9 (public)
+	Manufacturer: 0x000f (15)
+	Version: 0x09 (9)
+	Name: starlte
+	Alias: starlte
+	Class: 0x006c0110 (7078160)
+	Powered: yes
+	PowerState: on
+	Discoverable: no
+	DiscoverableTimeout: 0x000000b4 (180)
+	Pairable: no
+	UUID: Headset AG                (00001112-0000-1000-8000-00805f9b34fb)
+	UUID: A/V Remote Control        (0000110e-0000-1000-8000-00805f9b34fb)
+	UUID: PnP Information           (00001200-0000-1000-8000-00805f9b34fb)
+	UUID: Audio Sink                (0000110b-0000-1000-8000-00805f9b34fb)
+	UUID: Headset                   (00001108-0000-1000-8000-00805f9b34fb)
+	UUID: A/V Remote Control Target (0000110c-0000-1000-8000-00805f9b34fb)
+	UUID: Generic Access Profile    (00001800-0000-1000-8000-00805f9b34fb)
+	UUID: Handsfree Audio Gateway   (0000111f-0000-1000-8000-00805f9b34fb)
+	UUID: Generic Attribute Profile (00001801-0000-1000-8000-00805f9b34fb)
+	UUID: Device Information        (0000180a-0000-1000-8000-00805f9b34fb)
+	UUID: Audio Source              (0000110a-0000-1000-8000-00805f9b34fb)
+	UUID: Handsfree                 (0000111e-0000-1000-8000-00805f9b34fb)
+	UUID: Vendor specific           (03b80e5a-ede8-4b33-a751-6ce34ec4c700)
+	Modalias: usb:v1D6Bp0246d0557
+	Discovering: no
+	Roles: central
+	Roles: peripheral
+Advertising Features:
+	ActiveInstances: 0x00 (0)
+	SupportedInstances: 0x05 (5)
+	SupportedIncludes: tx-power
+	SupportedIncludes: appearance
+	SupportedIncludes: local-name
+	SupportedCapabilities.MaxAdvLen: 0x1f (31)
+	SupportedCapabilities.MaxScnRspLen: 0x1f (31)
+2026-10-24 13:45:09 backend up
+2026-10-24 13:45:23 once: woke: rtc wake_stat=0x80000002
+
+Sleep counters after resume:
+1
+cat: /sys/module/zrn_sleep_init/parameters/last_sleep_us: No such file or directory
+2147483650
+2026-10-23 16:07:17 woke: modem wake_stat=0x81000000 after 79s
+2026-10-23 16:07:40 woke: modem wake_stat=0x81000000 after 6s
+2026-10-23 16:08:07 woke: modem wake_stat=0x81000000 after 11s
+2026-10-23 16:08:40 woke: modem wake_stat=0x81000000 after 17s
+2026-10-23 16:09:02 woke: modem wake_stat=0x81000000 after 6s
+2026-10-23 16:09:24 woke: modem wake_stat=0x81000000 after 6s
+2026-10-23 16:09:51 woke: modem wake_stat=0x81000000 after 11s
+2026-10-23 16:10:17 woke: other wake_stat=0x80000001 after 10s
+2026-10-24 13:23:26 backend up
+2026-10-24 13:23:47 woke: key wake_stat=0x80000001 after 20s
+2026-10-24 13:45:09 backend up
+2026-10-24 13:45:23 once: woke: rtc wake_stat=0x80000002
+Controller 50:77:05:8E:75:B9 (public)
+	Manufacturer: 0x000f (15)
+	Version: 0x09 (9)
+	Name: starlte
+	Alias: starlte
+	Class: 0x006c0110 (7078160)
+	Powered: yes
+	PowerState: on
+	Discoverable: no
+	DiscoverableTimeout: 0x000000b4 (180)
+	Pairable: no
+	UUID: Headset AG                (00001112-0000-1000-8000-00805f9b34fb)
+	UUID: A/V Remote Control        (0000110e-0000-1000-8000-00805f9b34fb)
+	UUID: PnP Information           (00001200-0000-1000-8000-00805f9b34fb)
+	UUID: Audio Sink                (0000110b-0000-1000-8000-00805f9b34fb)
+	UUID: Headset                   (00001108-0000-1000-8000-00805f9b34fb)
+	UUID: A/V Remote Control Target (0000110c-0000-1000-8000-00805f9b34fb)
+	UUID: Generic Access Profile    (00001800-0000-1000-8000-00805f9b34fb)
+	UUID: Handsfree Audio Gateway   (0000111f-0000-1000-8000-00805f9b34fb)
+	UUID: Generic Attribute Profile (00001801-0000-1000-8000-00805f9b34fb)
+	UUID: Device Information        (0000180a-0000-1000-8000-00805f9b34fb)
+	UUID: Audio Source              (0000110a-0000-1000-8000-00805f9b34fb)
+	UUID: Handsfree                 (0000111e-0000-1000-8000-00805f9b34fb)
+	UUID: Vendor specific           (03b80e5a-ede8-4b33-a751-6ce34ec4c700)
+	Modalias: usb:v1D6Bp0246d0557
+	Discovering: no
+	Roles: central
+	Roles: peripheral
+Advertising Features:
+	ActiveInstances: 0x00 (0)
+	SupportedInstances: 0x05 (5)
+	SupportedIncludes: tx-power
+	SupportedIncludes: appearance
+	SupportedIncludes: local-name
+	SupportedCapabilities.MaxAdvLen: 0x1f (31)
+	SupportedCapabilities.MaxScnRspLen: 0x1f (31)
+SetDiscoveryFilter success
+Discovery started
+[[0;93mCHG[0m] Controller 50:77:05:8E:75:B9 Discovering: yes
+Failed to stop discovery: org.bluez.Error.Failed
+[   15.667655] Bluetooth: hci0: BCM: features 0x0f
+[   15.669023] Bluetooth: hci0: BCM4361B2 Crown E32A ANT1 [Version: 0110.0232]
+[   15.669040] Bluetooth: hci0: BCM (002.003.009) build 0232
+[   15.669518] Bluetooth: hci0: HCI Read Transmit Power Level command is advertised, but not supported.
+[   99.423856] PM: suspend entry (deep)
+[   99.539628] zrn-bt: sleep: gate 0x20c4 00300000 -> 00200000 (now 00200000)
+[   99.539651] zrn-bt: sleep: gate 0x20c8 00300000 -> 00200000 (now 00200000)
+[   99.539661] zrn-bt: sleep: gate 0x201c 00300000 -> 00200000 (now 00200000)
+[   99.539671] zrn-bt: sleep: gate 0x2034 00300000 -> 00200000 (now 00200000)
+[   99.539681] zrn-bt: sleep: q-channel 0x3028 = 003f0002, option -> 00000001
+[   99.539735] zrn-bt: UART_BT clock open, divider 0x0
+[   99.980906] PM: suspend exit
+Sat Oct 24 01:45:43 PM UTC 2026

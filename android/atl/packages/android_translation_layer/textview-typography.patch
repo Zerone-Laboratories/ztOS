@@ -1,0 +1,275 @@
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -38,6 +38,12 @@
+ 	private int break_strategy = 0 /*BREAK_STRATEGY_SIMPLE*/;
+ 	private int hyphenation_frequency = 0 /*HYPHENATION_FREQUENCY_NONE*/;
+ 	private boolean showSoftInputOnFocus = true;
++    private String fontFeatureSettings, fontVariationSettings;
++    private String pangoFontFeatures = "", pangoFontVariations = "";
++    private float letterSpacing = 0, lineSpacingExtra = 0, lineSpacingMultiplier = 1;
++    private boolean textSelectable = false, allCaps = false;
++    private ColorStateList hintColors = ColorStateList.valueOf(0xff808080);
++    private int highlightColor = 0x6633b5e5;
+     public static final int AUTO_SIZE_TEXT_TYPE_NONE = 0;
+     public static final int AUTO_SIZE_TEXT_TYPE_UNIFORM = 1;
+     private int autoSizeType = AUTO_SIZE_TEXT_TYPE_NONE;
+@@ -169,6 +175,7 @@
+ 		if (pixels < 0 || Float.isNaN(pixels) || Float.isInfinite(pixels)) return;
+ 		paint.setTextSize(pixels);
+ 		native_setTextSize(pixels);
++        applyTypography();
+ 		requestLayout();
+ 	}
+ 	public void setTextSize(float size) {
+@@ -178,6 +185,7 @@
+ 
+ 	public native final void native_setTextColor(int color);
+ 	public void setTextColor(int color) {
++        colors = ColorStateList.valueOf(color);
+ 		native_setTextColor(color);
+ 	}
+ 	public void setTextColor(ColorStateList colors) {
+@@ -206,7 +214,11 @@
+ 		}
+ 	}
+ 	public void setTypeface(Typeface tf) {}
+-	public void setLineSpacing(float add, float mult) {}
++	public void setLineSpacing(float add, float mult) {
++        if (Float.isNaN(add) || Float.isInfinite(add) || Float.isNaN(mult) || Float.isInfinite(mult) || mult <= 0)
++            throw new IllegalArgumentException("Invalid line spacing");
++        lineSpacingExtra = add; lineSpacingMultiplier = mult; applyTypography(); requestLayout();
++    }
+ 	public final void setLinksClickable(boolean whether) {}
+ 
+ 	public void setInputType(int type) {}
+@@ -229,8 +241,8 @@
+ 		return null;
+ 	}
+ 
+-	public void setHintTextColor(ColorStateList colorStateList) {}
+-	public void setHintTextColor(int i) {}
++	public void setHintTextColor(ColorStateList colors) { if (colors != null) hintColors = colors; }
++	public void setHintTextColor(int color) { hintColors = ColorStateList.valueOf(color); }
+ 	public void setLinkTextColor(ColorStateList colorStateList) {}
+ 
+ 	public void setSingleLine() { setSingleLine(true); }
+@@ -251,7 +263,17 @@
+ 		applyTextLimits();
+ 	}
+ 
+-	public void setTextAppearance(Context context, int appearance) {}
++	public void setTextAppearance(Context context, int appearance) {
++        TypedArray values = context.obtainStyledAttributes(appearance, com.android.internal.R.styleable.TextAppearance);
++        try {
++            if (values.hasValue(com.android.internal.R.styleable.TextAppearance_textColor))
++                setTextColor(values.getColorStateList(com.android.internal.R.styleable.TextAppearance_textColor));
++            if (values.hasValue(com.android.internal.R.styleable.TextAppearance_textSize))
++                setTextSize(TypedValue.COMPLEX_UNIT_PX, values.getDimensionPixelSize(com.android.internal.R.styleable.TextAppearance_textSize, 16));
++            if (values.hasValue(com.android.internal.R.styleable.TextAppearance_textStyle))
++                setTypeface(getTypeface(), values.getInt(com.android.internal.R.styleable.TextAppearance_textStyle, 0));
++        } finally { values.recycle(); }
++    }
+ 
+ 	public void setMaxLines(int maxLines) {
+ 		maxLines = Math.max(1, maxLines);
+@@ -374,6 +396,7 @@
+ 	}
+ 
+ 	public void setAllCaps(boolean allCaps) {
++        this.allCaps = allCaps;
+ 		String[] classesToRemove = {"ATL-text-uppercase"};
+ 		native_removeClasses(widget, classesToRemove);
+ 
+@@ -408,7 +431,7 @@
+ 
+ 	public void setMovementMethod(MovementMethod method) {}
+ 
+-	public void setTextIsSelectable(boolean selectable) {}
++	public void setTextIsSelectable(boolean selectable) { textSelectable = selectable; native_setSelectable(selectable); }
+ 
+ 	public MovementMethod getMovementMethod() {
+ 		return new BaseMovementMethod();
+@@ -441,7 +464,7 @@
+ 	}
+ 
+ 	public int getCurrentTextColor() {
+-		return Color.CYAN;
++		return colors.getColorForState(getDrawableState(), colors.getDefaultColor());
+ 	}
+ 
+ 	public void setSingleLine(boolean singleLine) {
+@@ -459,7 +482,7 @@
+ 		setHint(getContext().getResources().getText(resId));
+ 	}
+ 
+-	public float getLetterSpacing() { return 0.f; }
++	public float getLetterSpacing() { return letterSpacing; }
+ 
+ 	public void setCompoundDrawablesRelativeWithIntrinsicBounds(int start, int top, int end, int bottom) {}
+ 
+@@ -467,7 +490,7 @@
+ 
+ 	public boolean getLinksClickable() { return true; }
+ 
+-	public boolean isTextSelectable() { return true; }
++	public boolean isTextSelectable() { return textSelectable; }
+ 
+ 	public void setCompoundDrawablesWithIntrinsicBounds(int left, int top, int right, int bottom) {}
+ 
+@@ -479,13 +502,13 @@
+ 
+ 	public Drawable[] getCompoundDrawables() { return new Drawable[4]; }
+ 
+-	public void setTextAppearance(int dummy) {}
++	public void setTextAppearance(int appearance) { setTextAppearance(getContext(), appearance); }
+ 
+ 	public int length() {
+ 		return getText().length();
+ 	}
+ 
+-	public void setHighlightColor(int color) {}
++	public void setHighlightColor(int color) { highlightColor = color; }
+ 
+ 	public Editable getEditableText() {
+ 		return new SpannableStringBuilder(getText());
+@@ -529,7 +552,7 @@
+ 		return -1;
+ 	}
+ 
+-	public boolean isAllCaps() { return false; }
++	public boolean isAllCaps() { return allCaps; }
+ 
+     public int getAutoSizeStepGranularity() { return autoSizeStep; }
+     public int getAutoSizeTextType() { return autoSizeType; }
+@@ -613,9 +636,9 @@
+ 		include_padding = includePadding;
+ 	}
+ 
+-	public float getLineSpacingExtra() { return 0.f; }
+-
+-	public float getLineSpacingMultiplier() { return 1.f; }
++	public float getLineSpacingExtra() { return lineSpacingExtra; }
++
++	public float getLineSpacingMultiplier() { return lineSpacingMultiplier; }
+ 
+ 	public TextDirectionHeuristic getTextDirectionHeuristic() {
+ 		return TextDirectionHeuristics.LTR;
+@@ -660,7 +683,10 @@
+ 
+ 	public void setFreezesText(boolean freezesText) {}
+ 
+-	public void setLetterSpacing(float letterSpacing) {}
++	public void setLetterSpacing(float letterSpacing) {
++        if (Float.isNaN(letterSpacing) || Float.isInfinite(letterSpacing)) throw new IllegalArgumentException("Invalid letter spacing");
++        this.letterSpacing = letterSpacing; applyTypography(); requestLayout();
++    }
+ 
+ 	public void setMarqueeRepeatLimit(int marqueeLimit) {}
+ 
+@@ -735,4 +761,55 @@
+ 		}
+ 		return alignment;
+ 	}
++    public String getFontFeatureSettings() { return fontFeatureSettings; }
++    public void setFontFeatureSettings(String settings) {
++        String parsed = parseFontSettings(settings, false);
++        fontFeatureSettings = settings; pangoFontFeatures = parsed;
++        applyTypography(); requestLayout();
++    }
++    public String getFontVariationSettings() { return fontVariationSettings; }
++    public boolean setFontVariationSettings(String settings) {
++        try {
++            String parsed = parseFontSettings(settings, true);
++            fontVariationSettings = settings; pangoFontVariations = parsed;
++            applyTypography(); requestLayout(); return true;
++        } catch (IllegalArgumentException error) { return false; }
++    }
++    private static String parseFontSettings(String settings, boolean variation) {
++        if (settings == null || settings.trim().isEmpty()) return "";
++        StringBuilder result = new StringBuilder();
++        for (String setting : settings.split(",")) {
++            String normalized = setting.trim().replace("'", "").replace("\"", "");
++            String[] parts = normalized.split("[=\\s]+", 2);
++            if (parts.length == 0 || parts[0].length() != 4 || variation && parts.length != 2)
++                throw new IllegalArgumentException("Invalid font setting " + setting);
++            for (int i = 0; i < 4; i++)
++                if (parts[0].charAt(i) < 32 || parts[0].charAt(i) > 126)
++                    throw new IllegalArgumentException("Invalid font tag");
++            String value = parts.length == 1 ? "1" : parts[1].trim();
++            if (!variation) {
++                if (value.equals("on")) value = "1";
++                if (value.equals("off")) value = "0";
++                value = Integer.toString(Integer.parseInt(value));
++            } else {
++                float number = Float.parseFloat(value);
++                if (Float.isNaN(number) || Float.isInfinite(number)) throw new IllegalArgumentException("Invalid font axis");
++                value = Float.toString(number);
++            }
++            if (result.length() > 0) result.append(',');
++            result.append(parts[0]).append('=').append(value);
++        }
++        return result.toString();
++    }
++    private void applyTypography() {
++        native_applyTypography(pangoFontFeatures, pangoFontVariations,
++                letterSpacing * getTextSize(), lineSpacingExtra, lineSpacingMultiplier);
++    }
++    private native void native_applyTypography(String features, String variations, float spacing, float extra, float multiplier);
++    private native void native_setSelectable(boolean selectable);
++    public ColorStateList getHintTextColors() { return hintColors; }
++    public int getCurrentHintTextColor() { return hintColors.getColorForState(getDrawableState(), hintColors.getDefaultColor()); }
++    public int getHighlightColor() { return highlightColor; }
++    public boolean onPreDraw() { return true; }
++
+ }
+--- a/src/api-impl-jni/widgets/android_widget_TextView.c
++++ b/src/api-impl-jni/widgets/android_widget_TextView.c
+@@ -218,3 +218,48 @@
+     (*env)->ReleaseIntArrayElements(env, sizes_array, sizes, JNI_ABORT);
+     return result;
+ }
++
++static gboolean remove_line_height_attribute(PangoAttribute *attribute, gpointer unused)
++{
++    return attribute->klass->type == PANGO_ATTR_LINE_HEIGHT || attribute->klass->type == PANGO_ATTR_ABSOLUTE_LINE_HEIGHT;
++}
++
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1applyTypography(JNIEnv *env, jobject this,
++        jstring features, jstring variations, jfloat spacing, jfloat extra, jfloat multiplier)
++{
++    GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++    GtkLabel *label = GTK_IS_TEXT(widget) ? NULL : text_limits_find_label(widget);
++    if (!label && !GTK_IS_TEXT(widget)) return;
++    PangoAttrList *current = label ? gtk_label_get_attributes(label) : gtk_text_get_attributes(GTK_TEXT(widget));
++    PangoAttrList *attributes = current ? pango_attr_list_copy(current) : pango_attr_list_new();
++    const char *feature_string = features ? (*env)->GetStringUTFChars(env, features, NULL) : NULL;
++    const char *variation_string = variations ? (*env)->GetStringUTFChars(env, variations, NULL) : NULL;
++    pango_attr_list_change(attributes, pango_attr_font_features_new(feature_string ? feature_string : ""));
++    PangoFontDescription *font = pango_font_description_new();
++    pango_font_description_set_variations(font, variation_string && *variation_string ? variation_string : NULL);
++    pango_attr_list_change(attributes, pango_attr_font_desc_new(font));
++    pango_font_description_free(font);
++    pango_attr_list_change(attributes, pango_attr_letter_spacing_new((int)CLAMP((double)spacing * PANGO_SCALE, G_MININT, G_MAXINT)));
++    PangoAttrList *removed = pango_attr_list_filter(attributes, remove_line_height_attribute, NULL);
++    if (removed) pango_attr_list_unref(removed);
++    if (extra != 0 || multiplier != 1) {
++        PangoContext *context = gtk_widget_get_pango_context(label ? GTK_WIDGET(label) : widget);
++        PangoFontMetrics *metrics = pango_context_get_metrics(context, pango_context_get_font_description(context), pango_context_get_language(context));
++        double height = (pango_font_metrics_get_ascent(metrics) + pango_font_metrics_get_descent(metrics)) * multiplier + extra * PANGO_SCALE;
++        pango_attr_list_insert(attributes, pango_attr_line_height_new_absolute((int)CLAMP(height, 1, G_MAXINT)));
++        pango_font_metrics_unref(metrics);
++    }
++    if (label) gtk_label_set_attributes(label, attributes);
++    else gtk_text_set_attributes(GTK_TEXT(widget), attributes);
++    pango_attr_list_unref(attributes);
++    if (feature_string) (*env)->ReleaseStringUTFChars(env, features, feature_string);
++    if (variation_string) (*env)->ReleaseStringUTFChars(env, variations, variation_string);
++}
++
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setSelectable(JNIEnv *env, jobject this, jboolean selectable)
++{
++    GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++    if (GTK_IS_TEXT(widget)) return;
++    GtkLabel *label = text_limits_find_label(widget);
++    if (label) gtk_label_set_selectable(label, selectable);
++}

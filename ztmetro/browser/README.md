@@ -75,3 +75,33 @@ the device may need small deltas against the installed `wpe-webkit` version.
 Iteration 1: the chrome, navigation state, and the WPE view wiring. The
 engine glue targets `wpe-webkit-2.0`; confirm the installed version on the
 phone and adjust if the build reports a changed symbol.
+
+## Suggestions, history, and InPrivate
+
+Address editing offers matching favourites and history first, then DuckDuckGo
+OpenSearch suggestions. Requests are asynchronous, debounced by 220 ms, and
+cancelled when input changes. Tap a result to navigate. The bottom address bar
+keeps the Metro list above it, visible above the keyboard.
+
+The menu includes favourites, history, and **new inprivate tab**. History is
+stored at `~/.local/share/superscan/history`; its page groups visits by day and
+supports search, individual deletion, clear-all, and paging. Favourites live in
+`~/.local/share/superscan/bookmarks`.
+
+InPrivate tabs show a blue indicator and use ephemeral WebKit network sessions.
+They do not record visits or request address suggestions. Private page titles
+are excluded from the live tile. A private window can also be launched with:
+
+```sh
+superscan --inprivate https://example.org/
+```
+
+Tabs share graphics resources and the WebKit context, while their network
+sessions control persistent or ephemeral website data. Background views unmap,
+release imported frames and snapshots, and discard pending snapshot results.
+Downloads continue independently of view visibility.
+
+See [SWARM.md](SWARM.md) for deployment, phone screenshots, test commands, and
+remaining device limitations. `verify-swarm.py` uses a loopback fixture server
+and a separate test profile; its destructive history checks do not use the
+normal browser profile.

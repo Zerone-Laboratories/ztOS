@@ -506,11 +506,38 @@ static void sensorhub_look(void)
 	}
 
 	if (failed) {
-		say("Sensor hub failed to initialize: showing Lumia Metro dialog");
+		int attempt;
+
+		for (attempt = 1; attempt <= 2; attempt++) {
+			say("Sensor hub initialization failed; power retry %d/2", attempt);
+			run("systemctl stop ztoscsf-sensord.service");
+			/* No daemon may talk to the hub while its power is reset. */
+			run("systemctl stop ztoscsf-sensorhub.service");
+			if (run("echo 1 > /sys/class/sec/sensorhub/reset") != 0 ||
+			    run("systemctl restart ztoscsf-sensorhub.service") != 0)
+				continue;
+			for (int i = 0; i < 25; i++) {
+				FILE *ready = fopen("/sys/class/sec/sensorhub/ready", "r");
+				int value = 0;
+				if (ready) {
+					fscanf(ready, "%d", &value);
+					fclose(ready);
+				}
+				if (value == 1) {
+					run("systemctl restart ztoscsf-sensord.service");
+					say("Sensor hub recovered after power retry %d", attempt);
+					return;
+				}
+				sleep(1);
+			}
+		}
+		/* A dialog must never leave the failed vendor daemon spinning. */
+		run("systemctl stop ztoscsf-sensord.service ztoscsf-sensorhub.service");
+		say("Sensor hub failed to initialize; stopped sensor services: showing Lumia Metro dialog");
 		dialog_shown = true;
 		char cmd[512];
 		snprintf(cmd, sizeof(cmd),
-			"dialog ztOSCoreSensorFramework|Sensor hub failed to initialize, please boot into twrp, go to reboot, and select system to hot-boot the sensor hub.|reboot to recovery:reboot_recovery|stop sensor hub in this boot:stop_sensorhub\n");
+			"dialog ztOSCoreSensorFramework|Sensor hub failed to initialize.|stop sensor hub in this boot:stop_sensorhub\n");
 		if (!shell_tell(cmd)) {
 			if (q_len < MAX_QUEUE) {
 				snprintf(queue[q_len++], sizeof(queue[0]), "%s", cmd);
@@ -522,11 +549,7 @@ static void sensorhub_look(void)
 static void ctl_handle(const char *cmd)
 {
 	say("ctl command: %s", cmd);
-	if (strncmp(cmd, "reboot_recovery", 15) == 0) {
-		say("rebooting to recovery as requested");
-		run("reboot recovery");
-		run("systemctl reboot");
-	} else if (strncmp(cmd, "stop_sensorhub", 14) == 0) {
+	if (strncmp(cmd, "stop_sensorhub", 14) == 0) {
 		say("stopping sensor hub for this boot session");
 		int fd = open("/run/ztoscsf-sensorhub.stopped", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 		if (fd >= 0) close(fd);

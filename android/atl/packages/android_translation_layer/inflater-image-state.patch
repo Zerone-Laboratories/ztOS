@@ -1,0 +1,125 @@
+--- a/src/api-impl/android/view/LayoutInflater.java
++++ b/src/api-impl/android/view/LayoutInflater.java
+@@ -112,6 +112,9 @@
+ 		ta.recycle();
+ 		constructor.setAccessible(true);
+ 		View view_instance = (View)constructor.newInstance(context, attrs);
++        if (view_instance instanceof ViewStub) {
++            ((ViewStub)view_instance).setLayoutInflater(cloneInContext(context));
++        }
+ 
+ 		return view_instance;
+ 	}
+@@ -161,6 +164,11 @@
+ 		} else if (view == null) {
+ 			view = createView(name, null, attrs);
+ 		}
++
++        if (view instanceof ViewStub && ((ViewStub)view).getLayoutInflater() == null) {
++            // Factory-created stubs need the same themed inflater as reflected views.
++            ((ViewStub)view).setLayoutInflater(cloneInContext(view.getContext()));
++        }
+ 
+ 		if (Log.isLoggable(TAG, Log.VERBOSE))
+ 			Slog.v(TAG, tabs(indent) + "createViewFromTag: Created view is: " + view + " | id: " + String.format("%x", view.getId()) + ", id_str: " + view.getIdName());
+--- a/src/api-impl/android/widget/ImageView.java
++++ b/src/api-impl/android/widget/ImageView.java
+@@ -53,13 +53,9 @@
+ 	}
+ 
+ 	public void setImageResource(final int resid) {
+-		if (this.getResources().getString(resid).endsWith(".xml")) {
+-			setImageDrawable(getContext().getDrawable(resid));
+-			return;
+-		}
+-		bitmap = BitmapFactory.decodeResource(this.getResources(), resid);
+-		native_setDrawable(widget, bitmap != null ? bitmap.getTexture() : 0);
+-	}
++        setImageDrawable(resid == 0 ? null : getContext().getDrawable(resid));
++    }
++
+ 	public void setAdjustViewBounds(boolean adjustViewBounds) {}
+ 
+ 	public void setScaleType(ScaleType scaleType) {
+@@ -76,7 +72,7 @@
+ 	}
+ 
+ 	public void setImageDrawable(Drawable drawable) {
+-		if (drawable != null && colorFilter != null) {
++		if (drawable != null) {
+ 			drawable = drawable.mutate();
+ 			drawable.setColorFilter(colorFilter);
+ 		}
+@@ -93,8 +89,9 @@
+ 	public void setImageMatrix(Matrix matrix) {}
+ 
+ 	public void setImageBitmap(Bitmap bitmap) {
+-		native_setDrawable(widget, bitmap != null ? bitmap.getTexture() : 0);
+-	}
++        this.bitmap = bitmap;
++        setImageDrawable(bitmap == null ? null : new android.graphics.drawable.BitmapDrawable(getResources(), bitmap));
++    }
+ 
+ 	/**
+ 	 * Options for scaling the bounds of an image to the bounds of this view.
+@@ -165,7 +162,7 @@
+ 		ScaleType.CENTER_INSIDE,
+ 	};
+ 
+-	public final void setColorFilter(int color, PorterDuff.Mode mode) {}
++	public final void setColorFilter(int color, PorterDuff.Mode mode) { setColorFilter(new PorterDuffColorFilter(color, mode)); }
+ 
+ 	public void setImageTintList(ColorStateList tint) {
+ 		if (tint == null)
+@@ -195,17 +192,21 @@
+ 
+ 	public void setCropToPadding(boolean crop) {}
+ 
+-	public void setColorFilter(int color) {}
+-
+-	public void setColorFilter(ColorFilter cf) {}
++	public void setColorFilter(int color) { setColorFilter(color, PorterDuff.Mode.SRC_ATOP); }
++
++	public void setColorFilter(ColorFilter cf) {
++        colorFilter = cf;
++        setImageDrawable(drawable);
++        invalidate();
++    }
+ 
+ 	public Matrix getImageMatrix() {
+ 		return Matrix.IDENTITY_MATRIX;
+ 	}
+ 
+ 	public void clearColorFilter() {
+-		colorFilter = null;
+-	}
++        setColorFilter((ColorFilter)null);
++    }
+ 
+ 	@Override
+ 	protected native long native_constructor(Context context, AttributeSet attrs);
+--- a/src/api-impl-jni/widgets/android_widget_ImageView.c
++++ b/src/api-impl-jni/widgets/android_widget_ImageView.c
+@@ -20,6 +20,7 @@
+ {
+ 	GtkWidget *wrapper = g_object_ref(wrapper_widget_new());
+ 	GtkWidget *image = gtk_picture_new();
++	gtk_picture_set_content_fit(GTK_PICTURE(image), GTK_CONTENT_FIT_CONTAIN);
+ 	wrapper_widget_set_child(WRAPPER_WIDGET(wrapper), image);
+ 	wrapper_widget_set_jobject(WRAPPER_WIDGET(wrapper), env, this);
+ 	return _INTPTR(image);
+@@ -48,7 +49,12 @@
+ 			gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_COVER);
+ 			break;
+ 		case SCALE_TYPE_CENTER_INSIDE:
+-			gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_CONTAIN);
+-			break;
++            gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_SCALE_DOWN);
++            break;
++        case SCALE_TYPE_FIT_START:
++        case SCALE_TYPE_FIT_CENTER:
++        case SCALE_TYPE_FIT_END:
++            gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_CONTAIN);
++            break;
+ 	}
+ }

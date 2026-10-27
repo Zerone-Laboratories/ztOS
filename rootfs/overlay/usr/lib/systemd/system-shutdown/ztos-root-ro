@@ -1,0 +1,5 @@
+#!/bin/sh
+echo '<6>ztos-shutdown: syncing and remounting root read-only' > /dev/kmsg 2>/dev/null
+sync
+mount -o remount,ro / 2>/dev/null || echo '<3>ztos-shutdown: root remount-ro failed' > /dev/kmsg 2>/dev/null
+sync

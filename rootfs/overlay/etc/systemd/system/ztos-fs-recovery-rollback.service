@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore previous filesystem recovery files after failed trial boot
+DefaultDependencies=no
+Before=sysinit.target systemd-fsck-root.service emergency.service rescue.service
+ConditionPathExists=/var/backups/fs-recovery/rollback.pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ztos-fs-recovery-rollback
+
+[Install]
+WantedBy=sysinit.target

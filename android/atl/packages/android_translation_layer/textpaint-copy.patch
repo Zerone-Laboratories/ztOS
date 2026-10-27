@@ -1,0 +1,34 @@
+--- a/src/api-impl/android/text/TextPaint.java
++++ b/src/api-impl/android/text/TextPaint.java
+@@ -46,11 +46,11 @@
+ 	}
+ 
+ 	public TextPaint(int flags) {
+-		super(/*flags*/);
++		super(flags);
+ 	}
+ 
+ 	public TextPaint(Paint p) {
+-		super(/*p*/);
++		super(p);
+ 	}
+ 
+ 	/**
+@@ -58,7 +58,7 @@
+ 	 * fields inherited from Paint.
+ 	 */
+ 	public void set(TextPaint tp) {
+-		//super.set(tp);
++		super.set(tp);
+ 
+ 		bgColor = tp.bgColor;
+ 		baselineShift = tp.baselineShift;
+@@ -69,8 +69,6 @@
+ 		underlineThickness = tp.underlineThickness;
+ 	}
+ 
+-	public void reset() {}
+-
+ 	/**
+ 	 * Defines a custom underline for this Paint.
+ 	 * @param color underline solid color

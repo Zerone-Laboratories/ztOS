@@ -1,0 +1,120 @@
+UTC: 2026-10-23T20:31:51Z
+Session:	RUNNING
+Container:	RUNNING
+Vendor type:	MAINLINE
+IP address:	192.168.240.112
+Session user:	zerone(1000)
+Wayland display:	wayland-0
+/sys/fs/cgroup/lxc.payload.waydroid/memory.current
+2182012928
+/sys/fs/cgroup/lxc.payload.waydroid/memory.max
+max
+/sys/fs/cgroup/lxc.payload.waydroid/memory.events
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+sock_throttled 0
+/sys/fs/cgroup/lxc.payload.waydroid/memory.stat
+anon 669708288
+file 1357766656
+kernel 89423872
+kernel_stack 13549568
+pagetables 29548544
+sec_pagetables 0
+percpu 34800
+sock 8192
+vmalloc 5718016
+shmem 241299456
+file_mapped 455512064
+file_dirty 749568
+file_writeback 0
+swapcached 0
+anon_thp 241172480
+file_thp 10485760
+shmem_thp 142606336
+inactive_anon 729489408
+active_anon 1511424
+inactive_file 600313856
+active_file 513220608
+unevictable 247382016
+slab_reclaimable 12748648
+slab_unreclaimable 27793944
+slab 40542592
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 30232
+workingset_activate_anon 0
+workingset_activate_file 19346
+workingset_restore_anon 0
+workingset_restore_file 262
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgsteal_kswapd 175559
+pgsteal_direct 20066
+pgsteal_khugepaged 149
+pgsteal_proactive 0
+pgscan_kswapd 411486
+pgscan_direct 489593
+pgscan_khugepaged 156
+pgscan_proactive 0
+pgrefill 20406
+pgscan 901235
+pgsteal 195774
+pswpin 0
+pswpout 0
+pgfault 574853
+pgmajfault 6288
+pgactivate 108716
+pgdeactivate 2703
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+thp_fault_alloc 1214
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+               total        used        free      shared  buff/cache   available
+Mem:            3516        1888         435         347        1699        1627
+Swap:              0           0           0
+/usr/share/waydroid-extra/images/system.img 1950093312 bytes
+/usr/share/waydroid-extra/images/system.img.stock 1994985472 bytes
+/usr/share/waydroid-extra/images/vendor.img 421634048 bytes
+sys.boot_completed=1
+ro.zygote=zygote64
+ro.product.cpu.abilist=arm64-v8a
+ro.product.cpu.abilist32=
+init.svc.zygote=stopping
+init.svc.zygote_secondary=
+ro.lmk.use_psi=true
+root              76       1 5481580 202956 do_sys_poll         0 S zygote64
+system           290      76 9184376 336300 do_epoll_wait       0 S system_server
+u0_a107          527      76 6909524 233836 do_epoll_wait       0 S com.android.systemui
+webview_zygote   638      76 5489388  92384 do_sys_poll         0 S webview_zygote
+0
+default via 192.168.240.1 dev eth0 
+192.168.240.0/24 dev eth0 proto kernel scope link src 192.168.240.112 
+local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1 
+local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1 
+broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1 
+local 192.168.240.112 dev eth0 table local proto kernel scope host src 192.168.240.112 
+broadcast 192.168.240.255 dev eth0 table local proto kernel scope link src 192.168.240.112 
+local ::1 dev lo proto kernel metric 0 pref medium
+local fe80::14d1:bce8:b872:a1b4 dev eth0 proto kernel metric 0 pref medium
+fe80::/64 dev eth0 proto kernel metric 256 pref medium
+multicast ff00::/8 dev eth0 proto kernel metric 256 pref medium
+Active default network: 100
+HTTP 204
+10-23 20:31:01.726    83   139 F DEBUG   : Cmdline: /vendor/bin/hw/android.hardware.graphics.composer@2.1-service --desktop_file_hint=Waydroid.desktop
+10-23 20:31:01.726    83   139 F DEBUG   : Abort message: 'Binder threadpool cannot be shrunk after starting'
+10-23 20:31:06.419   274   282 F DEBUG   : Cmdline: /vendor/bin/hw/android.hardware.graphics.composer@2.1-service --desktop_file_hint=Waydroid.desktop
+10-23 20:31:06.419   274   282 F DEBUG   : Abort message: 'Binder threadpool cannot be shrunk after starting'
+10-23 20:31:44.754   357   359 F DEBUG   : Cmdline: /system/bin/surfaceflinger
+10-23 20:31:46.727  1573  1592 F DEBUG   : Cmdline: org.ztos.waydroid.probe
+10-23 20:31:46.727  1573  1592 F DEBUG   : Abort message: 'Failed to acquire physical displays for WCG support!'

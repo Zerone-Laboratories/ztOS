@@ -9,7 +9,7 @@ var ztosUnits = [
 	"ztoscoresensorframework.service", "zrn-bluetooth.service", "zrn-bluetooth-addr.service",
 	"bluetooth.service", "NetworkManager.service", "zrn-charge.service", "zrn-cpuidle.service", "zrn-cpuidle-reset.service",
 	"ztos-panel-selfmask.service", "ztos-pstore-keep.service", "zboot-usb-gadget.service",
-	"ztos-update-check.timer", "sshd.service"
+	"ztos-update-check.timer", "sshd.service", "ztos-iald.service"
 ];
 polkit.addRule(function(action, subject) {
 	if (action.id == "org.freedesktop.systemd1.manage-units" &&

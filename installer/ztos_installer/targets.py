@@ -183,7 +183,15 @@ def install_phone(root_image: Path, ask) -> None:
         raise Fail(f"the phone is not in TWRP over adb (adb says: {state}). Start TWRP (Volume Up + Bixby + "
                    "Power) and plug it in, then run this again.")
     boot = ROOT / "out" / "ztos-boot.img"
-    if not boot.exists() or ask("Build ztOS's boot image again? (no: use the one already built)"):
+    # building the boot image needs the kernel toolchain under build/ and TWRP's
+    # image in stock/, which a fresh clone has neither of: then the prebuilt one
+    can_build = (ROOT / "stock" / "RECOVERY.img").exists() and (ROOT / "build" / "toolchain").is_dir()
+    if not can_build:
+        if not boot.exists():
+            say("using the prebuilt boot image (prebuilts/boot/ztos-starlte-boot.img)")
+            boot.parent.mkdir(exist_ok=True)
+            shutil.copy(ROOT / "prebuilts" / "boot" / "ztos-starlte-boot.img", boot)
+    elif not boot.exists() or ask("Build ztOS's boot image again? (no: use the one already built)"):
         say("building the boot image (kernel, drivers, start-up program)")
         subprocess.run([str(ROOT / "scripts" / "build-boot.sh"), "ztos-boot", "--fallback", "recovery",
                         "--power", "--touch", "--cpufreq", "--gpu", "--decon", "--wlan"], check=True)

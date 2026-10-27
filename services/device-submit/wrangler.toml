@@ -1,0 +1,19 @@
+name = "ztos-device-submit"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+preview_urls = false
+
+[vars]
+SITE = "https://ztos.online"
+ALLOWED_ORIGINS = "https://ztos.online,https://devices.ztos.online,https://zerone-laboratories.github.io,http://localhost:8000"
+GITHUB_REPO = "Zerone-Laboratories/ztOS"
+GITHUB_BRANCH = "main"
+# the #ztos-device-ports forum on the ztOS Mobile Discord
+FORUM_CHANNEL = "1561079818089406495"
+
+# five entries a minute from one address
+[[ratelimits]]
+name = "SUBMIT_LIMIT"
+namespace_id = "1001"
+simple = { limit = 5, period = 60 }

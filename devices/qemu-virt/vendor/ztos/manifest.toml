@@ -1,0 +1,17 @@
+# ztOSIAL manifest: the QEMU "virt" machine (installer/ztos --target qemu).
+# No battery, modem or sensors: every interface is generic, and ztOS hides
+# what is not there.
+
+[device]
+codename = "qemu-virt"
+name = "QEMU virtual phone"
+form_factor = "phone"
+scale = 1.0
+
+[gsi]
+min = "0.2.0"
+
+[android]
+binder = "binderfs"
+gralloc = "gbm"
+memory_budget_mb = 1024

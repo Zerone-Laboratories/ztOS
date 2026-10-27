@@ -1,0 +1,14 @@
+--- a/src/api-impl/android/telephony/SubscriptionManager.java
++++ b/src/api-impl/android/telephony/SubscriptionManager.java
+@@ -1,4 +1,11 @@
+ package android.telephony;
+ 
+ public class SubscriptionManager {
++    // ATL currently exposes no active SIM subscriptions.
++    public static final int INVALID_SUBSCRIPTION_ID = -1;
++
++    public static int getDefaultDataSubscriptionId() { return INVALID_SUBSCRIPTION_ID; }
++    public static int getDefaultVoiceSubscriptionId() { return INVALID_SUBSCRIPTION_ID; }
++    public static int getDefaultSmsSubscriptionId() { return INVALID_SUBSCRIPTION_ID; }
++    public static int getDefaultSubscriptionId() { return INVALID_SUBSCRIPTION_ID; }
+ }

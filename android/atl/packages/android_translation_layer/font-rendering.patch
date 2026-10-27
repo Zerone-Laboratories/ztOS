@@ -1,0 +1,337 @@
+--- a/src/api-impl/android/graphics/Paint.java
++++ b/src/api-impl/android/graphics/Paint.java
+@@ -23,6 +23,7 @@
+ 	private Shader shader;
+ 	private Align align = Align.LEFT;
+ 	private ColorFilter color_filter;
++	private Typeface typeface;
+ 
+ 	public Paint() {
+ 		paint = native_create();
+@@ -40,6 +41,7 @@
+ 		shader = paint.shader;
+ 		align = paint.align;
+ 		color_filter = paint.color_filter;
++		typeface = paint.typeface;
+ 	}
+ 
+ 	public void setColor(int color) {
+@@ -85,7 +87,13 @@
+ 		native_set_text_size(paint, size);
+ 	}
+ 
++	/**
++	 * null resets to the platform default typeface, like Android.
++	 */
+ 	public Typeface setTypeface(Typeface typeface) {
++		this.typeface = typeface;
++		Typeface resolved = typeface != null ? typeface : Typeface.DEFAULT;
++		native_set_typeface(paint, resolved.getFamily(), resolved.getWeight(), resolved.isItalic());
+ 		return typeface;
+ 	}
+ 	public void getTextBounds(String text, int start, int end, Rect bounds) {
+@@ -408,7 +416,7 @@
+ 	}
+ 
+ 	public Typeface getTypeface() {
+-		return new Typeface();
++		return typeface;
+ 	}
+ 
+ 	public void setTextAlign(Align align) {
+@@ -462,6 +470,10 @@
+ 		shader = paint.shader;
+ 		align = paint.align;
+ 		color_filter = paint.color_filter;
++		typeface = paint.typeface;
++		native_set_typeface(this.paint, this.typeface != null ? this.typeface.getFamily() : null,
++				this.typeface != null ? this.typeface.getWeight() : Typeface.DEFAULT.getWeight(),
++				this.typeface != null ? this.typeface.isItalic() : false);
+ 	}
+ 
+ 
+@@ -504,6 +516,8 @@
+ 		shader = null;
+ 		align = Align.LEFT;
+ 		color_filter = null;
++		typeface = null;
++		native_set_typeface(paint, null, Typeface.DEFAULT.getWeight(), false);
+ 	}
+ 
+ 	private static native long native_create();
+@@ -527,6 +541,7 @@
+ 	private static native float native_measure_text(long paint, String text);
+ 	private static native void native_get_text_bounds(long paint, String text, Rect bounds);
+ 	private static native void native_set_text_align(long paint, int align);
++	private static native void native_set_typeface(long paint, String family, int weight, boolean italic);
+ 	private static native float native_get_font_metrics(long paint, FontMetrics metrics);
+ 	private static native int native_get_font_metrics_int(long paint, FontMetricsInt metrics);
+ }
+--- a/src/api-impl/android/graphics/Typeface.java
++++ b/src/api-impl/android/graphics/Typeface.java
+@@ -14,19 +14,19 @@
+ 	 * bold, depending on what fonts are installed. Call getStyle() to know
+ 	 * for sure.
+ 	 */
+-	public static final Typeface DEFAULT_BOLD = create((String)null, 0);
++	public static final Typeface DEFAULT_BOLD = create((String)null, Typeface.BOLD);
+ 	/**
+ 	 * The NORMAL style of the default sans serif typeface.
+ 	 */
+-	public static final Typeface SANS_SERIF = create((String)null, 0);
++	public static final Typeface SANS_SERIF = create("sans-serif", 0);
+ 	/**
+ 	 * The NORMAL style of the default serif typeface.
+ 	 */
+-	public static final Typeface SERIF = create((String)null, 0);
++	public static final Typeface SERIF = create("serif", 0);
+ 	/**
+ 	 * The NORMAL style of the default monospace typeface.
+ 	 */
+-	public static final Typeface MONOSPACE = create((String)null, 0);
++	public static final Typeface MONOSPACE = create("monospace", 0);
+ 
+ 	// Style
+ 	public static final int NORMAL = 0;
+@@ -36,33 +36,83 @@
+ 
+ 	public long native_instance = 0; // directly accessed by androidx
+ 
++	// null family means the platform default family
++	private final String family;
++	// API 28 weight, 0..1000; 400 = normal, 700 = bold
++	private final int weight;
++	private final boolean italic;
++
++	private Typeface(String family, int weight, boolean italic) {
++		this.family = family;
++		this.weight = weight;
++		this.italic = italic;
++	}
++
++	/**
++	 * Not implemented: no custom font file loading. Returns the default typeface.
++	 */
+ 	public static Typeface createFromAsset(AssetManager mgr, String path) {
+ 		return DEFAULT;
+ 	}
+ 
++	/**
++	 * family_name null means the platform default family. style is the
++	 * NORMAL/BOLD/ITALIC/BOLD_ITALIC bitmask, not a weight.
++	 */
+ 	public static Typeface create(String family_name, int style) {
+-		Typeface ret = new Typeface();
+-		return ret;
++		if (style < NORMAL || style > BOLD_ITALIC) style = NORMAL;
++		return new Typeface(family_name, (style & BOLD) != 0 ? 700 : 400, (style & ITALIC) != 0);
+ 	}
+ 
+ 	public static Typeface create(Typeface typeface, int style) {
+-		return typeface != null ? typeface : DEFAULT;
++		if (style < NORMAL || style > BOLD_ITALIC) style = NORMAL;
++		return create(typeface, (style & BOLD) != 0 ? 700 : 400, (style & ITALIC) != 0);
+ 	}
+ 
+-	public static Typeface create(Typeface typeface, int style, boolean isItalic) {
+-		return create(typeface, isItalic ? (style | ITALIC) : (style & ~ITALIC));
++	/**
++	 * API 28 overload: weight is 0..1000 (400 normal, 700 bold), not a style
++	 * bitmask. Invalid weight throws IllegalArgumentException.
++	 */
++	public static Typeface create(Typeface typeface, int weight, boolean isItalic) {
++		if (weight < 0 || weight > 1000)
++			throw new IllegalArgumentException("weight must be between 0 and 1000, got " + weight);
++		Typeface base = typeface != null ? typeface : DEFAULT;
++		return new Typeface(base.family, weight, isItalic);
+ 	}
+ 
+ 	public static Typeface createFromFile(String path) {
+-		return DEFAULT;
++		return DEFAULT; // custom font file loading not implemented
+ 	}
+ 
+ 	public static Typeface createFromFile(File file) {
+-		return DEFAULT;
++		return DEFAULT; // custom font file loading not implemented
+ 	}
+ 
++	/**
++	 * The NORMAL/BOLD/ITALIC bitmask derived from weight and italic.
++	 */
+ 	public int getStyle() {
+-		return 0;
++		return (isBold() ? BOLD : 0) | (italic ? ITALIC : 0);
++	}
++
++	public int getWeight() {
++		return weight;
++	}
++
++	/**
++	 * Not part of the Android API; lets TextView pass the family down to the
++	 * Pango renderer. null means the platform default family.
++	 */
++	public String getFamily() {
++		return family;
++	}
++
++	public boolean isBold() {
++		return weight >= 600;
++	}
++
++	public boolean isItalic() {
++		return italic;
+ 	}
+ 
+ 	public static Typeface defaultFromStyle(int style) {
+@@ -85,7 +135,7 @@
+ 		}
+ 
+ 		public Typeface build() {
+-			return DEFAULT;
++			return DEFAULT; // custom font file loading not implemented
+ 		}
+ 	}
+ }
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -40,6 +40,7 @@
+ 	private boolean showSoftInputOnFocus = true;
+     private String fontFeatureSettings, fontVariationSettings;
+     private String pangoFontFeatures = "", pangoFontVariations = "";
++    private Typeface typeface;
+     private float letterSpacing = 0, lineSpacingExtra = 0, lineSpacingMultiplier = 1;
+     private boolean textSelectable = false, allCaps = false;
+     private ColorStateList hintColors = ColorStateList.valueOf(0xff808080);
+@@ -195,25 +196,22 @@
+ 		}
+ 	}
+ 	public void setTypeface(Typeface tf, int style) {
+-		String[] classesToRemove = {"ATL-font-bold", "ATL-font-italic"};
+-		native_removeClasses(widget, classesToRemove);
+-
+-		switch (style) {
+-			case Typeface.BOLD:
+-				native_addClass(widget, "ATL-font-bold");
+-				break;
+-			case Typeface.ITALIC:
+-				native_addClass(widget, "ATL-font-italic");
+-				break;
+-			case Typeface.BOLD_ITALIC:
+-				native_addClass(widget, "ATL-font-bold");
+-				native_addClass(widget, "ATL-font-italic");
+-				break;
+-			default:
+-				break;
+-		}
+-	}
+-	public void setTypeface(Typeface tf) {}
++		setTypeface(style > 0 ? Typeface.create(tf, style) : tf);
++	}
++
++	public void setTypeface(Typeface tf) {
++		if (tf == null)
++			tf = Typeface.DEFAULT;
++		typeface = tf;
++		paint.setTypeface(tf);
++		native_removeClasses(widget, new String[] {"ATL-font-bold", "ATL-font-italic"});
++		/* single coherent path: applyTypography rebuilds the Pango attrs and
++		 * re-applies the typeface on top, so features/spacing/line-height and
++		 * the family/weight/style all survive */
++		applyTypography();
++		requestLayout();
++		invalidate();
++	}
+ 	public void setLineSpacing(float add, float mult) {
+         if (Float.isNaN(add) || Float.isInfinite(add) || Float.isNaN(mult) || Float.isInfinite(mult) || mult <= 0)
+             throw new IllegalArgumentException("Invalid line spacing");
+@@ -294,7 +292,7 @@
+ 	public void setMinWidth(int minWidth) {}
+ 	public void setMaxWidth(int maxWidth) {}
+ 
+-	public Typeface getTypeface() { return null; }
++	public Typeface getTypeface() { return typeface != null ? typeface : Typeface.DEFAULT; }
+ 
+ 	public float getTextSize() { return paint.getTextSize(); }
+ 
+@@ -804,8 +802,13 @@
+     private void applyTypography() {
+         native_applyTypography(pangoFontFeatures, pangoFontVariations,
+                 letterSpacing * getTextSize(), lineSpacingExtra, lineSpacingMultiplier);
++        /* native_applyTypography rebuilds the font-desc attribute without the
++         * family/weight/style, so re-apply the typeface on top of it */
++        if (typeface != null)
++            native_setTypeface(typeface.getFamily(), typeface.getWeight(), typeface.isItalic(), pangoFontVariations);
+     }
+     private native void native_applyTypography(String features, String variations, float spacing, float extra, float multiplier);
++    private native void native_setTypeface(String family, int weight, boolean italic, String variations);
+     private native void native_setSelectable(boolean selectable);
+     public ColorStateList getHintTextColors() { return hintColors; }
+     public int getCurrentHintTextColor() { return hintColors.getColorForState(getDrawableState(), hintColors.getDefaultColor()); }
+--- a/src/api-impl-jni/graphics/android_graphics_Paint.c
++++ b/src/api-impl-jni/graphics/android_graphics_Paint.c
+@@ -137,6 +137,23 @@
+ {
+ 	struct AndroidPaint *paint = _PTR(paint_ptr);
+ 	return (jfloat)pango_font_description_get_size(paint->font) / PANGO_SCALE;
++}
++
++/* Apply Typeface family/weight/style to the paint's existing Pango font
++ * description. Size and other fields are untouched, so text measurement
++ * (layouts, font metrics) picks the change up through paint->font. */
++JNIEXPORT void JNICALL Java_android_graphics_Paint_native_1set_1typeface(JNIEnv *env, jclass clazz, jlong paint_ptr, jstring family_ptr, jint weight, jboolean italic)
++{
++	struct AndroidPaint *paint = _PTR(paint_ptr);
++	const char *family = family_ptr ? (*env)->GetStringUTFChars(env, family_ptr, NULL) : NULL;
++	if (family)
++		pango_font_description_set_family(paint->font, family);
++	else
++		pango_font_description_unset_fields(paint->font, PANGO_FONT_MASK_FAMILY);
++	pango_font_description_set_weight(paint->font, (PangoWeight)CLAMP(weight, 100, 1000));
++	pango_font_description_set_style(paint->font, italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
++	if (family)
++		(*env)->ReleaseStringUTFChars(env, family_ptr, family);
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_graphics_Paint_native_1set_1color_1filter(JNIEnv *env, jclass clazz, jlong paint_ptr, jint mode, jint color)
+--- a/src/api-impl-jni/widgets/android_widget_TextView.c
++++ b/src/api-impl-jni/widgets/android_widget_TextView.c
+@@ -263,3 +263,37 @@
+     GtkLabel *label = text_limits_find_label(widget);
+     if (label) gtk_label_set_selectable(label, selectable);
+ }
++
++/* Apply Typeface family/weight/style through the existing Pango attr list,
++ * same update pattern as native_applyTypography: copy the current list and
++ * change only a font-desc attribute without a size, so the CSS font-size,
++ * the tnum font features and line-height attributes are preserved. */
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setTypeface(JNIEnv *env, jobject this,
++        jstring family_ptr, jint weight, jboolean italic, jstring variations_ptr)
++{
++    GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++    GtkLabel *label = GTK_IS_TEXT(widget) ? NULL : text_limits_find_label(widget);
++    if (!label && !GTK_IS_TEXT(widget)) return;
++    PangoAttrList *current = label ? gtk_label_get_attributes(label) : gtk_text_get_attributes(GTK_TEXT(widget));
++    PangoAttrList *attributes = current ? pango_attr_list_copy(current) : pango_attr_list_new();
++
++    PangoFontDescription *font = pango_font_description_new();
++    const char *family = family_ptr ? (*env)->GetStringUTFChars(env, family_ptr, NULL) : NULL;
++    const char *variations = variations_ptr ? (*env)->GetStringUTFChars(env, variations_ptr, NULL) : NULL;
++    if (family)
++        pango_font_description_set_family(font, family);
++    pango_font_description_set_weight(font, (PangoWeight)CLAMP(weight, 100, 1000));
++    pango_font_description_set_style(font, italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
++    if (variations && *variations)
++        pango_font_description_set_variations(font, variations);
++    pango_attr_list_change(attributes, pango_attr_font_desc_new(font));
++    pango_font_description_free(font);
++
++    if (label) gtk_label_set_attributes(label, attributes);
++    else gtk_text_set_attributes(GTK_TEXT(widget), attributes);
++    pango_attr_list_unref(attributes);
++    if (family)
++        (*env)->ReleaseStringUTFChars(env, family_ptr, family);
++    if (variations)
++        (*env)->ReleaseStringUTFChars(env, variations_ptr, variations);
++}

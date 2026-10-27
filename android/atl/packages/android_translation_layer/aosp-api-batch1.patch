@@ -1,0 +1,1422 @@
+--- a/src/api-impl/android/graphics/Canvas.java
++++ b/src/api-impl/android/graphics/Canvas.java
+@@ -1,5 +1,6 @@
+ package android.graphics;
+ 
++
+ import android.atl.GskCanvas;
+ import android.content.res.Resources;
+ import android.util.Log;
+@@ -657,4 +658,183 @@
+ 	public boolean quickReject(float left, float top, float right, float bottom, EdgeType edgeType) {
+ 		return false;
+ 	}
++
++
++	// Ported from AOSP android13-release Canvas.java
++
++	public boolean clipOutPath(Path path) {
++		// ATL's clipPath ignores Region.Op, so DIFFERENCE would clip to the path
++		// instead of excluding it. Leave the clip unchanged rather than hide content.
++		return true;
++	}
++
++	public boolean clipOutRect(float left, float top, float right, float bottom) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return true;
++	}
++
++	public boolean clipOutRect(int left, int top, int right, int bottom) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return true;
++	}
++
++	public boolean clipOutRect(Rect rect) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return true;
++	}
++
++	public boolean clipOutRect(RectF rect) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return true;
++	}
++
++	public void disableZ() {
++	}
++
++	public void drawBitmapMesh(Bitmap bitmap, int meshWidth, int meshHeight,
++			float[] verts, int vertOffset, int[] colors, int colorOffset,
++			Paint paint) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void drawColor(int color, BlendMode mode) {
++		drawColor(color);
++	}
++
++	public void drawColor(long color) {
++		drawColor((int) (color >> 32));
++	}
++
++	public void drawColor(long color, BlendMode mode) {
++		drawColor((int) (color >> 32));
++	}
++
++	public void drawDoubleRoundRect(RectF outer, float outerRx, float outerRy,
++			RectF inner, float innerRx, float innerRy, Paint paint) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void drawDoubleRoundRect(RectF outer, float[] outerRadii,
++			RectF inner, float[] innerRadii, Paint paint) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++
++
++
++	public void drawPicture(Picture picture, Rect dst) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void drawPicture(Picture picture, RectF dst) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void drawPosText(String text, float[] pos,
++			Paint paint) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void drawPosText(char[] text, int index, int count,
++			float[] pos,
++			Paint paint) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void drawRGB(int r, int g, int b) {
++		drawColor(0xFF000000 | (r << 16) | (g << 8) | b);
++	}
++
++
++	public void drawTextOnPath(char[] text, int index, int count, Path path,
++			float hOffset, float vOffset, Paint paint) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++
++	public void drawTextRun(CharSequence text, int start, int end, int contextStart,
++			int contextEnd, float x, float y, boolean isRtl, Paint paint) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void drawTextRun(char[] text, int index, int count, int contextIndex,
++			int contextCount, float x, float y, boolean isRtl, Paint paint) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++
++	public void enableZ() {
++	}
++
++	public int getDensity() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++
++	public int getMaximumBitmapHeight() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public int getMaximumBitmapWidth() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public boolean quickReject(float left, float top, float right, float bottom) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean quickReject(Path path) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean quickReject(Path path, EdgeType type) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean quickReject(RectF rect) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean quickReject(RectF rect, EdgeType type) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public int saveLayer(float left, float top, float right, float bottom, Paint paint,
++			int saveFlags) {
++		return save();
++	}
++
++	public int saveLayerAlpha(float left, float top, float right, float bottom, int alpha) {
++		return save();
++	}
++
++	public int saveLayerAlpha(float left, float top, float right, float bottom, int alpha,
++			int saveFlags) {
++		return save();
++	}
++
++	public int saveLayerAlpha(RectF bounds, int alpha) {
++		return save();
++	}
++
++	public int saveLayerAlpha(RectF bounds, int alpha, int saveFlags) {
++		return save();
++	}
++
++	public void setDensity(int density) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++
++	public void skew(float sx, float sy) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
+ }
+--- a/src/api-impl/android/graphics/drawable/Drawable.java
++++ b/src/api-impl/android/graphics/drawable/Drawable.java
+@@ -1,5 +1,11 @@
+ package android.graphics.drawable;
+ 
++import android.graphics.Insets;
++import android.graphics.Outline;
++import android.graphics.PixelFormat;
++import android.graphics.PorterDuff.Mode;
++import android.graphics.Region;
++
+ import android.atl.GskCanvas;
+ import android.content.res.ColorStateList;
+ import android.content.res.Resources;
+@@ -428,4 +434,94 @@
+ 	protected native void native_draw(long paintable, long snapshot, int width, int height);
+ 	protected native void native_ref(long paintable);
+ 	protected native void native_unref(long paintable);
++
++
++	// Ported from AOSP android13-release Drawable.java
++
++	public void applyTheme(Theme t) {
++	}
++
++	public boolean canApplyTheme() {
++		return false;
++	}
++
++	public int getAlpha() {
++		return 0xFF;
++	}
++
++	public Rect getDirtyBounds() {
++		return getBounds();
++	}
++
++	public void getHotspotBounds(Rect outRect) {
++		outRect.set(getBounds());
++	}
++
++	public Insets getOpticalInsets() {
++		return Insets.NONE;
++	}
++
++	public void getOutline(Outline outline) {
++		outline.setRect(getBounds());
++		outline.setAlpha(0);
++	}
++
++	public Region getTransparentRegion() {
++		return null;
++	}
++
++	public boolean hasFocusStateSpecified() {
++		return false;
++	}
++
++	public void inflate(Resources r, XmlPullParser parser,
++			AttributeSet attrs) throws XmlPullParserException, IOException {
++		inflate(r, parser, attrs, null);
++	}
++
++	public void inflate(Resources r, XmlPullParser parser,
++			AttributeSet attrs, Theme theme)
++			throws XmlPullParserException, IOException {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public boolean isAutoMirrored() {
++		return false;
++	}
++
++	public boolean isFilterBitmap() {
++		return false;
++	}
++
++	public boolean onLayoutDirectionChanged(int layoutDirection) {
++		return false;
++	}
++
++	protected boolean onLevelChange(int level) {
++		return false;
++	}
++
++	public static int resolveOpacity(int op1,
++			int op2) {
++		if (op1 == op2) {
++			return op1;
++		}
++		if (op1 == PixelFormat.UNKNOWN || op2 == PixelFormat.UNKNOWN) {
++			return PixelFormat.UNKNOWN;
++		}
++		if (op1 == PixelFormat.TRANSLUCENT || op2 == PixelFormat.TRANSLUCENT) {
++			return PixelFormat.TRANSLUCENT;
++		}
++		if (op1 == PixelFormat.TRANSPARENT || op2 == PixelFormat.TRANSPARENT) {
++			return PixelFormat.TRANSPARENT;
++		}
++		return PixelFormat.OPAQUE;
++	}
++
++	public void setTintBlendMode(BlendMode blendMode) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++	public int getOpacity() {
++		return PixelFormat.TRANSLUCENT;
++	}
+ }
+--- a/src/api-impl/android/graphics/Paint.java
++++ b/src/api-impl/android/graphics/Paint.java
+@@ -1,5 +1,7 @@
+ package android.graphics;
+ 
++import android.os.LocaleList;
++
+ import java.util.Locale;
+ 
+ public class Paint {
+@@ -544,4 +546,65 @@
+ 	private static native void native_set_typeface(long paint, String family, int weight, boolean italic);
+ 	private static native float native_get_font_metrics(long paint, FontMetrics metrics);
+ 	private static native int native_get_font_metrics_int(long paint, FontMetricsInt metrics);
++
++
++	// Ported from AOSP android13-release Paint.java
++
++	public long getColorLong() {
++		return ((long) getColor()) << 32;
++	}
++
++	public String getFontFeatureSettings() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public float getFontSpacing() {
++		return getFontMetrics(null);
++	}
++
++	public String getFontVariationSettings() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public MaskFilter getMaskFilter() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public int getOffsetForAdvance(CharSequence text, int start, int end, int contextStart,
++			int contextEnd, boolean isRtl, float advance) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public int getShadowLayerColor() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public void getTextBounds(CharSequence text, int start, int end,
++			Rect bounds) {
++		getTextBounds(text.toString(), start, end, bounds);
++	}
++
++	public LocaleList getTextLocales() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public void getTextPath(String text, int start, int end,
++							float x, float y, Path path) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public boolean isElegantTextHeight() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public void setColor(long color) {
++		setColor((int) (color >> 32));
++	}
+ }
+--- a/src/api-impl/android/os/Parcelable.java
++++ b/src/api-impl/android/os/Parcelable.java
+@@ -9,7 +9,9 @@
+ 		public T[] newArray(int size);
+ 	}
+ 
+-	public static interface ClassLoaderCreator<T> extends Creator<T> {}
++	public static interface ClassLoaderCreator<T> extends Creator<T> {
++		public T createFromParcel(Parcel source, ClassLoader loader);
++	}
+ 
+ 	// unlike AOSP, we have a default implementations, so we don't need to stub it in every individual class
+ 	public default int describeContents() {
+--- a/src/api-impl/android/os/Parcel.java
++++ b/src/api-impl/android/os/Parcel.java
+@@ -418,7 +418,11 @@
+ 		if (className == null)
+ 			return null;
+ 		try {
+-			Parcelable.Creator<?> creator = (Parcelable.Creator<?>)loader.loadClass(className).getField("CREATOR").get(null);
++			// AOSP treats a null loader as the framework class loader
++			ClassLoader classLoader = loader != null ? loader : Parcel.class.getClassLoader();
++			Parcelable.Creator<?> creator = (Parcelable.Creator<?>)Class.forName(className, true, classLoader).getField("CREATOR").get(null);
++			if (creator instanceof Parcelable.ClassLoaderCreator)
++				return (Parcelable)((Parcelable.ClassLoaderCreator<?>)creator).createFromParcel(this, loader);
+ 			return (Parcelable)creator.createFromParcel(this);
+ 		} catch (ReflectiveOperationException | IllegalArgumentException e) {
+ 			throw new BadParcelableException(e);
+--- a/src/api-impl/android/view/AbsSavedState.java
++++ b/src/api-impl/android/view/AbsSavedState.java
+@@ -1,4 +1,105 @@
++/*
++ * Copyright (C) 2006 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
+ package android.view;
+ 
+-public class AbsSavedState {
++import android.os.Parcel;
++import android.os.Parcelable;
++
++/**
++ * A {@link Parcelable} implementation that should be used by inheritance
++ * hierarchies to ensure the state of all classes along the chain is saved.
++ */
++public abstract class AbsSavedState implements Parcelable {
++    public static final AbsSavedState EMPTY_STATE = new AbsSavedState() {};
++
++    private final Parcelable mSuperState;
++
++    /**
++     * Constructor used to make the EMPTY_STATE singleton
++     */
++    private AbsSavedState() {
++        mSuperState = null;
++    }
++
++    /**
++     * Constructor called by derived classes when creating their SavedState objects
++     *
++     * @param superState The state of the superclass of this view
++     */
++    protected AbsSavedState(Parcelable superState) {
++        if (superState == null) {
++            throw new IllegalArgumentException("superState must not be null");
++        }
++        mSuperState = superState != EMPTY_STATE ? superState : null;
++    }
++
++    /**
++     * Constructor used when reading from a parcel. Reads the state of the superclass.
++     *
++     * @param source parcel to read from
++     */
++    protected AbsSavedState(Parcel source) {
++        this(source, null);
++    }
++
++    /**
++     * Constructor used when reading from a parcel using a given class loader.
++     * Reads the state of the superclass.
++     *
++     * @param source parcel to read from
++     * @param loader ClassLoader to use for reading
++     */
++    protected AbsSavedState(Parcel source, ClassLoader loader) {
++        Parcelable superState = source.readParcelable(loader);
++        mSuperState = superState != null ? superState : EMPTY_STATE;
++    }
++
++    final public Parcelable getSuperState() {
++        return mSuperState;
++    }
++
++    public int describeContents() {
++        return 0;
++    }
++
++    public void writeToParcel(Parcel dest, int flags) {
++        dest.writeParcelable(mSuperState, flags);
++    }
++
++    public static final Parcelable.Creator<AbsSavedState> CREATOR
++            = new Parcelable.ClassLoaderCreator<AbsSavedState>() {
++
++        @Override
++        public AbsSavedState createFromParcel(Parcel in) {
++            return createFromParcel(in, null);
++        }
++
++        @Override
++        public AbsSavedState createFromParcel(Parcel in, ClassLoader loader) {
++            Parcelable superState = in.readParcelable(loader);
++            if (superState != null) {
++                throw new IllegalStateException("superState must be null");
++            }
++            return EMPTY_STATE;
++        }
++
++        @Override
++        public AbsSavedState[] newArray(int size) {
++            return new AbsSavedState[size];
++        }
++    };
+ }
+--- a/src/api-impl/android/view/ViewGroup.java
++++ b/src/api-impl/android/view/ViewGroup.java
+@@ -1,5 +1,10 @@
+ package android.view;
+ 
++import android.graphics.Point;
++import android.graphics.Region;
++import android.os.Parcelable;
++import android.util.SparseArray;
++
+ import android.R;
+ import android.animation.LayoutTransition;
+ import android.annotation.UnsupportedAppUsage;
+@@ -729,4 +734,120 @@
+ 	public void scheduleLayoutAnimation() {}
+ 
+ 	public boolean addStatesFromChildren() { return false; }
++
++
++	// Ported from AOSP android13-release ViewGroup.java
++
++	public void childDrawableStateChanged(View child) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	protected void dispatchFreezeSelfOnly(SparseArray<Parcelable> container) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public boolean dispatchKeyEventPreIme(KeyEvent event) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	protected void dispatchRestoreInstanceState(SparseArray<Parcelable> container) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	protected void dispatchThawSelfOnly(SparseArray<Parcelable> container) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void dispatchWindowFocusChanged(boolean hasFocus) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public View focusSearch(View focused, int direction) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public boolean gatherTransparentRegion(Region region) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public final int getChildDrawingOrder(int drawingPosition) {
++		return getChildDrawingOrder(getChildCount(), drawingPosition);
++	}
++
++	protected int getChildDrawingOrder(int childCount, int drawingPosition) {
++		return drawingPosition;
++	}
++
++	public boolean getChildVisibleRect(View child, Rect r, android.graphics.Point offset) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public int getNestedScrollAxes() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public ViewParent invalidateChildInParent(final int[] location, final Rect dirty) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public void notifySubtreeAccessibilityStateChanged(View child, View source, int changeType) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public boolean onInterceptHoverEvent(MotionEvent event) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	protected boolean onRequestFocusInDescendants(int direction,
++			Rect previouslyFocusedRect) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++
++	public PointerIcon onResolvePointerIcon(MotionEvent event, int pointerIndex) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public void removeViews(int start, int count) {
++		for (int i = start + count - 1; i >= start; i--) {
++			removeViewAt(i);
++		}
++	}
++
++	public void removeViewsInLayout(int start, int count) {
++		for (int i = start + count - 1; i >= start; i--) {
++			removeViewInLayout(getChildAt(i));
++		}
++	}
++
++	public boolean requestChildRectangleOnScreen(View child, Rect rectangle, boolean immediate) {
++		return false;
++	}
++
++	protected void setChildrenDrawingCacheEnabled(boolean enabled) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setTransitionGroup(boolean isTransitionGroup) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public ActionMode startActionModeForChild(
++			View originalView, ActionMode.Callback callback, int type) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public void suppressLayout(boolean suppress) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
+ }
+--- a/src/api-impl/android/view/View.java
++++ b/src/api-impl/android/view/View.java
+@@ -1,5 +1,14 @@
+ package android.view;
+ 
++import android.content.ClipData;
++import android.os.Parcel;
++import android.util.Log;
++import android.view.ContextMenu.ContextMenuInfo;
++import android.view.WindowManager.LayoutParams;
++import android.view.accessibility.AccessibilityNodeInfo;
++import android.view.autofill.AutofillValue;
++import java.util.List;
++
+ import android.R;
+ import android.animation.AnimatorInflater;
+ import android.animation.StateListAnimator;
+@@ -1972,6 +1981,79 @@
+ 	}
+ 
+ 	public static class BaseSavedState extends AbsSavedState {
++		static final int START_ACTIVITY_REQUESTED_WHO_SAVED = 0b1;
++		static final int IS_AUTOFILLED = 0b10;
++		static final int AUTOFILL_ID = 0b100;
++
++		// Flags that describe what data in this state is valid
++		int mSavedData;
++		String mStartActivityRequestWhoSaved;
++		boolean mIsAutofilled;
++		boolean mHideHighlight;
++		int mAutofillViewId;
++
++		/**
++		 * Constructor used when reading from a parcel. Reads the state of the superclass.
++		 *
++		 * @param source parcel to read from
++		 */
++		public BaseSavedState(Parcel source) {
++			this(source, null);
++		}
++
++		/**
++		 * Constructor used when reading from a parcel using a given class loader.
++		 * Reads the state of the superclass.
++		 *
++		 * @param source parcel to read from
++		 * @param loader ClassLoader to use for reading
++		 */
++		public BaseSavedState(Parcel source, ClassLoader loader) {
++			super(source, loader);
++			mSavedData = source.readInt();
++			mStartActivityRequestWhoSaved = source.readString();
++			mIsAutofilled = source.readBoolean();
++			mHideHighlight = source.readBoolean();
++			mAutofillViewId = source.readInt();
++		}
++
++		/**
++		 * Constructor called by derived classes when creating their SavedState objects
++		 *
++		 * @param superState The state of the superclass of this view
++		 */
++		public BaseSavedState(Parcelable superState) {
++			super(superState);
++		}
++
++		@Override
++		public void writeToParcel(Parcel out, int flags) {
++			super.writeToParcel(out, flags);
++
++			out.writeInt(mSavedData);
++			out.writeString(mStartActivityRequestWhoSaved);
++			out.writeBoolean(mIsAutofilled);
++			out.writeBoolean(mHideHighlight);
++			out.writeInt(mAutofillViewId);
++		}
++
++		public static final Parcelable.Creator<BaseSavedState> CREATOR
++				= new Parcelable.ClassLoaderCreator<BaseSavedState>() {
++			@Override
++			public BaseSavedState createFromParcel(Parcel in) {
++				return new BaseSavedState(in);
++			}
++
++			@Override
++			public BaseSavedState createFromParcel(Parcel in, ClassLoader loader) {
++				return new BaseSavedState(in, loader);
++			}
++
++			@Override
++			public BaseSavedState[] newArray(int size) {
++				return new BaseSavedState[size];
++			}
++		};
+ 	}
+ 
+ 	public void clearFocus() {}
+@@ -2677,4 +2759,423 @@
+ 	public int getTextDirection() { return 0; /* TEXT_DIRECTION_INHERIT */ }
+ 
+ 	public TouchDelegate getTouchDelegate() { return null; }
++
++
++	// Ported from AOSP android13-release View.java
++
++	public void addChildrenForAccessibility(ArrayList<View> outChildren) {
++
++	}
++
++	public void addFocusables(ArrayList<View> views, int direction,
++			int focusableMode) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void addOnUnhandledKeyEventListener(OnUnhandledKeyEventListener listener) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void addTouchables(ArrayList<View> views) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void autofill(SparseArray<AutofillValue> values) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void buildDrawingCache() {
++		buildDrawingCache(false);
++	}
++
++	protected int computeHorizontalScrollOffset() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public AccessibilityNodeInfo createAccessibilityNodeInfo() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public WindowInsets dispatchApplyWindowInsets(WindowInsets insets) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public void dispatchFinishTemporaryDetach() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public boolean dispatchNestedFling(float velocityX, float velocityY, boolean consumed) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean dispatchNestedPreFling(float velocityX, float velocityY) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean dispatchNestedPreScroll(int dx, int dy,
++			int[] consumed, int[] offsetInWindow) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean dispatchNestedScroll(int dxConsumed, int dyConsumed,
++			int dxUnconsumed, int dyUnconsumed, int[] offsetInWindow) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++
++
++
++	public void dispatchStartTemporaryDetach() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void drawableHotspotChanged(float x, float y) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	protected void drawableStateChanged() {
++		if (background != null && background.isStateful())
++			background.setState(getDrawableState());
++	}
++
++
++	public void findViewsWithText(ArrayList<View> outViews, CharSequence searched,
++			int flags) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	protected boolean fitSystemWindows(Rect insets) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public View focusSearch(int direction) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public CharSequence getAccessibilityPaneTitle() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	protected float getBottomFadingEdgeStrength() {
++		return computeVerticalScrollOffset() + computeVerticalScrollExtent() <
++				computeVerticalScrollRange() ? 1.0f : 0.0f;
++	}
++
++	public Rect getClipBounds() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public boolean getClipBounds(Rect outRect) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++
++	public Bitmap getDrawingCache(boolean autoScale) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public int getHorizontalFadingEdgeLength() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public KeyEvent.DispatcherState getKeyDispatcherState() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	protected float getLeftFadingEdgeStrength() {
++		return computeHorizontalScrollOffset() > 0 ? 1.0f : 0.0f;
++	}
++
++	public final int getMeasuredHeightAndState() {
++		return measuredHeight;
++	}
++
++	public ViewParent getParentForAccessibility() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public String[] getReceiveContentMimeTypes() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	protected float getRightFadingEdgeStrength() {
++		return computeHorizontalScrollOffset() + computeHorizontalScrollExtent() <
++				computeHorizontalScrollRange() ? 1.0f : 0.0f;
++	}
++
++	public int getSolidColor() {
++		return 0;
++	}
++
++	public final CharSequence getStateDescription() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public List<Rect> getSystemGestureExclusionRects() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	protected float getTopFadingEdgeStrength() {
++		return computeVerticalScrollOffset() > 0 ? 1.0f : 0.0f;
++	}
++
++	public long getUniqueDrawingId() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	protected int getWindowAttachCount() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public boolean hasNestedScrollingParent() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean hasOverlappingRendering() {
++		return true;
++	}
++
++	public boolean isAccessibilityHeading() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public final boolean isFocusableInTouchMode() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean isHapticFeedbackEnabled() {
++		return true;
++	}
++
++	public boolean isHorizontalFadingEdgeEnabled() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean isHorizontalScrollBarEnabled() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean isImportantForAccessibility() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean isOpaque() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean isScreenReaderFocusable() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean isScrollContainer() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public final boolean isTemporarilyDetached() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean isVerticalScrollBarEnabled() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public void onFinishTemporaryDetach() {
++	}
++
++	protected void onFocusChanged(boolean gainFocus, int direction,
++			Rect previouslyFocusedRect) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public boolean onHoverEvent(MotionEvent event) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++
++	public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public boolean onKeyShortcut(int keyCode, KeyEvent event) {
++		return false;
++	}
++
++	public boolean onKeyUp(int keyCode, KeyEvent event) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++
++
++
++	protected void onRestoreInstanceState(Parcelable state) {
++		if (state != null && !(state instanceof AbsSavedState)) {
++			throw new IllegalArgumentException("Wrong state class, expecting View State but received "
++					+ state.getClass().toString() + " instead. This usually happens when two views of different type have the same id in the same hierarchy.");
++		}
++	}
++
++	public void onRtlPropertiesChanged(int layoutDirection) {
++	}
++
++	protected Parcelable onSaveInstanceState() {
++		return AbsSavedState.EMPTY_STATE;
++	}
++
++	public void onStartTemporaryDetach() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void onVisibilityAggregated(boolean isVisible) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void onWindowSystemUiVisibilityChanged(int visible) {
++	}
++
++	protected void onWindowVisibilityChanged(int visibility) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	protected boolean overScrollBy(int deltaX, int deltaY,
++			int scrollX, int scrollY,
++			int scrollRangeX, int scrollRangeY,
++			int maxOverScrollX, int maxOverScrollY,
++			boolean isTouchEvent) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++
++	public void postInvalidateDelayed(long delayMilliseconds) {
++		postDelayed(new Runnable() {
++			@Override
++			public void run() {
++				invalidate();
++			}
++		}, delayMilliseconds);
++	}
++
++	public void resetPivot() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++
++	public void setAccessibilityTraversalAfter(int afterId) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setAnimationMatrix(Matrix matrix) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setAutofillHints(String... autofillHints) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setAutofillId(AutofillId id) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setImportantForContentCapture(int mode) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setLayerPaint(Paint paint) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public final void setLeftTopRightBottom(int left, int top, int right, int bottom) {
++		setLeft(left);
++		setTop(top);
++		setRight(right);
++		setBottom(bottom);
++	}
++
++	public void setNextFocusForwardId(int nextFocusForwardId) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++
++
++	public void setScreenReaderFocusable(boolean screenReaderFocusable) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setStateDescription(CharSequence stateDescription) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setSystemGestureExclusionRects(List<Rect> rects) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setTransitionAlpha(float alpha) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setTransitionVisibility(int visibility) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setZ(float z) {
++		setTranslationZ(z - getElevation());
++	}
++
++	public final boolean startDrag(ClipData data, DragShadowBuilder shadowBuilder,
++								   Object myLocalState, int flags) {
++		return startDragAndDrop(data, shadowBuilder, myLocalState, flags);
++	}
++
++	public final boolean startDragAndDrop(ClipData data, DragShadowBuilder shadowBuilder,
++			Object myLocalState, int flags) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean startNestedScroll(int axes) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public void transformMatrixToLocal(Matrix matrix) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	protected boolean verifyDrawable(Drawable who) {
++		return who == background;
++	}
+ }
+--- a/src/api-impl/android/widget/ImageView.java
++++ b/src/api-impl/android/widget/ImageView.java
+@@ -1,5 +1,9 @@
+ package android.widget;
+ 
++import android.graphics.drawable.BitmapDrawable;
++import android.net.Uri;
++import com.android.internal.R;
++
+ import android.content.Context;
+ import android.content.res.ColorStateList;
+ import android.content.res.TypedArray;
+@@ -232,4 +236,48 @@
+ 	protected native long native_constructor(Context context, AttributeSet attrs);
+ 	protected native void native_setDrawable(long widget, long paintable);
+ 	protected native void native_setScaleType(long widget, int scale_type);
++
++
++	// Ported from AOSP android13-release ImageView.java
++
++	public void animateTransform(Matrix matrix) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public ColorFilter getColorFilter() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	public int getImageAlpha() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public int getMaxHeight() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public int getMaxWidth() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public void setAlpha(int alpha) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	protected boolean setFrame(int l, int t, int r, int b) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public void setImageLevel(int level) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setImageURI(Uri uri) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
+ }
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -1,5 +1,15 @@
+ package android.widget;
+ 
++import android.R;
++import android.graphics.PorterDuff;
++import android.graphics.Rect;
++import android.os.LocaleList;
++import android.text.Spanned;
++import android.text.TextUtils.TruncateAt;
++import android.util.DisplayMetrics;
++import android.view.autofill.AutofillValue;
++import java.util.Arrays;
++
+ import android.annotation.UnsupportedAppUsage;
+ import android.content.Context;
+ import android.content.res.ColorStateList;
+@@ -31,6 +41,10 @@
+ import android.view.View;
+ 
+ public class TextView extends View {
++	private float shadowRadius;
++	private float shadowDx;
++	private float shadowDy;
++	private int shadowColor;
+ 	private ColorStateList colors = new ColorStateList(new int[][] {new int[0]}, new int[1]);
+ 	private CharSequence text = "";
+ 	private TextPaint paint = new TextPaint();
+@@ -660,7 +674,13 @@
+ 
+ 	public int getImeOptions() { return 0; }
+ 
+-	public void setShadowLayer(float radius, float dx, float dy, int color) {}
++	public void setShadowLayer(float radius, float dx, float dy, int color) {
++		shadowRadius = radius;
++		shadowDx = dx;
++		shadowDy = dy;
++		shadowColor = color;
++		getPaint().setShadowLayer(radius, dx, dy, color);
++	}
+ 
+ 	public int getBreakStrategy() {
+ 		return break_strategy;
+@@ -815,4 +835,146 @@
+     public int getHighlightColor() { return highlightColor; }
+     public boolean onPreDraw() { return true; }
+ 
++
++	// Ported from AOSP android13-release TextView.java
++
++	public void autofill(AutofillValue value) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void beginBatchEdit() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void endBatchEdit() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public int getAutofillType() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public int getCompoundPaddingEnd() {
++		return getCompoundPaddingRight();
++	}
++
++	public int getCompoundPaddingStart() {
++		return getCompoundPaddingLeft();
++	}
++
++	public ActionMode.Callback getCustomSelectionActionModeCallback() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++	protected MovementMethod getDefaultMovementMethod() {
++		return null;
++	}
++
++	public int getImeActionId() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public int getLineBounds(int line, Rect bounds) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public int getOffsetForPosition(float x, float y) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return 0;
++	}
++
++	public int getShadowColor() {
++		return shadowColor;
++	}
++
++	public float getShadowDx() {
++		return shadowDx;
++	}
++
++	public float getShadowDy() {
++		return shadowDy;
++	}
++
++	public float getShadowRadius() {
++		return shadowRadius;
++	}
++
++
++	public Drawable getTextCursorDrawable() {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return null;
++	}
++
++
++
++	public boolean onKeyPreIme(int keyCode, KeyEvent event) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++		return false;
++	}
++
++	public boolean onPrivateIMECommand(String action, Bundle data) {
++		return false;
++	}
++
++	protected void onSelectionChanged(int selStart, int selEnd) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	protected void onTextChanged(CharSequence text, int start, int lengthBefore, int lengthAfter) {
++		// intentionally empty, template pattern method can be overridden by subclasses
++	}
++
++	public void setCompoundDrawableTintMode(PorterDuff.Mode tintMode) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setError(CharSequence error, Drawable icon) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setFallbackLineSpacing(boolean enabled) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setFirstBaselineToTopHeight(int firstBaselineToTopHeight) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setJustificationMode(int justificationMode) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setLastBaselineToBottomHeight(
++			int lastBaselineToBottomHeight) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setLineHeight(int lineHeight) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setMaxEms(int maxEms) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setPrivateImeOptions(String type) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++
++	public void setTextCursorDrawable(Drawable textCursorDrawable) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public final void setTextKeepState(CharSequence text) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
++
++	public void setTextLocales(LocaleList locales) {
++		// AOSP-PORT-SHIM: AOSP body needs framework internals ATL lacks.
++	}
+ }

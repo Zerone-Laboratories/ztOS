@@ -1,0 +1,13 @@
+# ztOS: straight into the ztMETRO session as the phone's user (there is no
+# keyboard to log in with; the screen lock is ztMETRO's own).
+[terminal]
+switch = false
+vt = 1
+
+[initial_session]
+command = "/usr/local/bin/ztmetro-session"
+user = "@USER@"
+
+[default_session]
+command = "/usr/local/bin/ztmetro-session"
+user = "@USER@"

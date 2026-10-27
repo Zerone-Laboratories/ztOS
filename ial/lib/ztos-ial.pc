@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: ztos-ial
+Description: ztOSIAL client library (org.ztos.ial)
+Version: 0.2.0
+Requires.private: libsystemd
+Libs: -L${libdir} -lztos-ial
+Cflags: -I${includedir}

@@ -1,0 +1,69 @@
+# Which repository each path of ztOSMobile goes to (design/ztOSIAL.md,
+# "Repositories"). One rule per line: <repo> <path> [renamed-to]. The longest
+# matching path wins; "-" drops a path from every repository (it stays in the
+# ztOSMobile archive). Paths are files or folders, relative to the root.
+
+# ---- ztos-ial: the interfaces, the daemon, the clients -----------------------
+ztos-ial        ial/                                    ./
+
+# ---- the Galaxy S9 device layer ---------------------------------------------
+ztos-device-samsung-starlte  devices/samsung-starlte/   ./
+ztos-device-samsung-starlte  kernel/
+ztos-device-samsung-starlte  initramfs/
+ztos-device-samsung-starlte  firmware/
+ztos-device-samsung-starlte  prebuilts/
+ztos-device-samsung-starlte  audio/
+ztos-device-samsung-starlte  sensors/
+ztos-device-samsung-starlte  haptics/
+ztos-device-samsung-starlte  leds/
+ztos-device-samsung-starlte  modem/
+ztos-device-samsung-starlte  score/
+ztos-device-samsung-starlte  power/
+ztos-device-samsung-starlte  bluetooth/
+ztos-device-samsung-starlte  camera/
+ztos-device-samsung-starlte  media/
+ztos-device-samsung-starlte  stock/
+ztos-device-samsung-starlte  third_party/
+ztos-device-samsung-starlte  scripts/build-boot.sh
+ztos-device-samsung-starlte  scripts/flash-boot-from-arch.sh
+ztos-device-samsung-starlte  scripts/flash-from-rescue.sh
+ztos-device-samsung-starlte  scripts/flash-root.sh
+ztos-device-samsung-starlte  scripts/flash.sh
+ztos-device-samsung-starlte  scripts/dev/samsung-power-audit.py
+ztos-device-samsung-starlte  ztmetro/sensord/
+ztos-device-samsung-starlte  ztmetro/modemd/
+ztos-device-samsung-starlte  ztmetro/csf/
+
+# ---- the build, the installer, the emulator target ---------------------------
+ztos-build      installer/
+ztos-build      scripts/build-arch-root.sh
+ztos-build      scripts/split/
+ztos-build      os/overlay-qemu/
+ztos-build      devices/qemu-virt/
+ztos-build      packaging/
+
+# ---- ztos-core: everything else that ships in the GSI ------------------------
+ztos-core       ztmetro/
+ztos-core       apps/
+ztos-core       sdk/
+ztos-core       android/
+ztos-core       prebuilts/ztOSAndroidRuntimeV1/
+ztos-core       os/
+ztos-core       rootfs/
+ztos-core       design/
+ztos-core       docs/
+ztos-core       services/
+ztos-core       devices-site/
+ztos-core       scripts/
+ztos-core       README.md
+ztos-core       LICENSE
+ztos-core       VERSION
+ztos-core       .gitignore
+ztos-core       .github/
+ztos-device-samsung-starlte  .gitmodules
+
+# ---- kept only in the ztOSMobile archive ------------------------------------
+-               archive/
+-               build/
+-               out/
+-               .claude/

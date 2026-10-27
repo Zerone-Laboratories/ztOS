@@ -1,0 +1,13 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- org.ztos.ial.AudioDevice1: The speaker path's own health: protection, calibration, amplifiers.
+     Licence: LGPL-2.1-or-later. -->
+<node>
+  <interface name="org.ztos.ial.AudioDevice1">
+    <property name="Version" type="u" access="read"/>
+    <property name="SpeakerProtection" type="b" access="read"/>
+    <property name="Calibrated" type="b" access="read"/>
+    <property name="AmpHealthy" type="b" access="read"/>
+    <property name="Details" type="a{ss}" access="read"/>
+  </interface>
+</node>

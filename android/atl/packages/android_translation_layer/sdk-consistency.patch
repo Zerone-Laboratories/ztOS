@@ -1,0 +1,90 @@
+--- a/meson.build
++++ b/meson.build
+@@ -90,6 +90,7 @@
+                                                                   	'src/api-impl-jni/android_content_res_AssetManager.c',
+                                                                   	'src/api-impl-jni/android_opengl_GLES20.c',
+                                                                   	'src/api-impl-jni/android_opengl_GLUtils.c',
++                                                                  	'src/api-impl-jni/android_os_Build.c',
+                                                                   	'src/api-impl-jni/android_os_Environment.c',
+                                                                   	'src/api-impl-jni/android_os_MemoryFile.c',
+                                                                   	'src/api-impl-jni/android_os_MessageQueue.c',
+--- a/src/api-impl/android/os/Build.java
++++ b/src/api-impl/android/os/Build.java
+@@ -146,7 +146,10 @@
+ 
+ 			SDK_INT = SDK_INT_tmp;
+ 			RESOURCES_SDK_INT = (RESOURCES_SDK_INT_str != null) ? Math.max(Integer.parseInt(RESOURCES_SDK_INT_str), 1) : SDK_INT_tmp;
++			nativePublishSdkInt(SDK_INT_tmp);
+ 		}
++
++		private static native void nativePublishSdkInt(int sdkInt);
+ 
+ 		/**
+ 		 * The internal value used by the underlying source control to
+--- a/src/api-impl/android/os/SystemProperties.java
++++ b/src/api-impl/android/os/SystemProperties.java
+@@ -29,11 +29,21 @@
+ 
+ 	public static String get(String prop) {
+ 		android.util.Log.i("SystemProperties", "Grabbing String prop " + prop);
++		if ("ro.build.version.sdk".equals(prop)) {
++			if (Build.VERSION.SDK_INT > 0) {
++				return String.valueOf(Build.VERSION.SDK_INT);
++			}
++		}
+ 		return properties.getProperty(prop);
+ 	}
+ 
+ 	public static String get(String prop, String def) {
+ 		android.util.Log.i("SystemProperties", "Grabbing String prop " + prop + ", default " + def);
++		if ("ro.build.version.sdk".equals(prop)) {
++			if (Build.VERSION.SDK_INT > 0) {
++				return String.valueOf(Build.VERSION.SDK_INT);
++			}
++		}
+ 		return properties.getProperty(prop, def);
+ 	}
+ 
+@@ -45,12 +55,22 @@
+ 
+ 	public static int getInt(String prop, int def) {
+ 		android.util.Log.i("SystemProperties", "Grabbing int prop " + prop + ", default " + def);
++		if ("ro.build.version.sdk".equals(prop)) {
++			if (Build.VERSION.SDK_INT > 0) {
++				return Build.VERSION.SDK_INT;
++			}
++		}
+ 		String val = properties.getProperty(prop);
+ 		return val == null ? def : Integer.parseInt(val);
+ 	}
+ 
+ 	public static long getLong(String prop, long def) {
+ 		android.util.Log.i("SystemProperties", "Grabbing long prop " + prop + ", default " + def);
++		if ("ro.build.version.sdk".equals(prop)) {
++			if (Build.VERSION.SDK_INT > 0) {
++				return (long) Build.VERSION.SDK_INT;
++			}
++		}
+ 		String val = properties.getProperty(prop);
+ 		return val == null ? def : Long.parseLong(val);
+ 	}
+--- a/src/api-impl-jni/android_os_Build.c
++++ b/src/api-impl-jni/android_os_Build.c
+@@ -0,0 +1,17 @@
++#include <jni.h>
++#include <stdlib.h>
++#include <stdio.h>
++
++JNIEXPORT void JNICALL Java_android_os_Build_00024VERSION_nativePublishSdkInt(JNIEnv *env, jclass clazz, jint sdkInt)
++{
++	(void)env;
++	(void)clazz;
++	if (sdkInt >= 1 && sdkInt <= 1000) {
++		char buf[16];
++		snprintf(buf, sizeof(buf), "%d", (int)sdkInt);
++		if (setenv("ATL_SDK_INT", buf, 1) != 0) {
++			jclass error = (*env)->FindClass(env, "java/lang/IllegalStateException");
++			if (error) (*env)->ThrowNew(env, error, "Cannot publish Android SDK property");
++		}
++	}
++}

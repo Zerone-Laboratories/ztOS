@@ -1,0 +1,14 @@
+diff --git a/src/api-impl/android/view/View.java b/src/api-impl/android/view/View.java
+index 1a289c2..a7909e3 100644
+--- a/src/api-impl/android/view/View.java
++++ b/src/api-impl/android/view/View.java
+@@ -1290,5 +1290,8 @@ public class View {
+ 	public void setFocusable(boolean focusable) {
+ 		atl_focusable = focusable;
+ 	}
+-	public void setFocusable(int focusable) {}
++	public void setFocusable(int focusable) {
++		atl_focusable = focusable != NOT_FOCUSABLE;
++	}
++	public int getFocusable() { return atl_focusable ? FOCUSABLE : NOT_FOCUSABLE; }
+ 	public void setFocusableInTouchMode(boolean focusableInTouchMode) {}

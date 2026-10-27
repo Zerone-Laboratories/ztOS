@@ -1,4 +1,0 @@
-# ztMETRO runs as zerone. The sensor hub failure screen's two buttons need
-# root: these exact commands, and nothing else, without a password.
-zerone ALL=(root) NOPASSWD: /usr/bin/systemctl reboot --reboot-argument=recovery, \
-	/usr/bin/systemctl stop zrn-sensorhub.service ztoscsf-sensorhub.service zrnsensord.service ztoscsf-sensord.service

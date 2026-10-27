@@ -1,7 +1,7 @@
 #!/bin/bash
 # fetch.sh NAME: bring /tmp/ztrec from the phone into build/NAME and make build/NAME.png
 set -e
-cd /home/zerone/Documents/Projects/ztOSMobile
+cd "$(dirname "$0")/../.."
 N=$1; mkdir -p build/$N
 (timeout 60 socat -u "TCP-LISTEN:5596,bind=172.16.42.2,reuseaddr" "OPEN:build/$N.tar,creat,trunc" &); sleep 1
 timeout 60 scripts/ssh-pw.py alarm "${ZT_PW:-alarm}" 172.16.42.1 'cd /tmp/ztrec && tar cf - . > /dev/tcp/172.16.42.2/5596' >/dev/null 2>&1 || true

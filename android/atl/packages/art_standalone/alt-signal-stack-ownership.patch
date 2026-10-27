@@ -1,0 +1,55 @@
+--- a/art/runtime/thread_linux.cc
++++ b/art/runtime/thread_linux.cc
+@@ -36,6 +36,11 @@
+ static /*constexpr*/ int kHostAltSigStackSize =
+     32 * KB < MINSIGSTKSZ ? MINSIGSTKSZ : 32 * KB;
+ 
++// The stack this thread's SetUpAlternateSignalStack allocated. Native code in the
++// app (crash reporters such as breakpad) may install its own alternate stack on
++// the thread later, so teardown must not assume the current one belongs to ART.
++static thread_local uint8_t* gArtAltSignalStack = nullptr;
++
+ void Thread::SetUpAlternateSignalStack() {
+   // Create and set an alternate signal stack.
+ #ifdef ART_TARGET_ANDROID
+@@ -43,6 +48,7 @@
+ #endif
+   stack_t ss;
+   ss.ss_sp = new uint8_t[kHostAltSigStackSize];
++  gArtAltSignalStack = static_cast<uint8_t*>(ss.ss_sp);
+   ss.ss_size = kHostAltSigStackSize;
+   ss.ss_flags = 0;
+   CHECK(ss.ss_sp != nullptr);
+@@ -55,18 +61,23 @@
+ }
+ 
+ void Thread::TearDownAlternateSignalStack() {
+-  // Get the pointer so we can free the memory.
++  uint8_t* allocated_signal_stack = gArtAltSignalStack;
++  gArtAltSignalStack = nullptr;
++
++  // Only stop the kernel using the stack if it is still ART's; a stack some
++  // other code installed is that code's to manage.
+   stack_t ss;
+   SigAltStack(nullptr, &ss);
+-  uint8_t* allocated_signal_stack = reinterpret_cast<uint8_t*>(ss.ss_sp);
+-
+-  // Tell the kernel to stop using it.
+-  ss.ss_sp = nullptr;
+-  ss.ss_flags = SS_DISABLE;
+-  ss.ss_size = kHostAltSigStackSize;  // Avoid ENOMEM failure with Mac OS' buggy libc.
+-  SigAltStack(&ss, nullptr);
++  if (allocated_signal_stack != nullptr && ss.ss_sp == allocated_signal_stack) {
++    // Tell the kernel to stop using it.
++    ss.ss_sp = nullptr;
++    ss.ss_flags = SS_DISABLE;
++    ss.ss_size = kHostAltSigStackSize;  // Avoid ENOMEM failure with Mac OS' buggy libc.
++    SigAltStack(&ss, nullptr);
++  }
+ 
+-  // Free it.
++  // Free it. Free only what SetUpAlternateSignalStack allocated. Freeing a foreign
++  // stack corrupts the heap ("free(): invalid size") or faults on its guard page.
+   delete[] allocated_signal_stack;
+ }
+ 

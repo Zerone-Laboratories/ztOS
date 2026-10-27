@@ -1,0 +1,46 @@
+{
+ "version": "0.2.0",
+ "ial": {
+  "required": [
+   "Device1",
+   "Power1",
+   "Perf1",
+   "Display1",
+   "Sleep1"
+  ],
+  "interfaces": {
+   "Device1": 1,
+   "Power1": 1,
+   "Perf1": 1,
+   "Display1": 1,
+   "Sleep1": 1,
+   "Sensors1": 1,
+   "Haptics1": 1,
+   "Lights1": 1,
+   "Modem1": 1,
+   "CallAudio1": 1,
+   "AudioDevice1": 1,
+   "Accel1": 1,
+   "Android1": 1
+  }
+ },
+ "kernel_contract": {
+  "hard": [
+   "CGROUPS",
+   "MEMCG",
+   "CPUSETS",
+   "NAMESPACES",
+   "PSI"
+  ],
+  "soft": [
+   "ANDROID_BINDER_IPC",
+   "ANDROID_BINDERFS",
+   "MEMFD_CREATE",
+   "VETH",
+   "BRIDGE",
+   "NF_TABLES",
+   "INPUT_FF_MEMLESS",
+   "ZRAM"
+  ]
+ }
+}

@@ -1,0 +1,668 @@
+diff -Naur base/meson.build source/meson.build
+--- base/meson.build	2026-10-23 09:41:59.990403896 +0530
++++ source/meson.build	2026-10-23 09:37:41.526387141 +0530
+@@ -66,6 +66,7 @@
+                                           	'src/libandroid/native_window.c',
+                                           	'src/libandroid/sensor.c',
+                                           	'src/libandroid/sharedmem.c',
++                                          	'src/libandroid/hardware_buffer.c',
+                                           	'src/libandroid/trace.c',
+                                           ],
+                                           install: true,
+diff -Naur base/src/api-impl/android/app/ActivityManager.java source/src/api-impl/android/app/ActivityManager.java
+--- base/src/api-impl/android/app/ActivityManager.java	2026-10-20 02:52:37.000000000 +0530
++++ source/src/api-impl/android/app/ActivityManager.java	2026-10-23 09:37:41.527875600 +0530
+@@ -45,6 +45,7 @@
+ 	}
+ 
+ 	public boolean isLowRamDevice() { return false; }
++	public boolean isBackgroundRestricted() { return false; }
+ 
+ 	public static class MemoryInfo implements Parcelable {
+ 		/* For now, just always report there's 10GB free RAM */
+diff -Naur base/src/api-impl/android/app/ActivityThread.java source/src/api-impl/android/app/ActivityThread.java
+--- base/src/api-impl/android/app/ActivityThread.java	2026-10-22 23:40:17.876299145 +0530
++++ source/src/api-impl/android/app/ActivityThread.java	2026-10-23 09:37:41.529747460 +0530
+@@ -8,8 +8,9 @@
+ import java.util.List;
+ 
+ public class ActivityThread {
++	private static volatile ActivityThread sCurrentActivityThread = new ActivityThread();
+ 	public static ActivityThread currentActivityThread() {
+-		return new ActivityThread();
++		return sCurrentActivityThread;
+ 	}
+ 	public static String currentPackageName() {
+ 		return ATLLoadedApp.getPrimaryApplication().pkg.packageName;
+diff -Naur base/src/api-impl-jni/app/android_app_Activity.c source/src/api-impl-jni/app/android_app_Activity.c
+--- base/src/api-impl-jni/app/android_app_Activity.c	2026-10-20 02:52:37.000000000 +0530
++++ source/src/api-impl-jni/app/android_app_Activity.c	2026-10-23 09:37:41.530875496 +0530
+@@ -197,7 +197,11 @@
+ 
+ 	GtkWidget *decor_view = get_decor_view(env, activity_object);
+ 	GtkStack *stack = GTK_STACK(gtk_window_get_child(window));
+-	gtk_stack_add_child(stack, decor_view);
++	if (gtk_widget_get_parent(decor_view) != GTK_WIDGET(stack)) {
++		if (gtk_widget_get_parent(decor_view) != NULL)
++			gtk_widget_unparent(decor_view);
++		gtk_stack_add_child(stack, decor_view);
++	}
+ 
+ 	activity_update_current(env);
+ }
+diff -Naur base/src/api-impl-jni/views/android_view_ViewGroup.c source/src/api-impl-jni/views/android_view_ViewGroup.c
+--- base/src/api-impl-jni/views/android_view_ViewGroup.c	2026-10-22 23:21:14.578484586 +0530
++++ source/src/api-impl-jni/views/android_view_ViewGroup.c	2026-10-23 09:37:41.533875391 +0530
+@@ -40,7 +40,10 @@
+ 			break;
+ 	}
+ 
+-	gtk_widget_insert_before(gtk_widget_get_parent(GTK_WIDGET(_PTR(child))), parent, iter);
++	GtkWidget *child_w = gtk_widget_get_parent(GTK_WIDGET(_PTR(child)));
++	if (gtk_widget_get_parent(child_w) != NULL)
++		gtk_widget_unparent(child_w);
++	gtk_widget_insert_before(child_w, parent, iter);
+ }
+ 
+ JNIEXPORT void JNICALL Java_android_view_ViewGroup_native_1removeView(JNIEnv *env, jobject this, jlong widget, jlong child)
+diff -Naur base/src/libandroid/hardware_buffer.c source/src/libandroid/hardware_buffer.c
+--- base/src/libandroid/hardware_buffer.c	1970-01-01 05:30:00.000000000 +0530
++++ source/src/libandroid/hardware_buffer.c	2026-10-23 09:38:40.641905899 +0530
+@@ -0,0 +1,597 @@
++/*
++ * Copyright (C) 2026 ztOS project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* AHardwareBuffer: CPU-accessible buffers backed by a sealed memfd, with the
++ * exact ABI shapes specified by authoritative AOSP/NDK headers (40-byte
++ * AHardwareBuffer_Desc layout including rfu0 and rfu1, int return for
++ * AHardwareBuffer_isSupported, exact usage bit values and format IDs).
++ * GPU sampling, framebuffer rendering, composer overlay, video decode/encode,
++ * camera streams, and protected content are truthful capabilities: isSupported
++ * reports 0 for any usage or format combination not backed by CPU shared memory,
++ * and lock accepts only valid AHARDWAREBUFFER_USAGE_CPU_* flags permitted by
++ * the buffer descriptor. */
++
++#define _GNU_SOURCE
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#ifndef F_ADD_SEALS
++#define F_ADD_SEALS 1033
++#define F_GET_SEALS 1034
++#define F_SEAL_SEAL   0x0001
++#define F_SEAL_SHRINK 0x0002
++#define F_SEAL_GROW   0x0004
++#endif
++
++// Usage flags (values from android/hardware_buffer.h)
++#define AHB_USAGE_CPU_READ_NEVER 0ULL
++#define AHB_USAGE_CPU_READ_RARELY 2ULL
++#define AHB_USAGE_CPU_READ_OFTEN 3ULL
++#define AHB_USAGE_CPU_READ_MASK 0xFULL
++
++#define AHB_USAGE_CPU_WRITE_NEVER (0ULL << 4)
++#define AHB_USAGE_CPU_WRITE_RARELY (2ULL << 4)
++#define AHB_USAGE_CPU_WRITE_OFTEN (3ULL << 4)
++#define AHB_USAGE_CPU_WRITE_MASK (0xFULL << 4)
++
++#define AHB_USAGE_GPU_SAMPLED_IMAGE (1ULL << 8)
++#define AHB_USAGE_GPU_FRAMEBUFFER (1ULL << 9)
++#define AHB_USAGE_COMPOSER_OVERLAY (1ULL << 11)
++#define AHB_USAGE_PROTECTED_CONTENT (1ULL << 14)
++#define AHB_USAGE_VIDEO_ENCODE (1ULL << 16)
++#define AHB_USAGE_SENSOR_DIRECT_DATA (1ULL << 23)
++#define AHB_USAGE_GPU_DATA_BUFFER (1ULL << 24)
++#define AHB_USAGE_GPU_CUBE_MAP (1ULL << 25)
++#define AHB_USAGE_GPU_MIPMAP_COMPLETE (1ULL << 26)
++#define AHB_USAGE_FRONT_BUFFER (1ULL << 32)
++
++// Formats
++#define AHB_FORMAT_R8G8B8A8_UNORM 1
++#define AHB_FORMAT_R8G8B8X8_UNORM 2
++#define AHB_FORMAT_R8G8B8_UNORM 3
++#define AHB_FORMAT_R5G6B5_UNORM 4
++#define AHB_FORMAT_R16G16B16A16_FLOAT 0x16
++#define AHB_FORMAT_BLOB 0x21
++#define AHB_FORMAT_Y8Cb8Cr8_420 0x23
++#define AHB_FORMAT_R10G10B10A2_UNORM 0x2b
++
++typedef struct AHardwareBuffer_Desc {
++	uint32_t width;
++	uint32_t height;
++	uint32_t layers;
++	uint32_t format;
++	uint64_t usage;
++	uint32_t stride;
++	uint32_t rfu0;
++	uint64_t rfu1;
++} AHardwareBuffer_Desc;
++
++typedef struct ARect {
++	int32_t left;
++	int32_t top;
++	int32_t right;
++	int32_t bottom;
++} ARect;
++
++typedef struct AHardwareBuffer AHardwareBuffer;
++
++struct AHardwareBuffer {
++	AHardwareBuffer_Desc desc;
++	int fd;
++	size_t size;
++	void *locked;
++	uint32_t readers;
++	bool writer;
++	pthread_mutex_t lock;
++	atomic_uint refcount;
++};
++
++static size_t ahb_format_bpp(uint32_t format)
++{
++	switch (format) {
++	case AHB_FORMAT_R8G8B8A8_UNORM:
++	case AHB_FORMAT_R8G8B8X8_UNORM:
++	case AHB_FORMAT_R10G10B10A2_UNORM:
++		return 4;
++	case AHB_FORMAT_R8G8B8_UNORM:
++		return 3;
++	case AHB_FORMAT_R5G6B5_UNORM:
++		return 2;
++	case AHB_FORMAT_R16G16B16A16_FLOAT:
++		return 8;
++	case AHB_FORMAT_BLOB:
++		return 1;
++	case AHB_FORMAT_Y8Cb8Cr8_420:
++		return 0; // multi-planar format handled specially
++	default:
++		return 0; // unsupported format
++	}
++}
++
++static bool ahb_calc_buffer_size(const AHardwareBuffer_Desc *desc, size_t *out_size)
++{
++	if (!desc || !out_size)
++		return false;
++
++	if (desc->format == AHB_FORMAT_BLOB) {
++		*out_size = (size_t)desc->width;
++		return true;
++	}
++
++	if (desc->format == AHB_FORMAT_Y8Cb8Cr8_420) {
++		uint64_t w = desc->stride;
++		uint64_t h = desc->height;
++		uint64_t prod = w * h;
++		if (w != 0 && prod / w != h)
++			return false;
++		if (prod > UINT64_MAX / 3)
++			return false;
++		uint64_t sz = (prod * 3) / 2;
++		if (sz == 0 || sz > SIZE_MAX || sz > (uint64_t)(((uint64_t)1 << (sizeof(off_t) * 8 - 1)) - 1))
++			return false;
++		*out_size = (size_t)sz;
++		return true;
++	}
++
++	size_t bpp = ahb_format_bpp(desc->format);
++	if (bpp == 0)
++		return false;
++
++	uint64_t stride = desc->stride;
++	uint64_t height = desc->height;
++	uint64_t row_bytes = stride * (uint64_t)bpp;
++	if (stride != 0 && row_bytes / stride != (uint64_t)bpp)
++		return false;
++
++	uint64_t total = row_bytes * height;
++	if (row_bytes != 0 && total / row_bytes != height)
++		return false;
++
++	if (total == 0 || total > SIZE_MAX || total > (uint64_t)(((uint64_t)1 << (sizeof(off_t) * 8 - 1)) - 1))
++		return false;
++
++	*out_size = (size_t)total;
++	return true;
++}
++
++static bool ahb_desc_supported(const AHardwareBuffer_Desc *desc)
++{
++	if (!desc)
++		return false;
++
++	if (desc->rfu0 != 0 || desc->rfu1 != 0)
++		return false;
++
++	if (desc->layers != 1)
++		return false;
++
++	if (desc->format == AHB_FORMAT_BLOB) {
++		if (desc->width == 0 || desc->height != 1)
++			return false;
++	} else {
++		if (desc->width == 0 || desc->height == 0)
++			return false;
++		if (ahb_format_bpp(desc->format) == 0)
++			return false;
++	}
++
++	uint64_t unsupported_usage_mask =
++		AHB_USAGE_GPU_SAMPLED_IMAGE |
++		AHB_USAGE_GPU_FRAMEBUFFER |
++		AHB_USAGE_COMPOSER_OVERLAY |
++		AHB_USAGE_PROTECTED_CONTENT |
++		AHB_USAGE_VIDEO_ENCODE |
++		AHB_USAGE_SENSOR_DIRECT_DATA |
++		AHB_USAGE_GPU_DATA_BUFFER |
++		AHB_USAGE_GPU_CUBE_MAP |
++		AHB_USAGE_GPU_MIPMAP_COMPLETE |
++		AHB_USAGE_FRONT_BUFFER;
++
++	if (desc->usage & unsupported_usage_mask)
++		return false;
++
++	uint64_t cpu_mask = AHB_USAGE_CPU_READ_MASK | AHB_USAGE_CPU_WRITE_MASK;
++	if ((desc->usage & ~cpu_mask) != 0)
++		return false;
++
++	uint64_t read_usage = desc->usage & AHB_USAGE_CPU_READ_MASK;
++	uint64_t write_usage = desc->usage & AHB_USAGE_CPU_WRITE_MASK;
++	if ((read_usage != 0 && read_usage != AHB_USAGE_CPU_READ_RARELY &&
++	     read_usage != AHB_USAGE_CPU_READ_OFTEN) ||
++	    (write_usage != 0 && write_usage != AHB_USAGE_CPU_WRITE_RARELY &&
++	     write_usage != AHB_USAGE_CPU_WRITE_OFTEN))
++		return false;
++
++	if (read_usage == 0 && write_usage == 0)
++		return false;
++
++	size_t dummy = 0;
++	AHardwareBuffer_Desc check_desc = *desc;
++	check_desc.stride = desc->width;
++	if (!ahb_calc_buffer_size(&check_desc, &dummy))
++		return false;
++
++	return true;
++}
++
++int AHardwareBuffer_isSupported(const AHardwareBuffer_Desc *desc)
++{
++	return ahb_desc_supported(desc) ? 1 : 0;
++}
++
++int AHardwareBuffer_allocate(const AHardwareBuffer_Desc *desc, AHardwareBuffer **outBuffer)
++{
++	if (!desc || !outBuffer)
++		return -EINVAL;
++
++	*outBuffer = NULL;
++
++	if (!ahb_desc_supported(desc))
++		return -EINVAL;
++
++	AHardwareBuffer_Desc fixed = *desc;
++	fixed.stride = fixed.width;
++	fixed.layers = 1;
++	fixed.rfu0 = 0;
++	fixed.rfu1 = 0;
++
++	size_t alloc_size = 0;
++	if (!ahb_calc_buffer_size(&fixed, &alloc_size) || alloc_size == 0)
++		return -EINVAL;
++
++	AHardwareBuffer *buffer = calloc(1, sizeof(*buffer));
++	if (!buffer)
++		return -ENOMEM;
++
++	pthread_mutex_init(&buffer->lock, NULL);
++	buffer->desc = fixed;
++	buffer->size = alloc_size;
++
++	buffer->fd = memfd_create("AHardwareBuffer", MFD_CLOEXEC | MFD_ALLOW_SEALING);
++	if (buffer->fd < 0) {
++		int saved = errno;
++		pthread_mutex_destroy(&buffer->lock);
++		free(buffer);
++		return saved == 0 ? -ENOMEM : -saved;
++	}
++
++	if (ftruncate(buffer->fd, (off_t)buffer->size) == -1) {
++		int saved = errno;
++		close(buffer->fd);
++		pthread_mutex_destroy(&buffer->lock);
++		free(buffer);
++		return saved == 0 ? -ENOMEM : -saved;
++	}
++
++	if (fcntl(buffer->fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == -1) {
++		int saved = errno;
++		close(buffer->fd);
++		pthread_mutex_destroy(&buffer->lock);
++		free(buffer);
++		return saved == 0 ? -ENOMEM : -saved;
++	}
++
++	buffer->refcount = 1;
++	*outBuffer = buffer;
++	return 0;
++}
++
++void AHardwareBuffer_acquire(AHardwareBuffer *buffer)
++{
++	if (buffer)
++		buffer->refcount++;
++}
++
++void AHardwareBuffer_release(AHardwareBuffer *buffer)
++{
++	if (!buffer)
++		return;
++
++	if (--buffer->refcount != 0)
++		return;
++
++	if (buffer->locked)
++		munmap(buffer->locked, buffer->size);
++	close(buffer->fd);
++	pthread_mutex_destroy(&buffer->lock);
++	free(buffer);
++}
++
++void AHardwareBuffer_describe(const AHardwareBuffer *buffer, AHardwareBuffer_Desc *outDesc)
++{
++	if (buffer && outDesc)
++		*outDesc = buffer->desc;
++}
++
++int AHardwareBuffer_lock(AHardwareBuffer *buffer, uint64_t usage, int32_t fence,
++                         const ARect *rect, void **outVirtual)
++{
++	if (!buffer || !outVirtual)
++		return -EINVAL;
++
++	if (buffer->desc.layers != 1)
++		return -EINVAL;
++
++	if (buffer->desc.format == AHB_FORMAT_Y8Cb8Cr8_420)
++		return -EINVAL;
++
++	if ((usage & ~(AHB_USAGE_CPU_READ_MASK | AHB_USAGE_CPU_WRITE_MASK)) != 0 || usage == 0)
++		return -EINVAL;
++
++	uint64_t read_usage = usage & AHB_USAGE_CPU_READ_MASK;
++	uint64_t write_usage = usage & AHB_USAGE_CPU_WRITE_MASK;
++	if ((read_usage != 0 && read_usage != AHB_USAGE_CPU_READ_RARELY &&
++	     read_usage != AHB_USAGE_CPU_READ_OFTEN) ||
++	    (write_usage != 0 && write_usage != AHB_USAGE_CPU_WRITE_RARELY &&
++	     write_usage != AHB_USAGE_CPU_WRITE_OFTEN))
++		return -EINVAL;
++
++	if ((usage & AHB_USAGE_CPU_READ_MASK) && !(buffer->desc.usage & AHB_USAGE_CPU_READ_MASK))
++		return -EINVAL;
++
++	if ((usage & AHB_USAGE_CPU_WRITE_MASK) && !(buffer->desc.usage & AHB_USAGE_CPU_WRITE_MASK))
++		return -EINVAL;
++
++	if (rect) {
++		if (rect->left < 0 || rect->top < 0 ||
++		    rect->right <= rect->left || rect->bottom <= rect->top ||
++		    (uint32_t)rect->right > buffer->desc.width ||
++		    (uint32_t)rect->bottom > buffer->desc.height)
++			return -EINVAL;
++	}
++
++	pthread_mutex_lock(&buffer->lock);
++
++	bool wants_write = write_usage != 0;
++	if ((wants_write && (buffer->writer || buffer->readers != 0)) ||
++	    (!wants_write && buffer->writer)) {
++		pthread_mutex_unlock(&buffer->lock);
++		return -EINVAL;
++	}
++
++	if (fence >= 0) {
++		struct pollfd pfd = { .fd = fence, .events = POLLIN };
++		int poll_result;
++		do {
++			poll_result = poll(&pfd, 1, -1);
++		} while (poll_result < 0 && errno == EINTR);
++		int poll_error = poll_result < 0 ? errno : 0;
++		bool invalid_fd = poll_result > 0 && (pfd.revents & POLLNVAL) != 0;
++		bool completed = poll_result > 0 &&
++			(pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0;
++		close(fence);
++		if (poll_error || invalid_fd || !completed) {
++			pthread_mutex_unlock(&buffer->lock);
++			return poll_error ? -poll_error : -EBADF;
++		}
++	}
++
++	if (!buffer->locked) {
++		int prot = PROT_READ;
++		if (wants_write)
++			prot |= PROT_WRITE;
++
++		void *addr = mmap(NULL, buffer->size, prot, MAP_SHARED, buffer->fd, 0);
++		if (addr == MAP_FAILED) {
++			int saved = errno;
++			pthread_mutex_unlock(&buffer->lock);
++			return saved == 0 ? -EINVAL : -saved;
++		}
++		buffer->locked = addr;
++	}
++
++	if (wants_write)
++		buffer->writer = true;
++	else
++		buffer->readers++;
++	*outVirtual = buffer->locked;
++
++	pthread_mutex_unlock(&buffer->lock);
++	return 0;
++}
++
++int AHardwareBuffer_unlock(AHardwareBuffer *buffer, int32_t *fence)
++{
++	if (!buffer)
++		return -EINVAL;
++
++	pthread_mutex_lock(&buffer->lock);
++
++	if (buffer->writer) {
++		buffer->writer = false;
++		munmap(buffer->locked, buffer->size);
++		buffer->locked = NULL;
++	} else if (buffer->readers != 0) {
++		buffer->readers--;
++		if (buffer->readers == 0) {
++			munmap(buffer->locked, buffer->size);
++			buffer->locked = NULL;
++		}
++	} else {
++		pthread_mutex_unlock(&buffer->lock);
++		return -EINVAL;
++	}
++
++	pthread_mutex_unlock(&buffer->lock);
++
++	if (fence)
++		*fence = -1;
++	return 0;
++}
++
++int AHardwareBuffer_sendHandleToUnixSocket(const AHardwareBuffer *buffer, int socketFd)
++{
++	if (!buffer || socketFd < 0)
++		return -EINVAL;
++
++	char payload[sizeof(AHardwareBuffer_Desc)];
++	memcpy(payload, &buffer->desc, sizeof(payload));
++
++	struct iovec iov = { .iov_base = payload, .iov_len = sizeof(payload) };
++	union { struct cmsghdr align; char buf[CMSG_SPACE(sizeof(int))]; } control = { 0 };
++	struct msghdr msg = {
++		.msg_iov = &iov,
++		.msg_iovlen = 1,
++		.msg_control = control.buf,
++		.msg_controllen = sizeof(control.buf),
++	};
++
++	struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
++	cmsg->cmsg_level = SOL_SOCKET;
++	cmsg->cmsg_type = SCM_RIGHTS;
++	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++	memcpy(CMSG_DATA(cmsg), &buffer->fd, sizeof(int));
++
++	if (sendmsg(socketFd, &msg, MSG_NOSIGNAL) < 0)
++		return -errno;
++
++	return 0;
++}
++
++int AHardwareBuffer_recvHandleFromUnixSocket(int socketFd, AHardwareBuffer **outBuffer)
++{
++	if (!outBuffer || socketFd < 0)
++		return -EINVAL;
++
++	*outBuffer = NULL;
++
++	char payload[sizeof(AHardwareBuffer_Desc)];
++	struct iovec iov = { .iov_base = payload, .iov_len = sizeof(payload) };
++	union { struct cmsghdr align; char buf[CMSG_SPACE(sizeof(int))]; } control = { 0 };
++	struct msghdr msg = {
++		.msg_iov = &iov,
++		.msg_iovlen = 1,
++		.msg_control = control.buf,
++		.msg_controllen = sizeof(control.buf),
++	};
++
++	ssize_t rc = recvmsg(socketFd, &msg, MSG_CMSG_CLOEXEC);
++	if (rc <= 0) {
++		int saved = errno;
++		for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c != NULL; c = CMSG_NXTHDR(&msg, c)) {
++			if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
++				int nfds = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++				int *fds = (int *)CMSG_DATA(c);
++				for (int i = 0; i < nfds; ++i) {
++					if (fds[i] >= 0) close(fds[i]);
++				}
++			}
++		}
++		return rc == 0 ? -ECONNRESET : (saved == 0 ? -EIO : -saved);
++	}
++
++	int received_fd = -1;
++	bool cmsg_valid = true;
++
++	for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c != NULL; c = CMSG_NXTHDR(&msg, c)) {
++		if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
++			int nfds = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++			int *fds = (int *)CMSG_DATA(c);
++			for (int i = 0; i < nfds; ++i) {
++				if (received_fd == -1 && cmsg_valid && nfds == 1) {
++					received_fd = fds[i];
++				} else {
++					cmsg_valid = false;
++					if (fds[i] >= 0) close(fds[i]);
++				}
++			}
++		} else {
++			cmsg_valid = false;
++		}
++	}
++
++	if (!cmsg_valid || received_fd < 0) {
++		if (received_fd >= 0) close(received_fd);
++		return -EINVAL;
++	}
++
++	if ((size_t)rc < sizeof(payload)) {
++		size_t remaining = sizeof(payload) - (size_t)rc;
++		char *ptr = payload + rc;
++		while (remaining > 0) {
++			ssize_t n = read(socketFd, ptr, remaining);
++			if (n <= 0) {
++				close(received_fd);
++				return -EIO;
++			}
++			ptr += n;
++			remaining -= (size_t)n;
++		}
++	}
++
++	AHardwareBuffer_Desc desc;
++	memcpy(&desc, payload, sizeof(desc));
++
++	if (!ahb_desc_supported(&desc)) {
++		close(received_fd);
++		return -EINVAL;
++	}
++
++	struct stat st;
++	if (fstat(received_fd, &st) == -1 || !S_ISREG(st.st_mode)) {
++		close(received_fd);
++		return -EINVAL;
++	}
++
++	size_t expected_size = 0;
++	if (!ahb_calc_buffer_size(&desc, &expected_size) || expected_size == 0) {
++		close(received_fd);
++		return -EINVAL;
++	}
++
++	if ((uint64_t)st.st_size < (uint64_t)expected_size) {
++		close(received_fd);
++		return -EINVAL;
++	}
++
++	int seals = fcntl(received_fd, F_GET_SEALS);
++	if (seals == -1 || (seals & F_SEAL_SHRINK) == 0) {
++		close(received_fd);
++		return -EINVAL;
++	}
++
++	AHardwareBuffer *buffer = calloc(1, sizeof(*buffer));
++	if (!buffer) {
++		close(received_fd);
++		return -ENOMEM;
++	}
++
++	pthread_mutex_init(&buffer->lock, NULL);
++	buffer->desc = desc;
++	buffer->fd = received_fd;
++	buffer->size = expected_size;
++	buffer->refcount = 1;
++	*outBuffer = buffer;
++	return 0;
++}
++
++const void *AHardwareBuffer_getNativeHandle(const AHardwareBuffer *buffer)
++{
++	(void)buffer;
++	return NULL;
++}

@@ -12,10 +12,11 @@
 #
 # Gentle on purpose: processes are paused (SIGSTOP) and continued, not killed;
 # nothing is unloaded; no cable-less step takes the phone's only link away.
+. /usr/lib/ztos/user.sh
 LOG=/var/tmp/power-ab.log
 CHG=/sys/class/power_supply/max77705-charger/online
 BAT=/sys/class/power_supply/max170xx_battery
-CTL=/run/user/1000/ztmetro.ctl
+CTL=$ZTOS_RUNTIME_DIR/ztmetro.ctl
 : > "$LOG"
 say() { echo "$*" >> "$LOG"; }
 shell() { printf '%s\n' "$1" > "$CTL"; }

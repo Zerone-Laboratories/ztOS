@@ -1,6 +1,7 @@
 #!/bin/sh
 # Pick which shell greetd starts: zboot-session plasma-mobile|phosh|hyprland|gnome|ztmetro
 set -e
+. /usr/lib/ztos/user.sh
 case "${1:-}" in
 plasma-mobile) CMD=/usr/bin/startplasmamobile ;;
 plasma)        CMD=/usr/bin/startplasma-wayland ;;
@@ -11,7 +12,10 @@ ztmetro)       CMD=/usr/local/bin/ztmetro-session ;;
 "")            grep -m1 '^command' /etc/greetd/config.toml; exit 0 ;;
 *) echo "usage: zboot-session plasma-mobile|plasma|phosh|hyprland|gnome|ztmetro" >&2; exit 2 ;;
 esac
-sed -i "s|^command = .*|command = \"$CMD\"|" /etc/greetd/config.toml
+# the template too, or ztos-user-dropins puts the old command back
+for f in /etc/greetd/config.toml /usr/lib/ztos/user-templates/etc/greetd/config.toml; do
+	if [ -f "$f" ]; then sed -i "s|^command = .*|command = \"$CMD\"|" "$f"; fi
+done
 grep '^command' /etc/greetd/config.toml
 # "systemctl restart greetd" leaves the old compositor running: the new session
 # then cannot take the display and the panel falls back to the text console.
@@ -20,4 +24,4 @@ grep '^command' /etc/greetd/config.toml
 # session, in which mutter refuses to start ("Failed to find any matching session"). Detached, because the caller is
 # usually that same user over ssh and goes down with it.
 systemd-run --no-block --collect --unit=zboot-session-reset sh -c \
-	'systemctl stop greetd; loginctl terminate-user alarm; sleep 4; pkill -9 -u alarm; sleep 1; rm -f /run/greetd.run; systemctl start greetd'
+	"systemctl stop greetd; loginctl terminate-user $ZTOS_USER; sleep 4; pkill -9 -u $ZTOS_USER; sleep 1; rm -f /run/greetd.run; systemctl start greetd"

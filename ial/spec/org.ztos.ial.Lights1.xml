@@ -1,0 +1,20 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- org.ztos.ial.Lights1: Notification lights and the torch. Colour is 0xRRGGBB.
+     Licence: LGPL-2.1-or-later. -->
+<node>
+  <interface name="org.ztos.ial.Lights1">
+    <property name="Version" type="u" access="read"/>
+    <property name="Lights" type="as" access="read"/>
+    <property name="Torch" type="b" access="read"/>
+    <method name="Set">
+      <arg direction="in" name="light" type="s"/>
+      <arg direction="in" name="colour" type="u"/>
+      <arg direction="in" name="on_ms" type="u"/>
+      <arg direction="in" name="off_ms" type="u"/>
+    </method>
+    <method name="SetTorch">
+      <arg direction="in" name="on" type="b"/>
+    </method>
+  </interface>
+</node>

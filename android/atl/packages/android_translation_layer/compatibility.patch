@@ -1,0 +1,288 @@
+--- a/src/api-impl/android/app/Activity.java
++++ b/src/api-impl/android/app/Activity.java
+@@ -481,6 +481,10 @@
+ 		this.title = title;
+ 	}
+ 
++	public final void atl_setInitialTitle(CharSequence title) {
++		this.title = title;
++	}
++
+ 	public void setTitle(int titleId) {
+ 		this.title = getText(titleId);
+ 	}
+--- a/src/api-impl/android/app/ActivityThread.java
++++ b/src/api-impl/android/app/ActivityThread.java
+@@ -17,6 +17,9 @@
+ 	public static String currentProcessName() {
+ 		return Application.getProcessName();
+ 	}
++	public String getProcessName() {
++		return currentProcessName();
++	}
+ 	public static Application currentApplication() {
+ 		return ATLLoadedApp.getPrimaryApplication().getApplication();
+ 	}
+--- a/src/api-impl/android/app/job/JobParameters.java
++++ b/src/api-impl/android/app/job/JobParameters.java
+@@ -14,6 +14,10 @@
+ 		this.jobInfo = jobInfo;
+ 	}
+ 
++	public int getJobId() {
++		return jobInfo.getId();
++	}
++
+ 	public PersistableBundle getExtras() {
+ 		return jobInfo.getExtras();
+ 	}
+--- a/src/api-impl/android/atl/ATLLoadedApp.java
++++ b/src/api-impl/android/atl/ATLLoadedApp.java
+@@ -231,11 +231,11 @@
+ 		activity.atl_attach_base_context(new ContextImpl(r, this, theme_res));
+ 		if (label_res != 0) {
+ 			try {
+-				activity.setTitle(r.getText(label_res));
++				activity.atl_setInitialTitle(r.getText(label_res));
+ 			} catch (Throwable ignore) {}
+ 		} else if (pkg.applicationInfo.labelRes != 0) {
+ 			try {
+-				activity.setTitle(r.getText(pkg.applicationInfo.labelRes));
++				activity.atl_setInitialTitle(r.getText(pkg.applicationInfo.labelRes));
+ 			} catch (Throwable ignore) {}
+ 		}
+ 		return activity;
+--- a/src/api-impl/android/content/ContentProvider.java
++++ b/src/api-impl/android/content/ContentProvider.java
+@@ -72,6 +72,10 @@
+ 		return fd != null ? new AssetFileDescriptor(fd, 0, -1) : null;
+ 	}
+ 
++	public interface PipeDataWriter<T> {
++		public void writeDataToPipe(ParcelFileDescriptor output, Uri uri, String mimeType, android.os.Bundle opts, T args);
++	}
++
+ 	public void attachInfo(Context context, ProviderInfo provider) {}
+ 
+ 	public String getCallingPackage() {
+--- a/src/api-impl/android/graphics/Paint.java
++++ b/src/api-impl/android/graphics/Paint.java
+@@ -18,9 +18,10 @@
+ 	public static final int VERTICAL_TEXT_FLAG = (1 << 12);
+ 
+ 	public long paint; // native paint
++	private int flags;
+ 	private Xfermode xfermode;
+ 	private Shader shader;
+-	private Align align = Align.CENTER;
++	private Align align = Align.LEFT;
+ 	private ColorFilter color_filter;
+ 
+ 	public Paint() {
+@@ -34,6 +35,11 @@
+ 
+ 	public Paint(Paint paint) {
+ 		this.paint = native_clone(paint.paint);
++		this.flags = paint.flags;
++		xfermode = paint.xfermode;
++		shader = paint.shader;
++		align = paint.align;
++		color_filter = paint.color_filter;
+ 	}
+ 
+ 	public void setColor(int color) {
+@@ -57,10 +63,15 @@
+ 	}
+ 
+ 	public void setAntiAlias(boolean aa) {
++		if (aa) {
++			flags |= ANTI_ALIAS_FLAG;
++		} else {
++			flags &= ~ANTI_ALIAS_FLAG;
++		}
+ 	}
+ 
+ 	public boolean isAntiAlias() {
+-		return true;
++		return (flags & ANTI_ALIAS_FLAG) != 0;
+ 	}
+ 
+ 	public boolean setFontVariationSettings(String fvs) {
+@@ -90,11 +101,24 @@
+ 		native_get_text_bounds(paint, text.substring(start, end), bounds);
+ 		return bounds.width();
+ 	}
+-	public void setFilterBitmap(boolean filter) {}
++	public void setFilterBitmap(boolean filter) {
++		if (filter) {
++			flags |= FILTER_BITMAP_FLAG;
++		} else {
++			flags &= ~FILTER_BITMAP_FLAG;
++		}
++	}
++
++	public boolean isFilterBitmap() {
++		return (flags & FILTER_BITMAP_FLAG) != 0;
++	}
+ 
+ 	public void setFlags(int flags) {
+-		if ((flags & ANTI_ALIAS_FLAG) != 0)
+-			setAntiAlias(true);
++		this.flags = flags;
++	}
++
++	public int getFlags() {
++		return flags;
+ 	}
+ 
+ 	public void setStyle(Style style) {
+@@ -197,21 +221,70 @@
+ 		}
+ 	}
+ 
+-	public /*native*/ int getFlags() { return 0; }
+-
+ 	public /*native*/ int getHinting() { return 0; }
+ 	public /*native*/ void setHinting(int mode) {}
+ 
+-	public /*native*/ void setDither(boolean dither) {}
++	public /*native*/ void setDither(boolean dither) {
++		if (dither) {
++			flags |= DITHER_FLAG;
++		} else {
++			flags &= ~DITHER_FLAG;
++		}
++	}
+ 	public boolean isDither() {
+-		return false;
+-	}
+-
+-	public /*native*/ void setLinearText(boolean linearText) {}
+-	public /*native*/ void setSubpixelText(boolean subpixelText) {}
+-	public /*native*/ void setUnderlineText(boolean underlineText) {}
+-	public /*native*/ void setStrikeThruText(boolean strikeThruText) {}
+-	public /*native*/ void setFakeBoldText(boolean fakeBoldText) {}
++		return (flags & DITHER_FLAG) != 0;
++	}
++
++	public /*native*/ void setLinearText(boolean linearText) {
++		if (linearText) {
++			flags |= LINEAR_TEXT_FLAG;
++		} else {
++			flags &= ~LINEAR_TEXT_FLAG;
++		}
++	}
++	public boolean isLinearText() {
++		return (flags & LINEAR_TEXT_FLAG) != 0;
++	}
++	public /*native*/ void setSubpixelText(boolean subpixelText) {
++		if (subpixelText) {
++			flags |= SUBPIXEL_TEXT_FLAG;
++		} else {
++			flags &= ~SUBPIXEL_TEXT_FLAG;
++		}
++	}
++	public boolean isSubpixelText() {
++		return (flags & SUBPIXEL_TEXT_FLAG) != 0;
++	}
++	public /*native*/ void setUnderlineText(boolean underlineText) {
++		if (underlineText) {
++			flags |= UNDERLINE_TEXT_FLAG;
++		} else {
++			flags &= ~UNDERLINE_TEXT_FLAG;
++		}
++	}
++	public boolean isUnderlineText() {
++		return (flags & UNDERLINE_TEXT_FLAG) != 0;
++	}
++	public /*native*/ void setStrikeThruText(boolean strikeThruText) {
++		if (strikeThruText) {
++			flags |= STRIKE_THRU_TEXT_FLAG;
++		} else {
++			flags &= ~STRIKE_THRU_TEXT_FLAG;
++		}
++	}
++	public boolean isStrikeThruText() {
++		return (flags & STRIKE_THRU_TEXT_FLAG) != 0;
++	}
++	public /*native*/ void setFakeBoldText(boolean fakeBoldText) {
++		if (fakeBoldText) {
++			flags |= FAKE_BOLD_TEXT_FLAG;
++		} else {
++			flags &= ~FAKE_BOLD_TEXT_FLAG;
++		}
++	}
++	public boolean isFakeBoldText() {
++		return (flags & FAKE_BOLD_TEXT_FLAG) != 0;
++	}
+ 
+ 	public float getStrokeWidth() {
+ 		return native_get_stroke_width(paint);
+@@ -356,11 +429,17 @@
+ 	}
+ 
+ 	public void set(Paint paint) {
++		if (paint == this) return;
++		long replacement = native_clone(paint.paint);
+ 		native_recycle(this.paint);
+-		this.paint = native_clone(paint.paint);
+-	}
+-
+-	public boolean isFilterBitmap() { return false; }
++		this.paint = replacement;
++		flags = paint.flags;
++		xfermode = paint.xfermode;
++		shader = paint.shader;
++		align = paint.align;
++		color_filter = paint.color_filter;
++	}
++
+ 
+ 	public Cap getStrokeCap() {
+ 		return Cap.values[native_get_stroke_cap(paint)];
+@@ -386,9 +465,6 @@
+ 
+ 	public MaskFilter setMaskFilter(MaskFilter filter) { return filter; }
+ 
+-	public boolean isFakeBoldText() {
+-		return false;
+-	}
+ 
+ 	public void setFontFeatureSettings(String settings) {}
+ 
+@@ -399,9 +475,10 @@
+ 	public void reset() {
+ 		native_recycle(paint);
+ 		paint = native_create();
++		flags = 0;
+ 		xfermode = null;
+ 		shader = null;
+-		align = Align.CENTER;
++		align = Align.LEFT;
+ 		color_filter = null;
+ 	}
+ 
+--- a/src/api-impl/android/media/Ringtone.java
++++ b/src/api-impl/android/media/Ringtone.java
+@@ -6,4 +6,8 @@
+ 	public String getTitle(Context context) {
+ 		return "FIXME: Ringtone.getTitle()";
+ 	}
++
++	public boolean isPlaying() {
++		return false;
++	}
+ };
+--- a/src/api-impl/android/view/Display.java
++++ b/src/api-impl/android/view/Display.java
+@@ -42,6 +42,10 @@
+ 
+ 	public float getRefreshRate() {
+ 		return 60; // FIXME
++	}
++
++	public float[] getSupportedRefreshRates() {
++		return new float[] {getRefreshRate()};
+ 	}
+ 
+ 	public long getAppVsyncOffsetNanos() {

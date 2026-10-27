@@ -1,0 +1,51 @@
+--- a/src/api-impl-jni/views/android_view_View.c
++++ b/src/api-impl-jni/views/android_view_View.c
+@@ -843,11 +843,36 @@
+ 		gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+ }
+ 
++struct long_press_state {
++	double start_x;
++	double start_y;
++	gboolean has_start;
++};
++
++static void on_long_click_begin(GtkGesture *gesture, GdkEventSequence *sequence, gpointer user_data)
++{
++	struct long_press_state *state = user_data;
++	state->has_start = gtk_gesture_get_point(gesture, sequence, &state->start_x, &state->start_y);
++}
++
+ static void on_long_click_update(GtkGesture *gesture, GdkEventSequence *sequence, gpointer user_data)
+ {
+ 	GdkEvent *event = gtk_gesture_get_last_event(gesture, sequence);
+ 	if (event == canceled_event) {
+ 		gtk_event_controller_reset(GTK_EVENT_CONTROLLER(gesture));
++		return;
++	}
++
++	struct long_press_state *state = user_data;
++	double x, y;
++	if (state->has_start && gtk_gesture_get_point(gesture, sequence, &x, &y)) {
++		double dx = x - state->start_x;
++		double dy = y - state->start_y;
++		/* Android scroll touch slop. A scroll must cancel row long-press. */
++		if (dx * dx + dy * dy > 144.0) {
++			state->has_start = FALSE;
++			gtk_gesture_set_state(gesture, GTK_EVENT_SEQUENCE_DENIED);
++		}
+ 	}
+ }
+ 
+@@ -861,7 +886,10 @@
+ 	GtkEventController *controller = GTK_EVENT_CONTROLLER(gtk_gesture_long_press_new());
+ 
+ 	g_signal_connect(controller, "pressed", G_CALLBACK(on_long_click), NULL);
+-	g_signal_connect(controller, "update", G_CALLBACK(on_long_click_update), NULL);
++	struct long_press_state *state = g_new0(struct long_press_state, 1);
++	g_signal_connect(controller, "begin", G_CALLBACK(on_long_click_begin), state);
++	g_signal_connect(controller, "update", G_CALLBACK(on_long_click_update), state);
++	g_object_set_data_full(G_OBJECT(controller), "long-press-state", state, g_free);
+ 	gtk_widget_add_controller(widget, controller);
+ 	g_object_set_data(G_OBJECT(widget), "on_long_click_listener", controller);
+ }

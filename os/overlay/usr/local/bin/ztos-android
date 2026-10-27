@@ -1,0 +1,702 @@
+#!/usr/bin/python3
+"""ztOS integration for native ARM64 Android Translation Layer applications."""
+import argparse
+import fcntl
+import signal
+import time
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
+
+ANDROID = '{http://schemas.android.com/apk/res/android}'
+
+
+def manifest_metadata(data, field="label"):
+    """Read package and literal app label from XML or Android binary XML."""
+    package = label = ''
+    if data.lstrip().startswith(b'<'):
+        root = ET.fromstring(data)
+        package = root.attrib.get('package', '')
+        application = root.find('application')
+        label = application.attrib.get(ANDROID+field, '') if application is not None else ''
+    else:
+        if len(data) < 8 or struct.unpack_from('<H', data)[0] != 3:
+            raise ValueError('The APK has an invalid Android manifest.')
+        strings = []
+        total = struct.unpack_from('<I', data, 4)[0]
+        if total > len(data): raise ValueError('The APK manifest is truncated.')
+        offset = struct.unpack_from('<H', data, 2)[0]
+        while offset+8 <= total:
+            kind, header, size = struct.unpack_from('<HHI', data, offset)
+            if size < header or header < 8 or offset+size > total:
+                raise ValueError('The APK manifest contains an invalid chunk.')
+            if kind == 1:
+                if header < 28: raise ValueError('Invalid manifest string table.')
+                count, _, flags, start, _ = struct.unpack_from('<IIIII', data, offset+8)
+                if count > 100000 or header+count*4 > size: raise ValueError('Invalid manifest string table.')
+                def length(pos, utf8):
+                    unit = 1 if utf8 else 2
+                    value = int.from_bytes(data[pos:pos+unit], 'little'); pos += unit
+                    mask = 0x80 if utf8 else 0x8000
+                    if value & mask:
+                        value = ((value & (mask-1)) << (unit*8)) | int.from_bytes(data[pos:pos+unit], 'little')
+                        pos += unit
+                    return value, pos
+                for i in range(count):
+                    pos = offset+start+struct.unpack_from('<I', data, offset+header+i*4)[0]
+                    if not offset <= pos < offset+size: raise ValueError('Invalid manifest string offset.')
+                    utf8 = bool(flags & 0x100)
+                    n, pos = length(pos, utf8)
+                    if utf8: n, pos = length(pos, True)
+                    byte_count = n if utf8 else n*2
+                    if pos+byte_count > offset+size: raise ValueError('Invalid manifest string length.')
+                    strings.append(data[pos:pos+byte_count].decode('utf-8' if utf8 else 'utf-16-le'))
+            elif kind == 0x102:
+                if header < 16 or size < header+20: raise ValueError('Invalid manifest element.')
+                element = offset+header
+                name = struct.unpack_from('<I', data, element+4)[0]
+                attr_start, attr_size, count = struct.unpack_from('<HHH', data, element+8)
+                if attr_size < 20 or attr_start+count*attr_size > size-header:
+                    raise ValueError('Invalid manifest attributes.')
+                tag = strings[name] if name < len(strings) else ''
+                for i in range(count):
+                    at = element+attr_start+i*attr_size
+                    _, key, raw = struct.unpack_from('<III', data, at)
+                    value_type = data[at+15]
+                    value = struct.unpack_from('<I', data, at+16)[0]
+                    key = strings[key] if key < len(strings) else ''
+                    index = raw if raw != 0xffffffff else value if value_type == 3 else 0xffffffff
+                    text = strings[index] if index < len(strings) else ''
+                    if tag == 'manifest' and key == 'package': package = text
+                    if tag == 'application' and key == field:
+                        label = text or ('@%08x' % value if value_type == 1 else '')
+            offset += size
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+', package):
+        raise ValueError('The APK has no valid application package name.')
+    return package, label
+
+
+def resource_strings(data):
+    """Resolve simple string resources such as android:label from resources.arsc."""
+    if len(data) < 12 or struct.unpack_from('<H', data)[0] != 2:
+        return {}
+
+    def chunk_strings(offset):
+        kind, header, size = struct.unpack_from('<HHI', data, offset)
+        if kind != 1 or size < header + 4:
+            return []
+        count, _, flags, start = struct.unpack_from('<IIII', data, offset + 8)
+        if count > 100000 or header + count * 4 > size:
+            return []
+        strings = []
+        for i in range(count):
+            pos = offset + start + struct.unpack_from('<I', data, offset + header + i * 4)[0]
+            try:
+                if flags & 0x100:
+                    length = data[pos]; pos += 1
+                    if length & 0x80: length = ((length & 0x7f) << 8) | data[pos]; pos += 1
+                    chars = data[pos]; pos += 1
+                    if chars & 0x80: chars = ((chars & 0x7f) << 8) | data[pos]; pos += 1
+                    strings.append(data[pos:pos+chars].decode('utf-8'))
+                else:
+                    length = struct.unpack_from('<H', data, pos)[0]; pos += 2
+                    if length & 0x8000:
+                        length = ((length & 0x7fff) << 16) | struct.unpack_from('<H', data, pos)[0]; pos += 2
+                    strings.append(data[pos:pos+length*2].decode('utf-16-le'))
+            except (IndexError, struct.error, UnicodeError):
+                strings.append('')
+        return strings
+
+    total = struct.unpack_from('<I', data, 4)[0]
+    global_strings, packages = [], []
+    pos = struct.unpack_from('<H', data, 2)[0]
+    while pos + 8 <= min(total, len(data)):
+        kind, header, size = struct.unpack_from('<HHI', data, pos)
+        if size < header or pos + size > total: break
+        if kind == 1 and not global_strings:
+            global_strings = chunk_strings(pos)
+        elif kind == 0x200 and header >= 284:
+            package_id = struct.unpack_from('<I', data, pos+8)[0]
+            type_offset = struct.unpack_from('<I', data, pos+284)[0] if header >= 288 else 0
+            type_pool = pos + struct.unpack_from('<I', data, pos+268)[0]
+            key_pool = pos + struct.unpack_from('<I', data, pos+276)[0]
+            packages.append((pos, pos+size, package_id, type_offset,
+                             chunk_strings(type_pool), chunk_strings(key_pool)))
+        pos += size
+
+    resolved = {}
+    for base, end, package_id, type_offset, types, _ in packages:
+        pos = base + struct.unpack_from('<H', data, base+2)[0]
+        while pos + 8 <= end:
+            kind, header, size = struct.unpack_from('<HHI', data, pos)
+            if size < header or pos + size > end: break
+            if kind == 0x201 and header >= 24:
+                type_id = data[pos+8] + type_offset
+                count = struct.unpack_from('<I', data, pos+12)[0]
+                entries_start = struct.unpack_from('<I', data, pos+16)[0]
+                if count <= 100000 and header + count*4 <= size and 1 <= type_id <= len(types):
+                    default = True
+                    conf_size = struct.unpack_from('<I', data, pos+20)[0]
+                    if 4 <= conf_size <= header-20:
+                        default = not any(data[pos+24:pos+20+conf_size])
+                    for index in range(count):
+                        entry_offset = struct.unpack_from('<I', data, pos+header+index*4)[0]
+                        if entry_offset == 0xffffffff or entries_start+entry_offset+16 > size: continue
+                        entry = pos+entries_start+entry_offset
+                        entry_size, entry_flags = struct.unpack_from('<HH', data, entry)
+                        if entry_flags & 1 or entry_size < 8: continue
+                        value_type = data[entry+entry_size+3]
+                        value_data = struct.unpack_from('<I', data, entry+entry_size+4)[0]
+                        if value_type == 3 and value_data < len(global_strings):
+                            resource_id = (package_id << 24) | (type_id << 16) | index
+                            if default or resource_id not in resolved:
+                                resolved[resource_id] = global_strings[value_data]
+            pos += size
+    return resolved
+
+
+def apk_metadata(path):
+    with zipfile.ZipFile(path) as apk:
+        info = apk.getinfo('AndroidManifest.xml')
+        if info.file_size > 10*1024*1024: raise ValueError('The APK manifest is too large.')
+        package, label = manifest_metadata(apk.read(info))
+        if label.startswith('@'):
+            try:
+                resources = apk.getinfo('resources.arsc')
+                if resources.file_size <= 64*1024*1024:
+                    label = resource_strings(apk.read(resources)).get(int(label[1:], 16), '')
+            except KeyError:
+                pass
+        abis = sorted({name.split('/')[1] for name in apk.namelist()
+                       if name.startswith('lib/') and name.endswith('.so') and len(name.split('/')) >= 3})
+    if abis and 'arm64-v8a' not in abis:
+        raise ValueError('This APK has native code for '+', '.join(abis)+
+                         '. This ztOS runtime needs an arm64-v8a APK (or a Java-only APK).')
+    return {'package': package, 'name': label or path.stem, 'abis': abis}
+
+
+def data_root():
+    return Path(os.environ.get('XDG_DATA_HOME', str(Path.home()/'.local/share'))) / 'ztos/android'
+
+
+def registry_key(package, runtime):
+    return package+'@'+runtime
+
+
+def installed():
+    path = data_root()/'applications.json'
+    if not path.exists():
+        return {}
+    registry = json.loads(path.read_text())
+    migrated = {}
+    for key, value in registry.items():
+        metadata = dict(value)
+        metadata.setdefault('package', key.split('@', 1)[0])
+        metadata.setdefault('runtime', 'atl')
+        migrated[registry_key(metadata['package'], metadata['runtime'])] = metadata
+    if migrated != registry:
+        backup = path.with_name('applications.json.pre-dual-backup')
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        write_desktops(migrated)
+        atomic_write(path, json.dumps(migrated, indent=2)+'\n')
+    return migrated
+
+
+def application(registry, package, runtime=None):
+    matches = [value for key, value in registry.items()
+               if value.get('package', key.split('@', 1)[0]) == package
+               and (runtime is None or value.get('runtime', 'atl') == runtime)]
+    if not matches:
+        raise ValueError('That Android application is not installed in the requested runtime.')
+    if len(matches) != 1:
+        raise ValueError('Application is installed in both runtimes; use --runtime atl or --runtime waydroid.')
+    return matches[0]
+
+
+def inspect_apk(path):
+    metadata = apk_metadata(path.expanduser().resolve(strict=True))
+    return metadata, any(value['package'] == metadata['package'] for value in installed().values())
+
+
+def write_desktops(registry):
+    directory = Path(os.environ.get('XDG_DATA_HOME', str(Path.home()/'.local/share')))/'applications'
+    for metadata in registry.values():
+        package, runtime = metadata['package'], metadata.get('runtime', 'atl')
+        name = metadata['name'].replace('\n', ' ').replace('\r', ' ').replace('|', '/')
+        if runtime == 'waydroid':
+            name += ' (Waydroid)'
+        icon = metadata.get('icon', 'applications-other')
+        desktop = directory/('ztos-android-'+package+'-'+runtime+'.desktop')
+        atomic_write(desktop, '[Desktop Entry]\nType=Application\nName='+name+
+                     '\nComment=Android application ('+runtime+')\nExec=ztos-android launch '+package+
+                     ' --runtime '+runtime+'\nIcon='+icon+
+                     '\nTerminal=false\nCategories=Utility;\nStartupNotify=true\n')
+        legacy = directory/('ztos-android-'+package+'.desktop')
+        # Preserve the old icon when migrating registry versions without it.
+        if legacy.exists():
+            if 'icon' not in metadata:
+                for line in legacy.read_text().splitlines():
+                    if line.startswith('Icon='):
+                        metadata['icon'] = line[5:]
+                        atomic_write(desktop, desktop.read_text().replace('Icon='+icon+'\n', line+'\n'))
+            backup = legacy.with_suffix('.desktop.pre-dual-backup')
+            if not backup.exists():
+                shutil.copy2(legacy, backup)
+            legacy.unlink()
+    # Preserve pinned launchers when a formerly unique package gains a peer.
+    tiles = Path.home()/'.config/ztmetro/tiles'
+    if tiles.exists():
+        original = tiles.read_text()
+        lines = []
+        for line in original.splitlines(keepends=True):
+            fields = line.rstrip('\n').split('|')
+            if len(fields) == 5:
+                command = fields[4].strip()
+                for metadata in registry.values():
+                    if command == 'ztos-android launch '+metadata['package']:
+                        fields[4] = ' '+command+' --runtime '+metadata.get('runtime', 'atl')
+                        line = '|'.join(fields)+'\n'
+                        break
+            lines.append(line)
+        updated = ''.join(lines)
+        if updated != original:
+            backup = tiles.with_name('tiles.pre-dual-backup')
+            if not backup.exists():
+                shutil.copy2(tiles, backup)
+            atomic_write(tiles, updated)
+
+
+# Apps installed from inside Android (Aurora Store, Play) never came through
+# `install`, so they had no entry and stayed out of the app list (Beeper,
+# Apple Music, 2026-10-26). Waydroid writes a launcher file for every app with
+# an activity; those not from the system become entries here. An entry made
+# this way goes again when Android uninstalls the app.
+WAYDROID_SYSTEM = ('com.android.', 'com.google.android.', 'org.lineageos.', 'com.aefyr.sai',
+                   'org.microg.', 'com.qualcomm.', 'android.')
+
+
+def sync_waydroid():
+    applications = Path(os.environ.get('XDG_DATA_HOME', str(Path.home()/'.local/share')))/'applications'
+    found = {}
+    for desktop in applications.glob('waydroid.*.desktop'):
+        package = desktop.name[len('waydroid.'):-len('.desktop')]
+        if package.startswith(WAYDROID_SYSTEM):
+            continue
+        name, icon = package, 'applications-other'
+        for line in desktop.read_text(errors='replace').splitlines():
+            if line.startswith('[Desktop Action'):
+                break
+            if line.startswith('Name='):
+                name = line[5:].strip() or package
+            elif line.startswith('Icon='):
+                icon = line[5:].strip() or icon
+        found[package] = (name, icon)
+    if not found and not any(applications.glob('waydroid.*.desktop')):
+        return []	# Waydroid has not written its files (yet): change nothing
+    registry = installed()
+    changed = []
+    for package, (name, icon) in found.items():
+        if registry_key(package, 'waydroid') not in registry:
+            registry[registry_key(package, 'waydroid')] = {
+                'package': package, 'name': name, 'runtime': 'waydroid', 'icon': icon, 'synced': True}
+            changed.append('+'+package)
+    for key, metadata in list(registry.items()):
+        if metadata.get('synced') and metadata.get('runtime') == 'waydroid' and metadata['package'] not in found:
+            del registry[key]
+            (applications/('ztos-android-'+metadata['package']+'-waydroid.desktop')).unlink(missing_ok=True)
+            changed.append('-'+metadata['package'])
+    if changed:
+        write_desktops(registry)
+        atomic_write(data_root()/'applications.json', json.dumps(registry, indent=2)+'\n')
+    return changed
+
+
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.ztos-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream: stream.write(data)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+
+def selected_runtime(value=None):
+    if value in ('atl', 'waydroid'):
+        return value
+    config = Path.home()/'.config/ztos/android.conf'
+    if config.exists():
+        for line in config.read_text().splitlines():
+            key, sep, val = line.partition('=')
+            if sep and key.strip() == 'default_runtime' and val.strip() in ('atl', 'waydroid'):
+                return val.strip()
+    if sys.stdin.isatty():
+        answer = input('Runtime [atl/waydroid] (atl): ').strip().lower()
+        if answer in ('atl', 'waydroid'):
+            return answer
+    return 'atl'
+
+
+def write_icon(path, package):
+    """Install the largest likely launcher bitmap found in the APK."""
+    candidates = []
+    with zipfile.ZipFile(path) as apk:
+        # Modern APKs often obfuscate resource filenames; resolve android:icon
+        # before falling back to name-based bitmap discovery.
+        _, reference = manifest_metadata(apk.read('AndroidManifest.xml'), 'icon')
+        member = ''
+        if reference.startswith('@'):
+            try:
+                member = resource_strings(apk.read('resources.arsc')).get(int(reference[1:], 16), '')
+            except (KeyError, ValueError):
+                pass
+        if member.startswith('res/') and member.endswith(('.png', '.webp')) and member in apk.namelist():
+            icon = Path.home()/'.local/share/icons/hicolor/192x192/apps'/('ztos-android-'+package+'.png')
+            icon.parent.mkdir(parents=True, exist_ok=True)
+            image = apk.read(member)
+            if member.endswith('.png'):
+                icon.write_bytes(image)
+                return str(icon)
+            try:
+                import gi
+                gi.require_version('GdkPixbuf', '2.0')
+                from gi.repository import GdkPixbuf, GLib
+            except (ImportError, ValueError):
+                pass
+            else:
+                try:
+                    loader = GdkPixbuf.PixbufLoader.new_with_type('webp')
+                    loader.write(image)
+                    loader.close()
+                    loader.get_pixbuf().savev(str(icon), 'png', [], [])
+                    return str(icon)
+                except GLib.Error:
+                    pass
+        for name in apk.namelist():
+            lower = name.lower()
+            if not lower.startswith('res/') or not lower.endswith(('.png', '.webp')):
+                continue
+            if not any(part in lower for part in ('launcher', 'icon', 'mipmap')):
+                continue
+            if lower.endswith('.webp'):
+                continue
+            try:
+                with apk.open(name) as image:
+                    header = image.read(24)
+                width, height = struct.unpack('>II', header[16:24])
+                if width >= 32 and height >= 32:
+                    candidates.append((width*height, name))
+            except (OSError, struct.error):
+                pass
+        if not candidates:
+            return 'applications-other'
+        _, member = max(candidates)
+        icon = Path.home()/'.local/share/icons/hicolor/192x192/apps'/('ztos-android-'+package+'.png')
+        icon.parent.mkdir(parents=True, exist_ok=True)
+        with apk.open(member) as source, icon.open('wb') as target:
+            shutil.copyfileobj(source, target)
+        return str(icon)
+
+
+def stage_apk(path, pending=False, runtime=None):
+    path = path.expanduser().resolve(strict=True)
+    metadata = apk_metadata(path)
+    apk_dir = data_root()/'apks'
+    destination = (apk_dir/'.staging'/(metadata['package']+'-'+str(os.getpid())+'.apk')
+                   if pending else apk_dir/(metadata['package']+('-'+runtime if runtime == 'waydroid' else '')+'.apk'))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as temp:
+        temporary = Path(temp.name)
+        try:
+            with path.open('rb') as source: shutil.copyfileobj(source, temp)
+            temp.flush(); os.fsync(temp.fileno())
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return destination, metadata
+
+
+def install(path, runtime='atl'):
+    destination, metadata = stage_apk(path, runtime=runtime)
+    metadata['apk'] = str(destination)
+    metadata['runtime'] = runtime
+    with destination.open('rb') as source:
+        metadata['sha256'] = hashlib.file_digest(source, 'sha256').hexdigest()
+    metadata['icon'] = write_icon(destination, metadata['package'])
+    registry = installed()
+    registry[registry_key(metadata['package'], runtime)] = metadata
+    write_desktops(registry)
+    atomic_write(data_root()/'applications.json', json.dumps(registry, indent=2)+'\n')
+    return metadata
+
+
+def pipe_message(path, message):
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        try: os.write(fd, (message + '\n').encode())
+        finally: os.close(fd)
+    except OSError:
+        pass
+
+
+def ensure_runtime():
+    binary = shutil.which('android-translation-layer')
+    missing = not binary
+    if binary:
+        result = subprocess.run(['ldd', binary], capture_output=True, text=True)
+        missing = result.returncode != 0 or 'not found' in result.stdout
+    # Pacman checks declared runtime dependencies without network access.
+    dependencies = (
+        'art_standalone bionic_translation libopensles-standalone vixl wolfssl-jni '
+        'alsa-lib bubblewrap expat ffmpeg fontconfig gcc-libs glibc gtk4 icu '
+        'jre8-openjdk libbsd libcap libdrm libglvnd libgudev libportal libpng '
+        'libsecret libunwind lz4 openxr openssl sqlite vulkan-icd-loader wayland '
+        'webkitgtk-6.0 xz zlib'
+    ).split()
+    check = subprocess.run(['pacman', '-T'] + dependencies, capture_output=True, text=True)
+    if not missing and check.returncode == 0:
+        return
+    helper = '/usr/local/sbin/ztos-android-dependencies'
+    command = [helper] if os.geteuid() == 0 else ['ztos-auth', helper]
+    if subprocess.run(command).returncode:
+        raise ValueError('Android runtime dependency installation failed. Check the network connection and try again.')
+
+
+def compiler_children(parent):
+    pending, found, seen = [parent], set(), set()
+    child_map = None
+    # The phone kernel does not expose /proc/PID/task/PID/children.
+    # Build a PPID map there; desktop kernels can use the cheaper children file.
+    if not Path('/proc/%d/task/%d/children' % (parent, parent)).exists():
+        child_map = {}
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdigit(): continue
+            try:
+                ppid = int((entry/'stat').read_text().rsplit(')', 1)[1].split()[1])
+                child_map.setdefault(ppid, []).append(int(entry.name))
+            except (OSError, ValueError, IndexError): pass
+    while pending:
+        pid = pending.pop()
+        if pid in seen or pid == os.getpid(): continue
+        seen.add(pid)
+        try:
+            children = child_map.get(pid, []) if child_map is not None else Path('/proc/%d/task/%d/children' % (pid, pid)).read_text().split()
+            pending.extend(int(child) for child in children)
+            cmd = Path('/proc/%d/cmdline' % pid).read_bytes().split(b'\0')[0]
+            if Path(os.fsdecode(cmd)).name == 'dex2oat': found.add(pid)
+        except (OSError, ValueError): pass
+    return found
+
+
+def watch_compilation(parent, identity, lock_fd):
+    os.close(lock_fd)
+    runtime = Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/%d' % os.getuid()))
+    shell = runtime/'ztmetro.ctl'
+    previous = set()
+    quiet_until = time.monotonic() + 30
+    try:
+        while True:
+            try:
+                stat = Path('/proc/%d/stat' % parent).read_text()
+                if stat.rsplit(')', 1)[1].split()[19] != identity: break
+            except OSError: break
+            current = compiler_children(parent)
+            if current: quiet_until = time.monotonic() + 30
+            elif time.monotonic() >= quiet_until: break
+            for pid in previous - current:
+                pipe_message('/run/zrnperfd.ctl', 'compile %d off' % pid)
+            for pid in current:
+                pipe_message('/run/zrnperfd.ctl', 'compile %d on' % pid)
+            # Repeated messages survive a race with the shell registering launch.
+            pipe_message(shell, 'android-compile %d %d' % (parent, bool(current)))
+            previous = current
+            time.sleep(0.25)
+    finally:
+        for pid in previous: pipe_message('/run/zrnperfd.ctl', 'compile %d off' % pid)
+        pipe_message(shell, 'android-compile %d 0' % parent)
+
+
+def launch(path, arguments):
+    metadata = apk_metadata(path)
+    ensure_runtime()
+    binary = shutil.which('android-translation-layer')
+    if not binary:
+        raise ValueError('Android runtime is not installed. Install the ztOS ATL ARM64 package set first.')
+    locks = data_root()/'locks'
+    locks.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(locks/(metadata['package']+'.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        raise ValueError('This Android app is already running or compiling.')
+    os.set_inheritable(lock_fd, True)
+    parent = os.getpid()
+    identity = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+    monitor = os.fork()
+    if monitor == 0:
+        # Reparent the watcher so ART does not inherit an unreaped helper.
+        if os.fork() != 0: os._exit(0)
+        try: watch_compilation(parent, identity, lock_fd)
+        finally: os._exit(0)
+    os.waitpid(monitor, 0)
+    env = dict(os.environ, GDK_BACKEND='wayland', GSK_RENDERER='gl', GDK_GL='gles',
+               ATL_DISABLE_WINDOW_DECORATIONS='1', ATL_UGLY_ENABLE_WEBVIEW='1')
+    # GTK coordinates are logical pixels. A slightly lower Android density
+    # gives phone applications more room without scaling touch coordinates.
+    env.setdefault('ATL_DISPLAY_DENSITY', '144')
+    env['ANDROID_APP_DATA_DIR'] = str(data_root()/'data')
+    Path(env['ANDROID_APP_DATA_DIR']).mkdir(parents=True, exist_ok=True)
+    # Menu launches otherwise lose ART/native crash output after a reboot.
+    logs = Path(os.environ.get('XDG_STATE_HOME', str(Path.home()/'.local/state')))/'ztos/android'
+    logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log = logs/(metadata['package']+'.log')
+    if log.exists() and log.stat().st_size > 8 * 1024 * 1024:
+        log.replace(log.with_suffix('.log.1'))
+    fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    os.write(fd, ('\n--- '+time.strftime('%Y-%m-%d %H:%M:%S')+' launch '+metadata['package']+' ---\n').encode())
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    if fd > 2: os.close(fd)
+    extra_args = []
+    width = os.environ.get('ZTOS_APP_WIDTH', '360')
+    height = os.environ.get('ZTOS_APP_HEIGHT', '672')
+    if not any(arg == '-w' or arg.startswith(('-w=', '--window-width')) for arg in arguments):
+        extra_args.extend(['--window-width', width])
+    if not any(arg == '-h' or arg.startswith(('-h=', '--window-height')) for arg in arguments):
+        extra_args.extend(['--window-height', height])
+    os.execvpe(binary, [binary] + extra_args + [str(path)] + arguments, env)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    for command in ('install', 'open', 'run', 'inspect'):
+        item = sub.add_parser(command); item.add_argument('apk', type=Path)
+        if command == 'install': item.add_argument('--runtime', choices=('atl', 'waydroid'))
+        if command not in ('install', 'inspect'): item.add_argument('arguments', nargs=argparse.REMAINDER)
+    item = sub.add_parser('launch'); item.add_argument('package')
+    item.add_argument('--runtime', choices=('atl', 'waydroid'))
+    item.add_argument('arguments', nargs=argparse.REMAINDER)
+    item = sub.add_parser('uninstall', aliases=['remove']); item.add_argument('package')
+    item.add_argument('--runtime', choices=('atl', 'waydroid'))
+    item = sub.add_parser('close'); item.add_argument('package')
+    sub.add_parser('list'); sub.add_parser('doctor'); sub.add_parser('sync')
+    args = parser.parse_args()
+    if args.command == 'launch':
+        if args.arguments[:1] == ['--runtime']:
+            if len(args.arguments) < 2 or args.arguments[1] not in ('atl', 'waydroid'):
+                parser.error('--runtime must be atl or waydroid')
+            args.runtime = args.arguments[1]
+            args.arguments = args.arguments[2:]
+        elif args.arguments and args.arguments[0].startswith('--runtime='):
+            args.runtime = args.arguments.pop(0).split('=', 1)[1]
+            if args.runtime not in ('atl', 'waydroid'):
+                parser.error('--runtime must be atl or waydroid')
+        if args.arguments[:1] == ['--']:
+            args.arguments = args.arguments[1:]
+    if args.command in ('install', 'open'):
+        apk_metadata(args.apk.expanduser().resolve(strict=True))
+        if args.command == 'open': ensure_runtime()
+    if args.command == 'inspect':
+        metadata, is_installed = inspect_apk(args.apk)
+        print(metadata['package']+'\t'+metadata['name']+'\t'+('installed' if is_installed else 'new'))
+    elif args.command == 'install':
+        runtime = selected_runtime(args.runtime)
+        if runtime == 'waydroid':
+            staged, metadata = stage_apk(args.apk, pending=True)
+            try:
+                subprocess.run(['ztos-waydroid-launch', '--install', str(staged)], check=True)
+                metadata = install(staged, runtime)
+            finally:
+                staged.unlink(missing_ok=True)
+        else:
+            metadata = install(args.apk, runtime)
+        print('Installed '+metadata['name']+' ('+metadata['package']+') on '+runtime)
+    elif args.command == 'open':
+        metadata = install(args.apk); launch(Path(metadata['apk']), args.arguments)
+    elif args.command == 'run':
+        launch(args.apk.expanduser().resolve(strict=True), args.arguments)
+    elif args.command == 'launch':
+        metadata = application(installed(), args.package, args.runtime)
+        if metadata.get('runtime', 'atl') == 'waydroid':
+            logs = Path(os.environ.get('XDG_STATE_HOME', str(Path.home()/'.local/state')))
+            logs.mkdir(parents=True, exist_ok=True)
+            log_path = logs/'ztos-android.log'
+            if log_path.exists() and log_path.stat().st_size > 8 * 1024 * 1024:
+                log_path.replace(log_path.with_suffix('.log.1'))
+            with log_path.open('a') as log:
+                log.write('\n--- '+time.strftime('%Y-%m-%d %H:%M:%S')+' launch '+args.package+
+                          ' tty='+str(sys.stdin.isatty())+' ---\n')
+                for key in ('XDG_RUNTIME_DIR', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'PATH'):
+                    log.write(key+'='+os.environ.get(key, '')+'\n')
+                log.flush()
+                result = subprocess.run(['ztos-waydroid-launch', args.package],
+                                        stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+                log.write('exit='+str(result.returncode)+'\n')
+                if result.returncode:
+                    raise ValueError('Waydroid launch failed. See '+str(logs/'ztos-android.log'))
+            runtime_dir = Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/'+str(os.getuid())))
+            pipe_message(runtime_dir/'ztmetro.ctl', 'focus waydroid.'+args.package)
+        else:
+            launch(Path(metadata['apk']), args.arguments)
+    elif args.command == 'sync':
+        for change in sync_waydroid(): print(change)
+    elif args.command == 'list':
+        for _, metadata in sorted(installed().items()): print(metadata['package']+'\t'+metadata['name']+'\t'+metadata.get('runtime', 'atl'))
+    elif args.command in ('uninstall', 'remove'):
+        registry = installed()
+        metadata = application(registry, args.package, args.runtime)
+        runtime = metadata.get('runtime', 'atl')
+        if runtime == 'waydroid':
+            subprocess.run(['ztos-waydroid-launch', '--remove', args.package], check=True)
+        del registry[registry_key(args.package, runtime)]
+        (Path(os.environ.get('XDG_DATA_HOME', str(Path.home()/'.local/share')))/'applications'/
+         ('ztos-android-'+args.package+'-'+runtime+'.desktop')).unlink(missing_ok=True)
+        if metadata.get('apk') and not any(value.get('apk') == metadata.get('apk') for value in registry.values()):
+            Path(metadata['apk']).unlink(missing_ok=True)
+        if not any(value['package'] == args.package for value in registry.values()):
+            (Path.home()/'.local/share/icons/hicolor/192x192/apps'/('ztos-android-'+args.package+'.png')).unlink(missing_ok=True)
+        atomic_write(data_root()/'applications.json', json.dumps(registry, indent=2)+'\n')
+        print('Removed application; saved app data was retained.')
+    elif args.command == 'close':
+        metadata = installed().get(registry_key(args.package, 'waydroid'))
+        if metadata:
+            subprocess.run(['sudo', '-n', '/usr/local/libexec/ztos-waydroid-recover', 'close', args.package], check=True)
+    elif args.command == 'doctor':
+        binary = shutil.which('android-translation-layer')
+        if not binary: raise ValueError('android-translation-layer is not installed.')
+        elf = Path(binary).read_bytes()[:20]
+        if len(elf) < 20 or elf[:4] != b'\x7fELF' or struct.unpack_from('<H', elf, 18)[0] != 183:
+            raise ValueError('The installed Android runtime is not an ARM64 ELF binary.')
+        result = subprocess.run(['ldd', binary], text=True, capture_output=True)
+        if result.returncode or 'not found' in result.stdout:
+            raise ValueError('Missing runtime libraries:\n'+result.stdout+result.stderr)
+        print('ARM64 runtime and linked libraries: OK')
+        print('Wayland: '+('available' if os.environ.get('WAYLAND_DISPLAY') else 'set by the graphical session'))
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError, KeyError, zipfile.BadZipFile, ET.ParseError, struct.error) as error:
+        print('ztos-android: '+str(error), file=sys.stderr)
+        runtime = os.environ.get('XDG_RUNTIME_DIR')
+        if runtime:
+            try:
+                fd = os.open(str(Path(runtime)/'ztmetro.ctl'), os.O_WRONLY|os.O_NONBLOCK)
+                message = str(error).replace('\n', ' ').replace('|', '/')[:220]
+                os.write(fd, ('notify Android apps|Unable to open application|'+message+'\n').encode())
+                os.close(fd)
+            except OSError:
+                pass
+        sys.exit(1)

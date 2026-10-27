@@ -1,0 +1,91 @@
+# Maintainer: txtsd <aur.archlinux@ihavea.quest>
+
+pkgname=art_standalone
+pkgver=r213.35696d99
+pkgrel=5
+_commit=35696d993a60434622f44b68ab4d882836683a73
+pkgdesc='A standalone version of Dalvik with Art built in'
+url='https://gitlab.com/android_translation_layer/art_standalone'
+arch=(x86_64 aarch64 armv7h)
+license=('Apache-2.0')
+depends=(
+  bash
+  bionic_translation
+  expat
+  gcc-libs
+  glibc
+  vixl
+  icu
+  libbsd
+  libpng
+  libunwind
+  lz4
+  openssl
+  wolfssl-jni
+  xz
+  zlib
+)
+makedepends=(
+  bsd-compat-headers
+  jdk8-openjdk
+  libcap
+  meson
+  python
+  valgrind
+  vixl
+  zip
+)
+source=(
+  "${pkgname}-${_commit}.tar.gz::${url}/-/archive/${_commit}/${pkgname}-${_commit}.tar.gz"
+  'r8-3.3.75.jar::https://dl.google.com/dl/android/maven2/com/android/tools/r8/3.3.75/r8-3.3.75.jar'
+  'desugar_core_oj.py'
+  'alt-signal-stack-ownership.patch'
+)
+sha256sums=('5edd26e9bf9d687b8092e06ed948c59c0d00282fe199a5773dddffc71c4019d6'
+            '92104f8584add622a08347d95ae27623ef48bfbda6f6c6093e9b8efcc14b883d'
+            '3c8e897d8b17e9a19bbef2a7c0a529ba59cb67bd1021b42a83761686623e3500'
+            '4a2f2cc3132c62306b55449f228d2400dc50352859225db0ac6835e008847234')
+
+prepare() {
+  cd "${pkgname}-${_commit}"
+  # Free only the alternate signal stack ART allocated, not one app native code installed
+  patch -Np1 -i "$srcdir/alt-signal-stack-ownership.patch"
+  # GCC 15+ no longer pulls <cstdint> in through other headers
+  sed -i 's/^COMMON_GLOBAL_CPPFLAGS:= /COMMON_GLOBAL_CPPFLAGS:= -include stdint.h /' build/core/config.mk
+  # DestroyJavaVM can unload libjavacore after detaching its shutdown thread.
+  # JNI cleanup cannot use an environment once that thread is detached.
+  python - <<'PATCH'
+from pathlib import Path
+p = Path('libcore/luni/src/main/native/Register.cpp')
+s = p.read_text()
+start = s.index('void JNI_OnUnload(')
+head, tail = s[:start], s[start:]
+tail = tail.replace('ALOGE("JavaVM::GetEnv() failed");\n        abort();',
+                    'ALOGV("Skipping JNI cleanup on detached shutdown thread");\n        return;', 1)
+p.write_text(head + tail)
+PATCH
+}
+
+build() {
+  cd "${pkgname}-${_commit}"
+
+  make ____PREFIX=/usr ____LIBDIR=lib
+}
+
+package() {
+  depends+=(java-runtime)
+
+  cd "${pkgname}-${_commit}"
+
+  DESTDIR="${pkgdir}" make \
+    ____PREFIX="${pkgdir}/usr" \
+    ____INSTALL_ETC="${pkgdir}/etc" \
+    ____LIBDIR=lib \
+    install
+
+  python "${startdir}/desugar_core_oj.py" \
+    --core-all "${pkgdir}/usr/lib/java/core-all_classes.jar" \
+    --core-oj-hostdex "${pkgdir}/usr/lib/java/dex/art/core-oj-hostdex.jar" \
+    --core-libart-hostdex "${pkgdir}/usr/lib/java/dex/art/core-libart-hostdex.jar" \
+    --r8 "${startdir}/r8-3.3.75.jar"
+}

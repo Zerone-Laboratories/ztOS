@@ -1,0 +1,13 @@
+[Unit]
+Description=Reconnect Waydroid audio once after host audio starts
+Wants=pipewire-pulse.service
+After=pipewire.service pipewire-pulse.service
+PartOf=pipewire.service pipewire-pulse.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sudo -n /usr/local/libexec/ztos-waydroid-recover audio
+TimeoutStartSec=30
+
+[Install]
+WantedBy=pipewire.service pipewire-pulse.service

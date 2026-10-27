@@ -1,0 +1,3 @@
+.microg-build/
+.oldsdk-build/
+__pycache__/

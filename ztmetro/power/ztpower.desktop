@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Power Management
+Comment=Battery, SoC sleep time and wake history
+Exec=ztpower
+Terminal=false
+Type=Application
+Icon=ztpower
+Categories=System;Settings;

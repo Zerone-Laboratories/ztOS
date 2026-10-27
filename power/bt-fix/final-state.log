@@ -1,0 +1,17 @@
+Controller 50:77:05:8E:75:B9 (public)
+	Manufacturer: 0x000f (15)
+	Version: 0x09 (9)
+	Name: starlte
+	Alias: starlte
+	Class: 0x006c0110 (7078160)
+	Powered: yes
+	PowerState: on
+	Discoverable: no
+	DiscoverableTimeout: 0x000000b4 (180)
+active
+active
+active
+4100
+[  185.907651] init: Command 'write /proc/sys/kernel/panic_on_oops 1' action=init (/system/etc/init/hw/init.rc:281) took 0ms and failed: Unable to write to file '/proc/sys/kernel/panic_on_oops': open() failed: Read-only file system
+1
+Result=success

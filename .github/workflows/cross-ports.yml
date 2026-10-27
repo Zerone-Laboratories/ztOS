@@ -1,0 +1,56 @@
+name: Cross Ports
+
+# devices.ztos.online's Cross Ports: the phones ztConflo can build ztOS for,
+# from today's postmarketOS ports, minus those already in the ztOS registry.
+# Written to docs/devices/cross-ports.json once a day; committed only when the
+# list changed.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cross-ports
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Zerone-Laboratories/ztconflo
+          path: .cross/ztconflo
+      - uses: actions/checkout@v4
+        with:
+          repository: Zerone-Laboratories/ztos-devices
+          path: .cross/ztos-devices
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: List the phones ztConflo can build
+        run: |
+          cd .cross/ztconflo
+          python -m ztconflo candidates --json \
+            --registry "$GITHUB_WORKSPACE/.cross/ztos-devices" \
+            --pmaports "$GITHUB_WORKSPACE/.cross/pmaports" > "$RUNNER_TEMP/cross-ports.json"
+          python -c "import json,sys; d=json.load(open(sys.argv[1])); assert len(d['devices']) > 0; print(len(d['devices']), 'phones')" "$RUNNER_TEMP/cross-ports.json"
+      - name: Commit when the list changed
+        run: |
+          new="$RUNNER_TEMP/cross-ports.json"
+          old=docs/devices/cross-ports.json
+          # the time it was made changes every day; compare the phones only
+          if [ -f "$old" ] && python -c "import json,sys; a,b=(json.load(open(f)) for f in sys.argv[1:]); sys.exit(0 if a['devices']==b['devices'] else 1)" "$old" "$new"; then
+            echo "no change"; exit 0
+          fi
+          cp "$new" "$old"
+          git config user.name "ztOS Cross Ports"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$old"
+          git commit -m "devices: Cross Ports from ztConflo ($(python -c "import json; print(len(json.load(open('$old'))['devices']))") phones)"
+          git push

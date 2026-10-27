@@ -1,0 +1,12 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- org.ztos.ial.Accel1: An accelerator for small models (IntelligentBoost). Engine is its name, or cpu.
+     Licence: LGPL-2.1-or-later. -->
+<node>
+  <interface name="org.ztos.ial.Accel1">
+    <property name="Version" type="u" access="read"/>
+    <property name="Engine" type="s" access="read"/>
+    <property name="Available" type="b" access="read"/>
+    <property name="DevicePath" type="s" access="read"/>
+  </interface>
+</node>

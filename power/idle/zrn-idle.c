@@ -45,6 +45,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/tick.h>
 #include <linux/suspend.h>
+#include <linux/syscore_ops.h>
 #include <asm/cputype.h>
 #include <asm/memory.h>
 
@@ -335,6 +336,16 @@ static bool zrn_bc_live;
 static unsigned long zrn_mct_hz;
 static unsigned long mct_late_events;
 module_param(mct_late_events, ulong, 0444);
+static void __iomem *gicd, *gicc, *uartbt;
+/* log this many broadcast programs and G0 interrupts after each resume */
+static unsigned int mct_trace, isr_trace, mct_trace_resume;
+module_param(mct_trace_resume, uint, 0644);
+static struct hrtimer watch_timer;
+static int watch_left, watch_resume;
+module_param(watch_resume, int, 0644);
+static enum hrtimer_restart zrn_watch(struct hrtimer *t);
+static unsigned long g0_irqs;
+module_param(g0_irqs, ulong, 0444);
 static DEFINE_RAW_SPINLOCK(mct_lock);
 static unsigned int alarm_irq = ~0U, alarm_seconds;
 static unsigned long alarm_fires;
@@ -385,6 +396,9 @@ static void mct_comp0_stop(void)
 	writel_relaxed(readl_relaxed(mct + MCT_G_INT_ENB) & ~1U, mct + MCT_G_INT_ENB);
 	tcon &= ~MCT_TCON_COMP0_EN;
 	mct_wr(tcon, MCT_G_TCON, 1U << 16);
+	/* a match that landed before the stop stays latched; left there, the
+	 * firmware sees G0 pending at the next SYS_SLEEP and refuses it */
+	writel_relaxed(1, mct + MCT_G_INT_CSTAT);
 }
 
 static int zrn_bc_set_next(unsigned long cycles, struct clock_event_device *evt)
@@ -396,6 +410,14 @@ static int zrn_bc_set_next(unsigned long cycles, struct clock_event_device *evt)
 
 	raw_spin_lock_irqsave(&mct_lock, flags);
 	comp = mct_count() + cycles;
+	if (mct_trace) {
+		mct_trace--;
+		pr_info("zrn-idle: bc set cpu%d cycles %lu comp %llx enb %08x gic en %08x pend %08x tgt %08x\n",
+				smp_processor_id(), cycles, comp, readl_relaxed(mct + MCT_G_INT_ENB),
+				gicd ? readl_relaxed(gicd + 0x100 + 15 * 4) : 0,
+				gicd ? readl_relaxed(gicd + 0x200 + 15 * 4) : 0,
+				gicd ? readl_relaxed(gicd + 0x800 + 498 / 4 * 4) : 0);
+	}
 	tcon = readl_relaxed(mct + MCT_G_TCON);
 
 	writel_relaxed(1, mct + MCT_G_INT_CSTAT);
@@ -429,6 +451,104 @@ static int zrn_bc_stop(struct clock_event_device *evt)
 	raw_spin_unlock_irqrestore(&mct_lock, flags);
 	return 0;
 }
+
+/*
+ * SYS_SLEEP takes the MCT down with the rest of the SoC. On the way back it
+ * comes up stopped, so the count freezes; the late-event check above never
+ * trips, a frozen count never meets the comparator, and the first broadcast
+ * after resume never arrives (measured: hard lockup, cpu1 polling in
+ * tick_check_broadcast_expired). Syscore resume runs before the tick resumes
+ * and the clockevent core re-arms the comparator, so start the counter here.
+ */
+static u32 mct_saved_tcon;
+
+/* GIC_DIST: G0 is SPI 466, hwirq 498: enable/pending word 15, bit 18 */
+#define GICD_PHYS		0x10101000UL
+
+static int zrn_mct_suspend(void *data)
+{
+	if (zrn_bc_live)
+		mct_saved_tcon = readl_relaxed(mct + MCT_G_TCON);
+	return 0;
+}
+
+static void zrn_mct_resume(void *data)
+{
+	u32 tcon;
+	u64 a;
+
+	if (!zrn_bc_live)
+		return;
+	tcon = readl_relaxed(mct + MCT_G_TCON);
+	a = mct_count();
+	if (!(tcon & MCT_TCON_START))
+		mct_wr(tcon | MCT_TCON_START, MCT_G_TCON, 1U << 16);
+	writel_relaxed(3, mct + MCT_G_INT_CSTAT);
+	pr_info("zrn-idle: MCT on resume: tcon %08x (was %08x) int_enb %08x count %llx -> %llx\n",
+		tcon, mct_saved_tcon, readl_relaxed(mct + MCT_G_INT_ENB), a, mct_count());
+	if (gicd)
+		pr_info("zrn-idle: GIC on resume: ctlr %08x G0 en %08x pend %08x act %08x tgt %08x cfg %08x\n",
+			readl_relaxed(gicd), readl_relaxed(gicd + 0x100 + 15 * 4),
+			readl_relaxed(gicd + 0x200 + 15 * 4), readl_relaxed(gicd + 0x300 + 15 * 4),
+			readl_relaxed(gicd + 0x800 + 498 / 4 * 4), readl_relaxed(gicd + 0xc00 + 498 / 16 * 4));
+	mct_trace = mct_trace_resume;
+	isr_trace = mct_trace_resume;
+	if (watch_resume) {
+		watch_left = watch_resume;
+		hrtimer_start(&watch_timer, ms_to_ktime(500), HRTIMER_MODE_REL_PINNED);
+	}
+}
+
+/* After resume, a cpu0-pinned look at the broadcast device once a second:
+ * cpu0 keeps its own arch tick, so this still runs when the broadcast is
+ * stuck and the other cores have stopped ticking. */
+static enum hrtimer_restart zrn_watch(struct hrtimer *t)
+{
+	pr_info("zrn-idle: watch now %lld bc next %lld state %d forced %u retries %lu min %llu | "
+		"count %llx comp %08x%08x tcon %08x enb %08x cstat %08x g0 %lu late %lu\n",
+		ktime_to_ns(ktime_get()), ktime_to_ns(zrn_bc.next_event),
+		(int)zrn_bc.state_use_accessors, zrn_bc.next_event_forced,
+		zrn_bc.retries, zrn_bc.min_delta_ns, mct_count(),
+		readl_relaxed(mct + MCT_G_COMP0_U), readl_relaxed(mct + MCT_G_COMP0_L),
+		readl_relaxed(mct + MCT_G_TCON), readl_relaxed(mct + MCT_G_INT_ENB),
+		readl_relaxed(mct + MCT_G_INT_CSTAT), g0_irqs, mct_late_events);
+	if (gicd) {
+		struct irq_data *d = irq_get_irq_data(zrn_bc_irq);
+
+		pr_info("zrn-idle: watch gic ctlr %08x en %08x pend %08x act %08x tgt %08x | irq dis %d mask %d prog %d cpu %u\n",
+			readl_relaxed(gicd), readl_relaxed(gicd + 0x100 + 15 * 4),
+			readl_relaxed(gicd + 0x200 + 15 * 4), readl_relaxed(gicd + 0x300 + 15 * 4),
+			readl_relaxed(gicd + 0x800 + 498 / 4 * 4),
+			d ? irqd_irq_disabled(d) : -1, d ? irqd_irq_masked(d) : -1,
+			d ? irqd_irq_inprogress(d) : -1,
+			d ? cpumask_first(irq_data_get_effective_affinity_mask(d)) : 99);
+		/* every SPI word with an interrupt both enabled and pending: one
+		 * stuck line, or delivery of all SPIs gone */
+		for (int w = 1; w < 20; w++) {
+			u32 ep = readl_relaxed(gicd + 0x100 + w * 4) & readl_relaxed(gicd + 0x200 + w * 4);
+
+			if (ep)
+				pr_info("zrn-idle: watch spi word %d en&pend %08x\n", w, ep);
+		}
+	}
+	if (uartbt)	/* UART_BT, SPI 422: is it the line that never drops? */
+		pr_info("zrn-idle: watch uartbt ucon %08x utrstat %08x uerstat %08x ufstat %08x uintp %08x uintsp %08x uintm %08x usi %08x/%08x\n",
+			readl_relaxed(uartbt + 0x4), readl_relaxed(uartbt + 0x10),
+			readl_relaxed(uartbt + 0x14), readl_relaxed(uartbt + 0x18),
+			readl_relaxed(uartbt + 0x30), readl_relaxed(uartbt + 0x34),
+			readl_relaxed(uartbt + 0x38), readl_relaxed(uartbt + 0xc4),
+			readl_relaxed(uartbt + 0xc8));
+	if (--watch_left <= 0)
+		return HRTIMER_NORESTART;
+	hrtimer_forward_now(t, ms_to_ktime(1000));
+	return HRTIMER_RESTART;
+}
+
+static const struct syscore_ops zrn_mct_syscore_ops = {
+	.suspend = zrn_mct_suspend,
+	.resume = zrn_mct_resume,
+};
+static struct syscore zrn_mct_syscore = { .ops = &zrn_mct_syscore_ops };
 
 /* Comparator 1 is independent of the broadcast clockevent (comparator 0).
  * It supplies an oscillator-backed, NO_SUSPEND test wakeup even when every
@@ -528,6 +648,12 @@ static irqreturn_t zrn_bc_isr(int irq, void *dev)
 	if (!(readl_relaxed(mct + MCT_G_INT_CSTAT) & 1))
 		return IRQ_NONE;
 	writel_relaxed(1, mct + MCT_G_INT_CSTAT);
+	g0_irqs++;
+	if (isr_trace) {
+		isr_trace--;
+		pr_info("zrn-idle: G0 irq on cpu%d count %llx\n",
+				smp_processor_id(), mct_count());
+	}
 	evt->event_handler(evt);
 	return IRQ_HANDLED;
 }
@@ -548,6 +674,9 @@ static int __init zrn_broadcast_init(void)
 	mct = ioremap(MCT_PHYS, 0x800);
 	if (!mct)
 		return -ENOMEM;
+	gicd = ioremap(GICD_PHYS, 0x1000);
+	gicc = ioremap(GICD_PHYS + 0x1000, 0x1000);	/* CPU interface, banked per core */
+	uartbt = ioremap(0x10840000, 0x100);
 
 	tcon = readl_relaxed(mct + MCT_G_TCON);
 	if (!(tcon & MCT_TCON_START)) {	/* the counter is not even running */
@@ -601,6 +730,8 @@ static int __init zrn_broadcast_init(void)
 	 * Fifteen cycles (<1 us) can expire before it is enabled. */
 	clockevents_config_and_register(&zrn_bc, rate, DIV_ROUND_UP(rate, 5000), UINT_MAX);
 	zrn_bc_live = true;
+	hrtimer_setup(&watch_timer, zrn_watch, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+	register_syscore(&zrn_mct_syscore);
 	zrn_alarm_init(&spec);
 	return 0;
 
@@ -620,6 +751,8 @@ static void zrn_broadcast_exit(void)
 	 * registered but was never installed. */
 	if (!zrn_bc_live)
 		return;
+	unregister_syscore(&zrn_mct_syscore);
+	hrtimer_cancel(&watch_timer);
 	zrn_bc_live = false;
 	if (alarm_irq != ~0U) {
 		unsigned long flags;
@@ -636,6 +769,13 @@ static void zrn_broadcast_exit(void)
 	irq_dispose_mapping(zrn_bc_irq);
 	iounmap(mct);
 	mct = NULL;
+	if (gicd)
+		iounmap(gicd);
+	if (gicc)
+		iounmap(gicc);
+	if (uartbt)
+		iounmap(uartbt);
+	gicd = gicc = uartbt = NULL;
 }
 
 static int __init zrn_idle_init(void)

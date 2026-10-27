@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Start Android at desktop login, wait briefly for readiness, then restore idle freeze.
+set -u
+marker=/run/ztos-waydroid-boot-ready
+rm -f "$marker"
+
+if ! sudo -n /usr/local/libexec/ztos-waydroid-recover prepare; then
+	logger -t ztos-waydroid-boot 'container prepare failed; lazy launch remains available'
+	exit 0
+fi
+
+wayland_socket=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY:-wayland-0}
+for ((i=0; i<100; i++)); do
+	[[ -S $wayland_socket ]] && break
+	sleep 0.1
+done
+if [[ ! -S $wayland_socket ]]; then
+	logger -t ztos-waydroid-boot 'Wayland socket unavailable; lazy launch remains available'
+	exit 0
+fi
+systemctl --user reset-failed ztos-waydroid-session.service 2>/dev/null || true
+if ! systemctl --user start ztos-waydroid-session.service; then
+	logger -t ztos-waydroid-boot 'session start failed; lazy launch remains available'
+	exit 0
+fi
+
+if timeout --signal=TERM --kill-after=2 45 \
+	 sudo -n /usr/local/libexec/ztos-waydroid-recover ready; then
+	install -m644 /dev/null "$marker"
+	if ! ztos-waydroid-power idle; then
+		logger -t ztos-waydroid-boot 'Android ready; idle freeze deferred to normal policy'
+	fi
+	logger -t ztos-waydroid-boot 'Android ready; boot marker set'
+else
+	logger -t ztos-waydroid-boot 'Android not ready within 45 seconds; continuing boot'
+fi
+exit 0

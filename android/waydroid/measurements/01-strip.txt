@@ -1,0 +1,72 @@
+e2fsck 1.47.4 (6-Mar-2025)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 3A: Optimizing directories
+Failed to optimize directory /system/lib64 (2794): Could not allocate block in ext2 filesystem
+Failed to optimize directory /system/system_ext/apex/com.android.vndk.v28/lib (4224): Could not allocate block in ext2 filesystem
+Failed to optimize directory /system/system_ext/apex/com.android.vndk.v29/lib (4676): Could not allocate block in ext2 filesystem
+Failed to optimize directory /system/system_ext/apex/com.android.vndk.v29/lib64 (4930): Could not allocate block in ext2 filesystem
+Failed to optimize directory /system/system_ext/apex/com.android.vndk.v30/lib (5193): Could not allocate block in ext2 filesystem
+Failed to optimize directory /system/system_ext/apex/com.android.vndk.v30/lib64 (5482): Could not allocate block in ext2 filesystem
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+
+/: ***** FILE SYSTEM WAS MODIFIED *****
+/: 6421/6480 files (0.4% non-contiguous), 487057/487057 blocks
+resize2fs 1.47.4 (6-Mar-2025)
+Resizing the filesystem on /usr/share/waydroid-extra/images/.strip.sargvB/system.img to 503441 (4k) blocks.
+The filesystem on /usr/share/waydroid-extra/images/.strip.sargvB/system.img is now 503441 (4k) blocks long.
+
+9880	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/Aperture
+68	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/ApertureLensLauncher
+4332	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/Backgrounds
+7456	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/DeskClock
+6604	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/Etar
+1096	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/ExactCalculator
+15012	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/Gallery2
+4900	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/Jelly
+124	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/LocalContactsBackup
+556	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/PhotoTable
+3748	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/app/Recorder
+10668	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/priv-app/Eleven
+12248	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/product/priv-app/Contacts
+228	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/app/BasicDreams
+5192	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/app/EasterEgg
+184	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/app/PrintRecommendationService
+13108	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/app/NfcNci
+204	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/app/SecureElement
+84	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/app/WallpaperBackup
+68	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/app/HTMLViewer
+96	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/app/CameraExtensionsProxy
+4760	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/priv-app/LiveWallpapersPicker
+6724	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/priv-app/ManagedProvisioning
+588	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/priv-app/BuiltInPrintService
+200	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/priv-app/DynamicSystemInstallationService
+1636	/usr/share/waydroid-extra/images/.strip.sargvB/root/system/priv-app/MtpService
+e2fsck 1.47.4 (6-Mar-2025)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 3A: Optimizing directories
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+
+/: ***** FILE SYSTEM WAS MODIFIED *****
+/: 6258/6912 files (0.3% non-contiguous), 459655/503441 blocks
+resize2fs 1.47.4 (6-Mar-2025)
+Resizing the filesystem on /usr/share/waydroid-extra/images/.strip.sargvB/system.img to 459713 (4k) blocks.
+The filesystem on /usr/share/waydroid-extra/images/.strip.sargvB/system.img is now 459713 (4k) blocks long.
+
+resize2fs 1.47.4 (6-Mar-2025)
+Resizing the filesystem on /usr/share/waydroid-extra/images/.strip.sargvB/system.img to 476097 (4k) blocks.
+The filesystem on /usr/share/waydroid-extra/images/.strip.sargvB/system.img is now 476097 (4k) blocks long.
+
+e2fsck 1.47.4 (6-Mar-2025)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+/: 6258/6480 files (0.4% non-contiguous), 459631/476097 blocks
+Removed 26 directories. Image bytes: 1994985472 -> 1950093312

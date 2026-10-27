@@ -9,7 +9,7 @@
  * does none of this itself: decoding 170 icons would hold up its frames, and
  * a bad icon file must never be able to take the shell down.
  *
- *     ~/.cache/ztmetro/apps            name | glyph | command, one line each
+ *     ~/.cache/ztmetro/apps            name | glyph | command | desktop path
  *     ~/.cache/ztmetro/icons/KEY.a8    the glyph: "ZA8\1", width, height (u16
  *                                      each), then one byte of cover per pixel
  *
@@ -46,6 +46,7 @@
 
 struct app {
 	char id[128];		/* the .desktop file's name */
+	char path[768];		/* exact source file, for safe package removal */
 	char name[96];
 	char icon[160];		/* as the entry names it */
 	char key[96];		/* the glyph's file name, or "-" */
@@ -605,6 +606,58 @@ static bool glyph_ensure(const char *icon, char *key, size_t key_size) {
 	return ok && rename(tmp, file) == 0;
 }
 
+/* System apps use Segoe UI Symbol, never a theme's silhouette. The battery
+ * uses Symbol's monochrome Unicode glyph, not a colour emoji fallback. */
+static bool system_glyph(const char *id, char *key, size_t key_size) {
+	static const struct { const char *id, *glyph; unsigned code; } symbols[] = {
+		{ "ztphone.desktop", "\xee\x84\xba", 0xe13a },
+		{ "ztmessages.desktop", "\xee\x85\x9f", 0xe15f },
+		{ "ztcontacts.desktop", "\xee\x84\xa5", 0xe125 },
+		{ "ztsettings.desktop", "\xee\x84\x95", 0xe115 },
+		{ "ztpower.desktop", "\xf0\x9f\x94\x8b", 0x1f50b },
+		{ "ztcamera.desktop", "\xee\x84\x94", 0xe114 },
+		{ "ztphotos.desktop", "\xee\x85\x98", 0xe158 },
+		{ "ztstore.desktop", "\xee\x85\x8d", 0xe14d },
+		{ "com.zerone.music.desktop", "\xee\x85\x82", 0xe142 },
+		{ "ztfiles.desktop", "\xee\x86\x88", 0xe188 },
+		{ "superscan.desktop", "\xee\x84\xa8", 0xe128 },
+		{ "ztcalendar.desktop", "\xee\x85\xa3", 0xe163 },
+		{ "ztclock.desktop", "\xee\x84\xa1", 0xe121 },
+		{ "ztcalculator.desktop", "\xee\x87\x90", 0xe1d0 },
+		{ "ztdevices.desktop", "\xee\x88\x92", 0xe212 },
+		{ "ztsound.desktop", "\xee\x85\x9d", 0xe15d },
+	};
+	for (size_t i = 0; i < sizeof(symbols) / sizeof(symbols[0]); i++) {
+		if (strcmp(id, symbols[i].id)) continue;
+		snprintf(key, key_size, "segoe-v1-%04x", symbols[i].code);
+		char file[768], tmp[800];
+		snprintf(file, sizeof(file), "%s/icons/%s.a8", cache_dir, key);
+		struct stat st;
+		if (stat(file, &st) == 0 && st.st_size == 8 + GLYPH * GLYPH) return true;
+		cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_A8, GLYPH, GLYPH);
+		cairo_t *cr = cairo_create(surface);
+		cairo_select_font_face(cr, "Segoe UI Symbol", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+		cairo_set_font_size(cr, GLYPH * .78);
+		cairo_text_extents_t ext;
+		cairo_text_extents(cr, symbols[i].glyph, &ext);
+		cairo_move_to(cr, (GLYPH - ext.width) / 2 - ext.x_bearing,
+			(GLYPH - ext.height) / 2 - ext.y_bearing);
+		cairo_set_source_rgba(cr, 1, 1, 1, 1);
+		cairo_show_text(cr, symbols[i].glyph);
+		cairo_destroy(cr);
+		cairo_surface_flush(surface);
+		snprintf(tmp, sizeof(tmp), "%s.new", file);
+		FILE *f = fopen(tmp, "wb");
+		const uint8_t head[8] = { 'Z', 'A', '8', GLYPH_VERSION, GLYPH & 255, GLYPH >> 8, GLYPH & 255, GLYPH >> 8 };
+		bool ok = f && fwrite(head, 1, 8, f) == 8;
+		if (ok) ok = fwrite(cairo_image_surface_get_data(surface), 1, GLYPH * GLYPH, f) == GLYPH * GLYPH;
+		if (f) ok = fclose(f) == 0 && ok;
+		cairo_surface_destroy(surface);
+		return ok && rename(tmp, file) == 0;
+	}
+	return false;
+}
+
 /* ---- .desktop files -------------------------------------------------------- */
 
 static bool in_path(const char *command) {
@@ -629,6 +682,9 @@ static bool in_path(const char *command) {
 
 static void desktop_read(const char *dir, const char *file) {
 	char path[768], line[1024];
+	/* Waydroid recreates its host launchers on every session start. Its
+	 * Android system apps belong to the container, not ztOS's app catalogue. */
+	if (strncmp(file, "waydroid.", 9) == 0) return;
 	snprintf(path, sizeof(path), "%s/%s", dir, file);
 	for (int i = 0; i < n_apps; i++) {
 		if (strcmp(apps[i].id, file) == 0) {
@@ -709,6 +765,7 @@ static void desktop_read(const char *dir, const char *file) {
 	}
 	snprintf(app.command, sizeof(app.command), "%s%s", terminal ? "foot -e " : "", clean);
 	snprintf(app.id, sizeof(app.id), "%s", file);
+	snprintf(app.path, sizeof(app.path), "%s", path);
 	apps[n_apps++] = app;
 }
 
@@ -756,7 +813,17 @@ static bool scan(bool print) {
 		while (dir && (entry = readdir(dir))) {
 			size_t len = strlen(entry->d_name);
 			if (len > 8 && strcmp(entry->d_name + len - 8, ".desktop") == 0) {
-				desktop_read(app_dirs[i], entry->d_name);
+				/* one id, the first folder's (as XDG has it): a NoDisplay
+				 * copy in /usr/local hides a package's own entry */
+				bool shadowed = false;
+				for (int j = 0; j < i && !shadowed; j++) {
+					char earlier[1024];
+					snprintf(earlier, sizeof(earlier), "%s/%s", app_dirs[j], entry->d_name);
+					shadowed = access(earlier, F_OK) == 0;
+				}
+				if (!shadowed) {
+					desktop_read(app_dirs[i], entry->d_name);
+				}
 			}
 		}
 		if (dir) {
@@ -788,7 +855,8 @@ static bool scan(bool print) {
 	}
 	for (int i = 0; i < n_apps; i++) {
 		struct app *app = &apps[i];
-		if (!glyph_ensure(app->icon, app->key, sizeof(app->key))) {
+		if (!system_glyph(app->id, app->key, sizeof(app->key)) &&
+				!glyph_ensure(app->icon, app->key, sizeof(app->key))) {
 			/* the entry's own name is often its icon's too */
 			char id[sizeof(app->id)];
 			memcpy(id, app->id, sizeof(id));
@@ -797,9 +865,9 @@ static bool scan(bool print) {
 				snprintf(app->key, sizeof(app->key), "-");
 			}
 		}
-		fprintf(f, "%s|%s|%s\n", app->name, app->key, app->command);
+		fprintf(f, "%s|%s|%s|%s\n", app->name, app->key, app->command, app->path);
 		if (print) {
-			printf("%s|%s|%s\n", app->name, app->key, app->command);
+			printf("%s|%s|%s|%s\n", app->name, app->key, app->command, app->path);
 		}
 	}
 	bool ok = fclose(f) == 0;

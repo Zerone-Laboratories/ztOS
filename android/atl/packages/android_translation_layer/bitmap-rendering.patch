@@ -1,0 +1,288 @@
+diff --git a/src/api-impl-jni/graphics/android_atl_GskCanvas.c b/src/api-impl-jni/graphics/android_atl_GskCanvas.c
+index 92b1c3d..b2790e1 100644
+--- a/src/api-impl-jni/graphics/android_atl_GskCanvas.c
++++ b/src/api-impl-jni/graphics/android_atl_GskCanvas.c
+@@ -12,10 +12,18 @@ JNIEXPORT void JNICALL Java_android_atl_GskCanvas_native_1drawBitmap__JJIIIIJ(JN
+ 	GdkSnapshot *snapshot = (GdkSnapshot *)_PTR(snapshot_ptr);
+ 	GdkTexture *texture = GDK_TEXTURE(_PTR(texture_ptr));
+ 	struct AndroidPaint *paint = _PTR(paint_ptr);
++	gboolean pushed_opacity = FALSE;
+ 	if (paint->use_color_filter) {
+ 		gtk_snapshot_push_color_matrix(snapshot, &paint->color_matrix, &paint->color_offset);
+ 	}
++	/* Paint alpha was previously ignored for bitmaps; apply it over whatever is inside */
++	if (paint->color.alpha < 1.f) {
++		gtk_snapshot_push_opacity(GTK_SNAPSHOT(snapshot), paint->color.alpha);
++		pushed_opacity = TRUE;
++	}
+ 	gtk_snapshot_append_texture(snapshot, texture, &GRAPHENE_RECT_INIT(x, y, width, height));
++	if (pushed_opacity)
++		gtk_snapshot_pop(snapshot);
+ 	if (paint->use_color_filter)
+ 		gtk_snapshot_pop(snapshot);
+ }
+@@ -25,9 +33,14 @@ JNIEXPORT void JNICALL Java_android_atl_GskCanvas_native_1drawBitmap__JJIIIIIIII
+ 	GdkSnapshot *snapshot = (GdkSnapshot *)_PTR(snapshot_ptr);
+ 	GdkTexture *texture = GDK_TEXTURE(_PTR(texture_ptr));
+ 	struct AndroidPaint *paint = _PTR(paint_ptr);
++	gboolean pushed_opacity = FALSE;
+ 	if (paint->use_color_filter) {
+ 		gtk_snapshot_push_color_matrix(snapshot, &paint->color_matrix, &paint->color_offset);
+ 	}
++	if (paint->color.alpha < 1.f) {
++		gtk_snapshot_push_opacity(GTK_SNAPSHOT(snapshot), paint->color.alpha);
++		pushed_opacity = TRUE;
++	}
+ 	gtk_snapshot_push_clip(snapshot, &GRAPHENE_RECT_INIT(x, y, width, height));
+ 	float xscale = width / (float)src_width;
+ 	float yscale = height / (float)src_height;
+@@ -35,6 +48,8 @@ JNIEXPORT void JNICALL Java_android_atl_GskCanvas_native_1drawBitmap__JJIIIIIIII
+ 	float scaled_height = gdk_texture_get_height(texture) * yscale;
+ 	gtk_snapshot_append_texture(snapshot, texture, &GRAPHENE_RECT_INIT(x - src_x * xscale, y - src_y * yscale, scaled_width, scaled_height));
+ 	gtk_snapshot_pop(snapshot);
++	if (pushed_opacity)
++		gtk_snapshot_pop(snapshot);
+ 	if (paint->use_color_filter)
+ 		gtk_snapshot_pop(snapshot);
+ }
+diff --git a/src/api-impl-jni/graphics/android_graphics_drawable_Drawable.c b/src/api-impl-jni/graphics/android_graphics_drawable_Drawable.c
+index ea6bf74..0173f26 100644
+--- a/src/api-impl-jni/graphics/android_graphics_drawable_Drawable.c
++++ b/src/api-impl-jni/graphics/android_graphics_drawable_Drawable.c
+@@ -87,6 +87,16 @@ JNIEXPORT jlong JNICALL Java_android_graphics_drawable_Drawable_native_1construc
+ 	return _INTPTR(paintable);
+ }
+ 
++/* Same as native_constructor(), but always creates a JavaPaintable, for
++ * classes that override draw() and need snapshot callbacks (e.g. tinted
++ * BitmapDrawable). The returned paintable holds a weak ref to `this'. */
++JNIEXPORT jlong JNICALL Java_android_graphics_drawable_Drawable_native_1new_1java_1paintable(JNIEnv *env, jobject this)
++{
++	JavaPaintable *paintable = g_object_new(java_paintable_get_type(), NULL);
++	paintable->drawable = _WEAK_REF(this);
++	return _INTPTR(paintable);
++}
++
+ static guint queue_invalidate_contents(GdkPaintable *paintable)
+ {
+ 	gdk_paintable_invalidate_contents(paintable);
+diff --git a/src/api-impl/android/graphics/drawable/BitmapDrawable.java b/src/api-impl/android/graphics/drawable/BitmapDrawable.java
+index b374b9d..ab4e97c 100644
+--- a/src/api-impl/android/graphics/drawable/BitmapDrawable.java
++++ b/src/api-impl/android/graphics/drawable/BitmapDrawable.java
+@@ -1,10 +1,14 @@
+ package android.graphics.drawable;
+ 
++import android.atl.GskCanvas;
++import android.content.res.ColorStateList;
+ import android.content.res.Resources;
+ import android.content.res.Resources.Theme;
+ import android.content.res.TypedArray;
+ import android.graphics.Bitmap;
+ import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.ColorFilter;
+ import android.graphics.Paint;
+ import android.graphics.Rect;
+ import android.graphics.RectF;
+@@ -18,6 +22,13 @@ import org.xmlpull.v1.XmlPullParserException;
+ public class BitmapDrawable extends Drawable {
+ 
+ 	private Bitmap bitmap;
++	/* JavaPaintable that renders through draw(Canvas) so tint/alpha reach
++	 * GskCanvas.drawBitmap. The base native_constructor() returns 0 for
++	 * classes that override draw(), so we create one lazily and keep our own
++	 * ref, because setPaintable() unrefs the previous paintable. */
++	private long javaPaintable;
++	private int alpha = 255;
++	private ColorFilter colorFilter;
+ 
+ 	public BitmapDrawable() {
+ 	}
+@@ -34,6 +45,111 @@ public class BitmapDrawable extends Drawable {
+ 			setPaintable(bitmap.getTexture());
+ 	}
+ 
++	private boolean needsJavaPaintable() {
++		return colorFilter != null || alpha != 255;
++	}
++
++	private void applyChanges() {
++		long target = 0;
++		if (bitmap != null) {
++			if (needsJavaPaintable()) {
++				if (javaPaintable == 0) {
++					javaPaintable = native_new_java_paintable();
++					native_ref(javaPaintable);
++				}
++				target = javaPaintable;
++			} else
++				target = bitmap.getTexture();
++		}
++		if (target != paintable)
++			setPaintable(target);
++		invalidateSelf(); /* repaints, and pushes a changed handle via the callback */
++	}
++
++	@Override
++	public void draw(Canvas canvas) {
++		if (bitmap == null || !(canvas instanceof GskCanvas)) {
++			super.draw(canvas);
++			return;
++		}
++		Rect bounds = getBounds();
++		if (bounds.isEmpty())
++			return;
++		Paint paint = new Paint();
++		if (colorFilter != null)
++			paint.setColorFilter(colorFilter);
++		if (alpha != 255)
++			paint.setAlpha(alpha);
++		if (bounds.left != 0 || bounds.top != 0)
++			canvas.translate(bounds.left, bounds.top);
++		canvas.drawBitmap(bitmap, null, new Rect(0, 0, bounds.width(), bounds.height()), paint);
++		if (bounds.left != 0 || bounds.top != 0)
++			canvas.translate(-bounds.left, -bounds.top);
++	}
++
++	@Override
++	public void setAlpha(int alpha) {
++		alpha &= 0xFF;
++		if (alpha != this.alpha) {
++			this.alpha = alpha;
++			applyChanges();
++		}
++	}
++
++	@Override
++	public void setColorFilter(ColorFilter filter) {
++		/* Only PorterDuffColorFilter is backed by the native Paint */
++		if (filter != null && !(filter instanceof android.graphics.PorterDuffColorFilter))
++			return;
++		if (filter != colorFilter) {
++			colorFilter = filter;
++			applyChanges();
++		}
++	}
++
++	@Override
++	public ColorFilter getColorFilter() {
++		return colorFilter;
++	}
++
++	@Override
++	public void setTintList(ColorStateList tint) {
++		setColorFilter(tint == null ? null : new android.graphics.PorterDuffColorFilter(
++			tint.getColorForState(getState(), Color.TRANSPARENT), android.graphics.PorterDuff.Mode.SRC_IN));
++	}
++
++	@Override
++	public ConstantState getConstantState() {
++		/* mutate() still returns `this' (Android semantics);
++		 * separate instances come from newDrawable() */
++		return new ConstantState() {
++			@Override
++			public Drawable newDrawable(Resources res) {
++				return new BitmapDrawable(res, bitmap);
++			}
++
++			@Override
++			public Drawable newDrawable() {
++				return new BitmapDrawable(null, bitmap);
++			}
++
++			@Override
++			public int getChangingConfigurations() {
++				return BitmapDrawable.this.getChangingConfigurations();
++			}
++		};
++	}
++
++	@SuppressWarnings("removal")
++	protected void finalize() throws Throwable {
++		try {
++			if (javaPaintable != 0)
++				native_unref(javaPaintable);
++		} finally {
++			super.finalize();
++		}
++	}
++
+ 	public Bitmap getBitmap() {
+ 		return bitmap;
+ 	}
+@@ -56,7 +172,7 @@ public class BitmapDrawable extends Drawable {
+ 		a.recycle();
+ 		if (bitmap == null)
+ 			throw new XmlPullParserException("<bitmap> needs a valid `src' attribute");
+-		setPaintable(bitmap.getTexture());
++		applyChanges();
+ 	}
+ 
+ 	@Override
+diff --git a/src/api-impl/android/graphics/drawable/Drawable.java b/src/api-impl/android/graphics/drawable/Drawable.java
+index 392415c..b71b362 100644
+--- a/src/api-impl/android/graphics/drawable/Drawable.java
++++ b/src/api-impl/android/graphics/drawable/Drawable.java
+@@ -423,6 +423,7 @@ public class Drawable {
+ 
+ 	protected static native long native_paintable_from_path(String path);
+ 	protected native long native_constructor();
++	protected native long native_new_java_paintable();
+ 	protected native void native_invalidate(long paintable);
+ 	protected native void native_draw(long paintable, long snapshot, int width, int height);
+ 	protected native void native_ref(long paintable);
+diff --git a/src/api-impl/android/widget/ImageView.java b/src/api-impl/android/widget/ImageView.java
+index 796171c..67c36f2 100644
+--- a/src/api-impl/android/widget/ImageView.java
++++ b/src/api-impl/android/widget/ImageView.java
+@@ -19,6 +19,8 @@ public class ImageView extends View {
+ 	private ScaleType scaleType = ScaleType.FIT_CENTER;
+ 	private Drawable drawable = null;
+ 	private ColorFilter colorFilter = null;
++	/* last paintable pushed into the GtkPicture, to detect handle changes */
++	private long lastSetPaintable = 0;
+ 
+ 	public ImageView(Context context) {
+ 		this(context, null);
+@@ -46,6 +48,7 @@ public class ImageView extends View {
+ 			if (colorFilter != null)
+ 				drawable.setColorFilter(colorFilter);
+ 			native_setDrawable(widget, drawable.paintable);
++			lastSetPaintable = drawable.paintable;
+ 		}
+ 		if (a.hasValue(com.android.internal.R.styleable.ImageView_scaleType))
+ 			setScaleType(scaletype_from_int[a.getInt(com.android.internal.R.styleable.ImageView_scaleType, 3 /*CENTER*/)]);
+@@ -84,6 +87,19 @@ public class ImageView extends View {
+ 			drawable.setCallback(this);
+ 		}
+ 		native_setDrawable(widget, drawable != null ? drawable.paintable : 0);
++		lastSetPaintable = drawable != null ? drawable.paintable : 0;
++	}
++
++	@Override
++	public void invalidateDrawable(Drawable drawable) {
++		/* A Drawable that switched its own paintable (e.g. a tinted or
++		 * alpha-scaled BitmapDrawable) needs the new handle pushed into the
++		 * GtkPicture; plain invalidation would keep showing the stale one. */
++		if (drawable != null && drawable.paintable != lastSetPaintable) {
++			lastSetPaintable = drawable.paintable;
++			native_setDrawable(widget, drawable.paintable);
++		}
++		invalidate();
+ 	}
+ 
+ 	public void setImageMatrix(Matrix matrix) {}
+@@ -172,7 +188,11 @@ public class ImageView extends View {
+ 		setImageDrawable(drawable);
+ 	}
+ 
+-	public void setImageAlpha(int alpha) {}
++	public void setImageAlpha(int alpha) {
++		if (drawable != null)
++			drawable.setAlpha(alpha & 0xFF);
++		invalidate();
++	}
+ 
+ 	public void setMaxWidth(int width) {}
+ 

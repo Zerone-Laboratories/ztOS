@@ -1,0 +1,58 @@
+--- a/src/api-impl/android/view/View.java
++++ b/src/api-impl/android/view/View.java
+@@ -98,13 +98,13 @@
+ 	 * This view does not want keystrokes. Use with TAKES_FOCUS_MASK when
+ 	 * calling setFlags.
+ 	 */
+-	private static final int NOT_FOCUSABLE = 0x00000000;
++	public static final int NOT_FOCUSABLE = 0x00000000;
+ 
+ 	/**
+ 	 * This view wants keystrokes. Use with TAKES_FOCUS_MASK when calling
+ 	 * setFlags.
+ 	 */
+-	private static final int FOCUSABLE = 0x00000001;
++	public static final int FOCUSABLE = 0x00000001;
+ 
+ 	/**
+ 	 * Mask for use with setFlags indicating bits used for focus.
+@@ -974,6 +974,8 @@
+ 
+ 	private boolean atl_enabled = true;
+ 	private boolean atl_focusable = true;
++	private int atl_focusableMode = FOCUSABLE;
++	public static final int FOCUSABLE_AUTO = 0x00000010;
+ 
+ 	private Handler handler;
+ 
+@@ -1052,7 +1054,11 @@
+ 			}
+ 		}
+ 		if (a.hasValue(com.android.internal.R.styleable.View_focusable)) {
+-			atl_focusable = a.getBoolean(com.android.internal.R.styleable.View_focusable, true);
++			TypedValue focusableValue = a.peekValue(com.android.internal.R.styleable.View_focusable);
++			if (focusableValue != null && focusableValue.type == TypedValue.TYPE_INT_BOOLEAN)
++				setFocusable(a.getBoolean(com.android.internal.R.styleable.View_focusable, true));
++			else
++				setFocusable(a.getInt(com.android.internal.R.styleable.View_focusable, FOCUSABLE));
+ 		}
+ 		if (a.hasValue(com.android.internal.R.styleable.View_visibility)) {
+ 			visibility = VISIBILITY_FLAGS[a.getInt(com.android.internal.R.styleable.View_visibility, 0)];
+@@ -1288,12 +1294,13 @@
+ 	public void setOnKeyListener(OnKeyListener l) {}
+ 
+ 	public void setFocusable(boolean focusable) {
+-		atl_focusable = focusable;
++		setFocusable(focusable ? FOCUSABLE : NOT_FOCUSABLE);
+ 	}
+ 	public void setFocusable(int focusable) {
+-		atl_focusable = focusable != NOT_FOCUSABLE;
+-	}
+-	public int getFocusable() { return atl_focusable ? FOCUSABLE : NOT_FOCUSABLE; }
++		atl_focusableMode = (focusable & FOCUSABLE_AUTO) != 0 ? FOCUSABLE_AUTO : (focusable & FOCUSABLE);
++		atl_focusable = atl_focusableMode == FOCUSABLE_AUTO ? isClickable() : atl_focusableMode == FOCUSABLE;
++	}
++	public int getFocusable() { return atl_focusableMode; }
+ 	public void setFocusableInTouchMode(boolean focusableInTouchMode) {}
+ 	public final boolean requestFocus() {
+ 		return requestFocus(View.FOCUS_DOWN);

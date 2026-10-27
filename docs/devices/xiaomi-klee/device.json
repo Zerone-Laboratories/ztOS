@@ -1,0 +1,244 @@
+{
+  "id": "xiaomi-klee",
+  "name": "Poco X8 Pro",
+  "maker": "Xiaomi",
+  "model": "2511FRT34C - 2511FPC34G",
+  "codename": "Klee",
+  "maintainer": "Emir Vapur",
+  "contact": "https://github.com/emir34-34/ubuntu-touch-poco-x8-pro",
+  "added": "2026-10-26",
+  "summary": "ztOS on the POCO X8 Pro (MediaTek MT6899, Mali-G720 MC8). It boots from slot B next to HyperOS, which stays untouched on slot A. The kernel is the phone's Android GKI 6.6 with Halium. Ubuntu Touch 24.04 runs the Android vendor services, and ztMETRO with the ztOS apps runs from a chroot. ztOS's data lives in a pinned file inside Android's userdata, so nothing is repartitioned. Graphics are hardware accelerated on the Mali through libhybris (ztMETRO, mpv, Firefox and Flatpak apps). Android apps run in Waydroid (LineageOS 23.2 / Android 16) on the same GPU. A rewrite on Arch Linux ARM, ztOS's own base, is coming soon and will replace the Ubuntu Touch layer.",
+  "photo": "photo.jpg",
+  "photo_caption": "",
+  "specs": [
+    [
+      "SoC",
+      "MediaTek MT6899 - Dimensity 8500-Ultra"
+    ],
+    [
+      "CPU",
+      "8 cores: 1× 3.4 GHz + 3× 3.2 GHz + 4× 2.2 GHz"
+    ],
+    [
+      "GPU",
+      "Arm Mali-G720 MC8"
+    ],
+    [
+      "RAM",
+      "8 or 12 (mine is 8gb model)"
+    ],
+    [
+      "Storage",
+      "256 gb or 512 gb (mine is 256gb model)"
+    ],
+    [
+      "Display",
+      "1268 × 2756 TCL M10 OLED/AMOLED panel"
+    ],
+    [
+      "Battery",
+      "6,500 mAh silicon-carbon battery"
+    ],
+    [
+      "Kernel",
+      "Linux 6.6 (Android GKI) + Halium"
+    ],
+    [
+      "Releasing",
+      "soon"
+    ]
+  ],
+  "install": {
+    "markdown": "> Installation guide coming soon. This port installs as a dual boot next to HyperOS (ztOS on slot B, its data in a pinned file inside userdata, nothing is erased), and its scripts are not public yet."
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage",
+      "status": "working",
+      "notes": "Dual boot: ztOS on slot B, HyperOS on slot A"
+    },
+    {
+      "category": "Display",
+      "feature": "Panel",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": "Mali-G720 through libhybris"
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "CPU, frequency scaling",
+      "status": "working",
+      "notes": "Full clocks after lifting the vendor's boot-time caps"
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charging",
+      "status": "partial",
+      "notes": "Charging works; battery life not measured yet"
+    },
+    {
+      "category": "Power",
+      "feature": "Sleep (suspend)",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "working",
+      "notes": "Headphones,PC,speaker,car stereo pair and play"
+    },
+    {
+      "category": "Network",
+      "feature": "Mobile data",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "SIM and signal",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphone",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Headphones",
+      "status": "working",
+      "notes": "Bluetooth (no headphone jack)"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient Lights",
+      "status": "working",
+      "notes": "Also used to turn the screen off during calls"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, gyroscope",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Proximity",
+      "status": "broken",
+      "notes": "The ultrasound proximity sensor isn't supported; during calls the screen turns off using the ambient light sensor instead(may fix later)"
+    },
+    {
+      "category": "Camera",
+      "feature": "Cameras",
+      "status": "partial",
+      "notes": "Not supported yet but works on lomiri"
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "broken",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "ztMETRO",
+      "status": "working",
+      "notes": "works perfectly(on ubuntu touch 24.04 right now)"
+    },
+    {
+      "category": "Software",
+      "feature": "Android apps (Waydroid)",
+      "status": "partial",
+      "notes": "Android 16 on the GPU with touch and audio; video playback and camera don't work yet"
+    },
+    {
+      "category": "Software",
+      "feature": "ztOSIAL (ztos-ial test)",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Fun stuff",
+      "feature": "Back camera LED's",
+      "status": "working",
+      "notes": "works perfectly (added KleeToys app for customizing the LED's"
+    }
+  ],
+  "notes": [
+    {
+      "title": "ztOS shares space with HyperOS",
+      "text": "Its data is a 64 GB file in HyperOS's storage. Don't delete /data/klee_ztos in HyperOS."
+    },
+    {
+      "title": "Waydroid video playback",
+      "text": "YouTube and other video apps report a player error. Being worked on."
+    },
+    {
+      "title": "Camera",
+      "text": "Not supported yet but works on lomiri"
+    }
+  ]
+}

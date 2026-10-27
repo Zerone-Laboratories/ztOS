@@ -19,15 +19,20 @@ $(info removed programs built for another machine, to build them here: $(FOREIGN
 endif
 
 all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
-	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts splash/ztos-splash \
-	store/ztstore
+	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles splash/ztos-splash \
+	store/ztstore power/ztpower camera/ztcamera sound/ztsound osial/ztosial
 
 sounds/ztos-sounds: sounds/ztos-sounds.c
 	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags libpulse) -o $@ $< $(shell pkg-config --libs libpulse) -lm
 
+# ztOSIAL (libztos-ial) when this system has it: the phone's backlight and
+# battery come from there, and the shell falls back to looking for itself
+IAL_FLAGS := $(shell pkg-config --exists ztos-ial 2>/dev/null && echo -DHAVE_ZTOS_IAL $$(pkg-config --cflags ztos-ial))
+IAL_LIBS := $(shell pkg-config --exists ztos-ial 2>/dev/null && pkg-config --libs --static ztos-ial)
+
 ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h
-	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
-		-o $@ ztmetro.c $(shell pkg-config --libs $(PKGS)) -lm -lpthread
+	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(IAL_FLAGS) \
+		-o $@ ztmetro.c $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
 
 xdg-shell-protocol.h:
 	wayland-scanner server-header $(XDG) $@
@@ -41,21 +46,42 @@ apps/ztapps: apps/ztapps.c
 VIEWPORTER := $(WP)/stable/viewporter/viewporter.xml
 CORE = core/zrnmetrocore.c core/zrnmetrogpu.c core/xdg-shell-protocol.c core/viewporter-protocol.c
 CORE_DEPS = $(CORE) core/zrnmetrocore.h core/zrnmetrogpu.h core/zrnmetrorender.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
-APP_BUILD = $(CC) $(CFLAGS) $(WARN) -Icore $(shell pkg-config --cflags $(APP_PKGS))
-APP_LIBS = $(shell pkg-config --libs $(APP_PKGS)) -lm
+APP_BUILD = $(CC) $(CFLAGS) $(WARN) -Icore $(shell pkg-config --cflags $(APP_PKGS)) $(IAL_FLAGS)
+APP_LIBS = $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS) -lm
 
-settings/ztsettings: settings/ztsettings.c $(CORE_DEPS)
+# ztCamera: the camera, in the Lumia Camera look (see camera/CAMERA-DRIVERS.md
+# for why its viewfinder runs against a source that is not a sensor)
+camera/ztcamera: camera/ztcamera.c $(CORE_DEPS)
+	$(APP_BUILD) -o $@ camera/ztcamera.c $(CORE) $(APP_LIBS)
+
+settings/ztsettings: settings/ztsettings.c settings/boostpage.h $(CORE_DEPS)
 	$(APP_BUILD) -o $@ settings/ztsettings.c $(CORE) $(APP_LIBS)
 
 devtest/zrndevtest: devtest/zrndevtest.c $(CORE_DEPS)
 	$(APP_BUILD) -o $@ devtest/zrndevtest.c $(CORE) $(APP_LIBS)
 
 # Devices and Services: what is running, crashed or missing
+# ztSound: the equalizer and effects (the engine, ztos-soundd, ships in rootfs/overlay/usr/local/bin)
+sound/ztsound: sound/ztsound.c $(CORE_DEPS)
+	$(APP_BUILD) $(shell pkg-config --cflags json-c) -o $@ sound/ztsound.c $(CORE) $(APP_LIBS) $(shell pkg-config --libs json-c)
+
 devices/ztdevices: devices/ztdevices.c $(CORE_DEPS)
 	$(APP_BUILD) -o $@ devices/ztdevices.c $(CORE) $(APP_LIBS)
 
-perfd/zrnperfd: perfd/zrnperfd.c perfd/tickle.c perfd/tickle.h
-	$(CC) $(CFLAGS) $(WARN) -o $@ perfd/zrnperfd.c perfd/tickle.c
+# File browser: the same ZrnMetroCore pages, tilt and turnstile transitions.
+files/ztfiles: files/ztfiles.c $(CORE_DEPS)
+	$(APP_BUILD) $(shell pkg-config --cflags gio-2.0) -o $@ files/ztfiles.c $(CORE) $(APP_LIBS) $(shell pkg-config --libs gio-2.0)
+
+# OSIAL Management: ztOSIAL's interfaces, whether they answer, and the device's capabilities
+osial/ztosial: osial/ztosial.c $(CORE_DEPS)
+	$(APP_BUILD) $(shell pkg-config --cflags json-c) -o $@ osial/ztosial.c $(CORE) $(APP_LIBS) $(shell pkg-config --libs json-c)
+
+# Power Management: battery fuel gauge, sleep diagnostics, wake history
+power/ztpower: power/ztpower.c $(CORE_DEPS)
+	$(APP_BUILD) -o $@ power/ztpower.c $(CORE) $(APP_LIBS)
+
+perfd/zrnperfd: perfd/zrnperfd.c perfd/tickle.c perfd/tickle.h background-apps.h ztos-user.h perfd/iblog.c perfd/iblog.h perfd/ibnet.c perfd/ibnet.h perfd/perfial.c perfd/perfial.h
+	$(CC) $(CFLAGS) $(WARN) -o $@ perfd/zrnperfd.c perfd/tickle.c perfd/iblog.c perfd/ibnet.c perfd/perfial.c -lm
 
 sensord/ztoscsf-sensord: sensord/ztoscsf-sensord.c
 	$(CC) $(CFLAGS) $(WARN) -o $@ sensord/ztoscsf-sensord.c -lm
@@ -148,6 +174,8 @@ check-arch: all
 	done; exit $$bad
 
 install: check-arch
+	install -Dm755 demoloop/ztos-demoloop /usr/local/bin/ztos-demoloop
+	install -Dm644 demoloop/ztos-demoloop.service /usr/lib/systemd/user/ztos-demoloop.service
 	install -Dm755 auth/ztos-polkit-agent /usr/local/bin/ztos-polkit-agent
 	install -Dm755 sounds/ztos-sounds /usr/local/bin/ztos-sounds
 	install -Dm755 ztmetro /usr/local/bin/ztmetro
@@ -159,6 +187,21 @@ install: check-arch
 	install -Dm755 devices/ztdevices /usr/local/bin/ztdevices
 	install -Dm644 devices/ztdevices.desktop /usr/local/share/applications/ztdevices.desktop
 	install -Dm644 devices/ztdevices.svg /usr/local/share/icons/hicolor/scalable/apps/ztdevices.svg
+	install -Dm755 files/ztfiles /usr/local/bin/ztfiles
+	install -Dm644 files/ztfiles.desktop /usr/local/share/applications/ztfiles.desktop
+	install -Dm644 files/ztfiles.svg /usr/local/share/icons/hicolor/scalable/apps/ztfiles.svg
+	install -Dm755 sound/ztsound /usr/local/bin/ztsound
+	install -Dm644 sound/ztsound.desktop /usr/local/share/applications/ztsound.desktop
+	install -Dm644 sound/ztsound.svg /usr/local/share/icons/hicolor/scalable/apps/ztsound.svg
+	install -Dm755 power/ztpower /usr/local/bin/ztpower
+	install -Dm755 osial/ztosial /usr/local/bin/ztosial
+	install -Dm644 osial/ztosial.desktop /usr/local/share/applications/ztosial.desktop
+	install -Dm644 osial/ztosial.svg /usr/local/share/icons/hicolor/scalable/apps/ztosial.svg
+	install -Dm644 power/ztpower.desktop /usr/local/share/applications/ztpower.desktop
+	install -Dm644 power/ztpower.svg /usr/local/share/icons/hicolor/scalable/apps/ztpower.svg
+	install -Dm755 camera/ztcamera /usr/local/bin/ztcamera
+	install -Dm644 camera/ztcamera.desktop /usr/local/share/applications/ztcamera.desktop
+	install -Dm644 camera/ztcamera.svg /usr/local/share/icons/hicolor/scalable/apps/ztcamera.svg
 	install -Dm755 store/ztstore /usr/local/bin/ztstore
 	install -Dm644 store/data/sections /etc/ztstore/sections
 	install -Dm644 store/data/ztstore.desktop /usr/local/share/applications/ztstore.desktop
@@ -181,8 +224,8 @@ install: check-arch
 	install -Dm644 csf/ztoscoresensorframework.service /etc/systemd/system/ztoscoresensorframework.service
 
 clean:
-	rm -f auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
-		phone/ztphone messages/ztmessages contacts/ztcontacts store/ztstore core/viewporter-protocol.c core/viewporter-client-protocol.h \
+	rm -f sound/ztsound osial/ztosial auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices power/ztpower perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
+		phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles store/ztstore camera/ztcamera core/viewporter-protocol.c core/viewporter-client-protocol.h \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c
 
 # Uses a private Wayland seat; does not touch the running compositor or display.
@@ -203,6 +246,11 @@ check-auth: xdg-shell-protocol.h
 	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
 		-o /tmp/ztmetro-auth-test tests/auth-prompt.c $(shell pkg-config --libs $(PKGS)) -lm
 	/tmp/ztmetro-auth-test
+
+.PHONY: check-demoloop-stop
+check-demoloop-stop:
+	$(CC) -std=c11 -Wall -Wextra -Werror -o /tmp/ztmetro-demoloop-stop-test demoloop/test-stop-key.c
+	/tmp/ztmetro-demoloop-stop-test
 
 # The native agent uses polkit's async callback API directly.
 auth/ztos-polkit-agent: auth/ztos-polkit-agent.c

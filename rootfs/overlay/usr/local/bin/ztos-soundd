@@ -1,0 +1,947 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""ztos-soundd: ztOS's system sound effects.
+
+One PipeWire filter-chain (run as its own `pipewire -c` client so it can be
+rebuilt without touching the user's PipeWire) sits between every stream and
+the real output:
+
+    streams -> ztos-eq (virtual sink, the default) -> chain -> real output
+
+The chain is: preamp, 10 band parametric EQ, bass boost, loudness, optional
+leveler (LSP compressor), stereo widener, crossfeed, optional HRTF virtual
+speakers (PipeWire's builtin sofa spatializer + libmysofa), LSP limiter, and a
+bit-exact dry/wet mixer that is the bypass.
+
+Settings live in ~/.config/ztmetro/sound.json, one profile each for the
+speaker, headphones and bluetooth; the profile follows the real output.
+Apps (ztsound) send one-line datagrams to $XDG_RUNTIME_DIR/ztos-sound.sock;
+parameter changes go to the running graph (no reload) through one persistent
+pw-cli. Only a change of spatial mode or of the real output rebuilds the graph.
+
+The state ztsound shows is $XDG_RUNTIME_DIR/ztos-sound-state.json.
+
+Datagrams:
+    p PROFILE band I F G Q      one band
+    p PROFILE KEY VALUE         a field of the profile (preamp, bass, ...)
+    p PROFILE preset NAME       load a preset into the profile
+    p PROFILE savepreset NAME   keep the profile's curve as a custom preset
+    p PROFILE delpreset NAME
+    g KEY VALUE                 enabled, output, crossfade, crossfade_seconds
+    dev NODE PROFILE            pin a device to a profile ("auto" to unpin)
+    refresh | quit
+"""
+import json
+import math
+import os
+import select
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG = os.path.join(HOME, ".config/ztmetro/sound.json")
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+SOCK = os.path.join(RUN, "ztos-sound.sock")
+STATE = os.path.join(RUN, "ztos-sound-state.json")
+CONF = os.path.join(RUN, "ztos-sound-chain.conf")
+SINK = "ztos-eq"
+SOFA = "/usr/share/libmysofa/default.sofa"
+LADSPA = "lsp-plugins-ladspa"
+LSP = "http://lsp-plug.in/plugins/ladspa/"
+
+FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+PRESETS = {
+    "Flat": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "Bass": [6, 5, 4, 2, 0, 0, 0, 0, 0, 0],
+    "Treble": [0, 0, 0, 0, 0, 1, 2, 4, 5, 6],
+    "Vocal": [-2, -2, -1, 1, 3, 4, 3, 1, 0, -1],
+    "Rock": [5, 4, 2, -1, -2, -1, 2, 4, 5, 5],
+    "Pop": [-1, 1, 3, 4, 3, 0, -1, -1, -2, -2],
+    "Jazz": [3, 2, 1, 2, -2, -2, 0, 1, 2, 3],
+    "Classical": [4, 3, 2, 1, -1, -1, 0, 2, 3, 4],
+}
+PROFILES = ("speaker", "headphones", "bluetooth")
+SPATIAL = ("off", "surround51", "surround71", "atmos3d")
+
+
+def default_profile():
+    return {
+        "preset": "Flat", "preamp": 0.0,
+        "bands": [{"f": f, "g": 0.0, "q": 0.7 if i in (0, 9) else 1.0} for i, f in enumerate(FREQS)],
+        "bass": 0.0, "loudness": 0.0, "leveler": False,
+        "surround": False, "width": 50.0,
+        "crossfeed": False, "crossfeed_amount": 50.0,
+        "spatial": "off", "spatial_amount": 70.0,
+    }
+
+
+def default_config():
+    cfg = {"version": 1, "enabled": True, "output": "auto", "auto_headroom": True,
+           "crossfade": False, "crossfade_seconds": 6.0,
+           "profiles": {p: default_profile() for p in PROFILES},
+           "presets": {}, "device_profiles": {}}
+    cfg["profiles"]["speaker"]["surround"] = False
+    cfg["profiles"]["headphones"]["crossfeed"] = False
+    return cfg
+
+
+def merge(base, new):
+    """new over base, keeping only keys base knows (lists of bands by index)."""
+    if isinstance(base, dict):
+        if not isinstance(new, dict):
+            return base
+        out = {}
+        for k, v in base.items():
+            out[k] = merge(v, new[k]) if k in new else v
+        for k in ("presets", "device_profiles"):
+            if k in base and isinstance(new.get(k), dict):
+                out[k] = new[k]
+        return out
+    if isinstance(base, list):
+        if not isinstance(new, list):
+            return base
+        return [merge(b, new[i]) if i < len(new) else b for i, b in enumerate(base)]
+    if isinstance(base, bool):
+        return bool(new)
+    if isinstance(base, (int, float)):
+        try:
+            return float(new)
+        except (TypeError, ValueError):
+            return base
+    return new if isinstance(new, type(base)) else base
+
+
+def log(*a):
+    print("ztos-soundd:", *a, file=sys.stderr, flush=True)
+
+
+# ---- the filter maths (RBJ cookbook) only for the auto headroom ------------
+def _bq(kind, f, gain_db, q, fs=48000.0):
+    A = 10 ** (gain_db / 40.0)
+    w0 = 2 * math.pi * f / fs
+    cw, sw = math.cos(w0), math.sin(w0)
+    al = sw / (2 * q)
+    if kind == "peak":
+        b = (1 + al * A, -2 * cw, 1 - al * A)
+        a = (1 + al / A, -2 * cw, 1 - al / A)
+    elif kind == "low":
+        s = 2 * math.sqrt(A) * al
+        b = (A * ((A + 1) - (A - 1) * cw + s), 2 * A * ((A - 1) - (A + 1) * cw), A * ((A + 1) - (A - 1) * cw - s))
+        a = ((A + 1) + (A - 1) * cw + s, -2 * ((A - 1) + (A + 1) * cw), (A + 1) + (A - 1) * cw - s)
+    else:
+        s = 2 * math.sqrt(A) * al
+        b = (A * ((A + 1) + (A - 1) * cw + s), -2 * A * ((A - 1) + (A + 1) * cw), A * ((A + 1) + (A - 1) * cw - s))
+        a = ((A + 1) - (A - 1) * cw + s, 2 * ((A - 1) - (A + 1) * cw), (A + 1) - (A - 1) * cw - s)
+    return b, a
+
+
+def _mag_db(b, a, f, fs=48000.0):
+    w = 2 * math.pi * f / fs
+    z1 = complex(math.cos(w), -math.sin(w))
+    z2 = z1 * z1
+    num = b[0] + b[1] * z1 + b[2] * z2
+    den = a[0] + a[1] * z1 + a[2] * z2
+    return 20 * math.log10(max(abs(num / den), 1e-9))
+
+
+def stages(p):
+    out = []
+    for i, b in enumerate(p["bands"]):
+        out.append(("low" if i == 0 else "high" if i == 9 else "peak", b["f"], b["g"], b["q"]))
+    out.append(("low", 90.0, p["bass"], 0.707))
+    out.append(("low", 120.0, p["loudness"] * 0.10, 0.707))
+    out.append(("high", 7000.0, p["loudness"] * 0.05, 0.707))
+    return out
+
+
+def peak_gain_db(p):
+    st = [s for s in stages(p) if abs(s[2]) > 0.01]
+    if not st:
+        return 0.0
+    best = 0.0
+    n = 120
+    for k in range(n + 1):
+        f = 20.0 * (20000.0 / 20.0) ** (k / n)
+        tot = 0.0
+        for kind, fc, g, q in st:
+            b, a = _bq(kind, fc, g, q)
+            tot += _mag_db(b, a, f)
+        best = max(best, tot)
+    return best
+
+
+# ---- the graph -------------------------------------------------------------
+def lin(db):
+    return 10 ** (db / 20.0)
+
+
+def spk_layout(mode):
+    """virtual speakers: (name, azimuth, elevation, feed)"""
+    base = [("fl", 30, 0, "xL"), ("fr", -30, 0, "xR"), ("c", 0, 0, "mid")]
+    if mode == "surround51":
+        return base + [("sl", 110, 0, "sL"), ("sr", -110, 0, "sR")]
+    if mode == "surround71":
+        return base + [("sl", 90, 0, "sL"), ("sr", -90, 0, "sR"), ("bl", 150, 0, "bL"), ("br", -150, 0, "bR")]
+    if mode == "atmos3d":
+        return base + [("sl", 100, 0, "sL"), ("sr", -100, 0, "sR"), ("hl", 45, 40, "hL"), ("hr", -45, 40, "hR")]
+    return []
+
+
+class Graph:
+    """The node list as data: name -> (type, label, extra config, controls)."""
+
+    def __init__(self, mode):
+        self.mode = mode
+        self.nodes = []   # (name, type, label, plugin, config, controls)
+        self.links = []
+        self.inputs = ["inL:In", "inR:In"]
+        self.outputs = ["oL:Out", "oR:Out"]
+        self.build()
+
+    def node(self, name, label, typ="builtin", plugin=None, config=None):
+        self.nodes.append((name, typ, label, plugin, config))
+
+    def link(self, a, b):
+        self.links.append((a, b))
+
+    def build(self):
+        n, L = self.node, self.link
+        both = "LR"
+        for c in both:
+            n("in" + c, "copy")
+            n("pre" + c, "linear")
+            L("in%s:Out" % c, "pre%s:In" % c)
+            prev = "pre%s:Out" % c
+            for i in range(10):
+                n("eq%s%d" % (c, i), "bq_lowshelf" if i == 0 else "bq_highshelf" if i == 9 else "bq_peaking")
+                L(prev, "eq%s%d:In" % (c, i))
+                prev = "eq%s%d:Out" % (c, i)
+            for nm, lab in (("bass", "bq_lowshelf"), ("loLo", "bq_lowshelf"), ("loHi", "bq_highshelf")):
+                n(nm + c, lab)
+                L(prev, "%s%s:In" % (nm, c))
+                prev = "%s%s:Out" % (nm, c)
+            self.__dict__["tail" + c] = prev
+        # leveler (stereo)
+        n("comp", LSP + "compressor_stereo", "ladspa", LADSPA)
+        L(self.tailL, "comp:Input L")
+        L(self.tailR, "comp:Input R")
+        # widener: L' = a L + b R, R' = b L + a R
+        n("wL", "mixer")
+        n("wR", "mixer")
+        L("comp:Output L", "wL:In 1")
+        L("comp:Output R", "wL:In 2")
+        L("comp:Output L", "wR:In 1")
+        L("comp:Output R", "wR:In 2")
+        # crossfeed: the other ear, low-passed and a hair late
+        n("cfLPr", "bq_lowpass")
+        n("cfLPl", "bq_lowpass")
+        n("cfDr", "delay", config={"max-delay": 0.01})
+        n("cfDl", "delay", config={"max-delay": 0.01})
+        L("wR:Out", "cfLPr:In")
+        L("cfLPr:Out", "cfDr:In")
+        L("wL:Out", "cfLPl:In")
+        L("cfLPl:Out", "cfDl:In")
+        n("cL", "mixer")
+        n("cR", "mixer")
+        L("wL:Out", "cL:In 1")
+        L("cfDr:Out", "cL:In 2")
+        L("wR:Out", "cR:In 1")
+        L("cfDl:Out", "cR:In 2")
+        xl, xr = "cL:Out", "cR:Out"
+        if self.mode != "off":
+            xl, xr = self.spatial(xl, xr)
+        n("lim", LSP + "limiter_stereo", "ladspa", LADSPA)
+        L(xl, "lim:Input L")
+        L(xr, "lim:Input R")
+        # the dry/wet mixer is the bypass: x*1 + y*0 is x, exactly
+        n("oL", "mixer")
+        n("oR", "mixer")
+        L("inL:Out", "oL:In 1")
+        L("lim:Output L", "oL:In 2")
+        L("inR:Out", "oR:In 1")
+        L("lim:Output R", "oR:In 2")
+
+    def spatial(self, xl, xr):
+        n, L = self.node, self.link
+        spk = spk_layout(self.mode)
+        feeds = {"xL": xl, "xR": xr}
+        n("mid", "mixer")
+        L(xl, "mid:In 1")
+        L(xr, "mid:In 2")
+        feeds["mid"] = "mid:Out"
+        n("sLm", "mixer")
+        n("sRm", "mixer")
+        for m in ("sLm", "sRm"):
+            L(xl, m + ":In 1")
+            L(xr, m + ":In 2")
+        feeds["sL"], feeds["sR"] = "sLm:Out", "sRm:Out"
+        if self.mode == "surround71":
+            for c, src in (("L", "sLm"), ("R", "sRm")):
+                n("bd" + c, "delay", config={"max-delay": 0.05})
+                n("blp" + c, "bq_lowpass")
+                L(src + ":Out", "bd%s:In" % c)
+                L("bd%s:Out" % c, "blp%s:In" % c)
+                feeds["b" + c] = "blp%s:Out" % c
+        if self.mode == "atmos3d":
+            for c, src in (("L", "sLm"), ("R", "sRm")):
+                n("hhp" + c, "bq_highpass")
+                L(src + ":Out", "hhp%s:In" % c)
+                feeds["h" + c] = "hhp%s:Out" % c
+        n("wetL", "mixer")
+        n("wetR", "mixer")
+        for i, (nm, az, el, feed) in enumerate(spk):
+            n("sp_" + nm, "spatializer", "sofa", None, {"filename": SOFA})
+            L(feeds[feed], "sp_%s:In" % nm)
+            L("sp_%s:Out L" % nm, "wetL:In %d" % (i + 1))
+            L("sp_%s:Out R" % nm, "wetR:In %d" % (i + 1))
+        n("sL", "mixer")
+        n("sR", "mixer")
+        L(xl, "sL:In 1")
+        L("wetL:Out", "sL:In 2")
+        L(xr, "sR:In 1")
+        L("wetR:Out", "sR:In 2")
+        return "sL:Out", "sR:Out"
+
+
+def controls(cfg, profile, wet):
+    """Every control port of the graph for these settings: {"node:Port": float}.
+    wet is 0..1, the bypass mixer (0 is the exact dry path)."""
+    p = cfg["profiles"][profile]
+    c = {}
+    pre = p["preamp"]
+    if cfg.get("auto_headroom", True):
+        pre -= peak_gain_db(p)
+    for ch in "LR":
+        c["pre%s:Mult" % ch] = lin(pre)
+        c["pre%s:Add" % ch] = 0.0
+        for i, b in enumerate(p["bands"]):
+            c["eq%s%d:Freq" % (ch, i)] = float(b["f"])
+            c["eq%s%d:Q" % (ch, i)] = float(b["q"])
+            c["eq%s%d:Gain" % (ch, i)] = float(b["g"])
+        c["bass%s:Freq" % ch] = 90.0
+        c["bass%s:Q" % ch] = 0.707
+        c["bass%s:Gain" % ch] = float(p["bass"])
+        c["loLo%s:Freq" % ch] = 120.0
+        c["loLo%s:Q" % ch] = 0.707
+        c["loLo%s:Gain" % ch] = p["loudness"] * 0.10
+        c["loHi%s:Freq" % ch] = 7000.0
+        c["loHi%s:Q" % ch] = 0.707
+        c["loHi%s:Gain" % ch] = p["loudness"] * 0.05
+    # leveler
+    c["comp:Bypass"] = 0.0 if p["leveler"] else 1.0
+    c["comp:Compression mode"] = 0.0
+    c["comp:Attack threshold (G)"] = 0.126
+    c["comp:Ratio"] = 3.0
+    c["comp:Attack time (ms)"] = 20.0
+    c["comp:Release time (ms)"] = 300.0
+    c["comp:Knee (G)"] = 0.5
+    c["comp:Makeup gain (G)"] = 1.6
+    # widener: width 50% is as recorded; 100% is two and a half times the sides
+    w = 1.0 + p["width"] / 100.0 * 1.5 if p["surround"] else 1.0
+    a, b = (1 + w) / 2, (1 - w) / 2
+    c["wL:Gain 1"], c["wL:Gain 2"] = a, b
+    c["wR:Gain 1"], c["wR:Gain 2"] = b, a
+    # crossfeed (bs2b style): 700 Hz low-pass, 0.3 ms, level 0.6 at full
+    amt = (p["crossfeed_amount"] / 100.0) if p["crossfeed"] else 0.0
+    g2 = 0.6 * amt
+    for side in ("r", "l"):
+        c["cfLP%s:Freq" % side] = 700.0
+        c["cfLP%s:Q" % side] = 0.5
+        c["cfD%s:Delay (s)" % side] = 0.0003
+    c["cL:Gain 1"] = c["cR:Gain 1"] = 1.0 / (1.0 + g2)
+    c["cL:Gain 2"] = c["cR:Gain 2"] = g2 / (1.0 + g2)
+    # limiter: -1 dBFS ceiling, never lifts the level
+    c["lim:Threshold (G)"] = lin(-1.0)
+    c["lim:Gain boost"] = 0.0
+    c["lim:Automatic level regulation"] = 0.0
+    c["lim:Input gain (G)"] = 1.0
+    c["lim:Output gain (G)"] = 1.0
+    # spatial
+    mode = p["spatial"]
+    if mode != "off":
+        s = p["spatial_amount"] / 100.0
+        c["sL:Gain 1"] = c["sR:Gain 1"] = 1.0 - s
+        c["sL:Gain 2"] = c["sR:Gain 2"] = s * 0.8
+        c["mid:Gain 1"] = c["mid:Gain 2"] = 0.5
+        c["sLm:Gain 1"], c["sLm:Gain 2"] = 0.5, -0.5
+        c["sRm:Gain 1"], c["sRm:Gain 2"] = -0.5, 0.5
+        spk = spk_layout(mode)
+        for i, (nm, az, el, feed) in enumerate(spk):
+            c["sp_%s:Azimuth" % nm] = float(az)
+            c["sp_%s:Elevation" % nm] = float(el)
+            c["sp_%s:Radius" % nm] = 1.0
+            c["wetL:Gain %d" % (i + 1)] = c["wetR:Gain %d" % (i + 1)] = 1.0 if feed != "mid" else 1.0
+        if mode == "surround71":
+            for ch in "LR":
+                c["bd%s:Delay (s)" % ch] = 0.012
+                c["blp%s:Freq" % ch] = 6000.0
+                c["blp%s:Q" % ch] = 0.707
+        if mode == "atmos3d":
+            for ch in "LR":
+                c["hhp%s:Freq" % ch] = 1500.0
+                c["hhp%s:Q" % ch] = 0.707
+    c["oL:Gain 1"] = c["oR:Gain 1"] = 1.0 - wet
+    c["oL:Gain 2"] = c["oR:Gain 2"] = wet
+    return c
+
+
+def fnum(v):
+    return "%.9g" % v if "." in "%.9g" % v or "e" in "%.9g" % v else "%.1f" % v
+
+
+def conf_text(graph, ctl, target, description):
+    by_node = {}
+    for k, v in ctl.items():
+        nm, port = k.split(":", 1)
+        by_node.setdefault(nm, []).append((port, v))
+    out = []
+    w = out.append
+    w("context.properties = { log.level = 1 }")
+    w("context.spa-libs = { audio.convert.* = audioconvert/libspa-audioconvert support.* = support/libspa-support }")
+    w("context.modules = [")
+    w(" { name = libpipewire-module-rt args = { } flags = [ ifexists nofail ] }")
+    w(" { name = libpipewire-module-protocol-native }")
+    w(" { name = libpipewire-module-client-node }")
+    w(" { name = libpipewire-module-adapter }")
+    w(" { name = libpipewire-module-filter-chain")
+    w("  args = {")
+    w('   node.description = "%s"' % description)
+    w('   media.name = "%s"' % description)
+    w("   filter.graph = {")
+    w("    nodes = [")
+    for name, typ, label, plugin, config in graph.nodes:
+        s = "     { type = %s name = %s" % (typ, name)
+        if plugin:
+            s += " plugin = %s" % plugin
+        s += ' label = "%s"' % label
+        if config:
+            s += " config = { " + " ".join(
+                '"%s" = %s' % (k, json.dumps(v)) for k, v in config.items()) + " }"
+        cs = by_node.get(name)
+        if cs:
+            s += " control = { " + " ".join('"%s" = %s' % (k, fnum(v)) for k, v in cs) + " }"
+        w(s + " }")
+    w("    ]")
+    w("    links = [")
+    for a, b in graph.links:
+        w('     { output = "%s" input = "%s" }' % (a, b))
+    w("    ]")
+    w("    inputs = [ %s ]" % " ".join('"%s"' % i for i in graph.inputs))
+    w("    outputs = [ %s ]" % " ".join('"%s"' % i for i in graph.outputs))
+    w("   }")
+    w("   audio.channels = 2")
+    w("   audio.position = [ FL FR ]")
+    w("   capture.props = { node.name = %s media.class = Audio/Sink priority.session = 3000 node.pause-on-idle = true }" % SINK)
+    w('   playback.props = { node.name = %s.out node.passive = true target.object = "%s" stream.dont-remix = true node.dont-fallback = true }' % (SINK, target))
+    w("  }")
+    w(" }")
+    w("]")
+    return "\n".join(out) + "\n"
+
+
+# ---- the daemon ------------------------------------------------------------
+def classify(sink, devices):
+    """speaker | headphones | bluetooth, from a sink's properties"""
+    name = sink.get("node.name", "")
+    if name.startswith("bluez_output") or sink.get("api.bluez5.address") or sink.get("device.api") == "bluez5":
+        return "bluetooth"
+    ff = sink.get("device.form-factor", "")
+    if ff in ("headphone", "headset", "hands-free", "handsfree"):
+        return "headphones"
+    if "usb" in name.lower() or sink.get("device.bus") == "usb":
+        return "headphones"
+    route = devices.get(sink.get("device.id"), "")
+    if any(k in route.lower() for k in ("headphone", "headset", "earphone")):
+        return "headphones"
+    return "speaker"
+
+
+class Daemon:
+    def __init__(self):
+        self.cfg = default_config()
+        self.load()
+        self.chain = None          # the pipewire -c subprocess
+        self.cli = None            # persistent pw-cli
+        self.node_id = None
+        self.graph_key = None
+        self.target = None
+        self.target_desc = ""
+        self.outputs = []
+        self.active = "speaker"
+        self.applied = {}
+        self.wet = 1.0 if self.cfg["enabled"] else 0.0
+        self.wet_goal = self.wet
+        self.dirty_params = False
+        self.save_at = 0.0
+        self.state_at = 0.0
+        self.eval_at = 0.0
+        self.retry_at = 0.0
+        self.last_flush = 0.0
+        self.sub = None
+        self.sock = None
+        self.running = True
+        self.default_ok = False
+        self.last_build = 0.0
+
+    # config
+    def load(self):
+        try:
+            with open(CONFIG) as f:
+                self.cfg = merge(default_config(), json.load(f))
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        tmp = CONFIG + ".new"
+        with open(tmp, "w") as f:
+            json.dump(self.cfg, f, indent=1)
+        os.replace(tmp, CONFIG)
+
+    def touch_save(self):
+        self.save_at = time.time() + 0.6
+
+    def write_state(self):
+        st = {"active": self.active, "target": self.target, "target_desc": self.target_desc,
+              "chain": self.node_id is not None, "outputs": self.outputs,
+              "wet": self.wet, "config": self.cfg, "time": time.time()}
+        tmp = STATE + ".new"
+        with open(tmp, "w") as f:
+            json.dump(st, f)
+        os.replace(tmp, STATE)
+
+    # pipewire
+    def pw_dump(self):
+        try:
+            return json.loads(subprocess.check_output(["pw-dump"], timeout=10, stderr=subprocess.DEVNULL))
+        except Exception:
+            return None
+
+    def evaluate(self):
+        """Look at the real outputs; decide the target and profile."""
+        d = self.pw_dump()
+        if d is None:
+            return False
+        routes = {}
+        for o in d:
+            if o.get("type", "").endswith(":Device"):
+                for r in o.get("info", {}).get("params", {}).get("Route", []):
+                    if r.get("direction") == "Output":
+                        routes[o["id"]] = (r.get("name") or "") + " " + (r.get("description") or "")
+        sinks = []
+        for o in d:
+            if not o.get("type", "").endswith(":Node"):
+                continue
+            pr = o.get("info", {}).get("props", {})
+            if pr.get("media.class") != "Audio/Sink" or pr.get("node.name", "").startswith(SINK):
+                continue
+            pr = dict(pr)
+            pr["id"] = o["id"]
+            sinks.append(pr)
+        self.outputs = []
+        for s in sinks:
+            name = s["node.name"]
+            prof = self.cfg["device_profiles"].get(name) or classify(s, routes)
+            self.outputs.append({"name": name, "desc": s.get("node.description", name),
+                                 "priority": s.get("priority.session", 0), "profile": prof,
+                                 "pinned": name in self.cfg["device_profiles"]})
+        want = self.cfg["output"]
+        names = [o["name"] for o in self.outputs]
+        if want != "auto" and want in names:
+            target = want
+        elif self.outputs:
+            target = max(self.outputs, key=lambda o: o["priority"])["name"]
+        else:
+            target = None
+        for o in self.outputs:
+            o["current"] = o["name"] == target
+        prof = next((o["profile"] for o in self.outputs if o["name"] == target), "speaker")
+        desc = next((o["desc"] for o in self.outputs if o["name"] == target), "")
+        changed = target != self.target or prof != self.active
+        self.target_desc = desc
+        if target is None:
+            self.target = None
+            self.write_state()
+            return True
+        self.active = prof
+        old = self.target
+        self.target = target
+        if old != target or self.chain is None or self.chain.poll() is not None or self.node_id is None:
+            self.rebuild()
+        elif changed:
+            self.after_profile_change()
+        self.write_state()
+        return True
+
+    def after_profile_change(self):
+        key = self.cfg["profiles"][self.active]["spatial"]
+        if key != self.graph_key:
+            self.rebuild()
+        else:
+            self.dirty_params = True
+
+    def stop_chain(self):
+        if self.chain and self.chain.poll() is None:
+            self.chain.terminate()
+            try:
+                self.chain.wait(3)
+            except subprocess.TimeoutExpired:
+                self.chain.kill()
+        self.chain = None
+        self.node_id = None
+        self.default_ok = False
+        self.applied = {}
+
+    def rebuild(self):
+        if self.target is None:
+            return
+        # never a storm: a graph is rebuilt at most once in four seconds
+        wait = self.last_build + 4.0 - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        self.last_build = time.time()
+        self.stop_chain()
+        mode = self.cfg["profiles"][self.active]["spatial"]
+        graph = Graph(mode)
+        ctl = controls(self.cfg, self.active, self.wet)
+        with open(CONF + ".new", "w") as f:
+            f.write(conf_text(graph, ctl, self.target, "ztOS Sound"))
+        os.replace(CONF + ".new", CONF)
+        self.graph_key = mode
+        env = dict(os.environ)
+        self.chain = subprocess.Popen(["pipewire", "-c", CONF], env=env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        while time.time() < deadline and self.chain.poll() is None:
+            d = self.pw_dump() or []
+            for o in d:
+                pr = o.get("info", {}).get("props", {}) if isinstance(o.get("info"), dict) else {}
+                if pr.get("node.name") == SINK and o.get("type", "").endswith(":Node"):
+                    self.node_id = o["id"]
+            if self.node_id is not None:
+                break
+            time.sleep(0.2)
+        if self.node_id is None:
+            log("chain did not come up")
+            self.stop_chain()
+            self.retry_at = time.time() + 3
+            return
+        self.applied = dict(ctl)
+        self.open_cli()
+        self.set_default()
+        log("chain up: node %s, mode %s, profile %s, target %s" % (self.node_id, mode, self.active, self.target))
+
+    def open_cli(self):
+        if self.cli and self.cli.poll() is None:
+            return
+        self.cli = subprocess.Popen(["pw-cli"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, text=True)
+
+    def get_default(self):
+        try:
+            return subprocess.check_output(["pactl", "get-default-sink"], text=True, timeout=5,
+                                           stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            return ""
+
+    def set_default(self):
+        """Make the chain's sink the default, and look until WirePlumber agrees."""
+        self.default_ok = False
+        for _ in range(20):
+            try:
+                names = subprocess.check_output(["pactl", "list", "short", "sinks"], text=True,
+                                                stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                names = ""
+            if "\t%s\t" % SINK in names:
+                subprocess.run(["pactl", "set-default-sink", SINK], stderr=subprocess.DEVNULL)
+                time.sleep(0.5)
+                got = self.get_default()
+                if got == SINK:
+                    self.default_ok = True
+                    break
+                log("default is %r, not the chain yet" % got)
+            else:
+                time.sleep(0.3)
+
+    def move_inputs(self):
+        """Streams that were sent to a real output by hand go through the chain
+        again; never the chain's own output stream."""
+        try:
+            out = json.loads(subprocess.check_output(["pactl", "-f", "json", "list", "sink-inputs"],
+                                                     timeout=5, stderr=subprocess.DEVNULL))
+        except Exception:
+            return
+        for si in out:
+            pr = si.get("properties", {})
+            if pr.get("node.name", "").startswith(SINK) or pr.get("node.link-group"):
+                continue
+            subprocess.run(["pactl", "move-sink-input", str(si["index"]), SINK], stderr=subprocess.DEVNULL)
+
+    def push(self, changes):
+        if not changes or self.node_id is None:
+            return
+        self.open_cli()
+        items = " ".join('"%s" %s' % (k, fnum(v)) for k, v in changes.items())
+        try:
+            self.cli.stdin.write("set-param %d Props { params = [ %s ] }\n" % (self.node_id, items))
+            self.cli.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.cli = None
+            return
+        self.applied.update(changes)
+
+    def flush_params(self):
+        if self.node_id is None:
+            return
+        want = controls(self.cfg, self.active, self.wet)
+        diff = {k: v for k, v in want.items() if k not in self.applied or abs(self.applied[k] - v) > 1e-9}
+        # a mixer whose gain moves may not be sent half way: both gains in one call
+        self.push(diff)
+        self.dirty_params = False
+        self.last_flush = time.time()
+
+    def step_wet(self):
+        if abs(self.wet - self.wet_goal) < 1e-9:
+            return False
+        step = 0.12
+        if self.wet < self.wet_goal:
+            self.wet = min(self.wet_goal, self.wet + step)
+        else:
+            self.wet = max(self.wet_goal, self.wet - step)
+        self.dirty_params = True
+        return True
+
+    # commands
+    def command(self, line):
+        parts = line.strip().split(None, 3)
+        if not parts:
+            return
+        try:
+            if parts[0] == "p" and len(parts) >= 3:
+                self.cmd_profile(parts)
+            elif parts[0] == "g" and len(parts) >= 3:
+                self.cmd_global(parts[1], line.strip().split(None, 2)[2])
+            elif parts[0] == "dev" and len(parts) >= 3:
+                if parts[2] == "auto":
+                    self.cfg["device_profiles"].pop(parts[1], None)
+                elif parts[2] in PROFILES:
+                    self.cfg["device_profiles"][parts[1]] = parts[2]
+                self.touch_save()
+                self.eval_at = time.time() + 0.05
+            elif parts[0] == "refresh":
+                self.eval_at = time.time()
+            elif parts[0] == "quit":
+                self.running = False
+        except (ValueError, KeyError, IndexError) as e:
+            log("bad command %r: %s" % (line, e))
+        self.state_at = time.time() + 0.15
+
+    def cmd_global(self, key, value):
+        if key == "enabled":
+            self.cfg["enabled"] = value in ("1", "true", "on")
+            self.wet_goal = 1.0 if self.cfg["enabled"] else 0.0
+        elif key == "output":
+            self.cfg["output"] = value
+            self.eval_at = time.time() + 0.05
+        elif key == "crossfade":
+            self.cfg["crossfade"] = value in ("1", "true", "on")
+        elif key == "crossfade_seconds":
+            self.cfg["crossfade_seconds"] = max(1.0, min(12.0, float(value)))
+        elif key == "auto_headroom":
+            self.cfg["auto_headroom"] = value in ("1", "true", "on")
+            self.dirty_params = True
+        self.touch_save()
+
+    def cmd_profile(self, parts):
+        prof = parts[1]
+        if prof not in PROFILES:
+            return
+        p = self.cfg["profiles"][prof]
+        key = parts[2]
+        if key == "band":
+            i, f, g, q = parts[3].split()
+            b = p["bands"][int(i)]
+            b["f"] = max(20.0, min(20000.0, float(f)))
+            b["g"] = max(-15.0, min(15.0, float(g)))
+            b["q"] = max(0.3, min(10.0, float(q)))
+            p["preset"] = "Custom"
+        elif key == "preset":
+            name = parts[3]
+            gains = PRESETS.get(name)
+            if gains is None and name in self.cfg["presets"]:
+                src = self.cfg["presets"][name]
+                p["preamp"] = float(src.get("preamp", 0.0))
+                for i, b in enumerate(src["bands"][:10]):
+                    p["bands"][i].update({"f": float(b["f"]), "g": float(b["g"]), "q": float(b["q"])})
+            elif gains is not None:
+                p["preamp"] = 0.0
+                for i, g in enumerate(gains):
+                    p["bands"][i].update({"f": float(FREQS[i]), "g": float(g), "q": 0.7 if i in (0, 9) else 1.0})
+            else:
+                return
+            p["preset"] = name
+        elif key == "savepreset":
+            self.cfg["presets"][parts[3]] = {"preamp": p["preamp"], "bands": [dict(b) for b in p["bands"]]}
+            p["preset"] = parts[3]
+        elif key == "delpreset":
+            self.cfg["presets"].pop(parts[3], None)
+        elif key in ("leveler", "surround", "crossfeed"):
+            p[key] = parts[3] in ("1", "true", "on")
+        elif key == "spatial":
+            if parts[3] not in SPATIAL:
+                return
+            p["spatial"] = parts[3]
+        elif key in ("preamp", "bass", "loudness", "width", "crossfeed_amount", "spatial_amount"):
+            lim = {"preamp": (-12, 12), "bass": (0, 12), "loudness": (0, 100), "width": (0, 100),
+                   "crossfeed_amount": (0, 100), "spatial_amount": (0, 100)}[key]
+            p[key] = max(lim[0], min(lim[1], float(parts[3])))
+        else:
+            return
+        self.touch_save()
+        if prof == self.active:
+            if key == "spatial" and p["spatial"] != self.graph_key:
+                self.rebuild()
+            else:
+                self.dirty_params = True
+
+    # main loop
+    def start(self):
+        os.makedirs(RUN, exist_ok=True)
+        try:
+            os.unlink(SOCK)
+        except OSError:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.sock.bind(SOCK)
+        self.sock.setblocking(False)
+
+    def open_sub(self):
+        if self.sub and self.sub.poll() is None:
+            return
+        try:
+            self.sub = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True)
+            os.set_blocking(self.sub.stdout.fileno(), False)
+        except OSError:
+            self.sub = None
+
+    def run(self):
+        self.start()
+        signal.signal(signal.SIGTERM, lambda *a: setattr(self, "running", False))
+        signal.signal(signal.SIGINT, lambda *a: setattr(self, "running", False))
+        self.eval_at = time.time()
+        while self.running:
+            now = time.time()
+            self.open_sub()
+            fds = [self.sock]
+            if self.sub:
+                fds.append(self.sub.stdout)
+            timeout = 1.0
+            if self.dirty_params or abs(self.wet - self.wet_goal) > 1e-9:
+                timeout = 0.02
+            for t in (self.save_at, self.state_at, self.eval_at):
+                if t:
+                    timeout = min(timeout, max(0.0, t - now))
+            try:
+                r, _, _ = select.select(fds, [], [], timeout)
+            except InterruptedError:
+                continue
+            now = time.time()
+            for f in r:
+                if f is self.sock:
+                    try:
+                        while True:
+                            data = self.sock.recv(4096)
+                            self.command(data.decode("utf-8", "replace"))
+                    except BlockingIOError:
+                        pass
+                else:
+                    try:
+                        data = self.sub.stdout.read() or ""
+                    except (BlockingIOError, TypeError):
+                        data = ""
+                    if data == "" and self.sub.poll() is not None:
+                        self.sub = None
+                    elif "on server" in data or "on sink #" in data:
+                        self.eval_at = now + 0.4
+            if self.eval_at and now >= self.eval_at:
+                self.eval_at = 0.0
+                if not self.evaluate():
+                    self.eval_at = now + 2
+                else:
+                    # an explicit default elsewhere (the shell's output switch) becomes the output
+                    self.check_default()
+            if self.chain is not None and self.chain.poll() is not None:
+                log("chain exited")
+                self.stop_chain()
+                self.eval_at = now + 1
+            if self.chain is None and self.target and now >= self.retry_at and not self.eval_at:
+                self.eval_at = now + 1
+                self.retry_at = now + 3
+            if self.step_wet():
+                pass
+            if self.dirty_params and now - self.last_flush >= 0.015:
+                self.flush_params()
+            if self.save_at and now >= self.save_at:
+                self.save_at = 0.0
+                try:
+                    self.save()
+                except OSError as e:
+                    log("save failed", e)
+            if self.state_at and now >= self.state_at:
+                self.state_at = 0.0
+                try:
+                    self.write_state()
+                except OSError:
+                    pass
+        self.shutdown()
+
+    def check_default(self):
+        cur = self.get_default()
+        if cur != SINK:
+            log("check_default: %r ok=%s node=%s" % (cur, self.default_ok, self.node_id))
+        if cur and cur != SINK and self.node_id is not None and self.default_ok:
+            if any(o["name"] == cur for o in self.outputs):
+                log("default moved to %s: now the chain's output" % cur)
+                self.cfg["output"] = cur
+                self.touch_save()
+                self.target = None
+            self.set_default()
+            self.move_inputs()
+            self.eval_at = time.time() + 0.2
+
+    def shutdown(self):
+        try:
+            self.save()
+        except OSError:
+            pass
+        self.stop_chain()
+        if self.cli:
+            self.cli.terminate()
+        if self.sub:
+            self.sub.terminate()
+        try:
+            os.unlink(SOCK)
+        except OSError:
+            pass
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--conf":
+        # print the graph for a profile, for checking: ztos-soundd --conf [profile]
+        d = Daemon()
+        prof = sys.argv[2] if len(sys.argv) > 2 else "speaker"
+        if len(sys.argv) > 3:
+            d.cfg["profiles"][prof]["spatial"] = sys.argv[3]
+        g = Graph(d.cfg["profiles"][prof]["spatial"])
+        sys.stdout.write(conf_text(g, controls(d.cfg, prof, 1.0), "TARGET", "ztOS Sound"))
+        return
+    Daemon().run()
+
+
+if __name__ == "__main__":
+    main()

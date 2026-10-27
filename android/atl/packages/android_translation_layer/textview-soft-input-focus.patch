@@ -1,0 +1,24 @@
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -37,6 +37,7 @@ public class TextView extends View {
+ 	private boolean include_padding = false;
+ 	private int break_strategy = 0 /*BREAK_STRATEGY_SIMPLE*/;
+ 	private int hyphenation_frequency = 0 /*HYPHENATION_FREQUENCY_NONE*/;
++	private boolean showSoftInputOnFocus = true;
+ 	private int gravity = Gravity.TOP | Gravity.START;
+ 
+ 	public TextView(Context context, AttributeSet attrs) {
+@@ -490,7 +491,13 @@ public class TextView extends View {
+ 
+ 	public void setMarqueeRepeatLimit(int marqueeLimit) {}
+ 
+-	public void setShowSoftInputOnFocus(boolean showSoftInputOnFocus) {}
++	public boolean getShowSoftInputOnFocus() {
++		return showSoftInputOnFocus;
++	}
++
++	public void setShowSoftInputOnFocus(boolean showSoftInputOnFocus) {
++		this.showSoftInputOnFocus = showSoftInputOnFocus;
++	}
+ 
+ 	public void setCustomInsertionActionModeCallback(ActionMode.Callback actionModeCallback) {}

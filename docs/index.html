@@ -3,8 +3,28 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>ztOS wiki</title>
-<meta name="description" content="ztOS is a phone operating system with Windows Phone 8.1's look and motion, on Arch Linux ARM and mainline Linux, running on the Galaxy S9.">
+<title>ztOS: a Windows Phone-style Linux phone OS (ztMETRO shell)</title>
+<meta name="description" content="ztOS is an open-source phone operating system with Windows Phone 8.1's look and motion (the ztMETRO shell), on Arch Linux ARM and mainline Linux. Runs on the Galaxy S9, in QEMU, and on phones postmarketOS supports, with Android apps through Waydroid.">
+<link rel="canonical" href="https://ztos.online/">
+<meta name="robots" content="index, follow, max-image-preview:large">
+<meta name="theme-color" content="#121212">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="ztOS">
+<meta property="og:title" content="ztOS: Windows Phone 8.1's look and motion, on Linux">
+<meta property="og:description" content="ztOS is an open-source phone operating system with Windows Phone 8.1's look and motion (the ztMETRO shell), on Arch Linux ARM and mainline Linux. Runs on the Galaxy S9, in QEMU, and on phones postmarketOS supports, with Android apps through Waydroid.">
+<meta property="og:url" content="https://ztos.online/">
+<meta property="og:image" content="https://ztos.online/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="ztOS's Start screen on a Galaxy S9">
+<meta property="og:locale" content="en_AU">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="ztOS: Windows Phone 8.1's look and motion, on Linux">
+<meta name="twitter:description" content="ztOS is an open-source phone operating system with Windows Phone 8.1's look and motion (the ztMETRO shell), on Arch Linux ARM and mainline Linux. Runs on the Galaxy S9, in QEMU, and on phones postmarketOS supports, with Android apps through Waydroid.">
+<meta name="twitter:image" content="https://ztos.online/og.jpg">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"WebSite","@id":"https://ztos.online/#website","url":"https://ztos.online/","name":"ztOS","inLanguage":"en-AU","publisher":{"@id":"https://ztos.online/#org"}},{"@type":"Organization","@id":"https://ztos.online/#org","name":"Zerone Laboratories","url":"https://ztos.online/","logo":"https://ztos.online/favicon.svg","sameAs":["https://github.com/Zerone-Laboratories"]},{"@type":"SoftwareApplication","name":"ztOS","applicationCategory":"OperatingSystem","operatingSystem":"Linux (aarch64)","softwareVersion":"0.2.0 BETA-1","description":"ztOS is an open-source phone operating system with Windows Phone 8.1's look and motion (the ztMETRO shell), on Arch Linux ARM and mainline Linux. Runs on the Galaxy S9, in QEMU, and on phones postmarketOS supports, with Android apps through Waydroid.","url":"https://ztos.online/","image":"https://ztos.online/og.jpg","license":"https://www.gnu.org/licenses/gpl-3.0.html","downloadUrl":"https://github.com/Zerone-Laboratories/ztOS","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"author":{"@id":"https://ztos.online/#org"}}]}</script>
+<meta name="ztos-submit" content="https://ztos-device-submit.ztos.workers.dev/submit">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&display=swap" rel="stylesheet">
@@ -213,6 +233,96 @@
     .side-nav.open { display: flex; }
     .side-foot { margin-top: 1rem; }
   }
+  /* Device list: status colours (Working, Partial, Broken, Untested) */
+  :root {
+    --st-working-bg: #d5efd2; --st-working-fg: #123f17;
+    --st-partial-bg: #fbecbd; --st-partial-fg: #533e00;
+    --st-broken-bg: #f6d2cf; --st-broken-fg: #66130e;
+    --st-untested-bg: #e2e5eb; --st-untested-fg: #353c48;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --st-working-bg: #1d3b21; --st-working-fg: #bfe8bb;
+      --st-partial-bg: #463a10; --st-partial-fg: #f4dd9d;
+      --st-broken-bg: #4a1e1b; --st-broken-fg: #f3c0bb;
+      --st-untested-bg: #2b3039; --st-untested-fg: #c8ced8;
+    }
+  }
+  :root[data-theme="dark"] {
+    --st-working-bg: #1d3b21; --st-working-fg: #bfe8bb;
+    --st-partial-bg: #463a10; --st-partial-fg: #f4dd9d;
+    --st-broken-bg: #4a1e1b; --st-broken-fg: #f3c0bb;
+    --st-untested-bg: #2b3039; --st-untested-fg: #c8ced8;
+  }
+  .st, td.st { font-style: normal; }
+  i.st { display: inline-block; padding: 0.05rem 0.45rem; font-size: 0.8125rem; font-weight: 450; }
+  .st.working { background: var(--st-working-bg); color: var(--st-working-fg); }
+  .st.partial { background: var(--st-partial-bg); color: var(--st-partial-fg); }
+  .st.broken { background: var(--st-broken-bg); color: var(--st-broken-fg); }
+  .st.untested { background: var(--st-untested-bg); color: var(--st-untested-fg); }
+  td.st { font-weight: 450; white-space: nowrap; }
+  .legend { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; font-size: 0.875rem; color: var(--mute); margin-bottom: 1.25rem; }
+  .legend i { margin-right: 0.35rem; }
+  .mute { color: var(--mute); }
+
+
+  /* Device list carousel: one large card at a time */
+  .carousel { border: 1px solid var(--line); background: var(--panel); }
+  .track { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; scrollbar-width: none; }
+  .track::-webkit-scrollbar { display: none; }
+  .slide { flex: 0 0 100%; scroll-snap-align: start; display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    color: inherit; text-decoration: none; min-height: 360px; }
+  .slide img { width: 100%; height: 100%; object-fit: cover; border-right: 1px solid var(--line); background: var(--faint); }
+  .slide-body { display: flex; flex-direction: column; gap: 0.35rem; padding: 1.25rem 1.5rem; }
+  .slide-body > small { color: var(--mute); font-size: 0.875rem; }
+  .slide-body b { font-weight: 300; font-stretch: 90%; font-size: clamp(1.75rem, 3.5vw, 2.5rem); letter-spacing: -0.03em; line-height: 1.05; }
+  .slide .pills { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.4rem 0; }
+  .slide .summary { font-size: 0.9375rem; margin-bottom: 0.4rem; }
+  .slide .kv { display: grid; grid-template-columns: 6.5rem 1fr; gap: 0.75rem; font-size: 0.875rem; border-top: 1px solid var(--faint); padding-top: 0.35rem; }
+  .slide .kv span { color: var(--mute); }
+  .slide .more { margin-top: auto; padding-top: 0.75rem; font-weight: 450; }
+  .slide:hover .more { text-decoration: underline; text-underline-offset: 0.2em; }
+  .carousel-nav { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.6rem 0.75rem; border-top: 1px solid var(--line); }
+  .carousel.single .carousel-nav { display: none; }
+  /* ztMETRO's logo beside its heading */
+  .with-logo { display: flex; align-items: center; gap: 0.6rem; }
+  .ztmetro-logo { width: 2.1rem; height: auto; flex: none; fill: currentColor; }
+  .credit { color: var(--mute); font-size: 0.8125rem; margin: 0.9rem 0 0.4rem; }
+  .profile { display: inline-flex; align-items: center; gap: 0.6rem; padding: 0.4rem 0.8rem 0.4rem 0.4rem; text-decoration: none;
+    border: 1px solid var(--line); background: var(--panel); transition: background-color 120ms linear, color 120ms linear; }
+  .profile:hover { background: var(--ink); color: var(--paper); }
+  .profile .avatar { position: relative; width: 2.5rem; height: 2.5rem; border-radius: 50%; overflow: hidden; flex: none;
+    background: linear-gradient(45deg, #f9ce34, #ee2a7b, #6228d7); display: grid; place-items: center; }
+  .profile .avatar svg { width: 1.45rem; height: 1.45rem; }
+  .profile .avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .profile b { display: block; font-weight: 500; font-size: 0.9375rem; line-height: 1.2; }
+  .profile small { display: block; font-size: 0.75rem; opacity: 0.7; }
+  /* Community Ports: the photo, and under it the name on a white bar */
+  .slide-pic { display: flex; flex-direction: column; border-right: 1px solid var(--line); min-width: 0; }
+  .slide-pic img { flex: 1; min-height: 0; border-right: 0; }
+  .nameplate { display: flex; flex-direction: column; gap: 0.3rem; padding: 1rem 1.25rem 1.1rem; background: #ffffff; color: #111111;
+    border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+  .nameplate span { font-size: 0.875rem; color: #555555; }
+  .nameplate b { font-weight: 300; font-stretch: 90%; font-size: clamp(1.75rem, 3.8vw, 2.75rem); letter-spacing: -0.035em; line-height: 1; }
+  .slide.text .slide-mark { display: flex; flex-direction: column; justify-content: flex-end; gap: 0.4rem; padding: 1.5rem;
+    border-right: 1px solid var(--line); background: var(--ink); color: var(--paper); min-height: 100%; overflow: hidden; overflow-wrap: anywhere; }
+  .slide.text .slide-mark span { font-size: 0.9375rem; opacity: 0.7; }
+  .slide.text .slide-mark b { font-weight: 300; font-stretch: 90%; font-size: clamp(2rem, 4.5vw, 3.25rem); letter-spacing: -0.035em; line-height: 1; }
+  .exp { display: inline-block; font-size: 0.75rem; font-weight: 450; letter-spacing: 0.04em; vertical-align: 0.35em; margin-left: 0.4rem;
+    padding: 0.05rem 0.4rem; border: 1px dashed #e51400; color: #e51400; }
+  .body h3 .exp { font-stretch: 100%; }
+  .carousel .where { display: none; font-size: 0.875rem; color: var(--mute); font-variant-numeric: tabular-nums; }
+  .carousel.many .dots button { display: none; }
+  .carousel.many .where { display: inline; }
+  .dots { display: flex; gap: 0.4rem; flex-wrap: wrap; justify-content: center; }
+  .dots button { width: 0.7rem; height: 0.7rem; padding: 0; border: 1px solid var(--line); background: transparent; cursor: pointer; }
+  .dots button[aria-current="true"] { background: var(--ink); }
+  @media (max-width: 760px) {
+    .slide { grid-template-columns: 1fr; }
+    .slide img { max-height: 280px; border-right: 0; border-bottom: 1px solid var(--line); }
+    .slide-pic { border-right: 0; border-bottom: 1px solid var(--line); }
+    .slide.text .slide-mark { border-right: 0; border-bottom: 1px solid var(--line); min-height: 140px; }
+  }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
@@ -232,20 +342,23 @@
     </div>
     <ul id="toc">
       <li><a href="#overview">Overview</a></li>
+      <li>
+        <a href="#installing">Installing</a>
+        <ul class="sub-nav">
+          <li><a href="#install-computer">Get the computer ready</a></li>
+          <li><a href="#install-emulator">Try it in the emulator</a></li>
+          <li><a href="#install-listed">On a listed phone</a></li>
+          <li><a href="#install-new">Port it to another phone</a></li>
+          <li><a href="#install-help">If something goes wrong</a></li>
+        </ul>
+      </li>
       <li><a href="#screens">Screenshots</a></li>
       <li><a href="#ztmetro">ztMETRO</a></li>
       <li><a href="#apps">Apps</a></li>
       <li><a href="#sdk">The SDK</a></li>
       <li><a href="#services">System services</a></li>
-      <li>
-        <a href="#s9">The Galaxy S9 port</a>
-        <ul class="sub-nav">
-          <li><a href="#installing">Installing</a></li>
-          <li><a href="#hardware">Hardware status</a></li>
-          <li><a href="#quirks">Known quirks</a></li>
-          <li><a href="#recovery">Getting back in</a></li>
-        </ul>
-      </li>
+      <li><a href="#structure">GSI and ztOSIAL</a></li>
+      <li><a href="#devices">Device list</a></li>
       <li><a href="#ztconflo">ztConflo: other phones</a></li>
       <li><a href="#status">Status and next</a></li>
       <li><a href="#see-also">See also</a></li>
@@ -267,27 +380,100 @@
         <p class="crumb">Zerone Laboratories / operating systems</p>
         <h1>ztOS</h1>
         <p class="lead">A phone operating system with Windows Phone 8.1's look and motion, on Arch Linux ARM and mainline Linux.</p>
-        <p>ztOS is the ztMETRO shell, its own apps, an updater and an SDK for apps in Python and Qt, on an ordinary Arch Linux ARM system. It runs on the Samsung Galaxy S9 (SM-G960N, starlte) and in the QEMU emulator. Everything that moves is drawn by the GPU.</p>
-        <p>It is alpha software. The S9 port runs a mainline 7.1 kernel with the phone's GPU, display, touch, Wi-Fi, 4G data, sound and sensors working. ztConflo, its image builder, is how it reaches other phones.</p>
+        <p>ztOS is the ztMETRO shell, its own apps, an updater and an SDK for apps in Python and Qt, on an ordinary Arch Linux ARM system. It runs on the phones in the <a href="#devices">device list</a> and in the QEMU emulator. Everything that moves is drawn by the GPU.</p>
+        <p>It is beta software. Since BETA-1 ztOS is a generic system image (GSI) plus a small layer per phone, the two meeting at ztOSIAL (Zerone Technologies Operating System Interface Abstraction Layer), its hardware interface layer. The S9 port runs a mainline 7.1 kernel with the phone's GPU, display, touch, Wi-Fi, 4G data, sound and sensors working. ztConflo, its image builder, is how it reaches other phones.</p>
         <div class="actions">
-          <a class="btn" href="#installing">Install it</a>
+          <a class="btn" href="https://devices.ztos.online">View Device List</a>
+          <a class="btn ghost" href="#installing">Install it</a>
           <a class="btn ghost" href="https://github.com/Zerone-Laboratories/ztOS">View the source</a>
         </div>
       </div>
       <aside class="infobox" aria-label="At a glance">
         <div class="cap">ztOS at a glance</div>
         <dl>
-          <dt>Version</dt><dd>0.1.0 alpha 2</dd>
+          <dt>Version</dt><dd>0.2.0 beta 1</dd>
           <dt>Shell</dt><dd>ztMETRO</dd>
           <dt>Base</dt><dd>Arch Linux ARM, systemd</dd>
           <dt>Kernel</dt><dd>Mainline Linux 7.1</dd>
-          <dt>Devices</dt><dd>Galaxy S9 (starlte), QEMU; others through <a href="#ztconflo">ztConflo</a></dd>
+          <dt>Devices</dt><dd>The <a href="#devices">device list</a>, QEMU; others through <a href="#ztconflo">ztConflo</a></dd>
           <dt>Graphics</dt><dd>Mesa Panfrost, OpenGL ES 3.1 on the S9's Mali-G72</dd>
           <dt>Apps</dt><dd>Native C apps, and Python and Qt through the SDK</dd>
+          <dt>Structure</dt><dd>A <a href="#structure">GSI and a device layer</a>, joined by ztOSIAL</dd>
           <dt>Written in</dt><dd>C, Python, shell</dd>
-          <dt>Licence</dt><dd>GPL 3</dd>
+          <dt>Licence</dt><dd>GPL 3; ztOSIAL LGPL 2.1 or later</dd>
         </dl>
       </aside>
+    </div>
+  </section>
+
+  <section class="section" id="installing">
+    <div class="wrap">
+      <div><h2>Installing</h2><p class="sub">From nothing to ztOS, in the emulator or on a phone.</p></div>
+      <div class="body">
+        <p>There are three ways in. Pick one, then follow its steps from the top: each step says what to type, what you'll see, and how long it takes.</p>
+        <div class="ladder">
+          <div><b><a href="#install-emulator">Try it</a></b><span>In the emulator on your computer. Nothing is flashed, nothing is erased. About an hour, mostly waiting.</span></div>
+          <div><b><a href="#install-listed">A listed phone</a></b><span>A phone in the <a href="#devices">device list</a>. Replaces Android and erases the phone.</span></div>
+          <div><b><a href="#install-new">Another phone</a></b><span>A phone that runs postmarketOS on mainline Linux, built with ztConflo. For people comfortable porting.</span></div>
+        </div>
+
+        <h3 id="install-computer">Get the computer ready</h3>
+        <p>Every way starts here. You need a Linux computer, x86-64 or ARM, with about 15 GB free and an internet connection: the build downloads Arch Linux ARM and about 2 GB of packages. It never asks for <code>sudo</code>; only installing the tools below does.</p>
+        <ol class="steps">
+          <li><div><b>Install the tools</b><span>On Arch Linux (tested):<br><code>sudo pacman -S --needed git util-linux libarchive dosfstools mtools e2fsprogs qemu-user-static qemu-user-static-binfmt qemu-system-aarch64 edk2-aarch64 qemu-hw-display-virtio-gpu-pci qemu-ui-gtk android-tools socat</code><br>On Debian or Ubuntu (not yet tested), the same tools are: <code>sudo apt install git uidmap libarchive-tools dosfstools mtools e2fsprogs qemu-user-static binfmt-support qemu-system-arm qemu-efi-aarch64 adb socat</code></span></div></li>
+          <li><div><b>Give your account a range of user IDs</b><span>The build runs as you, in a user namespace. <code>grep $USER /etc/subuid</code> should print a line. If it prints nothing: <code>sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER</code>, then log out and back in.</span></div></li>
+          <li><div><b>Get ztOS</b><span><code>git clone https://github.com/Zerone-Laboratories/ztOS.git</code><br><code>cd ztOS</code><br>For a phone whose entry says so, also <code>git submodule update --init</code> (the phone's kernel tree).</span></div></li>
+          <li><div><b>Check</b><span><code>installer/ztos doctor</code> should say <i>this computer can build ztOS</i>, and list what the emulator and phones over USB still need. Fix anything it names before going on.</span></div></li>
+        </ol>
+
+        <h3 id="install-emulator">Try it in the emulator</h3>
+        <ol class="steps">
+          <li><div><b>Build it</b><span><code>installer/ztos install --target qemu --mode build-install</code><br>It asks for a user name, a password (for logging in and <code>sudo</code>), a name for the phone and your time zone, then <i>Start?</i>: answer yes.</span></div></li>
+          <li><div><b>Wait</b><span>30 to 60 minutes the first time: ARM programs run emulated. Later builds reuse what was downloaded; <code>--fresh</code> starts again from scratch. If the network drops, run the same command again.</span></div></li>
+          <li><div><b>Start it</b><span>Answer yes to <i>Start it now?</i>. A phone-shaped window opens (540×1110) and ztOS starts in about a minute.</span></div></li>
+          <li><div><b>Use it</b><span>The mouse is your finger: click to tap, drag to swipe, hold to hold. Escape is the back button, and the computer's keyboard types. <code>ssh -p 2222 &lt;user&gt;@localhost</code> gets a shell.</span></div></li>
+          <li><div><b>Next time</b><span><code>installer/ztos emulator</code> starts it again. <code>--gl</code> draws with your computer's GPU (faster; some NVIDIA laptops refuse it), and <code>--headless</code> runs it without a window, on VNC at <code>127.0.0.1:5905</code>.</span></div></li>
+        </ol>
+        <p>The emulator has no modem, sensors or battery, so those parts of ztOS stay off there.</p>
+
+        <h3 id="install-listed">Install it on a listed phone</h3>
+        <div class="alert" role="note"><b>This erases the phone</b>Android and everything in its storage are replaced. Back up first. Each phone's entry says what is never touched (on Samsung phones, the IMEI and modem calibration).</div>
+        <ol class="steps">
+          <li><div><b>Open your phone's entry</b><span>Find it on <a href="https://devices.ztos.online">devices.ztos.online</a> and check the model number matches yours exactly: a phone sold under the same name with another chip will not boot. Read its <i>What works</i> table and quirks.</span></div></li>
+          <li><div><b>Unlock the bootloader and install the recovery it names</b><span>Usually in Android: Settings &gt; About phone, tap Build number seven times, then Developer options &gt; OEM unlocking. Then flash the recovery (TWRP on Samsung phones) the way the entry says. Unlocking erases the phone once already.</span></div></li>
+          <li><div><b>Follow its installation guide</b><span>Each phone's page has a full guide, written by its maintainer, with every command to copy. For most phones they come down to: start the recovery, plug the phone in, run <code>installer/ztos install --target &lt;phone&gt;</code>, confirm writing the boot image, type <code>ERASE</code> to write the system, and restart.</span></div></li>
+          <li><div><b>First start</b><span>About a minute while ztOS grows to fill the storage, then the Welcome app shows how ztOS is used. Android apps are set up in the background the first time (Waydroid downloads its images once, about 1 GB).</span></div></li>
+        </ol>
+
+        <h3 id="install-new">Port it to another phone</h3>
+        <p>ztOS is a generic system image (GSI) plus a device layer for each phone (see <a href="#structure">GSI and ztOSIAL</a>). For a phone postmarketOS already boots on mainline Linux, <a href="#ztconflo">ztConflo</a> builds an image from the GSI with a device layer made for it.</p>
+        <ol class="steps">
+          <li><div><b>Build the GSI</b><span><code>installer/ztos build --target gsi</code> makes <code>build/ztos/gsi/ztos-gsi-0.2.0-aarch64.tar.zst</code>, with its <code>.sha256</code>.</span></div></li>
+          <li><div><b>Get ztConflo</b><span><code>git clone https://github.com/Zerone-Laboratories/ztconflo.git</code>, then in it <code>python -m ztconflo lookup &lt;codename&gt;</code> says whether your phone can be built. The codename is on the phone's postmarketOS wiki page.</span></div></li>
+          <li><div><b>Try it first</b><span><code>python -m ztconflo build &lt;codename&gt; --gsi &lt;path to the GSI&gt; --dry-run</code> checks the phone's kernel against what ztOS needs and shows every command, without running them.</span></div></li>
+          <li><div><b>Build and flash</b><span>The same without <code>--dry-run</code> writes <code>out/&lt;codename&gt;/</code>; <code>python -m ztconflo flash &lt;codename&gt;</code> shows the partitions and asks before writing.</span></div></li>
+          <li><div><b>See what works</b><span>On the phone, <code>ztos-ial status</code> and <code>ztos-ial test</code>. The <a href="https://github.com/Zerone-Laboratories/ztos-ial">ztOSIAL porting guide</a> shows how to fix what doesn't.</span></div></li>
+          <li><div><b>Share it</b><span><a href="https://devices.ztos.online/add">Add it to the device list</a> with its photo, steps and what works, so others can install it too.</span></div></li>
+        </ol>
+
+        <h3 id="install-help">If something goes wrong</h3>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>What you see</th><th>What to do</th></tr></thead>
+            <tbody>
+              <tr><td><code>doctor</code> names a missing tool</td><td>Install it (the list above), then run <code>installer/ztos doctor</code> again.</td></tr>
+              <tr><td><i>a /etc/subuid range for …</i></td><td><code>sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER</code>, then log out and back in.</td></tr>
+              <tr><td>The build stops while downloading</td><td>Run the same command again: it carries on. <code>--fresh</code> throws the old build away first.</td></tr>
+              <tr><td><i>the phone is not in TWRP over adb</i></td><td>Start the recovery and plug the phone in; <code>adb devices</code> should show it as <code>recovery</code>. Try another cable or USB port; some cables only charge.</td></tr>
+              <tr><td>Writing the system waits for the phone on <code>172.16.42.1</code></td><td>The phone is on a USB network and hands your computer <code>172.16.42.2</code>. If <code>ip addr</code> shows no such address, set that USB network connection to automatic (DHCP) in your network settings, then run the install again: it carries on where it stopped.</td></tr>
+              <tr><td>The phone sits in ztOS Rescue</td><td><code>installer/ztos</code>, then choose 3, <i>Reboot the phone from ztOS Rescue</i>.</td></tr>
+              <tr><td>The phone goes back to the recovery by itself</td><td>ztOS didn't start, and the phone fell back safely. Run the install again from the recovery step.</td></tr>
+              <tr><td>The emulator window stays black or QEMU stops</td><td>Leave out <code>--gl</code>; with it, some graphics drivers fail with <code>EGL_BAD_ACCESS</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Still stuck? Ask in #porting on the ztOS Mobile Discord, or <a href="https://github.com/Zerone-Laboratories/ztOS/issues">open an issue</a> with the installer's last lines.</p>
+      </div>
     </div>
   </section>
 
@@ -308,7 +494,15 @@
 
   <section class="section" id="ztmetro">
     <div class="wrap">
-      <div><h2>ztMETRO</h2><p class="sub">The shell, and the only one installed.</p></div>
+      <div>
+        <h2 class="with-logo"><svg class="ztmetro-logo" viewBox="0 0 73.65 68.49" role="img" aria-label="The ztMETRO logo"><polygon points="46.47 10.87 0 18.23 0 65.35 46.47 10.87"/><polygon points="73.65 68.49 23.23 61.63 73.64 0 73.65 68.49"/></svg>ztMETRO</h2>
+        <p class="sub">The shell, and the only one installed.</p>
+        <p class="credit">Logo by</p>
+        <a class="profile" href="https://www.instagram.com/x10michi/" rel="noopener">
+          <span class="avatar"><img src="credits/x10michi.jpg" alt="" onerror="this.remove()"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4.2"/><circle cx="17.4" cy="6.6" r="0.6" fill="#fff" stroke="none"/></svg></span>
+          <span><b>@x10michi</b><small>on Instagram</small></span>
+        </a>
+      </div>
       <div class="body">
         <p>ztMETRO is a Wayland compositor, built on wlroots, that is also the whole phone interface: Start with its live tiles, the app list and search, the action centre, the app switcher, the lock screen and the on-screen keyboard. Its look and motion are Windows Phone 8.1's, measured frame by frame against screen recordings of real Lumias.</p>
         <p>It renders itself with OpenGL ES: every tile, bar and app surface is a textured quad with its own matrix, which is what lets tiles tilt under a finger and whole screens swing. Text is drawn once and kept as a texture, and frames are drawn only while something moves.</p>
@@ -377,6 +571,8 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
               <tr><td>ztOSCoreNetworking</td><td>The modem, calls, messages and mobile data, and joining Wi-Fi</td></tr>
               <tr><td>ztOSCirrusAudio</td><td>Sound: the audio DSP and the Cirrus speaker amplifiers</td></tr>
               <tr><td>zrnperfd</td><td>Power: dynamic boost from the efficiency cores up, and core power-down</td></tr>
+              <tr><td>ztos-iald</td><td>ztOSIAL: serves the phone's hardware to the rest of ztOS over D-Bus, the same on every phone</td></tr>
+              <tr><td>Waydroid</td><td>Android apps, in a stripped-down Android 13 fetched and set up on first boot</td></tr>
               <tr><td>ztos-update</td><td>The updater: a daily check, a notification, and the Updates app</td></tr>
             </tbody>
           </table>
@@ -385,70 +581,78 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
     </div>
   </section>
 
-  <section class="section" id="s9">
+  <section class="section" id="structure">
     <div class="wrap">
-      <div><h2>The Galaxy S9 port</h2><p class="sub">Mainline Linux on an Exynos 9810.</p></div>
+      <div><h2>GSI and ztOSIAL</h2><p class="sub">How ztOS is put together since BETA-1.</p></div>
       <div class="body">
-        <p>ztOS's first phone is the Galaxy S9, SM-G960N (starlte). It runs mainline Linux 7.1 with the Exynos 9810 drivers, booting from the phone's internal storage, with Arch on BOOT and TWRP left in RECOVERY. The phone's hardware support is built as loadable kernel modules, so drivers can be developed without reflashing. The modem and sensor hub still use Samsung's own Android daemons, run from the phone's stock partitions.</p>
-
-        <h3 id="installing">Installing</h3>
-        <div class="alert" role="note">
-          <b>This erases the phone</b>
-          Android and everything in its storage are replaced. The phone's IMEI and modem calibration are never touched. Read the <a href="#quirks">known quirks</a> below first.
-        </div>
-        <p>You need a Linux computer with about 15 GB free, an internet connection, a USB cable, and the phone charged above 50%. The bootloader must already be unlocked with TWRP installed in RECOVERY.</p>
-        <ol class="steps">
-          <li><div><b>Boot the phone into TWRP</b><span>Turn the phone off, then hold Volume Up, Bixby and Power until TWRP appears. Connect it to the computer with the USB cable.</span></div></li>
-          <li><div><b>Get ztOS on the computer</b><span><code>git clone https://github.com/Zerone-Laboratories/ztOS.git</code><br><code>cd ztOS</code></span></div></li>
-          <li><div><b>Run the installer</b><span><code>installer/ztos install --target starlte</code><br>Choose 1, then pick a user name and password. The build takes 30 to 60 minutes.</span></div></li>
-          <li><div><b>Confirm the install</b><span>Answer yes to write the boot image, then type <code>ERASE</code> when asked. Leave the cable in until it says done.</span></div></li>
-          <li><div><b>Restart the phone</b><span>Hold Power, Volume Up and Volume Down. The first start takes about a minute, then the Welcome app shows how ztOS is used.</span></div></li>
-        </ol>
-        <p>If something fails, the phone goes back to TWRP by itself. Start again from step 3. To try ztOS without a phone, run <code>installer/ztos install --target qemu</code> instead. It opens ztOS in a phone-shaped window on the computer.</p>
-
-        <h3 id="hardware">Hardware status</h3>
-        <div class="table-scroll">
+        <p>ztOS is built as one generic system image (GSI) for every aarch64 phone: the shell, the apps, the services and Waydroid, with no kernel, no user and nothing specific to a phone. Each phone adds a device layer: its kernel, firmware, drivers, and a manifest saying how its hardware is reached. The two meet at ztOSIAL, the Zerone Technologies Operating System Interface Abstraction Layer: a set of D-Bus interfaces (<code>org.ztos.ial</code>) served by <code>ztos-iald</code>.</p>
+        <dl class="rules">
+          <div><dt>Interfaces</dt><dd>13: device, power, performance, display, sleep, sensors, haptics, lights, modem, call audio, audio devices, acceleration and Android.</dd></div>
+          <div><dt>Backends</dt><dd>Each interface is served by a generic backend (enough on a phone with full mainline support), the generic one with parameters, a Python backend in the device layer, or a separate service.</dd></div>
+          <div><dt>Device layer</dt><dd><code>/vendor/ztos/manifest.toml</code> and what it names. Porting a phone means writing this, not changing ztOS.</dd></div>
+          <div><dt>Kernel contract</dt><dd>The GSI lists the kernel options it needs; ztConflo checks a phone's kernel against it before building.</dd></div>
+          <div><dt>Checking a port</dt><dd><code>ztos-ial status</code> and <code>ztos-ial test</code> on the phone show what works.</dd></div>
+        </dl>
+        <div class="table-scroll" style="margin-top:1.25rem">
           <table>
-            <thead><tr><th>Part</th><th>Status</th><th>Notes</th></tr></thead>
+            <thead><tr><th>Repository</th><th>What it holds</th></tr></thead>
             <tbody>
-              <tr><td>Display, 1440×2960</td><td>Works</td><td>Manual and automatic brightness</td></tr>
-              <tr><td>GPU</td><td>Works</td><td>Mali-G72 MC18 through Panfrost, OpenGL ES 3.1</td></tr>
-              <tr><td>Touchscreen</td><td>Works</td><td>S6SY761, multi-touch</td></tr>
-              <tr><td>CPU, all 8 cores</td><td>Works</td><td>Frequency scaling; big cores powered down when idle</td></tr>
-              <tr><td>Battery and charger</td><td>Works</td><td>MAX17042 gauge, MAX77705 charger</td></tr>
-              <tr><td>Wi-Fi</td><td>Works</td><td>BCM4361, joined from Settings</td></tr>
-              <tr><td>Mobile data, SIM, signal</td><td>Works</td><td>4G through ztOSCoreNetworking</td></tr>
-              <tr><td>Speaker</td><td>Works</td><td>Through ztOSCirrusAudio</td></tr>
-              <tr><td>Light sensor, vibration, notification light</td><td>Works</td><td></td></tr>
-              <tr><td>SMS</td><td>Partial</td><td>Sending works; receiving is untested</td></tr>
-              <tr><td>Calls</td><td>Partial</td><td>They connect, but the call's sound is not routed yet</td></tr>
-              <tr><td>Motion sensors</td><td>Partial</td><td>Readable; nothing in the shell uses them yet</td></tr>
-              <tr><td>Suspend</td><td>Broken</td><td>The big cores don't come back; the screen-off state runs at the lowest clocks instead</td></tr>
-              <tr><td>Bluetooth, camera, GPS, microphone</td><td>Not started</td><td></td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-core">ztos-core</a></td><td>ztMETRO, the apps, the SDK, Android support and the system files in the GSI</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-ial">ztos-ial</a></td><td>The interfaces, <code>ztos-iald</code>, the command line and the C and Python clients; the porting guide</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-build">ztos-build</a></td><td>The installer: <code>ztos build --target gsi</code> builds the GSI</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-device-samsung-starlte">ztos-device-samsung-starlte</a></td><td>The Galaxy S9's device layer, and the example for new ones</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztos-devices">ztos-devices</a></td><td>ztConflo's registry of phones</td></tr>
+              <tr><td><a href="https://github.com/Zerone-Laboratories/ztOS">ztOS</a></td><td>Everything in one tree, as before the split</td></tr>
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+  </section>
 
-        <h3 id="quirks">Known quirks</h3>
-        <ul class="prose">
-          <li><b>The modem or sensor hub doesn't come up.</b> It tends to follow a forced reboot or a crash. One pass through TWRP brings them back: reboot into recovery, then back into ztOS.</li>
-          <li><b>A driver that crashed while loading is skipped at the next boot,</b> so a crash can't become a boot loop. Remove its mark file under <code>/var/lib</code> to try again.</li>
-          <li><b>Reboot rather than unload a driver module</b> to try a new build; a failed unload has left the phone unable to shut down.</li>
-          <li><b>The clock resets at every boot</b> until the network sets it.</li>
-          <li><b>Keep the stock Android partitions.</b> The installer writes only BOOT and USERDATA, and the modem needs the rest.</li>
-        </ul>
+  <section class="section" id="devices">
+    <div class="wrap">
+      <div><h2>Device list</h2><p class="sub">Phones ztOS runs on: ported by people, or built by ztConflo.</p></div>
+      <div class="body">
+        <p>Every phone has its own page on <a href="https://devices.ztos.online">devices.ztos.online</a>: what works, its specifications, and a step-by-step installation guide with every command to type. Phones are sorted by maker, and you can search them.</p>
 
-        <h3 id="recovery">Getting back in</h3>
-        <p>Nothing can leave the phone unbootable, and every layer has a way back. If Arch doesn't come up, the initramfs opens a rescue shell on the same USB network. If the kernel hangs, a watchdog resets the phone into TWRP after 30 seconds. If nothing appears on USB at all, the boot stage resets the phone after ten minutes. And download mode, which can't be overwritten, has everything needed to put the stock firmware back.</p>
+        <h3 id="community-ports">Community Ports</h3>
+        <p>Ported, installed and checked on the phone itself, and reviewed by moderators.</p>
+        <div class="carousel" data-carousel="community" aria-roledescription="carousel" aria-label="Community ports">
+          <div class="track" aria-live="off"><p class="mute" style="padding:1.25rem">Loading the phones…</p></div>
+          <div class="carousel-nav">
+            <button class="btn ghost small" type="button" data-prev aria-label="Previous phone">←</button>
+            <div class="dots"></div>
+            <button class="btn ghost small" type="button" data-next aria-label="Next phone">→</button>
+          </div>
+        </div>
+        <div class="actions" style="margin-top:1rem">
+          <a class="btn" href="https://devices.ztos.online/community">Go to devices →</a>
+          <a class="btn ghost" href="https://devices.ztos.online/add">Add your port</a>
+        </div>
+
+        <h3 id="cross-ports">Cross-Ports <span class="exp">EXPERIMENTAL</span></h3>
+        <p>Phones ztConflo can build ztOS for, from postmarketOS's ports on mainline Linux. Most are untried; the list updates itself every day.</p>
+        <div class="carousel" data-carousel="cross" aria-roledescription="carousel" aria-label="Cross ports">
+          <div class="track" aria-live="off"><p class="mute" style="padding:1.25rem">Loading the phones…</p></div>
+          <div class="carousel-nav">
+            <button class="btn ghost small" type="button" data-prev aria-label="Previous phone">←</button>
+            <div class="dots"></div>
+            <button class="btn ghost small" type="button" data-next aria-label="Next phone">→</button>
+          </div>
+        </div>
+        <div class="actions" style="margin-top:1rem">
+          <a class="btn" href="https://devices.ztos.online/cross">Go to cross-ports →</a>
+        </div>
       </div>
     </div>
   </section>
 
   <section class="section" id="ztconflo">
     <div class="wrap">
-      <div><h2>ztConflo: other phones</h2><p class="sub">How ztOS leaves the S9.</p></div>
+      <div><h2>ztConflo: other phones</h2><p class="sub">How ztOS reaches more phones.</p></div>
       <div class="body">
-        <p>ztConflo takes a phone's codename and builds a flashable ztOS image for it: Arch Linux ARM with ztMETRO, on a kernel and boot setup that postmarketOS already boots. It looks in the ztOS device registry first and falls back to postmarketOS for phones nobody has ported ztOS to yet. It never ports new hardware.</p>
+        <p>ztConflo takes a phone's codename and builds a flashable ztOS image for it: Arch Linux ARM with ztMETRO, on a kernel and boot setup that postmarketOS already boots. Given the GSI (<code>--gsi</code>), it adds a device layer generated for the phone and checks the phone's kernel against the GSI's kernel contract. It looks in the ztOS device registry first and falls back to postmarketOS for phones nobody has ported ztOS to yet. It never ports new hardware.</p>
         <dl class="rules">
           <div><dt>Eligible phones</dt><dd>135 today, with a mainline aarch64 kernel; 71 of them archived by postmarketOS, and flagged.</dd></div>
           <div><dt>GPU check</dt><dd>Phones without a Mesa GPU driver still build, with a warning that ztMETRO won't start.</dd></div>
@@ -468,11 +672,12 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
       <div><h2>Status and next</h2><p class="sub">Where ztOS is today.</p></div>
       <div class="body">
         <div class="alert" role="note">
-          <b>Alpha</b>
-          ztOS 0.1.0 alpha 2 runs daily on one Galaxy S9. The installer's phone path is implemented but not yet validated end to end on a fresh install, and no ztConflo image has booted on another phone yet.
+          <b>Beta</b>
+          ztOS 0.2.0 beta 1 runs daily on one Galaxy S9, as the GSI and the S9's device layer. The installer's phone path is implemented but not yet validated end to end on a fresh install, and no ztConflo image has booted on another phone yet.
         </div>
         <ul class="prose" style="margin-top:1.25rem">
-          <li>The first phone besides the S9 booting a ztConflo build.</li>
+          <li>The first phone besides the S9 booting a ztConflo build from the GSI.</li>
+          <li>Calls, messages and sensors in the apps through ztOSIAL, rather than the S9's own services.</li>
           <li>The sound of calls, and receiving SMS.</li>
           <li>Suspend on the S9, for idle battery life closer to Android's.</li>
           <li>Native apps drawing with OpenGL ES the way the shell does, and a ztOS package repository for updates.</li>
@@ -486,8 +691,8 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
       <div><h2>See also</h2></div>
       <div class="body">
         <ul class="prose">
-          <li><a href="https://github.com/Zerone-Laboratories/ztOS">ztOS source</a>, with the full status page and the SDK guide</li>
-          <li><a href="https://zerone-laboratories.web.app/ztconflo/">ztConflo</a>, the image builder, and <a href="https://github.com/z3r0n3br4instorm/ztos-devices">ztos-devices</a>, its registry</li>
+          <li><a href="https://github.com/Zerone-Laboratories/ztOS">ztOS source</a>, with the full status page and the SDK guide, and its parts: <a href="https://github.com/Zerone-Laboratories/ztos-core">ztos-core</a>, <a href="https://github.com/Zerone-Laboratories/ztos-ial">ztos-ial</a>, <a href="https://github.com/Zerone-Laboratories/ztos-build">ztos-build</a> and <a href="https://github.com/Zerone-Laboratories/ztos-device-samsung-starlte">ztos-device-samsung-starlte</a></li>
+          <li><a href="https://zerone-laboratories.web.app/ztconflo/">ztConflo</a>, the image builder, and <a href="https://github.com/Zerone-Laboratories/ztos-devices">ztos-devices</a>, its registry</li>
           <li><a href="https://github.com/SheroAbi/galaxy-s9plus-mainline-linux">galaxy-s9plus-mainline-linux</a>, the Exynos 9810 mainline drivers ztOS builds on</li>
           <li><a href="https://postmarketos.org">postmarketOS</a>, whose kernels ztConflo reuses</li>
           <li><a href="https://omethabeyrathne.web.app">Ometh Abeyrathne</a>, who makes ztOS</li>
@@ -582,6 +787,119 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
   }
   window.addEventListener('scroll', function () { if (!ticking) { ticking = true; requestAnimationFrame(spy); } }, { passive: true });
   spy();
+})();
+</script>
+<script>
+// The device list's two carousels: Community Ports (docs/devices/<id>/) and
+// Cross-Ports (docs/devices/cross-ports.json), one large card at a time,
+// moving on by themselves
+(function () {
+  var STATUSES = ['working', 'partial', 'broken', 'untested'];
+  var SITE = 'https://devices.ztos.online/';
+  var still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function esc(t) {
+    return String(t == null ? '' : t).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function kv(k, v) { return v ? '<span class="kv"><span>' + esc(k) + '</span>' + esc(v) + '</span>' : ''; }
+
+  function community(d) {
+    var c = { working: 0, partial: 0, broken: 0, untested: 0 };
+    (d.features || []).forEach(function (f) { if (c[f.status] != null) c[f.status]++; });
+    var works = (d.features || []).filter(function (f) { return f.status === 'working'; }).slice(0, 8).map(function (f) { return f.feature; });
+    var spec = {};
+    (d.specs || []).forEach(function (r) { spec[r[0]] = r[1]; });
+    var a = document.createElement('a');
+    a.className = 'slide';
+    a.href = SITE + encodeURIComponent(d.id);
+    a.innerHTML = '<span class="slide-pic"><img src="devices/' + esc(d.id) + '/' + esc(d.photo) + '" alt="" loading="lazy">' +
+      '<span class="nameplate"><span>' + esc(d.maker) + '</span><b>' + esc(d.name) + '</b></span></span>' +
+      '<span class="slide-body"><small>' + esc(d.maker) + '</small><b>' + esc(d.name) + '</b>' +
+      '<small>' + esc([d.model, d.codename].filter(Boolean).join(' · ')) + '</small>' +
+      '<span class="pills">' + STATUSES.map(function (s) { return c[s] ? '<i class="st ' + s + '">' + c[s] + ' ' + s + '</i>' : ''; }).join('') + '</span>' +
+      '<span class="summary">' + esc(d.summary) + '</span>' +
+      kv('SoC', spec.SoC) + kv('Kernel', spec.Kernel) + kv('Maintainer', d.maintainer) + kv('Works', works.join(', ')) +
+      '<span class="more">Install it, and everything that works →</span></span>';
+    return a;
+  }
+  function cross(x) {
+    var a = document.createElement('a');
+    a.className = 'slide text';
+    a.href = SITE + 'cross/' + encodeURIComponent(x.codename);
+    a.innerHTML = '<span class="slide-mark"><span>' + esc(x.manufacturer) + '</span><b>' + esc(x.name) + '</b></span>' +
+      '<span class="slide-body"><small>' + esc(x.manufacturer) + '</small><b>' + esc(x.name) + '</b>' +
+      '<small>' + esc([x.codename, x.year].filter(Boolean).join(' · ')) + '</small>' +
+      '<span class="pills">' + (x.accelerated ? '<i class="st working">GPU: ' + esc(x.gpu_driver) + '</i>' : '<i class="st broken">No GPU driver</i>') +
+      (x.archived ? '<i class="st partial">Archived by postmarketOS</i>' : '<i class="st untested">postmarketOS ' + esc(x.category) + '</i>') + '</span>' +
+      '<span class="summary">postmarketOS boots this phone on mainline Linux; ztConflo puts the ztOS system image on that kernel. Experimental: nobody may have tried ztOS on it yet.</span>' +
+      kv('SoC', x.soc) + kv('Kernel', x.kernel) + kv('Screen', x.screen) + kv('Flashed with', x.flash_method) +
+      '<span class="more">How to build and flash it →</span></span>';
+    return a;
+  }
+
+  function carousel(root, items, make, empty) {
+    var track = root.querySelector('.track'), dots = root.querySelector('.dots');
+    var index = 0, timer = null, slides = [];
+    track.innerHTML = '';
+    items.forEach(function (d, n) {
+      var el = make(d);
+      track.appendChild(el); slides.push(el);
+      var dot = document.createElement('button');
+      dot.type = 'button'; dot.setAttribute('aria-label', d.name);
+      dot.addEventListener('click', function () { go(n, true); });
+      dots.appendChild(dot);
+    });
+    if (!slides.length) track.innerHTML = '<p class="mute" style="padding:1.25rem">' + empty + '</p>';
+    root.classList.toggle('single', slides.length < 2);
+    // many phones: the dots would be a wall, so show where we are instead
+    root.classList.toggle('many', slides.length > 12);
+    var where = document.createElement('span');
+    where.className = 'where';
+    dots.appendChild(where);
+    function go(i, user) {
+      if (!slides.length) return;
+      index = (i + slides.length) % slides.length;
+      track.scrollTo({ left: slides[index].offsetLeft - track.offsetLeft, behavior: still ? 'auto' : 'smooth' });
+      Array.prototype.forEach.call(dots.querySelectorAll('button'), function (d, n) { d.setAttribute('aria-current', String(n === index)); });
+      where.textContent = (index + 1) + ' of ' + slides.length;
+      if (user) restart();
+    }
+    function restart() {
+      clearInterval(timer);
+      if (!still && slides.length > 1) timer = setInterval(function () { go(index + 1); }, 6000);
+    }
+    root.querySelector('[data-prev]').addEventListener('click', function () { go(index - 1, true); });
+    root.querySelector('[data-next]').addEventListener('click', function () { go(index + 1, true); });
+    root.addEventListener('mouseenter', function () { clearInterval(timer); });
+    root.addEventListener('mouseleave', restart);
+    root.addEventListener('focusin', function () { clearInterval(timer); });
+    root.addEventListener('focusout', restart);
+    go(0); restart();
+  }
+
+  var one = document.querySelector('[data-carousel="community"]');
+  var two = document.querySelector('[data-carousel="cross"]');
+  function failed(root) {
+    root.querySelector('.track').innerHTML = '<p class="mute" style="padding:1.25rem">The phones didn\'t load. <a href="https://devices.ztos.online">See them on devices.ztos.online</a>.</p>';
+  }
+
+  fetch('devices/index.json', { cache: 'no-cache' }).then(function (r) { return r.json(); }).then(function (list) {
+    return Promise.all(list.devices.map(function (id) {
+      return fetch('devices/' + id + '/device.json', { cache: 'no-cache' }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
+    }));
+  }).then(function (list) {
+    carousel(one, list.filter(Boolean), community, 'No phones are listed yet. <a href="https://devices.ztos.online/add">Add yours</a>.');
+  }).catch(function () { failed(one); });
+
+  // the GPU-accelerated, maintained ones first, in a fresh order each visit
+  fetch('devices/cross-ports.json', { cache: 'no-cache' }).then(function (r) { return r.json(); }).then(function (x) {
+    var list = (x.devices || []).slice();
+    for (var i = list.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = list[i]; list[i] = list[j]; list[j] = t; }
+    list.sort(function (a, b) { return (b.accelerated - a.accelerated) || (a.archived - b.archived); });
+    carousel(two, list, cross, 'No cross-ports today.');
+  }).catch(function () { failed(two); });
 })();
 </script>
 </body>

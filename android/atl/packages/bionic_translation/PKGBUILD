@@ -1,0 +1,57 @@
+# Maintainer: txtsd <aur.archlinux@ihavea.quest>
+
+pkgname=bionic_translation-git
+pkgver=r130.6253dec
+pkgrel=8
+_commit=6253dec7f24a57a94039a088cb436d880e92e3be
+pkgdesc='A set of libraries for loading bionic-linked .so files on musl/glibc'
+url='https://gitlab.com/android_translation_layer/bionic_translation'
+arch=(x86_64 aarch64 armv7h)
+license=('MIT')
+provides=(bionic_translation)
+conflicts=(bionic_translation)
+depends=(
+  bubblewrap
+  glibc
+  libbsd
+  libglvnd
+  libunwind
+)
+makedepends=(
+  elfutils
+  mesa
+  meson
+)
+source=("bionic_translation-${_commit}.tar.gz::${url}/-/archive/$_commit/bionic_translation-${_commit}.tar.gz" elf-metadata.patch sdk-properties.patch native-properties.patch fortified-chk.patch egl-client-buffer-fallback.patch arm64-absolute-rela.patch relocation-trace.patch)
+sha256sums=('f1d599b7295ac1f0f261ef75319018bf1668aace53a67e4d8e8f0169e99c9c83'
+            '4e54d55b21d4ee8f4487244c9d6aac6e992abc8844fa0d32f63b9f4f395acc37'
+            'c8c46feb25134bc1c81b6513e59547f0a62daeebfa4f1252c1d836261023306d'
+            'd38bdb7ce4df5bd2e6cca703dda492292f26a4f234aefe6c893370723f791b77'
+            'e1f6af70669ec8acfb47e46f146ad01461d22fb60fee3b470cc2a61fca619980'
+            '655019f94e52fe3b9df98a3548f47f56555a2b8eac00b7b415a889246ed69937'
+            'b1e9115930127068d17c5ca436f26dc48ee0100ac111af64fadb767a021f8b07'
+            '3c668c1625389cb2ceead04c34cf803d87957c3c3e6cd0f2619b304223e4c230')
+
+prepare() {
+  patch -d "bionic_translation-${_commit}" -Np1 -i "$srcdir/elf-metadata.patch"
+  patch -d "bionic_translation-${_commit}" -Np1 -i "$srcdir/sdk-properties.patch"
+  patch -d "bionic_translation-${_commit}" -Np1 -i "$srcdir/native-properties.patch"
+  patch -d "bionic_translation-${_commit}" -Np1 -i "$srcdir/fortified-chk.patch"
+  patch -d "bionic_translation-${_commit}" -Np1 -i "$srcdir/egl-client-buffer-fallback.patch"
+  patch -d "bionic_translation-${_commit}" -Np1 -i "$srcdir/arm64-absolute-rela.patch"
+  patch -d "bionic_translation-${_commit}" -Np1 -i "$srcdir/relocation-trace.patch"
+  meson subprojects download --sourcedir="bionic_translation-${_commit}"
+}
+
+build() {
+  arch-meson "bionic_translation-${_commit}" build
+  meson compile -C build
+}
+
+# check() {
+#   meson test --no-rebuild --print-errorlogs -C build
+# }
+
+package() {
+  meson install --no-rebuild -C build --destdir "${pkgdir}"
+}

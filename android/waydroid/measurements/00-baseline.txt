@@ -1,0 +1,28 @@
+Observed before changes, 2026-10-23 UTC; phone had been running for over a day.
+Waydroid 1.6.3, 20260927 VANILLA system, MAINLINE vendor.
+Container FROZEN, user session RUNNING.
+sys.boot_completed=1
+ro.zygote=zygote64_32
+restricted_networking_mode=0
+HOME=com.android.launcher3/.uioverrides.QuickstepLauncher
+memory.current=1176170496 bytes
+free -m:
+               total        used        free      shared  buff/cache   available
+Mem:            3516        3165          95         795        1219         350
+Swap:              0           0           0
+Android had no default route in any routing table.
+Android ip rule: RTNETLINK answers: Operation not supported on transport endpoint
+ping 1.1.1.1: connect: Network is unreachable
+After adding default via 192.168.240.1 dev eth0: connectivitycheck HTTP 204.
+Host upstream nftables lxc forwarding and masquerade rules already existed.
+Crash buffer contained bootanimation and SystemUI null dereferences in libgallium_dri.so.
+The first ro.zygote=zygote64 property-only attempt had no Java services:
+init.zygote64.rc was absent. memory.current=995700736; boot_completed empty.
+
+After image strip + 64-bit init + no bootanimation, first cold-phone-boot idle sample:
+memory.current=2445312000 bytes; anon=791252992; file=1460256768; kernel=93212672.
+free -m: total=3516 used=2052 free=182 shared=372 buff/cache=1817 available=1464.
+ART defaults: heapminfree=8m heapmaxfree=16m heaptargetutilization=0.6.
+ro.lmk.use_psi=true, ro.lmk.use_minfree_levels=true.
+This snapshot preceded ART/LMKD tuning. Graphics remained intermittent until composer fixes.
+Snapshots have different cache histories; they are not controlled memory-savings benchmarks.

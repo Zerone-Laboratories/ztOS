@@ -1,0 +1,6 @@
+#!/bin/bash
+# Fixed system package set; APKs cannot supply root commands or package names.
+set -euo pipefail
+[ "$#" = 0 ] && [ "$(id -u)" = 0 ] || exit 1
+runtime=/usr/local/share/ztos/android-runtime
+exec bash "$runtime/install-runtime.sh" "$runtime/packages"

@@ -11,6 +11,7 @@ wpa_supplicant
 iw
 openssh
 xdg-user-dirs
+desktop-file-utils
 alsa-utils
 brightnessctl
 pipewire
@@ -61,6 +62,20 @@ mpv
 cava
 nodejs
 npm
-firefox
+# no desktop browser: Chromium only as the engine WhatsApp drives headless
+# (os/apps/whatsapp), its launcher hidden (os/overlay/usr/local/share/applications)
 chromium
 gnome-terminal
+
+# Android apps: Waydroid (the GSI ships its recipe; ztos-waydroid-images fetches
+# and strips the pinned Android 13 image at first boot), with what its scripts use
+waydroid
+lxc
+python-gbinder
+nftables
+dnsmasq
+python-dbus
+python-gobject
+curl
+unzip
+e2fsprogs

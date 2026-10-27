@@ -2,13 +2,14 @@
 # Detached battery-only comparison; automatic hardware wake after each trial.
 # Install beside suspend-test.py and firmware-state.py, then run through systemd.
 set -eu
+. /usr/lib/ztos/user.sh
 SELF=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 LOG=${1:-/var/lib/ztos-power-test/$(date -u +%Y%m%d)}
 mkdir -p "$LOG"
 # The display may have been re-lit while the detached service waited for the
 # cable to be removed. Ask zrnperfd to blank it now, then require DRM to
 # confirm the panel is off before the suspend helper starts.
-CTL=/run/user/1000/ztmetro.ctl
+CTL=$ZTOS_RUNTIME_DIR/ztmetro.ctl
 if [ -p "$CTL" ]; then
     printf 'screen off\n' > "$CTL"
 fi

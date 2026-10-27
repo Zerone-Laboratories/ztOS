@@ -1,0 +1,37 @@
+--- a/src/api-impl/android/content/Context.java
++++ b/src/api-impl/android/content/Context.java
+@@ -75,6 +75,7 @@
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Executor;
+ 
+ public abstract class Context {
+ 	private final static String TAG = "Context";
+@@ -90,6 +91,7 @@
+ 	public static final String POWER_SERVICE = "power";
+ 	public static final String VIBRATOR_SERVICE = "vibrator";
+ 	public static final String WINDOW_SERVICE = "window";
++	public static final String TELECOM_SERVICE = "telecom";
+ 
+ 	public static Vibrator vibrator;
+ 
+@@ -190,6 +192,18 @@
+ 
+ 	public Looper getMainLooper() {
+ 		return Looper.getMainLooper();
++	}
++
++	public Executor getMainExecutor() {
++		final Handler handler = new Handler(getMainLooper());
++		return new Executor() {
++			@Override
++			public void execute(Runnable command) {
++				if (!handler.post(command)) {
++					throw new java.util.concurrent.RejectedExecutionException("Main looper is not accepting work");
++				}
++			}
++		};
+ 	}
+ 
+ 	public String getPackageName() {

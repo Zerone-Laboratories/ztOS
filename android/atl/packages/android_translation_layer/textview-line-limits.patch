@@ -1,0 +1,143 @@
+--- a/src/api-impl/android/widget/TextView.java
++++ b/src/api-impl/android/widget/TextView.java
+@@ -38,6 +38,9 @@
+ 	private int break_strategy = 0 /*BREAK_STRATEGY_SIMPLE*/;
+ 	private int hyphenation_frequency = 0 /*HYPHENATION_FREQUENCY_NONE*/;
+ 	private boolean showSoftInputOnFocus = true;
++	private int maxLines = Integer.MAX_VALUE;
++	private boolean singleLine = false;
++	private TextUtils.TruncateAt ellipsize = null;
+ 	private int gravity = Gravity.TOP | Gravity.START;
+ 
+ 	public TextView(Context context, AttributeSet attrs) {
+@@ -98,6 +101,17 @@
+ 			} else {
+ 				applyAlignment();
+ 			}
++			if (a.hasValue(com.android.internal.R.styleable.TextView_maxLines))
++				setMaxLines(a.getInt(com.android.internal.R.styleable.TextView_maxLines, Integer.MAX_VALUE));
++			if (a.hasValue(com.android.internal.R.styleable.TextView_lines))
++				setLines(a.getInt(com.android.internal.R.styleable.TextView_lines, 1));
++			if (a.hasValue(com.android.internal.R.styleable.TextView_singleLine))
++				setSingleLine(a.getBoolean(com.android.internal.R.styleable.TextView_singleLine, false));
++			int truncate = a.getInt(com.android.internal.R.styleable.TextView_ellipsize, 0);
++			if (truncate == 1) setEllipsize(TextUtils.TruncateAt.START);
++			else if (truncate == 2) setEllipsize(TextUtils.TruncateAt.MIDDLE);
++			else if (truncate == 3) setEllipsize(TextUtils.TruncateAt.END);
++			else if (truncate == 4) setEllipsize(TextUtils.TruncateAt.MARQUEE);
+ 		} catch (java.lang.Exception e) {
+ 			System.out.println("exception while inflating TextView:");
+ 			e.printStackTrace();
+@@ -213,7 +227,7 @@
+ 	public void setHintTextColor(int i) {}
+ 	public void setLinkTextColor(ColorStateList colorStateList) {}
+ 
+-	public void setSingleLine() {}
++	public void setSingleLine() { setSingleLine(true); }
+ 	public void setSelection(int i) {}
+ 	public void setSelection(int i, int j) {}
+ 
+@@ -225,11 +239,29 @@
+ 		return 0;
+ 	}
+ 
+-	public void setEllipsize(TextUtils.TruncateAt truncateAt) {}
++	public void setEllipsize(TextUtils.TruncateAt truncateAt) {
++		if (ellipsize == truncateAt) return;
++		ellipsize = truncateAt;
++		applyTextLimits();
++	}
+ 
+ 	public void setTextAppearance(Context context, int appearance) {}
+ 
+-	public void setMaxLines(int maxLines) {}
++	public void setMaxLines(int maxLines) {
++		maxLines = Math.max(1, maxLines);
++		if (this.maxLines == maxLines) return;
++		this.maxLines = maxLines;
++		applyTextLimits();
++	}
++
++	private void applyTextLimits() {
++		int mode = ellipsize == TextUtils.TruncateAt.START ? 1
++			: ellipsize == TextUtils.TruncateAt.MIDDLE ? 2 : ellipsize != null ? 3 : 0;
++		native_setTextLimits(maxLines == Integer.MAX_VALUE ? -1 : maxLines, singleLine, mode);
++		requestLayout();
++	}
++
++	private native void native_setTextLimits(int maxLines, boolean singleLine, int ellipsize);
+ 
+ 	public void setMinWidth(int minWidth) {}
+ 	public void setMaxWidth(int maxWidth) {}
+@@ -358,7 +390,7 @@
+ 
+ 	public InputFilter[] getFilters() { return new InputFilter[0]; }
+ 
+-	public int getMaxLines() { return -1; }
++	public int getMaxLines() { return maxLines; }
+ 
+ 	public void setCompoundDrawablesRelative(Drawable start, Drawable top, Drawable end, Drawable bottom) {
+ 		setCompoundDrawables(start, top, end, bottom);
+@@ -406,7 +438,12 @@
+ 		return Color.CYAN;
+ 	}
+ 
+-	public void setSingleLine(boolean singleLine) {}
++	public void setSingleLine(boolean singleLine) {
++		if (this.singleLine == singleLine) return;
++		this.singleLine = singleLine;
++		maxLines = singleLine ? 1 : Integer.MAX_VALUE;
++		applyTextLimits();
++	}
+ 
+ 	public int getCompoundPaddingLeft() { return 0; }
+ 
+@@ -460,9 +497,9 @@
+ 
+ 	public void setRawInputType(int type) {}
+ 
+-	public TextUtils.TruncateAt getEllipsize() { return null; }
+-
+-	public void setLines(int lines) {}
++	public TextUtils.TruncateAt getEllipsize() { return ellipsize; }
++
++	public void setLines(int lines) { setMinLines(lines); setMaxLines(lines); }
+ 
+ 	public int getMinLines() {
+ 		return -1;
+--- a/src/api-impl-jni/widgets/android_widget_TextView.c
++++ b/src/api-impl-jni/widgets/android_widget_TextView.c
+@@ -150,3 +150,33 @@
+ 		gtk_widget_insert_before(picture, box, NULL);
+ 	}
+ }
++
++/* Apply Android line limits to text labels, including Button subclasses.
++ * EditText uses GtkText and handles its own input layout. */
++static GtkLabel *text_limits_find_label(GtkWidget *widget)
++{
++	if (GTK_IS_LABEL(widget)) return GTK_LABEL(widget);
++	for (GtkWidget *child = gtk_widget_get_first_child(widget); child;
++	     child = gtk_widget_get_next_sibling(child)) {
++		GtkLabel *label = text_limits_find_label(child);
++		if (label) return label;
++	}
++	return NULL;
++}
++
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setTextLimits(JNIEnv *env, jobject this,
++        jint max_lines, jboolean single_line, jint ellipsize)
++{
++	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++	GtkLabel *label = text_limits_find_label(widget);
++	if (!label) return;
++	gtk_label_set_single_line_mode(label, single_line);
++	gtk_label_set_wrap(label, !single_line);
++	gtk_label_set_lines(label, max_lines > 0 ? max_lines : -1);
++	PangoEllipsizeMode mode = ellipsize == 1 ? PANGO_ELLIPSIZE_START
++	        : ellipsize == 2 ? PANGO_ELLIPSIZE_MIDDLE
++	        : ellipsize == 3 || max_lines > 0 ? PANGO_ELLIPSIZE_END : PANGO_ELLIPSIZE_NONE;
++	/* Pango's line cap needs ellipsization to constrain natural measurement.
++	 * MARQUEE keeps an end ellipsis until scrolling text is implemented. */
++	gtk_label_set_ellipsize(label, mode);
++}

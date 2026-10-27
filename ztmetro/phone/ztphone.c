@@ -28,6 +28,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <cairo.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include "zrnvibe.h"
 
 #include "zrnmetrocore.h"
 #include "comm.h"
@@ -56,6 +61,7 @@ enum action {
 	ACT_SPEED_MENU,	/* arg: 0 remove, 1 move up, 2 move down */
 	ACT_ENTRY_SPEED,	/* add the number on the entry page to speed dial */
 	ACT_PIVOT_PLUS,	/* the plus on speed dial: pick a number from the history */
+	ACT_MUTE, ACT_SPEAKER, ACT_CALL_KEYS, ACT_REPLY,
 	ACT_CANCEL,	/* the keypad's cancel: back to the history */
 };
 
@@ -76,6 +82,120 @@ static int came_from = P_HISTORY;	/* where to go back to when a call ends */
 static char entry[40];			/* the number the entry page is of */
 static int menu_for = -1;
 static bool sample;
+static bool call_screen_only, call_keys, muted, speaker, ending, reply_hint;
+static uint32_t ended_at, swivel_at;
+static cairo_surface_t *swivel_surface;
+static unsigned swivel_revision;
+static bool swivel_leaving;
+static pid_t loop_pid;
+static char loop_sound[64];
+#define PHONE_SOUNDS "/usr/local/share/sounds/ztos/phone/"
+
+static pid_t vibe_pid;
+static char vibe_playing[80];	/* "pattern ringtone" being played */
+
+static void sound_stop(void) {
+	vibe_stop(&vibe_pid);	/* every way a ring ends goes through here: the motor stops with it */
+	vibe_playing[0] = 0;
+	if (loop_pid > 0) {
+		kill(-loop_pid, SIGTERM);
+		waitpid(loop_pid, NULL, 0);
+	}
+	loop_pid = 0;
+	loop_sound[0] = 0;
+}
+
+static int ring_volume(void) {
+	char path[512], line[160];
+	int volume = 70;
+	snprintf(path, sizeof(path), "%s/.config/ztmetro/config", getenv("HOME") ?: "");
+	FILE *f = fopen(path, "r");
+	while (f && fgets(line, sizeof(line), f)) {
+		int value;
+		if (sscanf(line, "ring_volume = %d", &value) == 1) volume = value < 0 ? 0 : value > 100 ? 100 : value;
+	}
+	if (f) fclose(f);
+	return volume;
+}
+
+static void sound_play(const char *file, bool loop) {
+	if (sample) return;
+	if (loop && !strcmp(loop_sound, file)) return;
+	if (loop) sound_stop();
+	char path[512], volume[24];
+	snprintf(volume, sizeof(volume), "%.2f", ring_volume() / 100.0);
+	snprintf(path, sizeof(path), "%s%s", PHONE_SOUNDS, file);
+	if (access(path, R_OK)) return;
+	pid_t pid = fork();
+	if (pid == 0) {
+		prctl(PR_SET_PDEATHSIG, SIGTERM);
+		if (getppid() == 1) _exit(0);
+		if (loop) setpgid(0, 0);
+		do {
+			pid_t child = fork();
+			if (child == 0) {
+				prctl(PR_SET_PDEATHSIG, SIGTERM);
+				if (getppid() == 1) _exit(0);
+				execlp("pw-play", "pw-play", "--volume", volume, path, (char *)NULL);
+				_exit(127);
+			}
+			int status = 0;
+			if (child < 0 || waitpid(child, &status, 0) < 0 || status != 0) break;
+		} while (loop);
+		_exit(0);
+	}
+	if (loop && pid > 0) {
+		setpgid(pid, pid);
+		loop_pid = pid;
+		snprintf(loop_sound, sizeof(loop_sound), "%s", file);
+	}
+}
+
+static void ringtone(char *out, size_t size) {
+	char path[512], line[80];
+	snprintf(out, size, "Nokia-Tune.wav");
+	snprintf(path, sizeof(path), "%s/.config/ztmetro/ringtone", getenv("HOME") ?: "");
+	FILE *f = fopen(path, "r");
+	if (f && fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\r\n")] = 0;
+		if (line[0] && strspn(line, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") == strlen(line))
+			snprintf(out, size, "%s", line);
+	}
+	if (f) fclose(f);
+}
+
+/* the ring vibration, from Settings > ringtones + sounds: the ringer switches
+ * and the pattern (see core/zrnvibe.h) */
+static bool ring_vibration(char *pattern, size_t size) {
+	int ring, silent;
+	vibe_config_load(&ring, &silent, pattern, size);
+	if (!strcmp(pattern, "off")) return false;
+	return ring_volume() ? ring != 0 : silent != 0;
+}
+
+static void call_sound(void) {
+	if (!strcmp(state, "incoming")) {
+		char file[80];
+		ringtone(file, sizeof(file));
+		sound_play(file, true);
+		char pattern[40], key[80];
+		if (ring_vibration(pattern, sizeof(pattern))) {
+			/* "match" follows the ringtone, so a change of either starts it afresh */
+			snprintf(key, sizeof(key), "%s %s", pattern, file);
+			if (strcmp(key, vibe_playing) || vibe_pid <= 0) {
+				vibe_stop(&vibe_pid);
+				vibe_pid = vibe_start(pattern, file, false);
+				snprintf(vibe_playing, sizeof(vibe_playing), "%s", key);
+			}
+		} else {
+			vibe_stop(&vibe_pid);
+			vibe_playing[0] = 0;
+		}
+	} else if (!strcmp(state, "dialing") || !strcmp(state, "ringing")) {
+		sound_play("ringback.wav", true);
+	} else sound_stop();
+}
+
 
 /* speed dial: one entry a line, "number<TAB>name", kept in the user's data */
 static void speed_load(void) {
@@ -368,55 +488,80 @@ static double draw_keypad(cairo_t *cr) {
 
 static double draw_call(cairo_t *cr) {
 	bool incoming = !strcmp(state, "incoming"), active = !strcmp(state, "active");
-	double y = zmc_header(cr, incoming ? "incoming" : active ? "in call" : "calling");
-	const char *who = number[0] ? number : digits;
-	const char *name = name_of(who);
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	y += zmc_text(cr, name, FONT_LIGHT, strlen(name) > 12 ? 30 : 40, MARGIN, y - 6, zmc.width - 2 * MARGIN) + 2;
-	if (strcmp(name, who)) {
-		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		zmc_text(cr, who, FONT_REGULAR, 16, MARGIN, y, 0);
-		y += 26;
-	}
-	char line[48];
-	if (active) {
-		long s = answered_at ? (long)(time(NULL) - answered_at) : 0;
-		snprintf(line, sizeof(line), "%ld:%02ld", s / 60, s % 60);
-	} else {
-		snprintf(line, sizeof(line), "%s", incoming ? "is calling" : !strcmp(state, "ringing") ? "ringing…" :
-			"dialling…");
-	}
+	cairo_set_source_rgb(cr, 0.10, 0.10, 0.10);
+	cairo_paint(cr);
+	double w = zmc.width - 2 * MARGIN, y = 34;
 	zmc_accent(cr);
-	zmc_text(cr, line, FONT_SEMILIGHT, 26, MARGIN, y + 8, 0);
-	y += 70;
-
-	double w = zmc.width - 2 * MARGIN;
+	zmc_text(cr, ending ? "CALL ENDED" : incoming ? "INCOMING CALL" : active ? "IN CALL" : "CALLING",
+		FONT_REGULAR, 16, MARGIN, y, 0);
+	y += 44;
+	const char *who = number[0] ? number : "Unknown number", *name = name_of(who);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	y += zmc_text(cr, name, FONT_LIGHT, strlen(name) > 14 ? 36 : 48, MARGIN, y, w) + 12;
+	cairo_set_source_rgb(cr, .65, .65, .65);
+	zmc_text(cr, reply_hint ? "Unlock to write a text reply" : strcmp(name, who) ? who : "mobile", FONT_REGULAR, 18, MARGIN, y, w);
+	y += 40;
+	if (active) {
+		char timer[40];
+		long seconds = answered_at ? time(NULL) - answered_at : 0;
+		snprintf(timer, sizeof(timer), "%ld:%02ld", seconds / 60, seconds % 60);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, timer, FONT_LIGHT, 30, MARGIN, y, 0);
+	}
+	if (ending) return zmc.height;
+	if (call_keys && active) {
+		const char *keys = "123456789*0#";
+		double kh = 48, kw = (w - 8) / 3;
+		y += 48;
+		for (int i = 0; i < 12; i++) {
+			double x = MARGIN + i % 3 * (kw + 4), ky = y + i / 3 * (kh + 4);
+			char key[2] = { keys[i], 0 };
+			cairo_set_source_rgb(cr, .22, .22, .22);
+			cairo_rectangle(cr, x, ky, kw, kh); cairo_fill(cr);
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_text_centred(cr, key, FONT_LIGHT, 28, x + kw / 2, ky + 6);
+			zmc_add_hit(x, ky, kw, kh, ACT_KEY, keys[i]);
+		}
+	}
+	double bottom = zmc.height - 150;
 	if (incoming) {
 		double half = (w - 8) / 2;
 		zmc_accent(cr);
-		cairo_rectangle(cr, MARGIN, y, half, 54);
-		cairo_fill(cr);
-		cairo_set_source_rgb(cr, 0.78, 0.13, 0.13);
-		cairo_rectangle(cr, MARGIN + half + 8, y, half, 54);
-		cairo_fill(cr);
+		cairo_rectangle(cr, MARGIN, bottom, half, 54); cairo_fill(cr);
+		cairo_set_source_rgb(cr, .25, .25, .25);
+		cairo_rectangle(cr, MARGIN + half + 8, bottom, half, 54); cairo_fill(cr);
+		cairo_rectangle(cr, MARGIN, bottom + 62, w, 48); cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
-		zmc_text_centred(cr, "answer", FONT_SEMILIGHT, 22, MARGIN + half / 2, y + 12);
-		zmc_text_centred(cr, "decline", FONT_SEMILIGHT, 22, MARGIN + half + 8 + half / 2, y + 12);
-		zmc_add_hit(MARGIN, y, half, 54, ACT_ANSWER, 0);
-		zmc_add_hit(MARGIN + half + 8, y, half, 54, ACT_HANGUP, 0);
+		zmc_text_centred(cr, "answer", FONT_SEMILIGHT, 22, MARGIN + half / 2, bottom + 12);
+		zmc_text_centred(cr, "ignore", FONT_SEMILIGHT, 22, MARGIN + half * 1.5 + 8, bottom + 12);
+		zmc_text_centred(cr, "text reply", FONT_REGULAR, 20, zmc.width / 2, bottom + 73);
+		zmc_add_hit(MARGIN, bottom, half, 54, ACT_ANSWER, 0);
+		zmc_add_hit(MARGIN + half + 8, bottom, half, 54, ACT_HANGUP, 0);
+		zmc_add_hit(MARGIN, bottom + 62, w, 48, ACT_REPLY, 0);
 	} else {
-		cairo_set_source_rgb(cr, 0.78, 0.13, 0.13);
-		cairo_rectangle(cr, MARGIN, y, w, 54);
-		cairo_fill(cr);
+		if (active) {
+			const char *labels[] = { "mute", "speaker", call_keys ? "hide keypad" : "keypad" };
+			int actions[] = { ACT_MUTE, ACT_SPEAKER, ACT_CALL_KEYS };
+			double side = (w - 16) / 3;
+			for (int i = 0; i < 3; i++) {
+				double x = MARGIN + i * (side + 8);
+				if ((i == 0 && muted) || (i == 1 && speaker) || (i == 2 && call_keys)) zmc_accent(cr);
+				else cairo_set_source_rgb(cr, .25, .25, .25);
+				cairo_rectangle(cr, x, bottom - 44, side, 64); cairo_fill(cr);
+				cairo_set_source_rgb(cr, 1, 1, 1);
+				zmc_text_centred(cr, labels[i], FONT_REGULAR, 15, x + side / 2, bottom - 23);
+				zmc_add_hit(x, bottom - 44, side, 64, actions[i], 0);
+			}
+		}
+		cairo_set_source_rgb(cr, .25, .25, .25);
+		cairo_rectangle(cr, MARGIN, bottom + 30, w, 54); cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
-		zmc_text_centred(cr, "end call", FONT_SEMILIGHT, 22, zmc.width / 2.0, y + 12);
-		zmc_add_hit(MARGIN, y, w, 54, ACT_HANGUP, 0);
+		zmc_text_centred(cr, "end call", FONT_SEMILIGHT, 22, zmc.width / 2, bottom + 42);
+		zmc_add_hit(MARGIN, bottom + 30, w, 54, ACT_HANGUP, 0);
+		cairo_set_source_rgb(cr, .65, .65, .65);
+		zmc_text(cr, "Call audio is not routed yet. Neither side can hear.", FONT_REGULAR, 12, MARGIN, bottom + 94, w);
 	}
-	y += 76;
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	y += zmc_text(cr, "The sound of a call is not connected on this phone yet: the call is made, "
-		"and neither side hears the other.", FONT_REGULAR, 12.5, MARGIN, y, w) + 16;
-	return y;
+	return zmc.height;
 }
 
 /* ---- one call of the history ---------------------------------------------- */
@@ -467,6 +612,38 @@ static double render(cairo_t *cr, int page) {
 	return 0;
 }
 
+/* Keep the named Lumia swivel on the GPU; cache its face once per arrival. */
+static void arrived(int page) {
+	if (page != P_KEYPAD && page != P_CALL) return;
+	if (swivel_surface) cairo_surface_destroy(swivel_surface);
+	swivel_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, zmc.width * zmc.scale, zmc.height * zmc.scale);
+	cairo_surface_set_device_scale(swivel_surface, zmc.scale, zmc.scale);
+	cairo_t *cr = cairo_create(swivel_surface);
+	cairo_set_source_rgb(cr, 0, 0, 0); cairo_paint(cr);
+	int hits = zmc.n_hits;
+	render(cr, page);
+	zmc.n_hits = hits;
+	cairo_destroy(cr);
+	swivel_at = zmc_now_ms();
+	swivel_leaving = false;
+	swivel_revision++;
+	zmc_present();
+}
+
+static void overlay(int page) {
+	if (!swivel_surface || (page != P_CALL && page != P_KEYPAD)) return;
+	const char *transition = swivel_leaving ? "swivel-out" : "swivel-in";
+	double t = (zmc_now_ms() - swivel_at) / zmc_transition_ms(transition);
+	if (t >= 1) {
+		cairo_surface_destroy(swivel_surface);
+		swivel_surface = NULL;
+		return;
+	}
+	zmc_gpu_rect(0, 0, zmc.width, zmc.height, 0, 0, 0);
+	zmc_transition(transition, t, 0, 0, zmc.width, zmc.height, swivel_surface, swivel_revision);
+	zmc.dirty = true;	/* request the next callback without entering the renderer again */
+}
+
 /* ---- what taps do --------------------------------------------------------- */
 
 static void dial(const char *who) {
@@ -500,14 +677,20 @@ static void other_app(const char *app, const char *arg) {
 }
 
 static void activate(int action, int arg) {
+	if (ending || (swivel_surface && zmc_now_ms() - swivel_at < 300)) return;
 	size_t len = strlen(digits);
 	switch (action) {
-	case ACT_KEY:
+	case ACT_KEY: {
+		char file[32];
+		snprintf(file, sizeof(file), "dtmf%s.wav", arg == '*' ? "ast" : arg == '#' ? "pd" : (char[2]){arg, 0});
+		sound_play(file, false);
+		if (on_call()) break;
 		if (len + 1 < sizeof(digits) - 1) {
 			digits[len] = (char)arg;
 			digits[len + 1] = 0;
 		}
 		break;
+	}
 	case ACT_ERASE:
 		if (len) {
 			digits[len - 1] = 0;
@@ -546,11 +729,39 @@ static void activate(int action, int arg) {
 	case ACT_ENTRY_SAVE:
 		other_app("ztcontacts --add", entry);
 		break;
+	case ACT_MUTE:
+		muted = !muted;
+		break;
+	case ACT_SPEAKER:
+		speaker = !speaker;
+		modem_tell(speaker ? "speaker on" : "speaker off");
+		break;
+	case ACT_CALL_KEYS:
+		call_keys = !call_keys;
+		zmc_turn(1);
+		break;
+	case ACT_REPLY: {
+		/* ztMETRO marks a call shown over the lock screen */
+		const char *runtime = getenv("XDG_RUNTIME_DIR");
+		char locked[256];
+		if (runtime) snprintf(locked, sizeof(locked), "%s/ztmetro-call-locked", runtime);
+		else snprintf(locked, sizeof(locked), "/run/user/%u/ztmetro-call-locked", (unsigned)getuid());
+		if (access(locked, F_OK) == 0) {
+			reply_hint = true;
+		} else {
+			modem_tell("hangup");
+			sound_stop();
+			other_app("ztmessages", number);
+		}
+		break;
+	}
 	case ACT_HANGUP:
+		sound_stop();
 		modem_tell("hangup");
 		zmc_haptic("click");
 		break;		/* the page goes when the modem says the call is over */
 	case ACT_ANSWER:
+		sound_stop();
 		modem_tell("answer");
 		zmc_haptic("click");
 		break;
@@ -654,6 +865,7 @@ static void typed(const char *text) {
 }
 
 static bool back(void) {
+	if (call_screen_only || on_call() || ending) return true;
 	if (menu_for >= 0) {
 		menu_for = -1;
 		zmc_redraw();
@@ -678,6 +890,21 @@ static bool back(void) {
 
 /* How the call stands, from the modem daemon's report: once a second. */
 static void tick(void) {
+	while (waitpid(-1, NULL, WNOHANG) > 0) {}
+	if (ending) {
+		if (!swivel_leaving && zmc_now_ms() - ended_at >= 600) {
+			arrived(P_CALL);
+			swivel_leaving = true;
+		}
+		if (zmc_now_ms() - ended_at >= 1000) {
+			ending = false;
+			number[0] = 0;
+			if (call_screen_only) zmc_quit();
+			else zmc_go(came_from, -1);
+		}
+		return;
+	}
+
 	char now[16], who[40];
 	bool was = on_call();
 	modem_value("call", now, sizeof(now));
@@ -702,23 +929,30 @@ static void tick(void) {
 		zmc_go(P_CALL, 1);
 	} else if (!on_call() && was) {
 		answered_at = 0;
-		number[0] = 0;
-		if (zmc.page == P_CALL) {
-			zmc_go(came_from, -1);
-		} else {
-			zmc_redraw();
-		}
+		sound_stop();
+		char result[16];
+		modem_value("call_result", result, sizeof(result));
+		sound_play(!strcmp(result, "busy") ? "Busy.wav" : !strcmp(result, "drop") ? "Calldrop.wav" : "Disconnct.wav", false);
+		ending = true;
+		ended_at = zmc_now_ms();
+		call_keys = muted = speaker = false;
+		zmc_redraw();
+		return;
 	} else if (changed || (zmc.page == P_CALL && !strcmp(state, "active"))) {
 		zmc_redraw();	/* the state, or the clock of the call */
 	}
+	call_sound();
 }
 
 static const struct zmc_app phone = {
 	.app_id = "ztphone", .title = "Phone", .caps = "PHONE",
 	.render = render, .activate = activate, .back = back, .text = typed, .hold = hold,
+	.arrived = arrived, .overlay = overlay, .overlay_above_header = true,
 };
 
 int main(int argc, char **argv) {
+	atexit(sound_stop);
+	call_screen_only = argc == 2 && !strcmp(argv[1], "--call-screen");
 	contacts_load();
 	speed_load();
 	if (argc == 4 && !strcmp(argv[1], "--render")) {
@@ -768,9 +1002,11 @@ int main(int argc, char **argv) {
 		snprintf(number, sizeof(number), "%.38s", call_now);
 		snprintf(state, sizeof(state), "dialing");
 	}
+	if (call_screen_only && !on_call()) return 0;
 	if (on_call()) {
 		first = P_CALL;
 	}
-	zmc_every(1000, tick);
+	call_sound();
+	zmc_every(250, tick);
 	return zmc_run(&phone, first);
 }

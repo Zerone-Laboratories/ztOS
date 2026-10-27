@@ -1,0 +1,116 @@
+--- a/src/api-impl/android/atl/GskCanvas.java
++++ b/src/api-impl/android/atl/GskCanvas.java
+@@ -20,6 +20,26 @@
+ 	public GskCanvas(long snapshot) {
+ 		this.snapshot = snapshot;
+ 		state_stack.push(new Matrix());
++	}
++
++	/** Start an isolated Android drawing frame inside the GTK snapshot. */
++	public void beginFrame(long snapshot) {
++		this.snapshot = snapshot;
++		state_stack.clear();
++		state_stack.push(new Matrix());
++		push_history = null;
++		native_save(snapshot);
++	}
++
++	/** Restore saves and root-level clips before returning to GTK. */
++	public void endFrame() {
++		restoreToCount(1);
++		if (push_history != null && push_history.length > 1 && push_history[1] > 0)
++			native_pop(snapshot, push_history[1]);
++		native_restore(snapshot);
++		push_history = null;
++		state_stack.peek().reset();
++		this.snapshot = 0;
+ 	}
+ 
+ 	@Override
+--- a/src/api-impl-jni/widgets/WrapperWidget.h
++++ b/src/api-impl-jni/widgets/WrapperWidget.h
+@@ -14,6 +14,8 @@
+ 	jobject jobj;
+ 	jobject canvas;
+ 	jmethodID draw_method;
++	jmethodID begin_frame_method;
++	jmethodID end_frame_method;
+ 	jmethodID measure_method;
+ 	jmethodID computeScroll_method;
+ 	int layout_width;
+--- a/src/api-impl-jni/widgets/WrapperWidget.c
++++ b/src/api-impl-jni/widgets/WrapperWidget.c
+@@ -186,13 +186,17 @@
+ 	snapshot_in_progress++;
+ 
+ 	WrapperWidget *wrapper = WRAPPER_WIDGET(widget);
+-	if (wrapper->real_height > 0 && wrapper->real_width > 0) {
++	const bool clipped = wrapper->real_height > 0 && wrapper->real_width > 0;
++	if (clipped) {
+ 		gtk_snapshot_push_clip(snapshot, &GRAPHENE_RECT_INIT(0, 0, wrapper->real_width, wrapper->real_height));
+ 	}
+ 	if (wrapper->draw_method) {
+ 		JNIEnv *env = get_jni_env();
+-		_SET_LONG_FIELD(wrapper->canvas, "snapshot", _INTPTR(snapshot));
++		(*env)->CallVoidMethod(env, wrapper->canvas, wrapper->begin_frame_method, _INTPTR(snapshot));
+ 		(*env)->CallVoidMethod(env, wrapper->jobj, wrapper->draw_method, wrapper->canvas);
++		if ((*env)->ExceptionCheck(env))
++			(*env)->ExceptionDescribe(env);
++		(*env)->CallVoidMethod(env, wrapper->canvas, wrapper->end_frame_method);
+ 		if ((*env)->ExceptionCheck(env))
+ 			(*env)->ExceptionDescribe(env);
+ 	} else {
+@@ -203,7 +207,7 @@
+ 			child = gtk_widget_get_next_sibling(child);
+ 		}
+ 	}
+-	if (wrapper->real_height > 0 && wrapper->real_width > 0) {
++	if (clipped) {
+ 		gtk_snapshot_pop(snapshot);
+ 	}
+ 
+@@ -462,6 +466,8 @@
+ 		wrapper->draw_method = draw_method;
+ 		jclass canvas_class = (*env)->FindClass(env, "android/atl/GskCanvas");
+ 		jmethodID canvas_constructor = _METHOD(canvas_class, "<init>", "(J)V");
++		wrapper->begin_frame_method = _METHOD(canvas_class, "beginFrame", "(J)V");
++		wrapper->end_frame_method = _METHOD(canvas_class, "endFrame", "()V");
+ 		wrapper->canvas = _REF((*env)->NewObject(env, canvas_class, canvas_constructor, 0));
+ 		(*env)->DeleteLocalRef(env, canvas_class);
+ 	}
+--- a/src/api-impl/android/graphics/drawable/VectorDrawable.java
++++ b/src/api-impl/android/graphics/drawable/VectorDrawable.java
+@@ -941,6 +941,11 @@
+ 
+ 		if (direct_draw_override) {
+ 			mVectorState.mVPathRenderer.draw(canvas, scaledWidth, scaledHeight, null);
++		} else if (canvas instanceof android.atl.GskCanvas && !mVectorState.hasTranslucentRoot()) {
++			// Keep vector paths for GTK's device-scale rendering. Raster caching
++			// at Android logical size otherwise blurs icons on high-DPI outputs.
++			// The canvas already carries its transform; do not scale it twice.
++			mVectorState.mVPathRenderer.draw(canvas, mTmpBounds.width(), mTmpBounds.height(), colorFilter);
+ 		} else {
+ 			mVectorState.createCachedBitmapIfNeeded(scaledWidth, scaledHeight);
+ 			if (!mAllowCaching) {
+--- a/src/api-impl-jni/graphics/android_graphics_BitmapFactory.c
++++ b/src/api-impl-jni/graphics/android_graphics_BitmapFactory.c
+@@ -58,8 +58,18 @@
+ {
+ 	GInputStream *stream = java_input_stream_new(env, is, storage);
+ 
+-	GdkPixbuf *pixbuf = gdk_pixbuf_new_from_stream(stream, NULL, NULL);
++	GError *error = NULL;
++	GdkPixbuf *pixbuf = gdk_pixbuf_new_from_stream(stream, NULL, &error);
+ 	g_object_unref(stream);
++	if (!pixbuf) {
++		g_warning("ATL bitmap decode failed: %s", error ? error->message : "unknown image format");
++		g_clear_error(&error);
++		if (opts) {
++			_SET_INT_FIELD(opts, "outWidth", -1);
++			_SET_INT_FIELD(opts, "outHeight", -1);
++		}
++		return 0;
++	}
+ 	GdkTexture *texture = gdk_texture_new_for_pixbuf(pixbuf);
+ 	g_object_unref(pixbuf);
+ 	return _INTPTR(texture);

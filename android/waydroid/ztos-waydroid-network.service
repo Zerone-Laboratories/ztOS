@@ -1,0 +1,12 @@
+[Unit]
+Description=ztOS Waydroid network recovery
+After=waydroid-container.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/ztos-waydroid-network
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

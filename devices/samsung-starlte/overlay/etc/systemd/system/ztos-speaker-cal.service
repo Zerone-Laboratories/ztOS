@@ -1,0 +1,13 @@
+[Unit]
+Description=ztOS: speaker calibration from EFS for the DSP's speaker management
+# after the audio service has loaded snd-zrn-abox (it runs late, after
+# multi-user.target: ordering this before that target deadlocked boot audio)
+After=ztoscirrusaudio.service run-android-mnt-vendor-efs.mount
+Wants=ztoscirrusaudio.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ztos-speaker-cal
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,114 @@
+UTC: 2026-10-23T20:48:48Z
+Session:	RUNNING
+Container:	RUNNING
+Vendor type:	MAINLINE
+IP address:	192.168.240.112
+Session user:	zerone(1000)
+Wayland display:	wayland-0
+/sys/fs/cgroup/lxc.payload.waydroid/memory.current
+1774587904
+/sys/fs/cgroup/lxc.payload.waydroid/memory.max
+max
+/sys/fs/cgroup/lxc.payload.waydroid/memory.events
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+sock_throttled 30
+/sys/fs/cgroup/lxc.payload.waydroid/memory.stat
+anon 601960448
+file 1082060800
+kernel 89509888
+kernel_stack 15138816
+pagetables 31653888
+sec_pagetables 0
+percpu 35520
+sock 12288
+vmalloc 5726208
+shmem 248950784
+file_mapped 470630400
+file_dirty 196608
+file_writeback 0
+swapcached 0
+anon_thp 180355072
+file_thp 8388608
+shmem_thp 4194304
+inactive_anon 598564864
+active_anon 774144
+inactive_file 350801920
+active_file 479367168
+unevictable 254644224
+slab_reclaimable 7077320
+slab_unreclaimable 29845984
+slab 36923304
+hugetlb 0
+workingset_refault_anon 0
+workingset_refault_file 168932
+workingset_activate_anon 0
+workingset_activate_file 51339
+workingset_restore_anon 0
+workingset_restore_file 8162
+workingset_nodereclaim 0
+pgdemote_kswapd 0
+pgdemote_direct 0
+pgdemote_khugepaged 0
+pgdemote_proactive 0
+pgsteal_kswapd 126729
+pgsteal_direct 14834
+pgsteal_khugepaged 37
+pgsteal_proactive 0
+pgscan_kswapd 1234296
+pgscan_direct 1014184
+pgscan_khugepaged 37
+pgscan_proactive 0
+pgrefill 28286
+pgscan 2248517
+pgsteal 141600
+pswpin 0
+pswpout 0
+pgfault 550293
+pgmajfault 6548
+pgactivate 75554
+pgdeactivate 9924
+pglazyfree 0
+pglazyfreed 0
+swpin_zero 0
+swpout_zero 0
+thp_fault_alloc 504
+thp_collapse_alloc 0
+thp_swpout 0
+thp_swpout_fallback 0
+               total        used        free      shared  buff/cache   available
+Mem:            3516        1776         154         355        2100        1739
+Swap:              0           0           0
+/usr/share/waydroid-extra/images/system.img 1950093312 bytes
+/usr/share/waydroid-extra/images/system.img.stock 1994985472 bytes
+/usr/share/waydroid-extra/images/vendor.img 421634048 bytes
+sys.boot_completed=1
+ro.zygote=zygote64
+ro.product.cpu.abilist=arm64-v8a
+ro.product.cpu.abilist32=
+init.svc.zygote=running
+init.svc.zygote_secondary=
+ro.lmk.use_psi=true
+root              77       1 5172460 176496 do_sys_poll         0 S zygote64
+system           282      77 8624188 311540 do_epoll_wait       0 S system_server
+u0_a107          463      77 6517400 215368 do_epoll_wait       0 S com.android.systemui
+webview_zygote   553      77 5180268  89400 do_sys_poll         0 S webview_zygote
+u0_a125         1095      77 7120384 290080 __futex_wait        0 S com.whatsapp
+0
+default via 192.168.240.1 dev eth0 
+192.168.240.0/24 dev eth0 proto kernel scope link src 192.168.240.112 
+local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1 
+local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1 
+broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1 
+local 192.168.240.112 dev eth0 table local proto kernel scope host src 192.168.240.112 
+broadcast 192.168.240.255 dev eth0 table local proto kernel scope link src 192.168.240.112 
+local ::1 dev lo proto kernel metric 0 pref medium
+local fe80::14d1:bce8:b872:a1b4 dev eth0 proto kernel metric 0 pref medium
+fe80::/64 dev eth0 proto kernel metric 256 pref medium
+multicast ff00::/8 dev eth0 proto kernel metric 256 pref medium
+Active default network: 100
+HTTP 204

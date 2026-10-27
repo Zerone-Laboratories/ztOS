@@ -1,0 +1,33 @@
+--- a/src/api-impl/android/security/keystore/KeyGenParameterSpec.java
++++ b/src/api-impl/android/security/keystore/KeyGenParameterSpec.java
+@@ -12,6 +12,7 @@
+ 	private String[] blockModes;
+ 	private String[] encryptionPaddings;
+ 	private boolean userAuthenticationRequired;
++	private boolean randomizedEncryptionRequired = true;
+ 
+ 	public static class Builder {
+ 		private KeyGenParameterSpec spec = new KeyGenParameterSpec();
+@@ -38,6 +39,11 @@
+ 
+ 		public Builder setUserAuthenticationRequired(boolean userAuthenticationRequired) {
+ 			spec.userAuthenticationRequired = userAuthenticationRequired;
++			return this;
++		}
++
++		public Builder setRandomizedEncryptionRequired(boolean required) {
++			spec.randomizedEncryptionRequired = required;
+ 			return this;
+ 		}
+ 
+@@ -90,6 +96,10 @@
+ 		return userAuthenticationRequired;
+ 	}
+ 
++	public boolean isRandomizedEncryptionRequired() {
++		return randomizedEncryptionRequired;
++	}
++
+ 	public String getKeystoreAlias() {
+ 		return keystoreAlias;
+ 	}

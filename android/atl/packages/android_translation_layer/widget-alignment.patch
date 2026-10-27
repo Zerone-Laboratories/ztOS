@@ -1,0 +1,237 @@
+--- a/src/api-impl/android/view/View.java	2026-10-20 02:52:37.000000000 +0530
++++ b/src/api-impl/android/view/View.java	2026-10-23 00:36:09.527966640 +0530
+@@ -2257,7 +2257,10 @@ public class View implements Drawable.Ca
+ 
+ 	public boolean hasOnClickListeners() { return false; }
+ 
++	protected int mTextAlignment = TEXT_ALIGNMENT_GRAVITY;
++
+ 	public void setTextAlignment(int textAlignment) {
++		this.mTextAlignment = textAlignment;
+ 		String[] classesToRemove = {"ATL-text-align-left", "ATL-text-align-center", "ATL-text-align-right"};
+ 		native_removeClasses(widget, classesToRemove);
+ 
+@@ -2355,7 +2358,7 @@ public class View implements Drawable.Ca
+ 
+ 	public void cancelLongPress() {}
+ 
+-	public int getTextAlignment() { return 0; }
++	public int getTextAlignment() { return mTextAlignment; }
+ 
+ 	public View findViewWithTag(Object tag) {
+ 		if (Objects.equals(tag, this.tag))
+--- a/src/api-impl/android/widget/Button.java	2026-10-20 02:52:37.000000000 +0530
++++ b/src/api-impl/android/widget/Button.java	2026-10-23 00:36:49.277320876 +0530
+@@ -3,6 +3,7 @@
+ import android.content.Context;
+ import android.content.res.TypedArray;
+ import android.graphics.drawable.Drawable;
++import android.view.Gravity;
+ import android.util.AttributeSet;
+
+ public class Button extends TextView {
+@@ -28,6 +29,11 @@ public class Button extends TextView {
+ 		if (a.hasValue(com.android.internal.R.styleable.TextView_text)) {
+ 			setText(a.getText(com.android.internal.R.styleable.TextView_text));
+ 		}
++		if (a.hasValue(com.android.internal.R.styleable.TextView_gravity)) {
++			setGravity(a.getInt(com.android.internal.R.styleable.TextView_gravity, Gravity.CENTER));
++		} else {
++			setGravity(Gravity.CENTER);
++		}
+ 
+ 		if (getBackground() != null) {
+ 			native_addClass(widget, "ATL-no-border");
+@@ -50,8 +55,6 @@ public class Button extends TextView {
+ 	@Override
+ 	public native CharSequence getText();
+ 
+-	@Override
+-	public void setTextSize(float size) {}
+ 
+ 	@Override
+ 	public void setCompoundDrawables(Drawable left, Drawable top, Drawable right, Drawable bottom) {
+--- a/src/api-impl/android/widget/TextView.java	2026-10-22 23:21:14.581193999 +0530
++++ b/src/api-impl/android/widget/TextView.java	2026-10-23 00:36:37.219225704 +0530
+@@ -37,7 +37,7 @@ public class TextView extends View {
+ 	private boolean include_padding = false;
+ 	private int break_strategy = 0 /*BREAK_STRATEGY_SIMPLE*/;
+ 	private int hyphenation_frequency = 0 /*HYPHENATION_FREQUENCY_NONE*/;
+-	private int gravity = Gravity.CENTER;
++	private int gravity = Gravity.TOP | Gravity.START;
+ 
+ 	public TextView(Context context, AttributeSet attrs) {
+ 		this(context, attrs, 0);
+@@ -91,6 +91,12 @@ public class TextView extends View {
+ 				boolean allCaps = a.getBoolean(com.android.internal.R.styleable.TextView_textAllCaps, false);
+ 				setAllCaps(allCaps);
+ 			}
++
++			if (a.hasValue(com.android.internal.R.styleable.TextView_gravity)) {
++				setGravity(a.getInt(com.android.internal.R.styleable.TextView_gravity, Gravity.TOP | Gravity.START));
++			} else {
++				applyAlignment();
++			}
+ 		} catch (java.lang.Exception e) {
+ 			System.out.println("exception while inflating TextView:");
+ 			e.printStackTrace();
+@@ -231,10 +237,74 @@ public class TextView extends View {
+ 
+ 	public float getTextSize() { return paint.getTextSize(); }
+ 
++	@Override
++	public void setGravity(int gravity) {
++		super.setGravity(gravity);
++		if (this.gravity != gravity) {
++			this.gravity = gravity;
++			applyAlignment();
++		}
++	}
++
+ 	public int getGravity() {
+ 		return gravity;
+ 	}
+ 
++	@Override
++	public void setTextAlignment(int textAlignment) {
++		super.setTextAlignment(textAlignment);
++		applyAlignment();
++	}
++
++	@Override
++	public void setLayoutDirection(int layoutDirection) {
++		super.setLayoutDirection(layoutDirection);
++		applyAlignment();
++	}
++
++	private void applyAlignment() {
++		int textAlignment = getTextAlignment();
++		float xalign = 0.0f;
++		boolean explicitHorizontal = false;
++
++		if (textAlignment == TEXT_ALIGNMENT_CENTER) {
++			xalign = 0.5f;
++			explicitHorizontal = true;
++		} else if (textAlignment == TEXT_ALIGNMENT_TEXT_START || textAlignment == TEXT_ALIGNMENT_VIEW_START) {
++			xalign = (getLayoutDirection() == LAYOUT_DIRECTION_RTL) ? 1.0f : 0.0f;
++			explicitHorizontal = true;
++		} else if (textAlignment == TEXT_ALIGNMENT_TEXT_END || textAlignment == TEXT_ALIGNMENT_VIEW_END) {
++			xalign = (getLayoutDirection() == LAYOUT_DIRECTION_RTL) ? 0.0f : 1.0f;
++			explicitHorizontal = true;
++		}
++
++		if (!explicitHorizontal) {
++			int absGrav = Gravity.getAbsoluteGravity(this.gravity, getLayoutDirection());
++			int hGrav = absGrav & Gravity.HORIZONTAL_GRAVITY_MASK;
++			if (hGrav == Gravity.RIGHT) {
++				xalign = 1.0f;
++			} else if (hGrav == Gravity.CENTER_HORIZONTAL) {
++				xalign = 0.5f;
++			} else {
++				xalign = 0.0f;
++			}
++		}
++
++		int vGrav = this.gravity & Gravity.VERTICAL_GRAVITY_MASK;
++		float yalign = 0.0f;
++		if (vGrav == Gravity.BOTTOM) {
++			yalign = 1.0f;
++		} else if (vGrav == Gravity.CENTER_VERTICAL) {
++			yalign = 0.5f;
++		} else {
++			yalign = 0.0f;
++		}
++
++		native_setAlign(xalign, yalign);
++	}
++
++	protected native void native_setAlign(float xalign, float yalign);
++
+ 	public int getCompoundPaddingTop() { return 0; }
+ 	public int getCompoundPaddingBottom() { return 0; }
+ 
+--- a/src/api-impl-jni/widgets/android_widget_Button.c	2026-10-22 23:21:14.588087293 +0530
++++ b/src/api-impl-jni/widgets/android_widget_Button.c	2026-10-23 00:37:23.400931128 +0530
+@@ -24,8 +24,16 @@ JNIEXPORT jlong JNICALL Java_android_wid
+ 	/* Android touch clicks do not transfer keyboard focus from the editor. */
+ 	gtk_widget_set_focus_on_click(button, FALSE);
+ 	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
++	gtk_widget_set_hexpand(box, TRUE);
++	gtk_widget_set_vexpand(box, TRUE);
+ 	gtk_button_set_child(GTK_BUTTON(button), box);
+-	gtk_box_append(GTK_BOX(box), gtk_label_new(text));
++	GtkWidget *label = gtk_label_new(text);
++	gtk_widget_set_hexpand(label, TRUE);
++	gtk_widget_set_vexpand(label, TRUE);
++	gtk_label_set_xalign(GTK_LABEL(label), 0.5f);
++	gtk_label_set_yalign(GTK_LABEL(label), 0.5f);
++	gtk_label_set_justify(GTK_LABEL(label), GTK_JUSTIFY_CENTER);
++	gtk_box_append(GTK_BOX(box), label);
+ 	wrapper_widget_set_child(WRAPPER_WIDGET(wrapper), button);
+ 	wrapper_widget_set_jobject(WRAPPER_WIDGET(wrapper), env, this);
+ 
+--- a/src/api-impl-jni/widgets/android_widget_TextView.c	2026-10-22 23:21:14.581903865 +0530
++++ b/src/api-impl-jni/widgets/android_widget_TextView.c	2026-10-23 00:37:11.711930684 +0530
+@@ -9,10 +9,20 @@
+ 
+ static GtkLabel *box_get_label(JNIEnv *env, GtkWidget *box)
+ {
+-	GtkWidget *label = gtk_widget_get_last_child(GTK_WIDGET(box));
+-	if (!GTK_IS_LABEL(label))
+-		label = gtk_widget_get_prev_sibling(label);
+-	return GTK_LABEL(label);
++	if (!box)
++		return NULL;
++	if (GTK_IS_BUTTON(box))
++		box = gtk_button_get_child(GTK_BUTTON(box));
++	if (GTK_IS_BOX(box)) {
++		GtkWidget *label = gtk_widget_get_last_child(GTK_WIDGET(box));
++		if (label && !GTK_IS_LABEL(label))
++			label = gtk_widget_get_prev_sibling(label);
++		if (label && GTK_IS_LABEL(label))
++			return GTK_LABEL(label);
++	}
++	if (GTK_IS_LABEL(box))
++		return GTK_LABEL(box);
++	return NULL;
+ }
+ 
+ JNIEXPORT jlong JNICALL Java_android_widget_TextView_native_1constructor(JNIEnv *env, jobject this, jobject context, jobject attrs)
+@@ -23,11 +33,14 @@ JNIEXPORT jlong JNICALL Java_android_wid
+ 
+ 	GtkWidget *wrapper = g_object_ref(wrapper_widget_new());
+ 	GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
++	gtk_widget_set_hexpand(box, TRUE);
++	gtk_widget_set_vexpand(box, TRUE);
+ 	GtkWidget *label = gtk_label_new(text);
+ 	gtk_label_set_wrap(GTK_LABEL(label), TRUE);
+ 	gtk_label_set_xalign(GTK_LABEL(label), 0.f);
+ 	gtk_label_set_yalign(GTK_LABEL(label), 0.f);
+ 	gtk_widget_set_hexpand(label, TRUE);
++	gtk_widget_set_vexpand(label, TRUE);
+ 	gtk_box_append(GTK_BOX(box), label);
+ 	wrapper_widget_set_child(WRAPPER_WIDGET(wrapper), box);
+ 	wrapper_widget_set_jobject(WRAPPER_WIDGET(wrapper), env, this);
+@@ -98,6 +111,22 @@ JNIEXPORT void JNICALL Java_android_widg
+ 	gtk_label_set_use_markup(label, value);
+ }
+ 
++JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setAlign(JNIEnv *env, jobject this, jfloat xalign, jfloat yalign)
++{
++	GtkWidget *widget = _PTR(_GET_LONG_FIELD(this, "widget"));
++	GtkLabel *label = box_get_label(env, widget);
++	if (label) {
++		gtk_label_set_xalign(label, xalign);
++		gtk_label_set_yalign(label, yalign);
++		if (xalign > 0.6f)
++			gtk_label_set_justify(label, GTK_JUSTIFY_RIGHT);
++		else if (xalign > 0.3f)
++			gtk_label_set_justify(label, GTK_JUSTIFY_CENTER);
++		else
++			gtk_label_set_justify(label, GTK_JUSTIFY_LEFT);
++	}
++}
++
+ JNIEXPORT void JNICALL Java_android_widget_TextView_native_1setCompoundDrawables(JNIEnv *env, jobject this, jlong widget_ptr, jlong left, jlong top, jlong right, jlong bottom)
+ {
+ 	GtkWidget *box = GTK_WIDGET(_PTR(widget_ptr));

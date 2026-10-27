@@ -16,6 +16,7 @@ third_party/vendor-kernel/
 *.o
 *.ko
 !prebuilts/modules/*.ko
+!prebuilts/power/*.ko
 *.mod
 *.mod.c
 .*.cmd
@@ -43,7 +44,11 @@ ztmetro/core/*-protocol.c
 ztmetro/core/*-client-protocol.h
 
 # SDK native renderer artifacts, rebuilt for each target
-sdk/native/prebuilt/
+sdk/native/prebuilt/*
+# the phone's renderer ships with the source: a fresh clone (and the release
+# workflow) cannot build it, being on x86-64; the SDK refuses it when its
+# .sha256 no longer matches renderer.c, so rebuild it then (make -C sdk/native on the phone)
+!sdk/native/prebuilt/aarch64/
 ztmetro/auth/ztos-polkit-agent
 ztmetro/sounds/ztos-sounds
 ztmetro/devices/ztdevices
@@ -52,3 +57,26 @@ ztmetro/browser/superscan
 # Windows Phone UI sounds (from the OS Sound Kit): Microsoft's audio, not ours to
 # redistribute; copied onto the phone locally, kept out of the public repository
 os/overlay/usr/local/share/sounds/ztos/system/*.wav
+
+# Local phone sound pack and third-party Lumia ringtones; do not redistribute.
+os/overlay/usr/local/share/sounds/ztos/phone/
+
+# Test screenshots, UI dumps and probe builds from the phone: they show real
+# chats, contacts and phone numbers, so they stay on the machine that took them
+android/waydroid/results/
+**/evidence/
+ztmetro/evidence-*.png
+ztmetro/browser/scroll-rubber-band.png
+ztmetro/settings/*-check.png
+ztmetro/settings/ztsettings-check
+
+# makepkg's downloads and work folders (PKGBUILD fetches them again)
+android/atl/packages/*/src/
+android/atl/packages/*/pkg/
+android/atl/packages/*/*.tar.gz
+android/atl/packages/android_translation_layer/apksig-8.9.1.jar
+android/atl/packages/art_standalone/r8-*.jar
+ztmetro/files/ztfiles
+ztmetro/sound/ztsound
+score/tools/scoremm
+ztmetro/osial/ztosial

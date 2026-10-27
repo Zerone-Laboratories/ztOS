@@ -1,0 +1,86 @@
+--- a/libc/libc-chk.c
++++ b/libc/libc-chk.c
+@@ -259,3 +259,83 @@
+ 	}
+ 	return dst;
+ }
++
++
++void *bionic___memchr_chk(const void *buf, int ch, size_t n, size_t buf_size)
++{
++	if (__builtin_expect(n > buf_size, 0)) {
++		fprintf(stderr, "*** memchr read overflow detected ***\n");
++		abort();
++	}
++	return (void *)memchr(buf, ch, n);
++}
++
++void *bionic___memrchr_chk(const void *buf, int ch, size_t n, size_t buf_size)
++{
++	if (__builtin_expect(n > buf_size, 0)) {
++		fprintf(stderr, "*** memrchr read overflow detected ***\n");
++		abort();
++	}
++	const unsigned char *p = (const unsigned char *)buf;
++	while (n-- > 0) {
++		if (p[n] == (unsigned char)ch)
++			return (void *)(p + n);
++	}
++	return NULL;
++}
++
++size_t bionic___strnlen_chk(const char *s, size_t size, size_t max_size)
++{
++	if (size <= max_size)
++		return strnlen(s, size);
++
++	/* A longer request is safe only when a terminator lies inside the object. */
++	size_t length = strnlen(s, max_size);
++	if (__builtin_expect(length == max_size, 0)) {
++		fprintf(stderr, "*** strnlen read overflow detected ***\n");
++		abort();
++	}
++	return length;
++}
++
++static size_t bionic_strlcpy_impl(char *dst, const char *src, size_t size)
++{
++	size_t len = strlen(src);
++	if (size) {
++		size_t copy = len >= size ? size - 1 : len;
++		memcpy(dst, src, copy);
++		dst[copy] = 0;
++	}
++	return len;
++}
++
++size_t bionic___strlcpy_chk(char *dst, const char *src, size_t size, size_t dst_size)
++{
++	if (__builtin_expect(size > dst_size, 0)) {
++		fprintf(stderr, "*** strlcpy write overflow detected ***\n");
++		abort();
++	}
++	return bionic_strlcpy_impl(dst, src, size);
++}
++
++size_t bionic___strlcat_chk(char *dst, const char *src, size_t size, size_t dst_size)
++{
++	if (size > dst_size) {
++		fprintf(stderr, "*** strlcat write overflow detected ***\n");
++		abort();
++	}
++
++	size_t slen = strlen(src);
++	/* strlcat permits size zero and an unterminated destination. */
++	size_t dlen = strnlen(dst, size);
++	if (dlen == size)
++		return size + slen;
++
++	size_t avail = size - dlen;
++	if (avail) {
++		size_t copy = slen >= avail ? avail - 1 : slen;
++		memcpy(dst + dlen, src, copy);
++		dst[dlen + copy] = 0;
++	}
++	return dlen + slen;
++}

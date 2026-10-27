@@ -1,0 +1,11 @@
+[Unit]
+Description=ztOS Waydroid user session
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=%t
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/bin/waydroid session start
+KillMode=control-group
+TimeoutStopSec=20
+# Deliberately no Install section: start only through ztos-waydroid-launch.

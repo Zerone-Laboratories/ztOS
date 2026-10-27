@@ -1133,7 +1133,19 @@ static void bcm_spi_shutdown(struct spi_device *spi)
 		priv->serial_wq = NULL;
 	}
 
-	pr_info("[SSPBBD]: %s --\n", __func__);
+	/*
+	 * ztOS: leave the chip in standby for the next boot. Its 1.8 V supply
+	 * (LDO37) stays on across a warm reboot, so a chip left running came up
+	 * wedged in the next kernel (MCU_RESP stuck, no SPI answer) until a
+	 * full power-off (2026-10-24 to 27). GPS_PWR_EN low is its standby.
+	 */
+	if (zrn_gpios[ZRN_GPIO_MCU_REQ])
+		gpiod_set_value(zrn_gpios[ZRN_GPIO_MCU_REQ], 0);
+	if (zrn_gpios[ZRN_GPIO_GPS_PWR])
+		gpiod_set_value(zrn_gpios[ZRN_GPIO_GPS_PWR], 0);
+	if (zrn_gpios[ZRN_GPIO_AP_SLEEP])
+		gpiod_set_value(zrn_gpios[ZRN_GPIO_AP_SLEEP], 0);
+	pr_info("[SSPBBD]: %s: hub left in standby for the next boot --\n", __func__);
 }
 
 static int bcm_spi_probe(struct spi_device *spi)
