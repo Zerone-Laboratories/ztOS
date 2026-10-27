@@ -813,7 +813,17 @@ static bool scan(bool print) {
 		while (dir && (entry = readdir(dir))) {
 			size_t len = strlen(entry->d_name);
 			if (len > 8 && strcmp(entry->d_name + len - 8, ".desktop") == 0) {
-				desktop_read(app_dirs[i], entry->d_name);
+				/* one id, the first folder's (as XDG has it): a NoDisplay
+				 * copy in /usr/local hides a package's own entry */
+				bool shadowed = false;
+				for (int j = 0; j < i && !shadowed; j++) {
+					char earlier[1024];
+					snprintf(earlier, sizeof(earlier), "%s/%s", app_dirs[j], entry->d_name);
+					shadowed = access(earlier, F_OK) == 0;
+				}
+				if (!shadowed) {
+					desktop_read(app_dirs[i], entry->d_name);
+				}
 			}
 		}
 		if (dir) {

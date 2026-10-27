@@ -60,8 +60,7 @@ class Apps(Step):
         for title, detail, command in (
             ("Settings", "Wi-Fi, accent colour, sounds, haptics", "ztsettings"),
             ("Music", "streaming and offline listening", "/usr/local/lib/ztos/apps/com.zerone.music"),
-            ("Firefox", "the web", "/usr/bin/firefox"),
-            ("Chromium", "the web, the other way", "/usr/bin/chromium"),
+            ("superscan", "the web", "superscan"),
             ("Terminal", "GNOME Terminal", "gnome-terminal"),
             ("ZrnDevTest", "what the hardware says", "zrndevtest"),
         ):

@@ -518,11 +518,15 @@ static void perf_tell(const char *command) {
 
 #include "boostpage.h"
 
-/* Auto brightness is sensord's: it has the light sensor. */
+/* Auto brightness is sensord's: it has the light sensor. Without its status
+ * the phone has no light sensor to go by (the J5), and nothing is offered. */
+static bool light_sensor;
+
 static void auto_load(void) {
 	char line[64];
 	FILE *f = fopen("/run/ztoscsf-sensors/status", "r");
 	if (!f) f = fopen("/run/zrn-sensors/status", "r");
+	light_sensor = f != NULL;
 	app.autobrightness = false;	/* no daemon, no sensor */
 	while (f && fgets(line, sizeof(line), f)) {
 		if (strncmp(line, "auto=", 5) == 0) {
@@ -1684,21 +1688,23 @@ static double draw_display(cairo_t *cr) {
 	zmc_slider(cr, MARGIN, y, zmc.width - 2 * MARGIN, app.brightness, "Screen brightness", ACT_BRIGHTNESS_STEP);
 	y += 62;
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "Automatically adjust brightness", FONT_SEMILIGHT, 20, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, app.autobrightness ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
-	zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.autobrightness);
-	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_AUTOBRIGHTNESS, 0);
-	y += 66;
+	if (light_sensor) {
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, "Automatically adjust brightness", FONT_SEMILIGHT, 20, MARGIN, y, 0);
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, app.autobrightness ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
+		zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.autobrightness);
+		zmc_add_hit(0, y - 4, zmc.width, 50, ACT_AUTOBRIGHTNESS, 0);
+		y += 66;
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "OpenTone", FONT_SEMILIGHT, 20, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, app.opentone ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
-	zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.opentone);
-	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPENTONE, 0);
-	y += 66;
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, "OpenTone", FONT_SEMILIGHT, 20, MARGIN, y, 0);
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, app.opentone ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
+		zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.opentone);
+		zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPENTONE, 0);
+		y += 66;
+	}
 
 	static const char *const timeouts[] = { "30 seconds", "1 minute", "3 minutes", "5 minutes", "Never" };
 	y = picker(cr, y, "Screen times out after", timeouts, 5, app.timeout_idx, ACT_TIMEOUT_CYCLE);
