@@ -27,7 +27,7 @@ From a Galaxy S9 running ztOS (taken from the live display with `scripts/phone-g
 <tr>
 <td align="center"><img src="docs/screenshots/start.png" width="230"><br><b>Start</b></td>
 <td align="center"><img src="docs/screenshots/app-list.png" width="230"><br><b>App list</b></td>
-<td align="center"><img src="docs/screenshots/networking.png" width="230"><br><b>Cellular + SIM</b></td>
+<td align="center"><img sr[bluetooth](bluetooth)c="docs/screenshots/networking.png" width="230"><br><b>Cellular + SIM</b></td>
 <td align="center"><img src="docs/screenshots/sensors.png" width="230"><br><b>Sensors</b> (ZrnDevTest)</td>
 <td align="center"><img src="docs/screenshots/about.png" width="230"><br><b>About</b></td>
 </tr>

@@ -1205,25 +1205,31 @@ static double draw_theme(cairo_t *cr) {
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Start screen columns", FONT_REGULAR, 13.5, MARGIN, y, 0);
 	y += 24;
-	for (int c = 2; c <= 4; c++) {
+	double last_by = y;
+	for (int c = 2; c <= 10; c++) {
+		int index = c - 2;
+		int row = index / 3;
+		int col = index % 3;
 		double btn_w = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0;
-		double bx = MARGIN + (c - 2) * (btn_w + gap);
+		double bx = MARGIN + col * (btn_w + gap);
+		double by = y + row * (36 + gap);
+		last_by = by;
 		if (app.columns == c) {
 			zmc_set_rgb(cr, ACCENTS[app.accent].color);
-			cairo_rectangle(cr, bx, y, btn_w, 36);
+			cairo_rectangle(cr, bx, by, btn_w, 36);
 			cairo_fill(cr);
 		} else {
 			cairo_set_source_rgb(cr, 0.18, 0.18, 0.18);
-			cairo_rectangle(cr, bx, y, btn_w, 36);
+			cairo_rectangle(cr, bx, by, btn_w, 36);
 			cairo_fill(cr);
 		}
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		char label[16];
 		snprintf(label, sizeof(label), "%d columns", c);
-		zmc_text(cr, label, FONT_REGULAR, 13, bx + 10, y + 9, 0);
-		zmc_add_hit(bx, y, btn_w, 36, ACT_COLUMNS, c);
+		zmc_text(cr, label, FONT_REGULAR, 13, bx + 10, by + 9, 0);
+		zmc_add_hit(bx, by, btn_w, 36, ACT_COLUMNS, c);
 	}
-	return draw_wall_row(cr, y + 60);	/* under the columns row (36 high, 24 below) */
+ 	return draw_wall_row(cr, last_by + 36 + 24);	/* under the columns row (36 high, 24 below) */
 }
 
 /* The brightness as it is now, in percent (the shell or sensord may have

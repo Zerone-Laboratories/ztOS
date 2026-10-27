@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * ztMETRO: a Wayland compositor and shell for a touch phone, in the manner of
@@ -26,7 +27,7 @@
  *
  * Built on wlroots 0.20; the xdg-shell plumbing follows wlroots' tinywl.
  */
-#define _GNU_SOURCE
+#include <wayland-util.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -48,6 +49,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <linux/input-event-codes.h>
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -75,6 +77,8 @@
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
+#include <wlr/types/wlr_pointer_constraints_v1.h>
+#include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_text_input_v3.h>
@@ -84,22 +88,23 @@
 #include <wlr/types/wlr_viewporter.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_cursor.h>
+#include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
+#include <libinput.h>
+#include <wlr/backend/libinput.h>
 #include <xkbcommon/xkbcommon.h>
 
 /* All layout below is in logical points; the output scale turns them into pixels. */
 #define STATUS_H	28	/* status bar */
-#define NAV_H		40	/* nav bar */
 #define DEFAULT_KEY_HEIGHT 56
 #define KEY_GAP		3	/* between keys: the gap is the border */
 #define TERM_ROW_H	38	/* the Esc / Tab / Ctrl / arrows row for terminals */
-/* The action centre comes down over everything but the nav bar. */
-#define SHADE_MAX_H	((double)(server->height - NAV_H))
 #define SHADE_MS	260	/* settling after the finger lets go */
 #define SCREEN_TIMEOUT_S 60	/* idle time before the screen sleeps, by default */
 #define TOP_PAD		14	/* Start: above the first row */
-#define MAX_UNITS	8	/* Start: the most small tiles a row can hold */
+#define MAX_UNITS	32	/* Start: the most small tiles a row can hold */
 #define EDGE		18	/* how close to the glass edge a system gesture starts */
 #define SWIPE		56	/* how far a system gesture has to travel */
 #define SLOP		8	/* movement that turns a tap into a drag */
@@ -158,7 +163,7 @@
 /* Motion, in milliseconds and degrees. Starting values, to be tuned by eye. */
 #define FOV_DEG		34	/* vertical field of view of the one projection */
 /* the press, as everywhere (ZMC_TILT_* in core/zrnmetrocore.h) */
-#define TILT_DEG	14	/* how far a pressed tile leans toward the finger */
+#define TILT_DEG	4	/* how far a pressed tile leans toward the finger */
 #define TORCH_PATH	"/sys/class/leds/white:torch/brightness"	/* leds/zrn-flash.ko */
 #define TORCH_LEVEL	9	/* of 15: the top of Samsung's torch table */
 #define TILT_IN_MS	70
@@ -359,7 +364,13 @@ struct zt_touch_device {
 struct zt_pointer_device {
 	struct zt_server *server;
 	struct wlr_pointer *pointer;
-	struct wl_listener motion, motion_absolute, button, destroy;
+	struct wl_listener motion, motion_absolute, button, axis, destroy;
+};
+
+struct zt_pointer_constraint {
+	struct zt_server *server;
+	struct wlr_pointer_constraint_v1 *constraint;
+	struct wl_listener destroy;
 };
 
 enum touch_role {
@@ -436,11 +447,19 @@ struct zt_server {
 	struct wlr_allocator *allocator;
 	struct wlr_output_layout *output_layout;
 	struct zt_output *output;
+	struct wlr_cursor *cursor;
+	struct wlr_xcursor_manager *cursor_mgr;
+	struct wlr_pointer_constraints_v1 *pointer_constraints;
+	struct wlr_relative_pointer_manager_v1 *relative_pointer_manager;
+	struct wlr_pointer_constraint_v1 *active_constraint;
+	struct wl_listener new_constraint;
+
 	float scale;
 	int width, height;	/* of the output, in points */
 	uint32_t accent;
 	bool haptics_enabled;
 	int units;		/* Start: small tiles per row; twice the medium columns */
+	bool explicit_columns;
 
 	/* renderer */
 	EGLDisplay egl_display;
@@ -583,6 +602,9 @@ struct zt_server {
 	bool shade_location;
 	bool shade_notifs_cleared;
 	int shade_brightness;
+	bool shade_compact;
+	int shade_align;
+	bool navbar_enabled;
 	int shade_pressed;		/* -1: none, 0..7: quick toggles, 8: clear all, 9: collapse */
 	GLuint white_tex, black_tex;	/* 1x1 each, for plain rectangles */
 	struct zt_layer shade_tile_layer[8];	/* the quick actions, one texture each */
@@ -594,6 +616,8 @@ struct zt_server {
 	bool sensorhub_fail_screen;
 	struct zt_layer sensorhub_fail_layer;
 	struct wl_event_source *boot_check_timer;
+	struct wl_event_source *resize_timer;
+	bool resize_pending;
 	int boot_check_count;
 
 	/* power */
@@ -628,6 +652,7 @@ struct zt_server {
 	uint32_t client_tap_ms;
 	double client_tap_y;		/* below the status bar, in screen points, unlifted */
 	bool osk_pending;		/* a field asked by itself: shown at the next tap */
+	bool last_click_was_touch;	/* virtual keyboard only comes up if preceding click was touch */
 	/* Hyperscan: the search button's search over apps, settings, files
 	 * and the web (see hyper_open) */
 	bool hyper;
@@ -733,6 +758,9 @@ struct zt_server {
 
 	cairo_surface_t *logo;		/* the distribution's logo, for the Start button */
 
+	bool meta_pressed;
+	bool meta_used;
+
 	int haptic_fd;
 	int haptic_effect[8];		/* by enum hap_kind */
 	int haptic_strength;		/* percent */
@@ -751,6 +779,12 @@ struct zt_server {
 		new_decoration, new_text_input, new_surface, request_set_selection;
 };
 
+static inline double nav_h(struct zt_server *server) {
+	return (server && server->navbar_enabled) ? 40.0 : 0.0;
+}
+#define NAV_H nav_h(server)
+
+static struct wlr_surface *surface_at(struct zt_server *server, double x, double y, double *sx, double *sy);
 static void auth_input(struct zt_server *, uint32_t, const char *);
 static void auth_submit(struct zt_server *);
 static void auth_finish(struct zt_server *);
@@ -963,6 +997,9 @@ static void mat_rotate_x(float m[16], float degrees) {
  * the top of the screen, so y is not flipped the way it would be for a window.
  */
 static void projection_set(struct zt_server *server) {
+	glViewport(0,0, (GLsizei)roundf(server->width * server->scale),
+					(GLsizei)roundf(server->height * server->scale));
+
 	float w = server->width, h = server->height;
 	float d = (h / 2.0f) / tanf(FOV_DEG * (float)M_PI / 360.0f);
 	server->eye = d;
@@ -1332,6 +1369,14 @@ static void set_rgb(cairo_t *cr, uint32_t color) {
  * box_w x box_h when centre is set. */
 static void draw_text(cairo_t *cr, const char *text, const char *font, double size,
 		double x, double y, double box_w, double box_h, bool centre) {
+	cairo_font_options_t *fo = cairo_font_options_create();
+	cairo_font_options_set_antialias(fo, CAIRO_ANTIALIAS_SUBPIXEL);
+	cairo_font_options_set_hint_style(fo, CAIRO_HINT_STYLE_FULL);
+	cairo_font_options_set_hint_metrics(fo, CAIRO_HINT_METRICS_ON);
+	cairo_font_options_set_subpixel_order(fo, CAIRO_SUBPIXEL_ORDER_RGB);
+	cairo_set_font_options(cr, fo);
+	cairo_font_options_destroy(fo);
+
 	PangoLayout *layout = pango_cairo_create_layout(cr);
 	PangoFontDescription *desc = pango_font_description_from_string(font);
 	/* sizes are in points of our own coordinate space, not typographic ones */
@@ -1348,7 +1393,7 @@ static void draw_text(cairo_t *cr, const char *text, const char *font, double si
 		pango_layout_get_pixel_size(layout, &tw, &th);
 		y += (box_h - th) / 2;
 	}
-	cairo_move_to(cr, x, y);
+	cairo_move_to(cr, floor(x) + 0.5, floor(y) + 0.5);
 	pango_cairo_show_layout(cr, layout);
 	pango_font_description_free(desc);
 	g_object_unref(layout);
@@ -2378,6 +2423,9 @@ static void load_config(struct zt_server *server) {
 		server->shade_brightness = 50;
 	}
 	server->shade_pressed = -1;
+	server->shade_compact = false;
+	server->shade_align = 0;
+	server->navbar_enabled = true;
 	memcpy(server->quick, QUICK_DEFAULT, sizeof(server->quick));
 	FILE *f = fopen(path, "r");
 	if (!f) {
@@ -2428,11 +2476,18 @@ static void load_config(struct zt_server *server) {
 		} else if (strcmp(key, "scale") == 0) {
 			server->scale = strtof(value, NULL);
 		} else if (strcmp(key, "columns") == 0) {
-			/* medium tiles across: 2, 3 or 4 */
+			/* medium tiles across: 2, 3 or more */
 			int columns = atoi(value);
-			server->units = columns < 2 ? 4 : columns > 4 ? 8 : columns * 2;
+			server->units = columns < 2 ? 4 : columns * 2;
+			server->explicit_columns = true;
 		} else if (strcmp(key, "brightness") == 0) {
 			server->shade_brightness = atoi(value);
+		} else if (strcmp(key, "shade_compact") == 0) {
+			server->shade_compact = strcmp(value, "off") != 0 && strcmp(value, "0") != 0 && strcmp(value, "false") != 0;
+		} else if (strcmp(key, "shade_align") == 0) {
+			server->shade_align = strcmp(value, "left") == 0 ? 1 : strcmp(value, "right") == 0 ? 2 : 0;
+		} else if (strcmp(key, "navbar") == 0 || strcmp(key, "nav_bar") == 0) {
+			server->navbar_enabled = strcmp(value, "off") != 0 && strcmp(value, "0") != 0 && strcmp(value, "false") != 0;
 		} else if (strcmp(key, "timeout") == 0) {
 			/* seconds without input before the screen sleeps; 0: never */
 			server->screen_timeout = atoi(value);
@@ -2584,12 +2639,23 @@ static void load_builtin_tiles(struct zt_server *server) {
 	}
 }
 
+static inline int server_units(struct zt_server *server) {
+	if (server->explicit_columns && server->units > 0) {
+		return server->units;
+	}
+	int cols = (int)fmax(3, round((double)(server->width > 0 ? server->width : 360) / 180.0));
+	int units = cols * 2;
+	return units > MAX_UNITS ? MAX_UNITS : units;
+}
+
 /* First-fit packing into a grid `units` small tiles wide, the way Start flows.
  * The gutter is 2 % of the width and the side margins twice that. */
 static void place_tiles(struct zt_server *server) {
-	double gutter = round(server->width * 0.02);
+	double layout_w = (double)server->width;
+	int units = server_units(server);
+	double gutter = fmin(10.0, round(layout_w * 0.02));
 	double margin = 2 * gutter;
-	double unit = (server->width - 2 * margin - (server->units - 1) * gutter) / server->units;
+	double unit = (layout_w - 2 * margin - (units - 1) * gutter) / units;
 	bool *taken = calloc(MAX_UNITS * MAX_TILES * 2, sizeof(bool));
 	int rows = 0;
 	for (int i = 0; i < server->n_tiles; i++) {
@@ -2601,7 +2667,7 @@ static void place_tiles(struct zt_server *server) {
 		 * with room, so that small tiles always stand as a block and never
 		 * strung out along a row. */
 		for (int block = 0; t->size == TILE_SMALL; block++) {
-			int br = block / (server->units / 2) * 2, bc = block % (server->units / 2) * 2, k;
+			int br = block / (units / 2) * 2, bc = block % (units / 2) * 2, k;
 			for (k = 0; k < 4 && taken[(br + k / 2) * MAX_UNITS + bc + k % 2]; k++) {
 			}
 			if (k == 4) {
@@ -2621,9 +2687,9 @@ static void place_tiles(struct zt_server *server) {
 			break;
 		}
 		for (int cell = 0; t->size != TILE_SMALL; cell++) {
-			int r = cell / server->units, c = cell % server->units;
+			int r = cell / units, c = cell % units;
 			/* medium and wide tiles sit on even cells, like the original */
-			if (c + cw > server->units || (cw > 1 && c % 2) || (ch > 1 && r % 2)) {
+			if (c + cw > units || (cw > 1 && c % 2) || (ch > 1 && r % 2)) {
 				continue;
 			}
 			bool free_here = true;
@@ -2929,13 +2995,15 @@ static void draw_tile(struct zt_server *server, int i) {
 	}
 	cairo_paint(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	/* a glyph made from an icon fills its box to the edge: a little smaller */
+	/* a glyph made from an icon fills its box to the edge: a little smaller; clamp max size on desktop */
 	double k = t->icon[0] == '@' ? 0.86 : 1.0;
 	if (t->size == TILE_SMALL) {
-		draw_glyph(server, cr, t->icon, t->label, t->w / 2, t->h / 2, t->h * 0.56 * k);
+		double s = fmin(32.0, t->h * 0.56 * k);
+		draw_glyph(server, cr, t->icon, t->label, t->w / 2, t->h / 2, s);
 	} else {
 		/* icon slightly above centre, label at the bottom left */
-		draw_glyph(server, cr, t->icon, t->label, t->w / 2, t->h * 0.44, t->h * 0.46 * k);
+		double s = fmin(54.0, t->h * 0.46 * k);
+		draw_glyph(server, cr, t->icon, t->label, t->w / 2, t->h * 0.44, s);
 		draw_text(cr, t->label, FONT_REGULAR, 13, 8, t->h - 23, t->w - 16, 0, false);
 	}
 	if (t->live && t->live_count > 0) {
@@ -3581,7 +3649,7 @@ static void set_scroll(struct zt_server *server, double scroll) {
 /* ---- status bar ---------------------------------------------------------- */
 
 static int read_battery(void) {
-	static const char *names[] = { "battery", "max77705-battery", "max170xx_battery", NULL };
+	static const char *names[] = { "battery", "max77705-battery", "max170xx_battery", "BAT0", NULL };
 	for (int i = 0; names[i]; i++) {
 		char path[128];
 		int capacity = -1;
@@ -3851,11 +3919,10 @@ static bool on_charger(void) {
  * under the clock.
  */
 static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool live) {
+	int offset = 0;
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	/* Sized against the screen, off photos of the real thing: the battery is
-	 * about 6.8 % of the screen's width and 2.8 % of it high, and the clock's
-	 * digits are as tall as the battery. */
-	const double cell = round(server->width * 0.032 * 2) / 2;	/* battery cell height */
+	/* Sized against the screen, but capped so it never overflows STATUS_H (28pt) on widescreen/PC displays */
+	const double cell = fmin(11.5, fmax(8.0, round(server->width * 0.032 * 2) / 2));	/* battery cell height */
 	const double right = server->width - 14;			/* Start's own side margin */
 	const double base = (STATUS_H + cell) / 2;	/* the baseline everything stands on */
 	double x = 14;
@@ -3869,13 +3936,16 @@ static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool
 		x += cell * 1.75 + 8;
 	} else {
 		bool there = server->cell_known && cell_registered(server);
-		draw_signal(cr, x, base, cell * 1.75, cell * 1.15, there ? server->cell_bars : 0);
+		if (server->cell_known) { // !cell_known = no sim
+			draw_signal(cr, x, base, cell * 1.75, cell * 1.15, there ? server->cell_bars : 0);
+			x += cell * 1.75 + 5;
+		}
 		if (server->st_arrow_at == 1 && server->st_arrow > 0.001f) {
 			status_pop(cr, x + arrow / 2, base - cell * 1.15 + arrow / 2, server->st_arrow);
 			draw_data_arrow(cr, x, base - cell * 1.15, arrow);
 			status_pop_end(cr, server->st_arrow);
+			x += cell * 1.75 + 5;
 		}
-		x += cell * 1.75 + 5;
 		double size = cell * 1.0;
 		double tw = text_width(server->st_tech_text, FONT_SEMIBOLD, size);
 		if (server->st_tech > 0.001f) {
@@ -4421,23 +4491,88 @@ static int clock_tick(void *data) {
 #define SHADE_GAP	3
 #define SHADE_HANDLE	16	/* the bar along the bottom */
 
-static void shade_tile_rect(struct zt_server *server, int index, double *x, double *y,
+static void shade_panel_geom(struct zt_server *server, double *out_x, double *out_w) {
+	if (!server->shade_compact) {
+		*out_x = 0;
+		*out_w = server->width;
+		return;
+	}
+	double max_w = 136.0;
+	double avail_w = server->width - 2 * SHADE_SIDE - 3 * SHADE_GAP;
+	double w = fmin(max_w, avail_w / 4.0);
+	double panel_w = 4 * w + 3 * SHADE_GAP + 2 * SHADE_SIDE;
+	if (panel_w > server->width) {
+		panel_w = server->width;
+	}
+	double panel_x = 0;
+	if (server->shade_align == 1) { // left
+		panel_x = 16.0;
+	} else if (server->shade_align == 2) { // right
+		panel_x = server->width - panel_w - 16.0;
+	} else { // center
+		panel_x = (server->width - panel_w) / 2.0;
+	}
+	if (panel_x < 0) panel_x = 0;
+	*out_x = panel_x;
+	*out_w = panel_w;
+}
+
+static void shade_tile_rect_local(struct zt_server *server, int index, double *x, double *y,
 		double *w, double *h) {
-	*w = (server->width - 2 * SHADE_SIDE - 3 * SHADE_GAP) / 4.0;
+	double panel_x, panel_w;
+	shade_panel_geom(server, &panel_x, &panel_w);
+	double avail_w = panel_w - 2 * SHADE_SIDE - 3 * SHADE_GAP;
+	*w = fmin(136.0, avail_w / 4.0);
 	*h = round(*w * 0.66);		/* the quick actions are about 3:2 */
 	*x = SHADE_SIDE + (index % 4) * (*w + SHADE_GAP);
 	*y = SHADE_TOP + (index / 4) * (*h + SHADE_GAP);
 }
 
+static void shade_tile_rect(struct zt_server *server, int index, double *x, double *y,
+		double *w, double *h) {
+	shade_tile_rect_local(server, index, x, y, w, h);
+	double panel_x, panel_w;
+	shade_panel_geom(server, &panel_x, &panel_w);
+	*x += panel_x;
+}
+
 static double shade_links_y(struct zt_server *server) {
 	double x, y, w, h;
-	shade_tile_rect(server, 4, &x, &y, &w, &h);
+	shade_tile_rect_local(server, 4, &x, &y, &w, &h);
 	return y + h + 12;
 }
+
+static double shade_max_h(struct zt_server *server) {
+	if (!server->shade_compact) {
+		return (double)(server->height - nav_h(server));
+	}
+	double x, y, w, h;
+	shade_tile_rect(server, 7, &x, &y, &w, &h);
+	double links = shade_links_y(server);
+	double content_h = links + 30;
+	if (server->n_notes == 0) {
+		content_h += 44 + 30;
+	} else {
+		content_h += 40;
+		for (int i = 0; i < server->n_notes; i++) {
+			content_h += server->notes[i].expanded ? 60 : 35;
+		}
+	}
+	content_h += SHADE_HANDLE + 24;
+	double max_h = (double)(server->height - nav_h(server));
+	return fmin(max_h, fmax(220.0, content_h));
+}
+
+#define SHADE_MAX_H shade_max_h(server)
 
 /* What is at (x, y) of the panel: 0..7 a quick action, 8 CLEAR ALL,
  * 9 ALL SETTINGS, 10 the bar along the bottom, 20.. a notification, -1 nothing. */
 static int shade_hit(struct zt_server *server, double x, double y) {
+	double panel_x, panel_w;
+	shade_panel_geom(server, &panel_x, &panel_w);
+	if (server->shade_compact && (x < panel_x || x >= panel_x + panel_w)) {
+		return 10; /* clicking outside compact panel collapses/closes it */
+	}
 	for (int i = 0; i < 8; i++) {
 		double tx, ty, tw, th;
 		shade_tile_rect(server, i, &tx, &ty, &tw, &th);
@@ -4447,7 +4582,7 @@ static int shade_hit(struct zt_server *server, double x, double y) {
 	}
 	double links = shade_links_y(server);
 	if (y >= links - 8 && y < links + 26) {
-		return x < server->width / 2.0 ? 8 : 9;
+		return x < panel_x + panel_w / 2.0 ? 8 : 9;
 	}
 	if (y >= SHADE_MAX_H - SHADE_HANDLE - 14) {
 		return 10;
@@ -4517,16 +4652,19 @@ static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double
 	} else {
 		snprintf(label, sizeof(label), "%s", QUICK[q].label);
 	}
-	draw_text(cr, label, FONT_SEMIBOLD, 7.6, 7, h - 15, w - 10, 0, false);
+	double font_size = fmax(11.0, w * 0.085);
+	draw_text(cr, label, FONT_SEMIBOLD, font_size, 8, h - (font_size + 6), w - 10, 0, false);
 }
 
 static void draw_shade(struct zt_server *server) {
 	const double height = SHADE_MAX_H;
+	double panel_x, panel_w;
+	shade_panel_geom(server, &panel_x, &panel_w);
 	server->shade_row = false;	/* the panel's own row is as new as any */
 	/* the quick actions first, each into a texture of its own */
 	for (int i = 0; i < 8 && !g_dump_dir; i++) {
 		double x, y, w, h;
-		shade_tile_rect(server, i, &x, &y, &w, &h);
+		shade_tile_rect_local(server, i, &x, &y, &w, &h);
 		cairo_t *tile_cr;
 		struct zt_buffer *tile = zt_buffer_create(server, w, h, &tile_cr);
 		shade_tile_draw(server, tile_cr, i, w, h);
@@ -4534,14 +4672,14 @@ static void draw_shade(struct zt_server *server) {
 	}
 
 	cairo_t *cr;
-	struct zt_buffer *buffer = zt_buffer_create(server, server->width, height, &cr);
+	struct zt_buffer *buffer = zt_buffer_create(server, panel_w, height, &cr);
 	cairo_set_source_rgb(cr, 0, 0, 0);
 	cairo_paint(cr);
 	status_row(server, cr, true, false);
 	/* rendering to a file has no quads to put them on: draw them in place */
 	for (int i = 0; i < 8 && g_dump_dir; i++) {
 		double x, y, w, h;
-		shade_tile_rect(server, i, &x, &y, &w, &h);
+		shade_tile_rect_local(server, i, &x, &y, &w, &h);
 		cairo_save(cr);
 		cairo_translate(cr, x, y);
 		shade_tile_draw(server, cr, i, w, h);
@@ -4553,8 +4691,8 @@ static void draw_shade(struct zt_server *server) {
 	draw_icon(cr, "close", 14 + 5, links + 7, 10);
 	draw_text(cr, "CLEAR ALL", FONT_SEMIBOLD, 10, 14 + 18, links, 0, 0, false);
 	double settings_w = text_width("ALL SETTINGS", FONT_SEMIBOLD, 10);
-	draw_text(cr, "ALL SETTINGS", FONT_SEMIBOLD, 10, server->width - 14 - settings_w, links, 0, 0, false);
-	draw_icon(cr, "gear", server->width - 14 - settings_w - 12, links + 7, 12);
+	draw_text(cr, "ALL SETTINGS", FONT_SEMIBOLD, 10, panel_w - 14 - settings_w, links, 0, 0, false);
+	draw_icon(cr, "gear", panel_w - 14 - settings_w - 12, links + 7, 12);
 
 	/* What has been reported (`notify` on the control pipe), as the phone's
 	 * action centre lists it: under each app's name the notifications from
@@ -4570,7 +4708,7 @@ static void draw_shade(struct zt_server *server) {
 	struct tm tm_now, tm_at;
 	localtime_r(&today, &tm_now);
 	cairo_save(cr);
-	cairo_rectangle(cr, 0, links + 30, server->width, bottom - (links + 30));
+	cairo_rectangle(cr, 0, links + 30, panel_w, bottom - (links + 30));
 	cairo_clip(cr);
 	for (int i = 0; i < server->n_notes; i++) {
 		server->notes[i].y0 = server->notes[i].y1 = -1;
@@ -4587,7 +4725,7 @@ static void draw_shade(struct zt_server *server) {
 		cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		draw_text(cr, initial, FONT_SEMIBOLD, 17, 14, note_y, 28, 28, true);
-		draw_text(cr, app, FONT_SEMILIGHT, 22, 52, note_y - 2, server->width - 66, 0, false);
+		draw_text(cr, app, FONT_SEMILIGHT, 22, 52, note_y - 2, panel_w - 66, 0, false);
 		note_y += 40;
 		for (int i = first; i < server->n_notes && note_y < bottom; i++) {
 			if (listed[i] || strcmp(server->notes[i].app, app) != 0) {
@@ -4602,8 +4740,8 @@ static void draw_shade(struct zt_server *server) {
 			server->notes[i].y0 = (float)(note_y - 4);
 			cairo_set_source_rgb(cr, 1, 1, 1);
 			draw_text(cr, server->notes[i].title, FONT_SEMIBOLD, 14.5, 14, note_y,
-				server->width - 28 - when_w - 12, 0, false);
-			draw_text(cr, when, FONT_REGULAR, 13.5, server->width - 14 - when_w, note_y + 1, 0, 0, false);
+				panel_w - 28 - when_w - 12, 0, false);
+			draw_text(cr, when, FONT_REGULAR, 13.5, panel_w - 14 - when_w, note_y + 1, 0, 0, false);
 			note_y += 21;
 			cairo_set_source_rgb(cr, 0.62, 0.62, 0.62);
 			if (server->notes[i].expanded) {
@@ -4612,7 +4750,7 @@ static void draw_shade(struct zt_server *server) {
 				PangoFontDescription *desc = pango_font_description_from_string(FONT_REGULAR);
 				pango_font_description_set_absolute_size(desc, 13.5 * PANGO_SCALE);
 				pango_layout_set_font_description(layout, desc);
-				pango_layout_set_width(layout, (int)((server->width - 28) * PANGO_SCALE));
+				pango_layout_set_width(layout, (int)((panel_w - 28) * PANGO_SCALE));
 				pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
 				pango_layout_set_text(layout, server->notes[i].text, -1);
 				int tw, th;
@@ -4624,7 +4762,7 @@ static void draw_shade(struct zt_server *server) {
 				note_y += th;
 			} else {
 				draw_text(cr, server->notes[i].text, FONT_REGULAR, 13.5, 14, note_y,
-					server->width - 28 - when_w - 12, 0, false);
+					panel_w - 28 - when_w - 12, 0, false);
 				note_y += 19;
 			}
 			server->notes[i].y1 = (float)(note_y + 4);
@@ -4636,13 +4774,13 @@ static void draw_shade(struct zt_server *server) {
 
 	/* the bar it is pushed back up by */
 	set_rgb(cr, server->accent);
-	cairo_rectangle(cr, 0, height - SHADE_HANDLE, server->width, SHADE_HANDLE);
+	cairo_rectangle(cr, 0, height - SHADE_HANDLE, panel_w, SHADE_HANDLE);
 	cairo_fill(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	cairo_rectangle(cr, server->width / 2.0 - 14, height - SHADE_HANDLE / 2.0 - 1.5, 28, 3);
+	cairo_rectangle(cr, panel_w / 2.0 - 14, height - SHADE_HANDLE / 2.0 - 1.5, 28, 3);
 	cairo_fill(cr);
 
-	zt_buffer_show(server, &server->shade_layer, buffer, cr, server->width, height);
+	zt_buffer_show(server, &server->shade_layer, buffer, cr, panel_w, height);
 }
 
 static void shade_set_open(struct zt_server *server, bool open) {
@@ -4688,6 +4826,9 @@ static void load_logo(struct zt_server *server) {
 }
 
 static void draw_nav(struct zt_server *server) {
+	if (!server->navbar_enabled) {
+		return;
+	}
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, NAV_H, &cr);
 	cairo_set_source_rgb(cr, 0, 0, 0);
@@ -5276,7 +5417,7 @@ static const char *app_name(struct zt_toplevel *toplevel) {
  * the turnstile counts its rows up from there, not from the bottom of the
  * screen, so that with few tiles nothing waits for rows that are not there. */
 static float start_rows(struct zt_server *server) {
-	float pitch = 2.0f * (float)server->width / (float)(server->units > 0 ? server->units : 6);
+	float pitch = 2.0f * (float)server->width / (float)(server_units(server) > 0 ? server_units(server) : 6);
 	double visible = server->height - STATUS_H - NAV_H, top = 1e9, bottom = -1e9;
 	if (server->page > 0.5f) {
 		for (int i = 0; i < server->n_items; i++) {
@@ -5409,6 +5550,19 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 	wlr_seat_set_keyboard(server->seat, &server->vkbd);
 	wlr_seat_keyboard_notify_enter(server->seat, surface, NULL, 0, &server->vkbd.modifiers);
 	text_inputs_focus(server, surface);
+	if (server->pointer_constraints) {
+		struct wlr_pointer_constraint_v1 *constraint =
+			wlr_pointer_constraints_v1_constraint_for_surface(server->pointer_constraints, surface, server->seat);
+		if (constraint && server->active_constraint != constraint) {
+			if (server->seat->pointer_state.focused_surface != surface) {
+				double sx = 0, sy = 0;
+				surface_at(server, server->pointer_x, server->pointer_y, &sx, &sy);
+				wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+			}
+			wlr_pointer_constraint_v1_send_activated(constraint);
+			server->active_constraint = constraint;
+		}
+	}
 	/* Start swings away if it has not already, and the app arrives */
 	server->leaving = NULL;
 	bool start_was_visible = server->start_t < 0.5f;
@@ -5456,7 +5610,7 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 	}
 	/* A terminal never asks for a keyboard, and is useless without one. */
 	server->osk_terminal = is_terminal(toplevel);
-	osk_show(server, server->osk_terminal);
+	osk_show(server, server->osk_terminal && server->last_click_was_touch);
 }
 
 static pid_t toplevel_pid(struct zt_toplevel *toplevel) {
@@ -5627,6 +5781,17 @@ static int launch_timed_out(void *data) {
 static void show_next_app(struct zt_server *server) {
 	struct zt_toplevel *t;
 	wl_list_for_each_reverse(t, &server->toplevels, link) {
+		if (t->mapped && t != server->shown) {
+			show_toplevel(server, t);
+			return;
+		}
+	}
+}
+
+static void show_previous_app(struct zt_server *server) {
+	struct zt_toplevel *t;
+
+	wl_list_for_each(t, &server->toplevels, link) {
 		if (t->mapped && t != server->shown) {
 			show_toplevel(server, t);
 			return;
@@ -5962,7 +6127,9 @@ static void search_begin(struct zt_server *server) {
 	draw_search(server);
 	list_relayout(server);
 	server->osk_terminal = false;
-	osk_show(server, true);
+	if (server->last_click_was_touch) {
+		osk_show(server, true);
+	}
 	wlr_log(WLR_INFO, "app list: search");
 }
 
@@ -6336,7 +6503,9 @@ static void hyper_open(struct zt_server *server) {
 	server->hyper_t = 0;
 	animate(server, &server->hyper_t, 1.0f, 250, 0, false);
 	server->osk_terminal = false;
-	osk_show(server, true);
+	if (server->last_click_was_touch) {
+		osk_show(server, true);
+	}
 	wlr_log(WLR_INFO, "hyperscan: open (%d files)", server->n_hyper_files);
 }
 
@@ -6711,7 +6880,7 @@ static void text_input_commit(struct wl_listener *listener, void *data) {
 static void text_input_enable(struct wl_listener *listener, void *data) {
 	struct zt_text_input *ti = wl_container_of(listener, ti, enable);
 	struct zt_server *server = ti->server;
-	if (now_ms() - server->client_tap_ms > OSK_TAP_MS) {
+	if (now_ms() - server->client_tap_ms > OSK_TAP_MS || !server->last_click_was_touch) {
 		server->osk_pending = true;
 		return;
 	}
@@ -7899,6 +8068,7 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 	if (!p) {
 		return;
 	}
+	server->last_click_was_touch = (id != POINTER_TOUCH_ID);
 	p->x0 = p->x = x;
 	p->y0 = p->y = y;
 	p->scroll0 = server->scroll;
@@ -8199,7 +8369,7 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		wlr_seat_touch_notify_frame(server->seat);
 		server->client_tap_ms = now_ms();
 		server->client_tap_y = y + server->app_lift - STATUS_H;
-		if (server->osk_pending) {
+		if (server->osk_pending && server->last_click_was_touch) {
 			/* a field the page focused by itself: now the user is in it */
 			server->osk_pending = false;
 			server->osk_box_bottom = server->client_tap_y + 36;
@@ -8378,16 +8548,6 @@ static void touch_update(struct zt_server *server, int32_t id, double x, double 
 		}
 		break;
     case ROLE_CURSOR:
-        if (!server->osk_trackpad && server->osk_cursor_touch == p && p->moved) {
-            /* dragged off the dot at once: that starts the trackpad too,
-             * not only a still hold (which a drag never becomes) */
-            p->lx = p->x; p->ly = p->y;
-            server->osk_trackpad = true;
-            server->osk_pressed = -1;
-            hap(server, HAP_TICK, HG_KEYS);
-            draw_osk(server);
-            damage(server);
-        }
         if (server->osk_trackpad && server->osk_cursor_touch == p) {
             /* Accumulate sub-cell movement, with no acceleration or sound. */
             bool ctrl = server->osk_ctrl, alt = server->osk_alt;
@@ -8481,9 +8641,10 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 		break;
 	case ROLE_LOCK:
 		if (!server->locked) {
+			animate(server, &server->lock_y, (float)-server->height, 200, 0, false);
 			break;
 		}
-		if (!cancelled && p->y - p->y0 < -server->height / 5.0) {
+		if (!cancelled && (p->y - p->y0 < -server->height / 5.0 || (!server->last_click_was_touch && p->y - p->y0 < -30.0))) {
 			server->locked = false;
 			hap(server, HAP_TAP, HG_SLIDE);
 			ui_sound(server, UIS_UNLOCK);
@@ -8546,14 +8707,14 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 				}
 			}
 		} else if (p->axis == 1) {
-			float vx = rested || cancelled ? 0.0f : p->vx;
+			float vx = rested || cancelled || !server->last_click_was_touch ? 0.0f : p->vx;
 			float to = vx < -PAGE_FLICK_V ? 1.0f : vx > PAGE_FLICK_V ? 0.0f : server->page > 0.5f ? 1.0f : 0.0f;
 			page_go(server, to, -vx / (float)server->width);
 			if (to == 0.0f) {
 				search_end(server);
 			}
 		} else if (p->axis == 2) {
-			float v = rested || cancelled ? 0.0f : -p->vy;
+			float v = rested || cancelled || !server->last_click_was_touch ? 0.0f : -p->vy;
 			v = v > SCROLL_MAX_V ? SCROLL_MAX_V : v < -SCROLL_MAX_V ? -SCROLL_MAX_V : v;
 			p->holding = false;
 			*(p->on_list ? &server->list_v : &server->scroll_v) = v;
@@ -8753,19 +8914,96 @@ static void touch_destroy(struct wl_listener *listener, void *data) {
 }
 
 static void pointer_moved(struct zt_server *server, uint32_t time) {
+	if (server->cursor) {
+		server->pointer_x = server->cursor->x;
+		server->pointer_y = server->cursor->y;
+	}
 	server->pointer_x = server->pointer_x < 0 ? 0 : server->pointer_x > server->width ? server->width : server->pointer_x;
 	server->pointer_y = server->pointer_y < 0 ? 0 : server->pointer_y > server->height ? server->height : server->pointer_y;
+
+	bool dragging_shade = false;
+	struct touch_point *tp = touch_find(server, POINTER_TOUCH_ID, false);
+	if (tp && tp->used && tp->role == ROLE_SHADE) {
+		dragging_shade = true;
+	}
+
+	if (server->shown && !server->shown->awaiting && !dragging_shade) {
+		double sx, sy;
+		struct wlr_surface *surface = surface_at(server, server->pointer_x, server->pointer_y, &sx, &sy);
+		if (surface) {
+			wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
+			wlr_seat_pointer_notify_motion(server->seat, time, sx, sy);
+			wlr_seat_pointer_notify_frame(server->seat);
+			damage(server);
+			return;
+		} else {
+			wlr_seat_pointer_clear_focus(server->seat);
+		}
+	}
+
 	if (server->pointer_down) {
 		touch_update(server, POINTER_TOUCH_ID, server->pointer_x, server->pointer_y, time);
 	}
+	damage(server);
 }
 
 static void pointer_motion(struct wl_listener *listener, void *data) {
 	struct zt_pointer_device *device = wl_container_of(listener, device, motion);
 	struct wlr_pointer_motion_event *event = data;
 	struct zt_server *server = device->server;
-	server->pointer_x += event->delta_x / server->scale;
-	server->pointer_y += event->delta_y / server->scale;
+
+	if (server->active_constraint && server->active_constraint->surface) {
+		struct wlr_surface *kb_focus = server->seat->keyboard_state.focused_surface;
+		struct wlr_surface *ptr_focus = server->seat->pointer_state.focused_surface;
+		struct wlr_surface *target_surf = server->active_constraint->surface;
+		struct wlr_surface *target_root = wlr_surface_get_root_surface(target_surf);
+
+		bool matches = false;
+		if (kb_focus && wlr_surface_get_root_surface(kb_focus) == target_root) {
+			matches = true;
+		} else if (ptr_focus && wlr_surface_get_root_surface(ptr_focus) == target_root) {
+			matches = true;
+		} else if (server->shown && server->shown->xdg_toplevel &&
+		           wlr_surface_get_root_surface(server->shown->xdg_toplevel->base->surface) == target_root) {
+			matches = true;
+		}
+
+		if (matches) {
+			if (ptr_focus != target_surf) {
+				double sx = 0, sy = 0;
+				surface_at(server, server->pointer_x, server->pointer_y, &sx, &sy);
+				wlr_seat_pointer_notify_enter(server->seat, target_surf, sx, sy);
+			}
+			if (server->relative_pointer_manager) {
+				wlr_relative_pointer_manager_v1_send_relative_motion(
+					server->relative_pointer_manager,
+					server->seat,
+					(uint64_t)event->time_msec * 1000,
+					event->delta_x, event->delta_y,
+					event->unaccel_dx, event->unaccel_dy
+				);
+			}
+			wlr_seat_pointer_notify_frame(server->seat);
+			return;
+		}
+	}
+
+	if (server->cursor) {
+        wlr_cursor_move(server->cursor, &event->pointer->base, event->delta_x, event->delta_y);
+
+        if (server->relative_pointer_manager && server->seat->pointer_state.focused_surface) {
+            wlr_relative_pointer_manager_v1_send_relative_motion(
+                server->relative_pointer_manager,
+                server->seat,
+                (uint64_t)event->time_msec * 1000,
+                event->delta_x, event->delta_y,
+                event->unaccel_dx, event->unaccel_dy
+            );
+        }
+    } else {
+		server->pointer_x += event->delta_x / server->scale;
+		server->pointer_y += event->delta_y / server->scale;
+	}
 	pointer_moved(server, event->time_msec);
 }
 
@@ -8773,25 +9011,130 @@ static void pointer_motion_absolute(struct wl_listener *listener, void *data) {
 	struct zt_pointer_device *device = wl_container_of(listener, device, motion_absolute);
 	struct wlr_pointer_motion_absolute_event *event = data;
 	struct zt_server *server = device->server;
-	server->pointer_x = event->x * server->width;
-	server->pointer_y = event->y * server->height;
+
+	double prev_x = server->cursor ? server->cursor->x : server->pointer_x;
+	double prev_y = server->cursor ? server->cursor->y : server->pointer_y;
+	double new_x = event->x * server->width;
+	double new_y = event->y * server->height;
+	double delta_x = new_x - prev_x;
+	double delta_y = new_y - prev_y;
+
+	if (server->active_constraint && server->active_constraint->surface) {
+		struct wlr_surface *kb_focus = server->seat->keyboard_state.focused_surface;
+		struct wlr_surface *ptr_focus = server->seat->pointer_state.focused_surface;
+		struct wlr_surface *target_surf = server->active_constraint->surface;
+		struct wlr_surface *target_root = wlr_surface_get_root_surface(target_surf);
+
+		bool matches = false;
+		if (kb_focus && wlr_surface_get_root_surface(kb_focus) == target_root) {
+			matches = true;
+		} else if (ptr_focus && wlr_surface_get_root_surface(ptr_focus) == target_root) {
+			matches = true;
+		} else if (server->shown && server->shown->xdg_toplevel &&
+		           wlr_surface_get_root_surface(server->shown->xdg_toplevel->base->surface) == target_root) {
+			matches = true;
+		}
+
+		if (matches) {
+			if (ptr_focus != target_surf) {
+				double sx = 0, sy = 0;
+				surface_at(server, server->pointer_x, server->pointer_y, &sx, &sy);
+				wlr_seat_pointer_notify_enter(server->seat, target_surf, sx, sy);
+			}
+			if (server->relative_pointer_manager) {
+				wlr_relative_pointer_manager_v1_send_relative_motion(
+					server->relative_pointer_manager,
+					server->seat,
+					(uint64_t)event->time_msec * 1000,
+					delta_x, delta_y,
+					delta_x, delta_y
+				);
+			}
+			wlr_seat_pointer_notify_frame(server->seat);
+			return;
+		}
+	}
+
+	if (server->cursor) {
+		wlr_cursor_warp_absolute(server->cursor, &event->pointer->base, event->x, event->y);
+	} else {
+		server->pointer_x = new_x;
+		server->pointer_y = new_y;
+	}
 	pointer_moved(server, event->time_msec);
 }
 
 static void pointer_button(struct wl_listener *listener, void *data) {
-	struct zt_pointer_device *device = wl_container_of(listener, device, button);
-	struct wlr_pointer_button_event *event = data;
+    struct zt_pointer_device *device = wl_container_of(listener, device, button);
+    struct wlr_pointer_button_event *event = data;
+    struct zt_server *server = device->server;
+
+    server->last_click_was_touch = false;
+
+    if (server->shown && !server->shown->awaiting) {
+        double sx, sy;
+        struct wlr_surface *surface = surface_at(server, server->pointer_x, server->pointer_y, &sx, &sy);
+        if (surface) {
+            wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button, event->state);
+            wlr_seat_pointer_notify_frame(server->seat);
+        }
+    }
+
+    if (event->button == BTN_RIGHT) {
+        if (event->state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            double x = server->pointer_x, y = server->pointer_y;
+            if (!server->shown && !server->locked) {
+                bool on_list = server->page > 0.5f;
+                int idx = on_list ? item_at(server, x, y) : tile_at(server, x, y);
+                if (idx >= 0) {
+                    hap(server, HAP_HEAVY, HG_TILES);
+                    if (on_list) {
+                        menu_show(server, idx);
+                    } else {
+                        edit_begin(server, idx);
+                    }
+                    damage(server);
+                }
+            }
+        }
+        return;
+    }
+
+    if (event->button != BTN_LEFT) {
+        return;
+    }
+
+    bool pressed = event->state == WL_POINTER_BUTTON_STATE_PRESSED;
+    if (pressed && !server->pointer_down) {
+        server->pointer_down = true;
+        touch_begin(server, POINTER_TOUCH_ID, server->pointer_x, server->pointer_y, event->time_msec);
+    } else if (!pressed && server->pointer_down) {
+        server->pointer_down = false;
+        touch_end(server, POINTER_TOUCH_ID, event->time_msec, false);
+    }
+}
+
+static void pointer_axis(struct wl_listener *listener, void *data) {
+	struct zt_pointer_device *device = wl_container_of(listener, device, axis);
+	struct wlr_pointer_axis_event *event = data;
 	struct zt_server *server = device->server;
-	if (event->button != BTN_LEFT) {
-		return;
-	}
-	bool pressed = event->state == WL_POINTER_BUTTON_STATE_PRESSED;
-	if (pressed && !server->pointer_down) {
-		server->pointer_down = true;
-		touch_begin(server, POINTER_TOUCH_ID, server->pointer_x, server->pointer_y, event->time_msec);
-	} else if (!pressed && server->pointer_down) {
-		server->pointer_down = false;
-		touch_end(server, POINTER_TOUCH_ID, event->time_msec, false);
+
+	if (server->shown && !server->shown->awaiting) {
+		// send to app
+		wlr_seat_pointer_notify_axis(server->seat, event->time_msec, event->orientation, event->delta, event->delta_discrete, event->source, event->relative_direction);
+		wlr_seat_pointer_notify_frame(server->seat);
+	} else if (!server->locked) {
+		// send to shell
+		double step = event->delta;
+		if (server->page > 0.5f) {
+			server->list_scroll += step;
+			if (server->list_scroll < 0) server->list_scroll = 0;
+		} else {
+			server->scroll += step;
+			if (server->scroll < 0) server->scroll = 0;
+		}
+
+		damage(server);
 	}
 }
 
@@ -8800,6 +9143,7 @@ static void pointer_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&device->motion.link);
 	wl_list_remove(&device->motion_absolute.link);
 	wl_list_remove(&device->button.link);
+	wl_list_remove(&device->axis.link);
 	wl_list_remove(&device->destroy.link);
 	free(device);
 }
@@ -9064,6 +9408,9 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 	struct zt_keyboard *keyboard = wl_container_of(listener, keyboard, key);
 	struct zt_server *server = keyboard->server;
 	struct wlr_keyboard_key_event *event = data;
+
+	server->last_click_was_touch = false;
+
 	if (event->keycode == KEY_POWER) {
 		/* the power key sleeps and wakes the screen, and goes no further */
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
@@ -9074,7 +9421,88 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 		}
 		return;
 	}
+	if (event->keycode == KEY_LEFTMETA || event->keycode == KEY_RIGHTMETA) {
+        if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+            server->meta_pressed = true;
+            server->meta_used = false;
+        } else if (event->state == WL_KEYBOARD_KEY_STATE_RELEASED) {
+            if (server->meta_pressed && !server->meta_used) {
+				if (server->switcher) {
+					show_toplevel(server, NULL);
+				} else {
+					switcher_open(server);
+				}
+                damage(server);
+                wlr_log(WLR_INFO, "shortcut: meta pressed alone");
+            }
+            server->meta_pressed = false;
+            server->meta_used = false;
+        }
+        return;
+    }
+	if (server->meta_pressed && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        server->meta_used = true;
+		switch (event->keycode) {
+            case KEY_L:
+                server->locked = true;
+                server->lock_y = 0.0f;
+                lock(server);
+                damage(server);
+                wlr_log(WLR_INFO, "shortcut: locked screen");
+                return;
+
+            case KEY_RIGHT:
+                show_next_app(server);
+                damage(server);
+                wlr_log(WLR_INFO, "shortcut: next app");
+                return;
+            
+			case KEY_LEFT:
+                show_previous_app(server);
+                damage(server);
+                wlr_log(WLR_INFO, "shortcut: previous app");
+                return;
+
+            case KEY_SPACE:
+                hyper_open(server);
+                damage(server);
+                wlr_log(WLR_INFO, "shortcut: hyperscan search");
+                return;
+
+            case KEY_TAB:
+                if (server->shown) {
+                    show_toplevel(server, NULL);
+                } else {
+                    home_reset(server);
+                }
+                damage(server);
+                wlr_log(WLR_INFO, "shortcut: home");
+                return;
+			
+			case KEY_Q:
+				if (server->shown) {
+					wlr_xdg_toplevel_send_close(server->shown->xdg_toplevel);
+					switcher_open(server);
+				}
+				return;
+
+			case KEY_A:
+				shade_set_open(server, !server->shade_open);
+				return;
+
+			case KEY_DELETE:
+				wl_display_terminate(server->wl_display);
+				return;
+
+            default:
+                break;
+        }
+    }
 	if (!server->screen_on) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			screen_set(server, true);
+			activity(server);
+		}
 		return;
 	}
 	activity(server);
@@ -9085,15 +9513,220 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 		}
 		return;
 	}
-    if (server->auth_active) {
-        if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-            char text[64] = "";
-            xkb_state_key_get_utf8(keyboard->wlr_keyboard->xkb_state, event->keycode+8, text, sizeof(text));
-            auth_input(server, event->keycode, text);
-        }
-        return;
-    }
+	if (server->locked) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			server->locked = false;
+			animate(server, &server->lock_y, (float)-server->height, 200, 0, false);
+			damage(server);
+			wlr_log(WLR_INFO, "unlocked via keyboard");
+		}
+		return;
+	}
+	if (server->auth_active) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			char text[64] = "";
+			xkb_state_key_get_utf8(keyboard->wlr_keyboard->xkb_state, event->keycode+8, text, sizeof(text));
+			auth_input(server, event->keycode, text);
+		}
+		return;
+	}
+	if (server->dialog_open) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			uint32_t k = event->keycode;
+			if (k == KEY_ENTER || k == KEY_KPENTER || k == KEY_SPACE) {
+				dialog_handle_action(server, server->dialog_act1);
+				dialog_close(server);
+			} else if (k == KEY_ESC || k == KEY_BACK) {
+				if (server->dialog_act2[0]) {
+					dialog_handle_action(server, server->dialog_act2);
+				}
+				dialog_close(server);
+			}
+		}
+		return;
+	}
+	if (server->menu_open) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			uint32_t k = event->keycode;
+			if (k == KEY_ESC || k == KEY_BACK) {
+				server->menu_open = false;
+				damage(server);
+			} else if (k == KEY_ENTER || k == KEY_KPENTER || k == KEY_SPACE) {
+				server->menu_open = false;
+				damage(server);
+			}
+		}
+		return;
+	}
+	if (server->switcher) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			uint32_t k = event->keycode;
+			if (k == KEY_ESC || k == KEY_BACK) {
+				switcher_close(server);
+			} else if (k == KEY_LEFT || k == KEY_UP) {
+				int target = (int)round(server->switch_x) - 1;
+				if (target < 0) target = 0;
+				animate(server, &server->switch_x, (float)target, 200, 0, false);
+			} else if (k == KEY_RIGHT || k == KEY_DOWN || k == KEY_TAB) {
+				int target = (int)round(server->switch_x) + 1;
+				if (target >= server->n_cards) target = server->n_cards - 1;
+				if (target < 0) target = 0;
+				animate(server, &server->switch_x, (float)target, 200, 0, false);
+			} else if (k == KEY_ENTER || k == KEY_KPENTER || k == KEY_SPACE) {
+				int current = (int)round(server->switch_x);
+				if (current >= 0 && current < server->n_cards) {
+					switcher_pick(server, current);
+				} else {
+					switcher_close(server);
+				}
+			} else if (k == KEY_DELETE || k == KEY_BACKSPACE) {
+				int current = (int)round(server->switch_x);
+				if (current >= 0 && current < server->n_cards && server->cards[current]) {
+					switcher_forget(server, server->cards[current]);
+				}
+			}
+		}
+		return;
+	}
+	if (server->hyper) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			uint32_t k = event->keycode;
+			if (k == KEY_ESC || k == KEY_BACK) {
+				hyper_close(server);
+			} else if (k == KEY_ENTER || k == KEY_KPENTER) {
+				int best = -1;
+				for (int i = 0; i < server->n_hyper; i++) {
+					if (server->hyper_hits[i].kind != HK_WEB &&
+							(best < 0 || server->hyper_hits[i].score > server->hyper_hits[best].score)) {
+						best = i;
+					}
+				}
+				if (best >= 0) {
+					hyper_launch(server, &server->hyper_hits[best]);
+				}
+			} else if (k == KEY_BACKSPACE) {
+				size_t len = strlen(server->hyper_q);
+				if (len > 0) {
+					size_t pos = len - 1;
+					while (pos && ((unsigned char)server->hyper_q[pos] & 0xc0) == 0x80) pos--;
+					server->hyper_q[pos] = 0;
+					hyper_search(server);
+					draw_hyper(server);
+					damage(server);
+				}
+			} else {
+				char text[64] = "";
+				int n = xkb_state_key_get_utf8(keyboard->wlr_keyboard->xkb_state, k + 8, text, sizeof(text));
+				if (n > 0 && (unsigned char)text[0] >= 32 && text[0] != 127) {
+					size_t len = strlen(server->hyper_q);
+					if (len + n < sizeof(server->hyper_q)) {
+						memcpy(server->hyper_q + len, text, n + 1);
+						hyper_search(server);
+						draw_hyper(server);
+						damage(server);
+					}
+				}
+			}
+		}
+		return;
+	}
+	if (server->searching) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			uint32_t k = event->keycode;
+			if (k == KEY_ESC || k == KEY_BACK) {
+				search_end(server);
+			} else if (k == KEY_ENTER || k == KEY_KPENTER) {
+				for (int i = 0; i < server->n_items; i++) {
+					if (!server->items[i].hidden && !server->items[i].header) {
+						launch(server, server->items[i].command);
+						search_end(server);
+						break;
+					}
+				}
+			} else if (k == KEY_BACKSPACE) {
+				size_t len = strlen(server->search);
+				if (len > 0) {
+					size_t pos = len - 1;
+					while (pos && ((unsigned char)server->search[pos] & 0xc0) == 0x80) pos--;
+					server->search[pos] = 0;
+					draw_search(server);
+					list_relayout(server);
+					damage(server);
+				}
+			} else {
+				char text[64] = "";
+				int n = xkb_state_key_get_utf8(keyboard->wlr_keyboard->xkb_state, k + 8, text, sizeof(text));
+				if (n > 0 && (unsigned char)text[0] >= 32 && text[0] != 127) {
+					size_t len = strlen(server->search);
+					if (len + n < sizeof(server->search)) {
+						memcpy(server->search + len, text, n + 1);
+						draw_search(server);
+						list_relayout(server);
+						damage(server);
+					}
+				}
+			}
+		}
+		return;
+	}
+	if (!server->shown) {
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			uint32_t k = event->keycode;
+			if (k == KEY_LEFT || k == KEY_RIGHT) {
+				float target = (k == KEY_RIGHT) ? 1.0f : 0.0f;
+				animate(server, &server->page, target, 250, 0, false);
+			} else if (k == KEY_UP || k == KEY_DOWN || k == KEY_PAGEUP || k == KEY_PAGEDOWN) {
+				double step = (k == KEY_PAGEUP || k == KEY_PAGEDOWN) ? 200 : 60;
+				if (k == KEY_UP || k == KEY_PAGEUP) step = -step;
+				if (server->page > 0.5f) {
+					server->list_scroll += step;
+					if (server->list_scroll < 0) server->list_scroll = 0;
+				} else {
+					server->scroll += step;
+					if (server->scroll < 0) server->scroll = 0;
+				}
+				damage(server);
+			} else if (k == KEY_ENTER || k == KEY_KPENTER) {
+				if (server->page > 0.5f && server->n_items > 0) {
+					for (int i = 0; i < server->n_items; i++) {
+						if (!server->items[i].header) {
+							launch(server, server->items[i].command);
+							break;
+						}
+					}
+				} else if (server->n_tiles > 0) {
+					launch(server, server->tiles[0].command);
+				}
+			} else if (k == KEY_ESC || k == KEY_BACK) {
+				if (server->page > 0.5f) {
+					animate(server, &server->page, 0.0f, 250, 0, false);
+				}
+			} else {
+				char text[64] = "";
+				int n = xkb_state_key_get_utf8(keyboard->wlr_keyboard->xkb_state, k + 8, text, sizeof(text));
+				if (n > 0 && (unsigned char)text[0] >= 32 && text[0] != 127) {
+					if (server->page > 0.5f) {
+						search_begin(server);
+						snprintf(server->search, sizeof(server->search), "%s", text);
+						draw_search(server);
+						list_relayout(server);
+					} else {
+						hyper_open(server);
+						snprintf(server->hyper_q, sizeof(server->hyper_q), "%s", text);
+						hyper_search(server);
+						draw_hyper(server);
+					}
+					damage(server);
+				}
+			}
+		}
+		return;
+	}
 	wlr_seat_set_keyboard(server->seat, keyboard->wlr_keyboard);
+	struct wlr_surface *surface = server->shown->xdg_toplevel->base->surface;
+	if (server->seat->keyboard_state.focused_surface != surface) {
+		wlr_seat_keyboard_notify_enter(server->seat, surface, NULL, 0, &keyboard->wlr_keyboard->modifiers);
+	}
 	wlr_seat_keyboard_notify_key(server->seat, event->time_msec, event->keycode, event->state);
 }
 
@@ -9134,6 +9767,18 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 		wl_signal_add(&device->events.destroy, &touch->destroy);
 		wlr_log(WLR_INFO, "touch device: %s", device->name);
 	} else if (device->type == WLR_INPUT_DEVICE_POINTER) {
+		if (server->cursor) {
+			wlr_cursor_attach_input_device(server->cursor, device);
+			
+			// we should do this elsewhere and provide config options!!! - tenkuma
+			if (wlr_input_device_is_libinput(device)) {
+				struct libinput_device *lidevice = wlr_libinput_get_device_handle(device);
+				if (lidevice) {
+					libinput_device_config_tap_set_enabled(lidevice, LIBINPUT_CONFIG_TAP_ENABLED);
+					libinput_device_config_dwt_set_enabled(lidevice, LIBINPUT_CONFIG_DWT_DISABLED);
+				}
+			}
+		}
 		struct zt_pointer_device *pointer = calloc(1, sizeof(*pointer));
 		pointer->server = server;
 		pointer->pointer = wlr_pointer_from_input_device(device);
@@ -9143,6 +9788,8 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 		wl_signal_add(&pointer->pointer->events.motion_absolute, &pointer->motion_absolute);
 		pointer->button.notify = pointer_button;
 		wl_signal_add(&pointer->pointer->events.button, &pointer->button);
+		pointer->axis.notify = pointer_axis;
+		wl_signal_add(&pointer->pointer->events.axis, &pointer->axis);
 		pointer->destroy.notify = pointer_destroy;
 		wl_signal_add(&device->events.destroy, &pointer->destroy);
 		wlr_log(WLR_INFO, "pointer, used as a finger: %s", device->name);
@@ -9161,6 +9808,47 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 		wl_signal_add(&device->events.destroy, &keyboard->destroy);
 		wl_list_insert(&server->keyboards, &keyboard->link);
 	}
+}
+
+static void constraint_destroy(struct wl_listener *listener, void *data);
+
+static void server_new_pointer_constraint(struct wl_listener *listener, void *data) {
+    struct wlr_pointer_constraint_v1 *constraint = data;
+    struct zt_server *server = wl_container_of(listener, server, new_constraint);
+
+    struct zt_pointer_constraint *c = calloc(1, sizeof(*c));
+    c->server = server;
+    c->constraint = constraint;
+    c->destroy.notify = constraint_destroy;
+    wl_signal_add(&constraint->events.destroy, &c->destroy);
+
+    struct wlr_surface *kb_focus = server->seat->keyboard_state.focused_surface;
+    struct wlr_surface *target_root = wlr_surface_get_root_surface(constraint->surface);
+
+    bool is_focused = (kb_focus && wlr_surface_get_root_surface(kb_focus) == target_root) ||
+                      (server->shown && server->shown->xdg_toplevel &&
+                       wlr_surface_get_root_surface(server->shown->xdg_toplevel->base->surface) == target_root);
+    if (is_focused) {
+        if (server->seat->pointer_state.focused_surface != constraint->surface) {
+            double sx = 0, sy = 0;
+            surface_at(server, server->pointer_x, server->pointer_y, &sx, &sy);
+            wlr_seat_pointer_notify_enter(server->seat, constraint->surface, sx, sy);
+        }
+        wlr_pointer_constraint_v1_send_activated(constraint);
+        server->active_constraint = constraint;
+    }
+}
+
+static void constraint_destroy(struct wl_listener *listener, void *data) {
+    struct zt_pointer_constraint *c = wl_container_of(listener, c, destroy);
+    struct zt_server *server = c->server; // <-- Retrieve server pointer
+    
+    if (server->active_constraint == c->constraint) {
+        wlr_pointer_constraint_v1_send_deactivated(c->constraint);
+        server->active_constraint = NULL;
+    }
+	wl_list_remove(&c->destroy.link);
+    free(c);
 }
 
 static void seat_request_set_selection(struct wl_listener *listener, void *data) {
@@ -9298,7 +9986,7 @@ static float turn_at(struct zt_server *server, float rows_up, float left, bool s
 }
 
 static float turn_pitch(struct zt_server *server) {
-	return 2.0f * (float)server->width / (float)(server->units > 0 ? server->units : 6);
+	return 2.0f * (float)server->width / (float)(server_units(server) > 0 ? server_units(server) : 6);
 }
 
 static float tile_turn(struct zt_server *server, int i) {
@@ -9543,7 +10231,8 @@ static void render_frame(struct zt_server *server) {
 				server->edit_t < 0.999f) {
 			/* the arrow into the app list, under the last tiles on the right */
 			float y = (float)(server->arrow_y + STATUS_H - server->scroll);
-			float x = (float)(server->width - 2 * round(server->width * 0.02)) - ROUND + page_dx;
+			double layout_w = (double)server->width;
+			float x = (float)(layout_w - 2 * round(layout_w * 0.02)) - ROUND + page_dx;
 			if (y < server->height && y + ROUND > 0) {
 				float m[16];
 				float turn = turn_at(server, (float)((server->turn_bottom - server->arrow_y - ROUND) /
@@ -9667,7 +10356,7 @@ static void render_frame(struct zt_server *server) {
 	}
 	if (server->osk_slide > 0.003f && server->osk_layer.tex) {
 		layer_draw(server, &server->osk_layer, 0,
-			(float)(server->height - NAV_H - server->osk_h * server->osk_slide), 1.0f);
+			(float)(server->height - nav_h(server) - server->osk_h * server->osk_slide), 1.0f);
 	}
 	layer_draw(server, &server->status_layer, 0, 0, 1.0f);
 	if (server->charging && server->plug_layer.tex) {
@@ -9687,30 +10376,26 @@ static void render_frame(struct zt_server *server) {
 		glDisable(GL_SCISSOR_TEST);
 	}
 	if (server->shade_h > 0.5f && server->shade_layer.tex) {
-		/*
-		 * The panel does not travel. Its contents stay where they are, at
-		 * the top, and the bar along its bottom edge comes down the screen
-		 * uncovering them, while what lies below the bar goes dim. (Seen on
-		 * the phone: the quick actions are already in place while the bar
-		 * is still half way down.)
-		 */
+		double panel_x, panel_w;
+		shade_panel_geom(server, &panel_x, &panel_w);
 		float reveal = server->shade_h, bar = SHADE_HANDLE;
 		float cover = reveal > bar ? reveal - bar : 0;
-		int px_w = output->width;
+		int px_x = (int)(panel_x * server->scale);
+		int px_w = (int)(panel_w * server->scale);
 		int px_cover = (int)(cover * server->scale), px_bar = (int)(bar * server->scale);
 		float m[16];
 		mat_identity(m);
 		mat_translate(m, 0, STATUS_H);
-		mat_scale(m, server->width, (float)(SHADE_MAX_H - STATUS_H));
+		mat_scale(m, server->width, (float)(server->height - STATUS_H));
 		quad(server, GL_TEXTURE_2D, server->black_tex, m,
 			0.6f * (reveal / (float)SHADE_MAX_H), false, false, 1.0f, 1.0f);
 
 		glEnable(GL_SCISSOR_TEST);
 		/* the frame buffer's first row is the top of the screen */
-		glScissor(0, 0, px_w, px_cover);
-		layer_draw(server, &server->shade_layer, 0, 0, 1.0f);
+		glScissor(px_x, 0, px_w, px_cover);
+		layer_draw(server, &server->shade_layer, (float)panel_x, 0, 1.0f);
 		if (server->shade_row && server->peek_layer.tex) {
-			layer_draw(server, &server->peek_layer, 0, 0, 1.0f);
+			layer_draw(server, &server->peek_layer, (float)panel_x, 0, 1.0f);
 		}
 		plug_over(server, 0.0f);
 		for (int i = 0; i < 8; i++) {
@@ -9732,8 +10417,8 @@ static void render_frame(struct zt_server *server) {
 				layer->th ? (float)layer->ph / layer->th : 1.0f);
 		}
 		/* the bar: the bottom strip of the panel, riding on the edge */
-		glScissor(0, px_cover, px_w, px_bar);
-		layer_draw(server, &server->shade_layer, 0, reveal - (float)SHADE_MAX_H, 1.0f);
+		glScissor(px_x, px_cover, px_w, px_bar);
+		layer_draw(server, &server->shade_layer, (float)panel_x, reveal - (float)SHADE_MAX_H, 1.0f);
 		glDisable(GL_SCISSOR_TEST);
 	}
 	} /* layers hidden by the boot splash */
@@ -9748,8 +10433,8 @@ static void render_frame(struct zt_server *server) {
 		draw_nav(server);
 	}
 	/* the nav bar stays on top: the panel comes down behind it */
-	if (!server->sensorhub_fail_screen) {
-		layer_draw(server, &server->nav_layer, 0, server->height - NAV_H, 1.0f);
+	if (server->navbar_enabled && !server->sensorhub_fail_screen) {
+		layer_draw(server, &server->nav_layer, 0, (float)(server->height - nav_h(server)), 1.0f);
 	}
 	if (server->keypop && server->osk_visible && server->keypop_layer.tex) {
 		layer_draw(server, &server->keypop_layer, server->keypop_x, server->keypop_y, 1.0f);
@@ -9937,14 +10622,60 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	}
 }
 
+static int resize_debounced(void *data) {
+	struct zt_server *server = data;
+	server->resize_pending = false;
+
+	projection_set(server);
+
+	place_tiles(server);
+	draw_start(server);
+	draw_status(server);
+	draw_shade(server);
+	draw_nav(server);
+	draw_lock(server);
+	draw_rounds(server);
+	osk_layout(server);
+
+	wlr_xcursor_manager_load(server->cursor_mgr, server->scale);
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+
+	damage(server);
+	return 0;
+}
+
 static void output_request_state(struct wl_listener *listener, void *data) {
 	struct zt_output *output = wl_container_of(listener, output, request_state);
+	struct zt_server *server = output->server;
+
 	const struct wlr_output_event_request_state *event = data;
 	wlr_output_commit_state(output->wlr_output, event->state);
+
+	int prev_w = server->width;
+	int prev_h = server->height;
+	wlr_output_effective_resolution(output->wlr_output, &server->width, &server->height);
+
+	if (server->width == prev_w && server->height == prev_h) {
+		return;
+	}
+
+	/* Update projection immediately so drawing bounds match, but defer full Cairo/layout redraw */
+	projection_set(server);
+
+	if (!server->resize_timer) {
+		server->resize_timer = wl_event_loop_add_timer(server->loop, resize_debounced, server);
+	}
+	server->resize_pending = true;
+	/* Wait 150ms after dragging stops to perform the full redraw */
+	wl_event_source_timer_update(server->resize_timer, 150);
 }
 
 static void output_destroy(struct wl_listener *listener, void *data) {
 	struct zt_output *output = wl_container_of(listener, output, destroy);
+	if (output->server->resize_timer) {
+		wl_event_source_remove(output->server->resize_timer);
+		output->server->resize_timer = NULL;
+	}
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->destroy.link);
@@ -9985,6 +10716,9 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	wl_signal_add(&wlr_output->events.destroy, &output->destroy);
 
 	wlr_output_layout_add_auto(server->output_layout, wlr_output);
+
+	wlr_xcursor_manager_load(server->cursor_mgr, server->scale);
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
 
 	wlr_output_effective_resolution(wlr_output, &server->width, &server->height);
 	wlr_log(WLR_INFO, "output %s: %dx%d points at scale %g", wlr_output->name,
@@ -10131,7 +10865,7 @@ static int reload(int signal_number, void *data) {
 		}
 	}
 	wlr_log(WLR_INFO, "configuration reloaded: accent %06x, %d columns, haptics %s",
-		server->accent, server->units / 2, server->haptics_enabled ? "on" : "off");
+		server->accent, server_units(server) / 2, server->haptics_enabled ? "on" : "off");
 	return 0;
 }
 
@@ -10330,8 +11064,21 @@ int main(int argc, char *argv[]) {
 	wlr_subcompositor_create(server.wl_display);
 	wlr_data_device_manager_create(server.wl_display);
 	wlr_viewporter_create(server.wl_display);
+	server.pointer_constraints = wlr_pointer_constraints_v1_create(server.wl_display);
+	server.relative_pointer_manager = wlr_relative_pointer_manager_v1_create(server.wl_display);
+	server.new_constraint.notify = server_new_pointer_constraint;
+	wl_signal_add(&server.pointer_constraints->events.new_constraint, &server.new_constraint);
 
 	server.output_layout = wlr_output_layout_create(server.wl_display);
+
+	server.cursor = wlr_cursor_create();
+	wlr_cursor_attach_output_layout(server.cursor, server.output_layout);
+
+	server.cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
+
+	wlr_xcursor_manager_load(server.cursor_mgr, server.scale);
+	wlr_cursor_set_xcursor(server.cursor, server.cursor_mgr, "default");
+
 	load_tiles(&server);
 	haptics_init(&server);
 
@@ -10342,7 +11089,7 @@ int main(int argc, char *argv[]) {
 
 	server.seat = wlr_seat_create(server.wl_display, "seat0");
 	wlr_seat_set_capabilities(server.seat,
-		WL_SEAT_CAPABILITY_TOUCH | WL_SEAT_CAPABILITY_KEYBOARD);
+		WL_SEAT_CAPABILITY_TOUCH | WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_POINTER);
 	wlr_keyboard_init(&server.vkbd, &vkbd_impl, "ztmetro-osk");
 	set_default_keymap(&server.vkbd);
     {
@@ -10482,7 +11229,19 @@ int main(int argc, char *argv[]) {
 	}
 	wl_display_run(server.wl_display);
 
+	wl_list_remove(&server.new_surface.link);
+	wl_list_remove(&server.new_constraint.link);
+	wl_list_remove(&server.new_output.link);
+	wl_list_remove(&server.new_xdg_toplevel.link);
+	wl_list_remove(&server.new_xdg_popup.link);
+	wl_list_remove(&server.new_decoration.link);
+	wl_list_remove(&server.new_text_input.link);
+	wl_list_remove(&server.new_input.link);
+	wl_list_remove(&server.request_set_selection.link);
+
 	wl_display_destroy_clients(server.wl_display);
+	wlr_xcursor_manager_destroy(server.cursor_mgr);
+	wlr_cursor_destroy(server.cursor);
 	wlr_allocator_destroy(server.allocator);
 	wlr_renderer_destroy(server.renderer);
 	wlr_backend_destroy(server.backend);

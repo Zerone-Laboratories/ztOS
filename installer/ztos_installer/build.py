@@ -149,9 +149,11 @@ if [ "$TARGET" = starlte ]; then
 fi
 
 step "setting up package signing keys"
+rm -f "$R/var/lib/pacman/db.lck"
 ch sh -c 'pacman-key --init && pacman-key --populate archlinuxarm' > /dev/null
 
 step "updating the base system"
+rm -f "$R/var/lib/pacman/db.lck"
 ch $P -Syu
 
 step "installing ztOS's packages (this is the long part)"
@@ -246,8 +248,10 @@ for f in "$STAGEDIR"/apps/*.desktop; do
 done
 
 step "making your account"
-if [ "$USERNAME" != alarm ] && ch id alarm > /dev/null 2>&1; then
-	ch userdel -r alarm > /dev/null 2>&1 || ch userdel alarm
+OLD_USER=$(ch getent passwd 1000 | cut -d: -f1 || true)
+if [ -n "$OLD_USER" ] && [ "$OLD_USER" != "$USERNAME" ]; then
+	ch userdel -r -f "$OLD_USER" >/dev/null 2>&1 || ch userdel -f "$OLD_USER" >/dev/null 2>&1 || true
+	sed -i "/^${OLD_USER}:/d" "$R/etc/passwd" "$R/etc/shadow" "$R/etc/group" "$R/etc/gshadow" 2>/dev/null || true
 fi
 if ! ch id "$USERNAME" > /dev/null 2>&1; then
 	ch useradd -m -u 1000 -G wheel,video,audio,input -s /bin/bash "$USERNAME"
@@ -277,7 +281,7 @@ step "turning on ztOS's services"
 # (systemd-resolved: names; NetworkManager hands it each network's DNS)
 # (systemd-pstore: the kernel log of a crash or hang is kept in /var/lib/systemd/pstore)
 for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoresensorframework ztos-update-check.timer; do
-	ch systemctl enable "$u" > /dev/null 2>&1
+	ch systemctl enable "$u" > /dev/null 2>&1 || echo "(no $u)"
 done
 for u in systemd-networkd getty@tty1; do
 	ch systemctl disable "$u" > /dev/null 2>&1 || true
