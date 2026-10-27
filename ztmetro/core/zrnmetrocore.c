@@ -1604,7 +1604,18 @@ static void collect_rows(struct rowset *set, double scroll, double tapped, bool 
 
 /* Start a page change. Either page may be missing: none to leave when the app
  * starts, none to arrive when it closes. */
+static void begin_animation_(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start);
 static void begin_animation(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start) {
+	uint32_t t0 = now_ms();
+	begin_animation_(have_from, have_to, target, tapped, requested_start);
+	uint32_t took = now_ms() - t0;
+	if (took >= 16) {
+		fprintf(stderr, "%s: page change set up in %u ms (scroll %.0f, %s)\n", zmc.app->app_id, took,
+			zmc.scroll, zmc.quit_after_anim ? "closing" : "turning");
+	}
+}
+
+static void begin_animation_(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start) {
 	zmc.anim_from = zmc.page;
 	zmc.anim_to = target;
 	zmc.anim_from_surface = zmc.anim_to_surface = NULL;
@@ -2347,7 +2358,12 @@ void zmc_quit(void) {
 		zmc.running = false;
 		return;
 	}
-	/* closing: the page's rows leave first */
+	/* closing: the page's rows leave first, as they were last drawn. Drawn
+	 * again first (something had asked for a redraw), Settings' first page
+	 * held the exit back 350 ms on the J5 before its first frame */
+	if (zmc.cache && cairo_image_surface_get_width(zmc.cache) == zmc.width * zmc.scale) {
+		zmc.cache_stale = false;
+	}
 	zmc.quit_after_anim = true;
 	begin_animation(true, false, zmc.page, -1, 0);
 }

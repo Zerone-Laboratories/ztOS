@@ -279,6 +279,8 @@ static struct picture *picture(cairo_surface_t *source, unsigned revision) {
 			if (glGetError() != GL_NO_ERROR) { gpu.failed = true; forget(p); return NULL; }
 		}
 	}
+	struct timespec up0, up1;
+	clock_gettime(CLOCK_MONOTONIC, &up0);
 	cairo_surface_flush(source);
 	const unsigned char *data = cairo_image_surface_get_data(source);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -292,6 +294,11 @@ static struct picture *picture(cairo_surface_t *source, unsigned revision) {
 	}
 	p->revision = revision;
 	p->used = ++gpu.clock;
+	clock_gettime(CLOCK_MONOTONIC, &up1);
+	double up_ms = (up1.tv_sec - up0.tv_sec) * 1e3 + (up1.tv_nsec - up0.tv_nsec) / 1e6;
+	if (up_ms >= 8) {
+		fprintf(stderr, "ZrnMetroCore: %dx%d page uploaded in %.0f ms (revision %u)\n", w, h, up_ms, revision);
+	}
 	gpu.uploads++;
 	gpu.bytes += (size_t)w * h * 4;
 	return p;

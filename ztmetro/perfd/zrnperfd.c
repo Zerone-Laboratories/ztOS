@@ -1098,9 +1098,16 @@ static void apply(void) {
 		if (power_level >= 4 && max > capped(table, n, 0.6))
 			max = capped(table, n, 0.6);
 		put(perfial_gpu_file("governor"), "simple_ondemand");
+		/* The floor, with the screen on: the same usable step. With only the
+		 * crystal's 19.2 MHz below 400 MHz (the J5), simple_ondemand dropped
+		 * to 19.2 whenever a light animation left the GPU mostly idle, and
+		 * the next frames took two vblanks each (Start's tiles coming back
+		 * from an app). The GPU still idles between frames at any clock */
+		long floor = screen_on ? (rest < max ? rest : max) : table[0];
 		/* lower the floor before the ceiling, and raise them the other way */
 		put_long(perfial_gpu_file("min_freq"), table[0]);
 		put_long(perfial_gpu_file("max_freq"), max);
+		put_long(perfial_gpu_file("min_freq"), floor);
 		if (profile == PERFORMANCE && !idle0) {
 			put_long(perfial_gpu_file("min_freq"), top);
 		}

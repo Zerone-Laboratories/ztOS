@@ -45,6 +45,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <drm_fourcc.h>
+#include <xf86drm.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
@@ -465,6 +467,12 @@ struct zt_server {
 	struct zt_output *output;
 	float scale;
 	float size_step;	/* Settings' display size: 0.875, 1 or 1.125 of the automatic scale */
+	/* what every colour drawn this frame is multiplied by: the software
+	 * brightness and the colour temperature (see frame_tint) */
+	float tint[3];
+	/* the display driver waits for the GPU's fences before it shows a buffer
+	 * (implicit sync): a frame is flushed, not finished, before it goes */
+	bool implicit_sync;
 	int width, height;	/* of the output, in points */
 	uint32_t accent;
 	bool haptics_enabled;
@@ -824,6 +832,25 @@ static uint32_t menu_ms(struct zt_server *server, uint32_t ms) {
 	return ms * 100 / (uint32_t)(server->menu_speed > 0 ? server->menu_speed : 100);
 }
 
+static void perf_tell(const char *command);
+
+/* The CPU's floor raised until a motion ends (zrnperfd's "motion MS"): with
+ * schedutil starting from its idle clocks, the first frames of an animation
+ * nobody touched for (Start's tiles coming back after an app has shut) came
+ * every other vblank on the J5; held up, they come at every one. One message
+ * per lengthening, not per animation. */
+static void motion_lease(uint32_t until) {
+	static uint32_t leased;
+	uint32_t now = now_ms();
+	if (until <= now + 50 || (int32_t)(until - leased) < 50) {
+		return;
+	}
+	leased = until;
+	char line[32];
+	snprintf(line, sizeof(line), "motion %u\n", until - now);
+	perf_tell(line);
+}
+
 /* Move *value to `to` over `duration` ms, after `delay` ms, at the speed the
  * user set. A value already being animated is redirected from where it is now. */
 static void animate(struct zt_server *server, float *value, float to, uint32_t duration,
@@ -853,6 +880,7 @@ static void animate(struct zt_server *server, float *value, float to, uint32_t d
 		.active = true, .value = value, .from = *value, .to = to,
 		.start = now_ms() + delay, .duration = duration ? duration : 1, .linear = linear,
 	};
+	motion_lease(now_ms() + delay + duration);
 	damage(server);
 }
 
@@ -1058,10 +1086,12 @@ static GLuint gl_program(const char *fragment_head, const char *sampler) {
 		"uniform float alpha;\n"
 		"uniform float swap_rb;\n"
 		"uniform float opaque;\n"
+		"uniform vec3 tint;\n"
 		"void main() {\n"
 		"	vec4 c = texture2D(tex, uv);\n"
 		"	if (swap_rb > 0.5) c = c.bgra;\n"
 		"	if (opaque > 0.5) c.a = 1.0;\n"
+		"	c.rgb *= tint;\n"
 		"	gl_FragColor = c * alpha;\n"	/* premultiplied throughout */
 		"}\n", fragment_head, sampler);
 	const char *sources[2] = { vertex, fragment };
@@ -1130,6 +1160,26 @@ static void renderer_init(struct zt_server *server) {
 static unsigned frame_quads, frame_uploads, anim_quads, anim_uploads;
 static double frame_px, frame_upload_bytes, anim_px, anim_upload_bytes;
 
+static float backlight_darkening(int percent);
+static void tone_rgb(int k, float rgb[3]);
+
+/* The software brightness (no backlight, or one that cannot go low enough)
+ * and the colour temperature (no gamma table on these display drivers), as
+ * one tint every quad's colour is multiplied by. Everything is premultiplied
+ * and blended over black, so that is the same as a full-screen black layer
+ * and a full-screen multiply drawn last, without the two extra screens of
+ * pixels: on the J5's Adreno 306 each costs about 3 ms of a 16.7 ms frame. */
+static void frame_tint(struct zt_server *server) {
+	float k = 1.0f - backlight_darkening(server->shade_brightness);
+	float rgb[3] = { 1.0f, 1.0f, 1.0f };
+	if (server->tone_k > 0 && server->tone_k < 6450) {
+		tone_rgb(server->tone_k, rgb);
+	}
+	for (int i = 0; i < 3; i++) {
+		server->tint[i] = k * rgb[i];
+	}
+}
+
 static void quad(struct zt_server *server, GLenum target, GLuint tex, const float model[16],
 		float alpha, bool swap_rb, bool opaque, float u_max, float v_max) {
 	static const GLfloat corners[8] = { 0, 0, 1, 0, 0, 1, 1, 1 };
@@ -1165,6 +1215,7 @@ static void quad(struct zt_server *server, GLenum target, GLuint tex, const floa
 	glUniform1f(glGetUniformLocation(program, "alpha"), alpha);
 	glUniform1f(glGetUniformLocation(program, "swap_rb"), swap_rb ? 1.0f : 0.0f);
 	glUniform1f(glGetUniformLocation(program, "opaque"), opaque ? 1.0f : 0.0f);
+	glUniform3f(glGetUniformLocation(program, "tint"), server->tint[0], server->tint[1], server->tint[2]);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(target, tex);
 	/* App textures arrive with GL's default filter, which wants mipmaps that
@@ -5328,6 +5379,12 @@ static int boot_check_sensorhub(void *data) {
 	bool test_fail = getenv("ZT_TEST_SENSORHUB_FAIL") != NULL;
 
 	bool sensor_ready = server->boot_skip_sensorhub;
+	/* Samsung's sensor hub (SSP) is on the S9's vendor kernel only, under
+	 * the sec class; a phone without that class has none to wait for (the
+	 * J5 sat on the boot splash 45 s, then warned that it had failed) */
+	if (!sensor_ready && !test_fail && access("/sys/class/sec", F_OK) != 0) {
+		sensor_ready = true;
+	}
 	if (!sensor_ready && !test_fail) {
 		char buf[16] = {0};
 		int fd = open("/sys/class/sec/sensorhub/ready", O_RDONLY);
@@ -5341,7 +5398,9 @@ static int boot_check_sensorhub(void *data) {
 	}
 
 	uint32_t elapsed = now_ms() - server->boot_wait_started_ms;
-	bool android_ready = access("/run/ztos-waydroid-boot-ready", F_OK) == 0;
+	/* and Android only where Waydroid has been set up (waydroid init) */
+	bool android_ready = access("/run/ztos-waydroid-boot-ready", F_OK) == 0 ||
+		access("/var/lib/waydroid/waydroid.cfg", F_OK) != 0;
 	if ((android_ready && (sensor_ready || server->sensorhub_fail_screen)) || elapsed >= 45000) {
 		if (android_ready && sensor_ready) {
 			wlr_log(WLR_INFO, "boot: sensor hub and Waydroid ready, starting transition");
@@ -9961,6 +10020,12 @@ static void ctl_command(struct zt_server *server, char *line) {
 		damage(server);
 	} else if (sscanf(line, "volume %d", &id) == 1) {
 		volume_step(server, id);
+	} else if (strcmp(line, "back") == 0) {
+		/* what the nav bar's back does to an app in front (for testing
+		 * transitions without a finger on the glass) */
+		if (server->shown) {
+			vkbd_send(server, KEY_ESC, false);
+		}
 	} else if (strcmp(line, "restart") == 0) {
 		/* a new display size: greetd starts the session again at it */
 		wlr_log(WLR_INFO, "restart asked for");
@@ -10571,13 +10636,43 @@ static void render_frame(struct zt_server *server) {
 	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 	glClearColor(0, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
+	frame_tint(server);
 
 	struct zt_toplevel *app = server->shown ? server->shown : server->leaving;
 	struct app_draw draw = { .server = server, .x = 0, .y = STATUS_H - server->app_lift, .scale = 1.0f,
 		.angle = server->app_angle,
 		.alpha = fminf(1.0f, server->app_alpha * 4.0f) * turn_alpha(fabsf(server->app_angle) / TURN_OUT_DEG) };
+	/* The lock screen is opaque too: what it covers is not drawn, and while it
+	 * slides up only the strip below it is. Each screen of pixels costs the
+	 * J5's Adreno 306 about 3 ms, and Start, an app and the panel under a
+	 * resting lock screen were 4.5 screens a frame. */
+	bool lock_shown = server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height);
+	float under = lock_shown ? server->lock_y + server->height : 0.0f;	/* the first row it leaves */
+	bool lock_covers = lock_shown && under >= server->height - 0.5f;
+	int under_top = lock_shown && under > 0.5f ? (int)floorf(under * server->scale) : 0;
+	/* The action centre's panel and the nav bar are opaque black as well, and
+	 * what the panel uncovers below its bar goes dim: that dim is folded
+	 * into the tint (as the brightness is) instead of a layer over it all */
+	float tint_saved[3] = { server->tint[0], server->tint[1], server->tint[2] };
+	bool shade_folded = false;
+	if (server->shade_h > 0.5f && server->shade_layer.tex) {
+		float cover = server->shade_h > SHADE_HANDLE ? server->shade_h - SHADE_HANDLE : 0.0f;
+		int top = (int)floorf(cover * server->scale);
+		under_top = top > under_top ? top : under_top;
+		if (cover >= STATUS_H) {
+			float k = 1.0f - 0.6f * (server->shade_h / (float)SHADE_MAX_H);
+			for (int i = 0; i < 3; i++) server->tint[i] *= k;
+			shade_folded = true;
+		}
+	}
+	int under_bottom = server->sensorhub_fail_screen ? output->height :
+		output->height - (int)floorf(NAV_H * server->scale);
+	if (!lock_covers && (under_top > 0 || under_bottom < output->height)) {
+		glEnable(GL_SCISSOR_TEST);
+		glScissor(0, under_top, output->width, under_bottom - under_top);	/* row 0 is the top */
+	}
 	/* The opaque boot splash covers these layers; avoid drawing them underneath. */
-	if (!server->splash) {
+	if (!server->splash && !lock_covers) {
 	/* Start and the app list beside it, unless they have swung away completely */
 	if (server->start_t < 0.999f) {
 		float page_dx = -server->page * (float)server->width;
@@ -10814,6 +10909,9 @@ static void render_frame(struct zt_server *server) {
 		glDisable(GL_SCISSOR_TEST);
 	}
 	if (server->shade_h > 0.5f && server->shade_layer.tex) {
+		/* the panel itself undimmed, and wherever it draws */
+		memcpy(server->tint, tint_saved, sizeof(tint_saved));
+		glDisable(GL_SCISSOR_TEST);
 		/*
 		 * The panel does not travel. Its contents stay where they are, at
 		 * the top, and the bar along its bottom edge comes down the screen
@@ -10829,8 +10927,10 @@ static void render_frame(struct zt_server *server) {
 		mat_identity(m);
 		mat_translate(m, 0, STATUS_H);
 		mat_scale(m, server->width, (float)(SHADE_MAX_H - STATUS_H));
-		quad(server, GL_TEXTURE_2D, server->black_tex, m,
-			0.6f * (reveal / (float)SHADE_MAX_H), false, false, 1.0f, 1.0f);
+		if (!shade_folded) {
+			quad(server, GL_TEXTURE_2D, server->black_tex, m,
+				0.6f * (reveal / (float)SHADE_MAX_H), false, false, 1.0f, 1.0f);
+		}
 
 		glEnable(GL_SCISSOR_TEST);
 		/* the frame buffer's first row is the top of the screen */
@@ -10864,6 +10964,8 @@ static void render_frame(struct zt_server *server) {
 		glDisable(GL_SCISSOR_TEST);
 	}
 	} /* layers hidden by the boot splash */
+	glDisable(GL_SCISSOR_TEST);
+	memcpy(server->tint, tint_saved, sizeof(tint_saved));
 	if (server->splash && server->splash_layer.tex) {
 		layer_draw(server, &server->splash_layer, 0, 0, 1.0f);
 	}
@@ -10936,38 +11038,8 @@ static void render_frame(struct zt_server *server) {
 			quad(server, GL_TEXTURE_2D, server->white_tex, m, 0.55f, false, false, 1.0f, 1.0f);
 		}
 	}
-	if (server->tone_k > 0 && server->tone_k < 6450) {
-		/* colour temperature: there is no gamma table to load on this
-		 * display driver, so every pixel is multiplied instead */
-		if (!server->tone_tex) {
-			glGenTextures(1, &server->tone_tex);
-			server->tone_dirty = true;
-		}
-		glBindTexture(GL_TEXTURE_2D, server->tone_tex);
-		if (server->tone_dirty) {
-			float rgb[3];
-			tone_rgb(server->tone_k, rgb);
-			unsigned char px[4] = { (unsigned char)(rgb[0] * 255), (unsigned char)(rgb[1] * 255),
-				(unsigned char)(rgb[2] * 255), 255 };
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
-			server->tone_dirty = false;
-		}
-		float m[16];
-		mat_identity(m);
-		mat_scale(m, server->width, server->height);
-		glBlendFunc(GL_DST_COLOR, GL_ZERO);
-		quad(server, GL_TEXTURE_2D, server->tone_tex, m, 1.0f, false, true, 1.0f, 1.0f);
-		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-	}
-	/* darkened in software: always without a backlight, and with one for the
-	 * moment until the panel has been told (see backlight_set) */
-	float dark = backlight_darkening(server->shade_brightness);
-	if (dark > 0.002f) {
-		float m[16];
-		mat_identity(m);
-		mat_scale(m, server->width, server->height);
-		quad(server, GL_TEXTURE_2D, server->black_tex, m, dark, false, false, 1.0f, 1.0f);
-	}
+	/* the colour temperature and the software brightness are not drawn here:
+	 * every quad is multiplied by them as it is drawn (frame_tint) */
 
 	if (server->record_until && (int32_t)(server->record_until - now) > 0) {
 		/* Read a smaller title region when debugging resume, and write each
@@ -11003,7 +11075,14 @@ static void render_frame(struct zt_server *server) {
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	struct timespec t1, t2, t3;
 	clock_gettime(CLOCK_MONOTONIC, &t1);
-	glFinish();	/* the buffer goes to the display as it is: it has to be complete */
+	if (server->implicit_sync) {
+		/* msm waits on the buffer's fences before the flip: the CPU need
+		 * not wait for the GPU. glFinish here cost the J5 about 2.7 ms a
+		 * frame, CPU and GPU taking turns instead of overlapping */
+		glFlush();
+	} else {
+		glFinish();	/* the buffer goes to the display as it is: it has to be complete */
+	}
 	GLenum frame_error = glGetError();
 	gl_end(server);
 	clock_gettime(CLOCK_MONOTONIC, &t2);
@@ -11158,6 +11237,19 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	snprintf(scale_text, sizeof(scale_text), "%.2f", server->scale);
 	setenv("ZTMETRO_SCALE", scale_text, 1);
 	wlr_output_state_set_scale(&state, server->scale);
+	/* ZTMETRO_DEPTH=16: the screen drawn in RGB565, half the bytes the GPU
+	 * writes out every frame (3.7 MB at 720x1280 in 32 bits, about 4 ms of
+	 * the J5's frame); GL dithers what is drawn into it */
+	const char *depth = getenv("ZTMETRO_DEPTH");
+	if (depth && atoi(depth) == 16) {
+		wlr_output_state_set_render_format(&state, DRM_FORMAT_RGB565);
+		if (!wlr_output_test_state(wlr_output, &state)) {
+			wlr_log(WLR_ERROR, "output: RGB565 not accepted, staying at 32 bits");
+			wlr_output_state_set_render_format(&state, DRM_FORMAT_XRGB8888);
+		} else {
+			wlr_log(WLR_INFO, "output: drawn in RGB565");
+		}
+	}
 	wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
 
@@ -11463,6 +11555,7 @@ int main(int argc, char *argv[]) {
 	server.drop_card = -1;
 	server.battery_level = -1;
 	server.shade_brightness = 50;	/* until the config says what it was left at */
+	server.tint[0] = server.tint[1] = server.tint[2] = 1.0f;
 	server.shade_wifi = wifi_up();
 	server.shade_pressed = -1;
 	server.uevent_fd = -1;
@@ -11498,6 +11591,17 @@ int main(int argc, char *argv[]) {
 	backlight_init(&server);
 	backlight_set(server.shade_brightness);	/* (load_config ran before the loop) */
 	server.backend = wlr_backend_autocreate(server.loop, NULL);
+	if (server.backend) {
+		int drm_fd = wlr_backend_get_drm_fd(server.backend);
+		drmVersion *version = drm_fd >= 0 ? drmGetVersion(drm_fd) : NULL;
+		/* drivers known to wait on implicit fences before scanout; the S9's
+		 * DECON is not among them and keeps the glFinish */
+		server.implicit_sync = version && version->name && !strcmp(version->name, "msm") &&
+			!getenv("ZTMETRO_FINISH");	/* to measure the GPU's time per frame */
+		wlr_log(WLR_INFO, "display driver %s: frames %s", version && version->name ? version->name : "?",
+			server.implicit_sync ? "flushed (implicit sync)" : "finished before they are shown");
+		if (version) drmFreeVersion(version);
+	}
 	if (!server.backend) {
 		wlr_log(WLR_ERROR, "failed to create the backend");
 		return 1;
