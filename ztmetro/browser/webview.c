@@ -1440,11 +1440,15 @@ void webview_touch_cancel(struct webview *wv) {
  * these on its scrolling thread, without the web process's main thread,
  * which on the J5 took about 24 ms for each step of a touch-driven scroll
  * (frames every other vblank). stop ends the gesture: sent with nothing
- * left to move, so WebKit adds no momentum of its own. */
+ * left to move, so WebKit adds no momentum of its own. WebKit multiplies a
+ * touchpad's precise deltas by 2.5 (WebEventFactoryWPE.cpp,
+ * wpeScrollDeltaMultiplier): handed over divided, the page keeps to the
+ * finger instead of running 2.5 times ahead of it. */
+#define WPE_TOUCHPAD_MULTIPLIER 2.5
 void webview_pan(struct webview *wv, double dy, double x, double y, bool stop) {
 	if (!wv || !wv->view) return;
 	send(wv, wpe_event_scroll_new(wv->view, WPE_INPUT_SOURCE_TOUCHPAD,
-		(guint32)(g_get_monotonic_time() / 1000), 0, 0, -dy, TRUE, stop, x, y));	/* (a touchpad's deltas point the other way) */
+		(guint32)(g_get_monotonic_time() / 1000), 0, 0, -dy / WPE_TOUCHPAD_MULTIPLIER, TRUE, stop, x, y));	/* (a touchpad's deltas point the other way) */
 	if (getenv("ZTB_DEBUG")) fprintf(stderr, "superscan: pan %.1f%s\n", dy, stop ? " stop" : "");
 }
 
