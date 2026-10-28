@@ -302,8 +302,10 @@ echo LANG=en_US.UTF-8 > "$R/etc/locale.conf"
 step "turning on ztOS's services"
 # (systemd-resolved: names; NetworkManager hands it each network's DNS)
 # (systemd-pstore: the kernel log of a crash or hang is kept in /var/lib/systemd/pstore)
+# (zrnperfd: the CPU and GPU clocks from ztOSIAL's Perf1; without it the
+# GPU rests at its lowest step and ztMETRO lags)
 for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoresensorframework ztos-update-check.timer \
-		ztos-iald waydroid-container ztos-waydroid-images; do
+		ztos-iald zrnperfd waydroid-container ztos-waydroid-images; do
 	ch systemctl enable "$u" > /dev/null 2>&1
 done
 for u in systemd-networkd getty@tty1; do
