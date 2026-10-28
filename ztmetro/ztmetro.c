@@ -80,6 +80,9 @@
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_output_layer.h>
+#include <wlr/types/wlr_buffer.h>
+#include <wlr/render/dmabuf.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_seat.h>
@@ -710,6 +713,14 @@ struct zt_server {
 	float scroll_v;		/* and how fast it is coasting, points per ms */
 	bool moving;		/* something coasts or settles: keep drawing frames */
 	uint32_t app_live_until;	/* the app sent a frame lately: a frame every vblank until then */
+	/* The page on a display plane: an app's DMA-BUF subsurface (Superscan's
+	 * WebKit frames) scanned out by the display controller, over the frame
+	 * the GPU draws, which then leaves it out. See plane_pick(). */
+	struct wlr_output_layer *plane_layer;
+	struct wlr_surface *plane_surface;	/* on the plane this frame, or NULL */
+	bool plane_off;		/* the backend refused it for 2 s on end: drawn by the GPU from then on */
+	int plane_refusals;	/* frames in a row the backend did not take the plane */
+	bool plane_shown;	/* the plane had a buffer at the last commit */
 	uint32_t physics_ms;
 
 	/* the app list, to the right of Start */
@@ -10520,6 +10531,7 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 
 struct app_draw {
 	struct zt_server *server;
+	struct wlr_surface *skip;	/* on a display plane: not drawn */
 	double ox, oy, fit;
 	float x, y, scale;	/* where the app area's corner goes, and how large */
 	float angle, alpha;
@@ -10529,6 +10541,9 @@ struct app_draw {
 static void draw_app_surface(struct wlr_surface *surface, int sx, int sy, void *data) {
 	struct app_draw *draw = data;
 	struct zt_server *server = draw->server;
+	if (surface == draw->skip) {
+		return;
+	}
 	struct wlr_texture *texture = wlr_surface_get_texture(surface);
 	if (!texture || !wlr_texture_is_gles2(texture)) {
 		return;
@@ -10833,6 +10848,82 @@ static void render_retry_later(struct zt_server *server) {
 	if (timer) wl_event_source_timer_update(timer, 100);
 }
 
+struct plane_find {
+	struct wlr_surface *root, *found;
+	struct wlr_buffer *buffer;
+	int sx, sy;
+};
+
+static void plane_find_surface(struct wlr_surface *surface, int sx, int sy, void *data) {
+	struct plane_find *f = data;
+	struct wlr_dmabuf_attributes attribs;
+	/* the client's own buffer: wlroots keeps it as the client buffer's source */
+	struct wlr_buffer *buf = surface->current.buffer ? surface->current.buffer :
+		surface->buffer ? surface->buffer->source : NULL;
+	if (surface != f->root && buf && surface->current.width >= 100 &&
+			surface->current.height >= 100 && wlr_buffer_get_dmabuf(buf, &attribs)) {
+		f->buffer = buf;
+		f->found = surface;
+		f->sx = sx;
+		f->sy = sy;
+	}
+}
+
+/* The page goes on a display plane when nothing of the shell's is drawn over
+ * it, the app is at rest in front, and every pixel the GPU would draw of it
+ * is drawn unchanged (no dimming tint): then a scroll frame is a plane flip,
+ * no composition. Superscan's frames on the J5: 3 ms of GPU each, and the
+ * shell's whole frame with them, saved. */
+static bool plane_pick(struct zt_server *server, struct zt_toplevel *app, const struct app_draw *draw,
+		bool app_covers, struct wlr_output_layer_state *ls) {
+	static const char *last_why;
+	const char *why = NULL;
+#define PLANE_NO(reason) do { why = reason; goto no; } while (0)
+	if (server->plane_off || getenv("ZTMETRO_NO_PLANE")) PLANE_NO("off");
+	if (!app_covers || !app || !app->mapped) PLANE_NO("no app at rest in front");
+	if (server->peek > 0.001f || server->shade_h > 0.5f || server->splash ||
+			server->sensorhub_fail_screen || server->osk_slide > 0.003f || server->hyper_t > 0.003f ||
+			server->locked || server->lock_y > 1.0f - server->height || server->call_over_lock ||
+			server->switch_t > 0.001f || server->keypop) {
+		PLANE_NO("something of the shell's over the app");
+	}
+	for (int i = 0; i < 3; i++) {
+		if (fabsf(server->tint[i] - 1.0f) > 0.002f) {
+			PLANE_NO("tinted");
+		}
+	}
+	struct plane_find f = { .root = app->xdg_toplevel->base->surface };
+	wlr_xdg_surface_for_each_surface(app->xdg_toplevel->base, plane_find_surface, &f);
+	if (!f.found) {
+		PLANE_NO("no DMA-BUF subsurface");
+	}
+	if (!server->plane_layer) {
+		server->plane_layer = wlr_output_layer_create(server->output->wlr_output);
+	}
+	double k = draw->fit * draw->scale * server->scale;
+	*ls = (struct wlr_output_layer_state){
+		.layer = server->plane_layer,
+		.buffer = f.buffer,
+		.dst_box = {
+			.x = (int)lround((draw->x + draw->fit * draw->scale * (draw->ox + f.sx)) * server->scale),
+			.y = (int)lround((draw->y + draw->fit * draw->scale * (draw->oy - STATUS_H + f.sy)) * server->scale),
+			.width = (int)lround(f.found->current.width * k),
+			.height = (int)lround(f.found->current.height * k),
+		},
+	};
+	wlr_surface_get_buffer_source_box(f.found, &ls->src_box);
+	server->plane_surface = f.found;
+	last_why = NULL;
+	return true;
+no:
+	if (why != last_why) {
+		wlr_log(WLR_INFO, "plane: not used: %s", why);
+		last_why = why;
+	}
+	return false;
+#undef PLANE_NO
+}
+
 static void render_frame(struct zt_server *server) {
 	struct wlr_output *output = server->output->wlr_output;
 	uint32_t now = now_ms();
@@ -10900,6 +10991,8 @@ static void render_frame(struct zt_server *server) {
 	struct app_draw draw = { .server = server, .x = 0, .y = STATUS_H - server->app_lift, .scale = 1.0f,
 		.angle = server->app_angle,
 		.alpha = fminf(1.0f, server->app_alpha * 4.0f) * turn_alpha(fabsf(server->app_angle) / TURN_OUT_DEG) };
+	struct wlr_output_layer_state plane_state = {0};
+	bool plane = false;	/* the page on a display plane this frame (plane_pick) */
 	/* The lock screen is opaque too: what it covers is not drawn, and while it
 	 * slides up only the strip below it is. Each screen of pixels costs the
 	 * J5's Adreno 306 about 3 ms, and Start, an app and the panel under a
@@ -10942,6 +11035,37 @@ static void render_frame(struct zt_server *server) {
 	 * GPU (about 3 ms a screen) ran out of frame before WebKit did */
 	bool app_covers = app && app->mapped && !server->leaving && server->switch_t <= 0.001f &&
 		draw.alpha >= 0.999f && fabsf(draw.angle) < 0.01f && server->app_lift == 0;
+	server->plane_surface = NULL;
+	if (app && app->mapped) {
+		app_origin(app, &draw.ox, &draw.oy);
+		draw.fit = app_fit(server, app);
+		plane = plane_pick(server, app, &draw, app_covers, &plane_state);
+	}
+	if (plane) {
+		wlr_output_state_set_buffer(&state, buffer);
+		wlr_output_state_set_layers(&state, &plane_state, 1);
+		bool tested = wlr_output_test_state(output, &state);
+		if (!tested || !plane_state.accepted) {
+			/* libliftoff ranks layers by how often they change: a new one
+			 * waits a few frames for a plane. Only a refusal that lasts 2 s
+			 * turns it off */
+			if (++server->plane_refusals == 120) {
+				wlr_log(WLR_INFO, "plane: refused (test %s, layer %s) for %dx%d at %d,%d; the GPU draws the page",
+					tested ? "passed" : "failed", plane_state.accepted ? "accepted" : "not accepted",
+					plane_state.dst_box.width, plane_state.dst_box.height, plane_state.dst_box.x, plane_state.dst_box.y);
+				server->plane_off = true;
+			}
+			plane = false;
+			server->plane_surface = NULL;
+		}
+	}
+	if (plane) {
+		server->plane_refusals = 0;
+		draw.skip = server->plane_surface;
+	} else if (server->plane_shown && server->plane_layer) {
+		plane_state = (struct wlr_output_layer_state){ .layer = server->plane_layer };	/* off */
+		wlr_output_state_set_layers(&state, &plane_state, 1);
+	}
 	/* Start and the app list beside it, unless they have swung away completely */
 	if (server->start_t < 0.999f && !app_covers) {
 		float page_dx = -server->page * (float)server->width;
@@ -11368,6 +11492,11 @@ static void render_frame(struct zt_server *server) {
 	if (!wlr_output_commit_state(output, &state)) {
 		wlr_log(WLR_ERROR, "output commit failed");
 	} else {
+		bool was = server->plane_shown;
+		server->plane_shown = plane;
+		if (plane != was) {
+			wlr_log(WLR_INFO, "plane: the page %s", plane ? "on a display plane" : "drawn by the GPU");
+		}
 		server->output->last_submitted = buffer;
 		ladder_committed();	/* the panel's level, behind the frame that matches it */
 	}
