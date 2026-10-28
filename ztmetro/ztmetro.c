@@ -6491,6 +6491,16 @@ static void show_next_app(struct zt_server *server) {
 	}
 }
 
+static void show_previous_app(struct zt_server *server) {
+	struct zt_toplevel *t;
+	wl_list_for_each(t, &server->toplevels, link) {
+		if (t->mapped && !t->background_hidden && t != server->shown) {
+			show_toplevel(server, t);
+			return;
+		}
+	}
+}
+
 /* ---- the app switcher ------------------------------------------------------ */
 
 /* Put a value where it should be now, whatever was moving it. */
@@ -11458,7 +11468,9 @@ static void render_frame(struct zt_server *server) {
 	if (server->shade_h > 0.5f && server->shade_layer.tex) {
 		float cover = server->shade_h > SHADE_HANDLE ? server->shade_h - SHADE_HANDLE : 0.0f;
 		int top = (int)floorf(cover * server->scale);
-		under_top = top > under_top ? top : under_top;
+		if (!server->shade_compact) {
+			under_top = top > under_top ? top : under_top;
+		}
 		if (cover >= STATUS_H) {
 			float k = 1.0f - 0.6f * (server->shade_h / (float)SHADE_MAX_H);
 			for (int i = 0; i < 3; i++) server->tint[i] *= k;
