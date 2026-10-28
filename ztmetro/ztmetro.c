@@ -709,6 +709,7 @@ struct zt_server {
 	double turn_bottom, list_turn_bottom;	/* where the turnstile counts rows up from */
 	float scroll_v;		/* and how fast it is coasting, points per ms */
 	bool moving;		/* something coasts or settles: keep drawing frames */
+	uint32_t app_live_until;	/* the app sent a frame lately: a frame every vblank until then */
 	uint32_t physics_ms;
 
 	/* the app list, to the right of Start */
@@ -10393,11 +10394,13 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 		wlr_log(WLR_INFO, "nav: key %u %s", event->keycode,
 			event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "down" : "up");
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			/* the two touch keys answer every touch, locked or not: home
+			 * is a button that clicks by itself */
+			if (nav != NAV_START) {
+				hap(server, HAP_TAP, HG_NAV);
+			}
 			if (server->locked || server->auth_active) {
 				return;
-			}
-			if (nav != NAV_START) {
-				hap(server, HAP_TAP, HG_NAV);	/* the two touch keys */
 			}
 			server->hwkey_held = nav;
 			server->hwkey_long = false;
@@ -10934,8 +10937,13 @@ static void render_frame(struct zt_server *server) {
 	}
 	/* The opaque boot splash covers these layers; avoid drawing them underneath. */
 	if (!server->splash && !lock_covers) {
+	/* An app at rest in front covers them as the lock screen does: Superscan
+	 * scrolling over a Start left in place drew 3.5 screens a frame, and the
+	 * GPU (about 3 ms a screen) ran out of frame before WebKit did */
+	bool app_covers = app && app->mapped && !server->leaving && server->switch_t <= 0.001f &&
+		draw.alpha >= 0.999f && fabsf(draw.angle) < 0.01f && server->app_lift == 0;
 	/* Start and the app list beside it, unless they have swung away completely */
-	if (server->start_t < 0.999f) {
+	if (server->start_t < 0.999f && !app_covers) {
 		float page_dx = -server->page * (float)server->width;
 		int n = server->page < 0.999f ? server->n_tiles : 0, draw_order[n > 0 ? n : 1];
 		float turns[n > 0 ? n : 1];
@@ -11440,9 +11448,17 @@ static void render_frame(struct zt_server *server) {
 static void output_frame(struct wl_listener *listener, void *data) {
 	struct zt_output *output = wl_container_of(listener, output, frame);
 	struct zt_server *server = output->server;
+	/* An app that is moving (a scroll, its own animation) gets a frame, and
+	 * its frame callback, on every vblank, not only when its commit came in
+	 * before this one: a commit just after it waited for the one after, and
+	 * Superscan's scroll fell into frames two vblanks apart */
+	bool app_live = (int32_t)(server->app_live_until - now_ms()) > 0;
 	/* nothing damaged and nothing moving: no frame, and no further wake-ups */
-	if (server->dirty || server->moving || loading_active(server) || animating(server, NULL)) {
+	if (server->dirty || server->moving || app_live || loading_active(server) || animating(server, NULL)) {
 		render_frame(server);
+	}
+	if (app_live) {
+		wlr_output_schedule_frame(output->wlr_output);
 	}
 }
 
@@ -11578,6 +11594,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 static void surface_commit(struct wl_listener *listener, void *data) {
 	struct zt_surface *zs = wl_container_of(listener, zs, commit);
 	if (zs->server->shown || zs->server->leaving) {
+		zs->server->app_live_until = now_ms() + 50;
 		damage(zs->server);
 	}
 }
