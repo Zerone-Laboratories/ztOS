@@ -99,6 +99,7 @@ enum action {
 	ACT_BT_MENU,		/* an item of a held device's menu */
 	ACT_BT_MENU_CLOSE,
 	ACT_COLUMNS,
+	ACT_STYLE,		/* arg: the shell's style, 0 Metro, 1 DotMatrix */
 	ACT_HAPTICS,
 	ACT_WIFI_RADIO,
 	ACT_WIFI_SUSPEND,
@@ -209,6 +210,7 @@ static struct {
 	char start_wall[256], lock_wall[256];	/* the photos, or "" */
 	int wall_target;			/* 0 both, 1 Start, 2 lock screen */
 	int columns;
+	int style;				/* ztRetrofit's look: 0 Metro, 1 DotMatrix */
 	bool haptics;
 	char scale_text[16];
 
@@ -363,6 +365,8 @@ static void config_load(void) {
             app.media_vol = atoi(val) < 0 ? 0 : atoi(val) > 100 ? 100 : atoi(val);
         } else if (strcmp(key, "columns") == 0) {
 			app.columns = atoi(val);
+		} else if (strcmp(key, "style") == 0) {
+			app.style = strcmp(val, "dotmatrix") == 0 || strcmp(val, "1") == 0;
 		} else if (strcmp(key, "haptics") == 0) {
 			app.haptics = strcmp(val, "off") != 0 && strcmp(val, "0") != 0;
 		} else if (strcmp(key, "haptic_strength") == 0) {
@@ -540,7 +544,7 @@ static void auto_load(void) {
 
 static void config_save(void) {
 	static const int timeouts[] = { 30, 60, 180, 300, 0 };
-	enum { N_KEYS = 21 + N_HAPTIC_GROUPS };
+	enum { N_KEYS = 22 + N_HAPTIC_GROUPS };
 	struct { const char *key; char value[300]; bool written; } keys[N_KEYS] = {
 		{ .key = "accent" }, { .key = "columns" }, { .key = "haptics" },
 		{ .key = "brightness" }, { .key = "timeout" }, { .key = "demo_tiles" },
@@ -573,6 +577,8 @@ static void config_save(void) {
 	static const char *const sizes[] = { "compact", "standard", "large" };
 	keys[20 + N_HAPTIC_GROUPS].key = "display_size";
 	snprintf(keys[20 + N_HAPTIC_GROUPS].value, 32, "%s", sizes[app.scale_idx]);
+	keys[21 + N_HAPTIC_GROUPS].key = "style";
+	snprintf(keys[21 + N_HAPTIC_GROUPS].value, 32, "%s", app.style ? "dotmatrix" : "metro");
 	snprintf(keys[0].value, 32, "%s", ACCENTS[app.accent].name);
 	snprintf(keys[1].value, 32, "%d", app.columns);
 	snprintf(keys[2].value, 32, "%s", app.haptics ? "on" : "off");
@@ -1644,7 +1650,28 @@ static double draw_theme(cairo_t *cr) {
 		zmc_text(cr, label, FONT_REGULAR, 13, bx + 10, y + 9, 0);
 		zmc_add_hit(bx, y, btn_w, 36, ACT_COLUMNS, c);
 	}
-	return draw_wall_row(cr, y + 60);	/* under the columns row (36 high, 24 below) */
+	y += 60;
+
+	/* ztRetrofit's styles: the same shell, the same apps, another look */
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, "Shell style", FONT_REGULAR, 13.5, MARGIN, y, 0);
+	y += 24;
+	static const char *const styles[] = { "Metro", "DotMatrix" };
+	for (int k = 0; k < 2; k++) {
+		double btn_w = (zmc.width - 2 * MARGIN - gap) / 2.0;
+		double bx = MARGIN + k * (btn_w + gap);
+		if (app.style == k) {
+			zmc_set_rgb(cr, ACCENTS[app.accent].color);
+		} else {
+			cairo_set_source_rgb(cr, 0.18, 0.18, 0.18);
+		}
+		cairo_rectangle(cr, bx, y, btn_w, 36);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, styles[k], FONT_REGULAR, 13, bx + 10, y + 9, 0);
+		zmc_add_hit(bx, y, btn_w, 36, ACT_STYLE, k);
+	}
+	return draw_wall_row(cr, y + 60);	/* under the style row (36 high, 24 below) */
 }
 
 /* The brightness as it is now, in percent (the shell or sensord may have
@@ -3023,6 +3050,10 @@ static void activate(int action, int arg) {
 	case ACT_COLUMNS:
 		app.columns = arg;
 		config_save();
+		break;
+	case ACT_STYLE:
+		app.style = arg;
+		config_save();	/* the shell reads it on SIGHUP and changes at once */
 		break;
 	case ACT_HAPTICS:
 		app.haptics = !app.haptics;

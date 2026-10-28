@@ -30,9 +30,18 @@ sounds/ztos-sounds: sounds/ztos-sounds.c
 IAL_FLAGS := $(shell pkg-config --exists ztos-ial 2>/dev/null && echo -DHAVE_ZTOS_IAL $$(pkg-config --cflags ztos-ial))
 IAL_LIBS := $(shell pkg-config --exists ztos-ial 2>/dev/null && pkg-config --libs --static ztos-ial)
 
-ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h
+# ztRetrofit's styles beside Metro: retro/ (DotMatrix: the dot engine and its launcher)
+RETRO = retro/dotmatrix.c retro/dm-launcher.c retro/dm-chrome.c
+RETRO_DEPS = $(RETRO) retro/dotmatrix.h retro/dm-launcher.h retro/dm-chrome.h retro/dm-glyphs.h
+
+ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h $(RETRO_DEPS)
 	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(IAL_FLAGS) \
-		-o $@ ztmetro.c $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
+		-o $@ ztmetro.c $(RETRO) $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
+
+# the DotMatrix screens rendered offscreen to PNG files, to check them without a phone
+retro/dm-test: retro/dm-test.c $(RETRO_DEPS)
+	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags egl glesv2 cairo) -o $@ retro/dm-test.c $(RETRO) \
+		$(shell pkg-config --libs egl glesv2 cairo) -lm
 
 xdg-shell-protocol.h:
 	wayland-scanner server-header $(XDG) $@
@@ -44,8 +53,9 @@ apps/ztapps: apps/ztapps.c
 
 # ZrnMetroCore: the window, motion and widgets our own apps share
 VIEWPORTER := $(WP)/stable/viewporter/viewporter.xml
-CORE = core/zrnmetrocore.c core/zrnmetrogpu.c core/xdg-shell-protocol.c core/viewporter-protocol.c
-CORE_DEPS = $(CORE) core/zrnmetrocore.h core/zrnmetrogpu.h core/zrnmetrorender.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
+CORE = core/zrnmetrocore.c core/zrnmetrogpu.c core/xdg-shell-protocol.c core/viewporter-protocol.c \
+	retro/dotmatrix.c retro/dm-chrome.c
+CORE_DEPS = $(CORE) retro/dotmatrix.h retro/dm-chrome.h retro/dm-glyphs.h core/zrnmetrocore.h core/zrnmetrogpu.h core/zrnmetrorender.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
 APP_BUILD = $(CC) $(CFLAGS) $(WARN) -Icore $(shell pkg-config --cflags $(APP_PKGS)) $(IAL_FLAGS)
 APP_LIBS = $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS) -lm
 

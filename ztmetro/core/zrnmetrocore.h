@@ -35,6 +35,7 @@
 #define ZMC_TILT_IN_MS	90
 #define ZMC_TILT_OUT_MS	200
 #define ZMC_MARGIN	16	/* left edge of everything: 20 px on a 450 px wide reference */
+enum { ZMC_STYLE_METRO, ZMC_STYLE_DOTMATRIX };
 #define ZMC_HEADER_H	104	/* the title stays; the list moves under it */
 #define ZMC_ACT_BACK	(-1)	/* the title: up a page */
 #define ZMC_ACT_PIVOT	(-2)	/* the next tab's title: slide to it (arg: its page) */
@@ -121,6 +122,11 @@ struct zmc_state {
 	bool configured, running, dirty;
 	bool active;		/* the shell has this app in front (XDG activated) */
 	uint32_t accent;	/* 0xRRGGBB */
+	/* the shell's style (ztRetrofit): the same widgets with another face.
+	 * ZMC_STYLE_DOTMATRIX draws switches, sliders, buttons, the loading dots
+	 * and page titles as dots, in the palette chosen on its home screen */
+	int style;
+	uint32_t dm_main, dm_accent;
 
 	int page;
 	double scroll, content_h;
@@ -301,6 +307,7 @@ void zmc_accent(cairo_t *cr);
 void zmc_haptic(const char *kind);
 uint32_t zmc_now_ms(void);
 void zmc_read_file(const char *path, char *out, size_t size);	/* first line, or "" */
-uint32_t zmc_config_accent(void);	/* the accent in ~/.config/ztmetro/config */
+uint32_t zmc_config_accent(void);
+void zmc_config_style(void);	/* style and palette from the same file; DotMatrix also sets the accent */	/* the accent in ~/.config/ztmetro/config */
 
 #endif
