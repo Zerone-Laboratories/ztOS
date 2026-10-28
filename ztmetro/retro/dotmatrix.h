@@ -107,6 +107,7 @@ int dm_palette_index(const char *name);			/* 0 (Mono) when unknown */
 
 /* ---- the GPU ---- */
 struct dm_frame {
+	const struct dm_screen *screen;	/* whose grid and ghosts; NULL: the renderer's first */
 	const uint8_t *grid;		/* the steady-state fast path: a composed grid... */
 	const struct dm_dot *dots;	/* ...or a list of dots (morphs, ripples) */
 	int n_dots;
@@ -115,16 +116,18 @@ struct dm_frame {
 	float ghost_op, bloom_op, face_op;
 };
 struct dm_renderer {
-	GLuint prog, gbuf, dbuf;
+	GLuint prog, gbuf, dbuf, gbuf2;
 	GLint a_pos, a_state;
 	GLint u_res, u_size, u_main, u_acc, u_ghost, u_face, u_glow, u_tint, u_off;
 	float *dyn;
 	int cap;
-	int n_ghost;
-	const struct dm_screen *s;
+	int n_ghost, n_ghost2;
+	const struct dm_screen *s, *s2;
 };
 bool dm_gl_init(struct dm_renderer *r, const struct dm_screen *s);
 void dm_gl_finish(struct dm_renderer *r);
+/* a second screen over the same area (a finer grid for small type) */
+bool dm_gl_screen2(struct dm_renderer *r, const struct dm_screen *s2);
 /* Draws into the bound framebuffer, whose viewport covers the screen.
  * scale: pixels per point; tint: what every colour is multiplied by;
  * y_off: points the whole field is moved down (a screen sliding). */

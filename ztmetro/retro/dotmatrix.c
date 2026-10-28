@@ -488,6 +488,35 @@ static void rgb(uint32_t c, float out[3]) {
 	out[2] = (c & 0xff) / 255.0f;
 }
 
+static GLuint ghost_buffer(const struct dm_screen *s) {
+	float *gv = malloc(sizeof(float) * 3 * s->n_ghost);
+	if (!gv) return 0;
+	for (int i = 0; i < s->n_ghost; i++) {
+		gv[3 * i] = s->ghost[2 * i];
+		gv[3 * i + 1] = s->ghost[2 * i + 1];
+		gv[3 * i + 2] = 0;
+	}
+	GLuint b = 0;
+	glGenBuffers(1, &b);
+	glBindBuffer(GL_ARRAY_BUFFER, b);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 3 * s->n_ghost, gv, GL_STATIC_DRAW);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	free(gv);
+	return b;
+}
+
+static bool dyn_buffer(struct dm_renderer *r, int cap) {
+	float *dyn = realloc(r->dyn, sizeof(float) * 3 * cap);
+	if (!dyn) return false;
+	r->dyn = dyn;
+	r->cap = cap;
+	if (!r->dbuf) glGenBuffers(1, &r->dbuf);
+	glBindBuffer(GL_ARRAY_BUFFER, r->dbuf);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 3 * cap, NULL, GL_DYNAMIC_DRAW);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	return true;
+}
+
 bool dm_gl_init(struct dm_renderer *r, const struct dm_screen *s) {
 	memset(r, 0, sizeof(*r));
 	r->s = s;
@@ -526,31 +555,24 @@ bool dm_gl_init(struct dm_renderer *r, const struct dm_screen *s) {
 	glUniform3fv(u_pal, DM_PALETTES, pal);
 
 	/* the ghost field never moves: one static buffer */
+	if (!(r->gbuf = ghost_buffer(s))) return false;
 	r->n_ghost = s->n_ghost;
-	float *gv = malloc(sizeof(float) * 3 * s->n_ghost);
-	if (!gv) return false;
-	for (int i = 0; i < s->n_ghost; i++) {
-		gv[3 * i] = s->ghost[2 * i];
-		gv[3 * i + 1] = s->ghost[2 * i + 1];
-		gv[3 * i + 2] = 0;
-	}
-	glGenBuffers(1, &r->gbuf);
-	glBindBuffer(GL_ARRAY_BUFFER, r->gbuf);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 3 * s->n_ghost, gv, GL_STATIC_DRAW);
-	free(gv);
-	r->cap = s->cols * s->rows + 4096;
-	r->dyn = malloc(sizeof(float) * 3 * r->cap);
-	glGenBuffers(1, &r->dbuf);
-	glBindBuffer(GL_ARRAY_BUFFER, r->dbuf);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 3 * r->cap, NULL, GL_DYNAMIC_DRAW);
-	glBindBuffer(GL_ARRAY_BUFFER, 0);
-	return r->dyn != NULL;
+	return dyn_buffer(r, s->cols * s->rows + 4096);
+}
+
+bool dm_gl_screen2(struct dm_renderer *r, const struct dm_screen *s2) {
+	if (r->gbuf2) glDeleteBuffers(1, &r->gbuf2);
+	r->s2 = s2;
+	if (!(r->gbuf2 = ghost_buffer(s2))) return false;
+	r->n_ghost2 = s2->n_ghost;
+	return s2->cols * s2->rows + 4096 <= r->cap || dyn_buffer(r, s2->cols * s2->rows + 4096);
 }
 
 void dm_gl_finish(struct dm_renderer *r) {
 	if (r->prog) glDeleteProgram(r->prog);
 	if (r->gbuf) glDeleteBuffers(1, &r->gbuf);
 	if (r->dbuf) glDeleteBuffers(1, &r->dbuf);
+	if (r->gbuf2) glDeleteBuffers(1, &r->gbuf2);
 	free(r->dyn);
 	memset(r, 0, sizeof(*r));
 }
@@ -563,7 +585,8 @@ static void bind(struct dm_renderer *r, GLuint buf) {
 
 void dm_gl_draw(struct dm_renderer *r, const struct dm_frame *f, int palette, float scale,
 		const float tint[3], float y_off) {
-	const struct dm_screen *s = r->s;
+	const struct dm_screen *s = f->screen ? f->screen : r->s;
+	bool second = s == r->s2 && r->gbuf2;
 	if (!r->prog) return;
 	if (palette < 0 || palette >= DM_PALETTES) palette = 0;
 	int n = 0, n_ghosts = 0;
@@ -612,8 +635,8 @@ void dm_gl_draw(struct dm_renderer *r, const struct dm_frame *f, int palette, fl
 	glUniform1f(r->u_glow, 0);
 	glUniform1f(r->u_size, dot);
 	if (f->ghost_op > 0) {
-		bind(r, r->gbuf);
-		glDrawArrays(GL_POINTS, 0, r->n_ghost);
+		bind(r, second ? r->gbuf2 : r->gbuf);
+		glDrawArrays(GL_POINTS, 0, second ? r->n_ghost2 : r->n_ghost);
 	}
 	bind(r, r->dbuf);
 	glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(float) * 3 * n, r->dyn);

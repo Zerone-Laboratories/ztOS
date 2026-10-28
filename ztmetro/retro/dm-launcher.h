@@ -29,7 +29,7 @@ struct dm_status {
 	char ssid[64], track[128], artist[128], alarm[16];
 	int cpu, ram, gpu;		/* load, percent */
 	int n_notif;
-	char notif[DM_MAX_NOTIF][256];	/* acts (as the dock uses them) with notifications waiting */
+	char notif[DM_MAX_NOTIF][64];	/* the names of apps with notifications waiting */
 };
 
 struct dm_app { char label[64]; char act[256]; };
@@ -46,12 +46,17 @@ struct dm_host {
 	bool (*toggle_radio)(void *data, const char *id);
 	void (*saved)(void *data);	/* palette or AMOLED changed: persist them */
 	void (*haptic)(void *data, int kind, int ms);
-	void (*settings)(void *data);	/* three fingers up */
-	bool h24;
+	void (*style)(void *data, const char *name);	/* settings: another style ("metro") */
 	const char *version;		/* under the boot wordmark */
-	bool sys_stats;			/* idle middle widget: load meters (else context) */
-	bool event_banners;
+};
+
+/* What the launcher's settings sheet sets; the host keeps it (saved()) */
+struct dm_config {
 	int launch_delay;		/* ms of launch animation before the app is asked for */
+	bool sys_stats;			/* idle middle widget: load meters (else context) */
+	bool event_banners;		/* Wi-Fi, Bluetooth and data coming and going */
+	bool h24;
+	char dock[5][256];		/* each dock slot's app (its act), "" to pick one by kind */
 };
 
 struct dm_launcher;
@@ -59,10 +64,15 @@ struct dm_launcher *dm_launcher_new(const struct dm_host *host, float w, float h
 void dm_launcher_free(struct dm_launcher *L);
 bool dm_launcher_resize(struct dm_launcher *L, float w, float h);
 const struct dm_screen *dm_launcher_screen(const struct dm_launcher *L);
+/* the finer screen the settings sheet uses: give it to the renderer (dm_gl_screen2) */
+const struct dm_screen *dm_launcher_screen2(const struct dm_launcher *L);
 
 void dm_launcher_status(struct dm_launcher *L, const struct dm_status *st);
 void dm_launcher_apps(struct dm_launcher *L, const struct dm_app *apps, int n);	/* in display order */
-void dm_launcher_dock(struct dm_launcher *L, int slot, const char *name, const char *act);	/* 0..4 */
+void dm_launcher_set_config(struct dm_launcher *L, const struct dm_config *c);
+void dm_launcher_get_config(const struct dm_launcher *L, struct dm_config *c);
+/* the app each dock slot resolved to (its act), "" when none */
+const char *dm_launcher_dock_act(const struct dm_launcher *L, int slot);
 void dm_launcher_weather(struct dm_launcher *L, int kind, float temp_c);
 void dm_launcher_set_palette(struct dm_launcher *L, int palette, bool amoled);
 int dm_launcher_palette(const struct dm_launcher *L);
@@ -83,7 +93,7 @@ void dm_launcher_launch_failed(struct dm_launcher *L, int64_t now);
 
 enum { DM_TOUCH_DOWN, DM_TOUCH_MOVE, DM_TOUCH_UP, DM_TOUCH_CANCEL };
 void dm_launcher_touch(struct dm_launcher *L, int phase, float x, float y, int64_t now);
-void dm_launcher_three_up(struct dm_launcher *L, int64_t now);
+void dm_launcher_three_up(struct dm_launcher *L, int64_t now);	/* three fingers up: settings */
 
 /* Composes the frame for `now`. False when the picture is the same as the
  * last one returned (nothing to draw). The frame points into the launcher

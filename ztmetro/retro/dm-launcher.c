@@ -38,10 +38,11 @@
 #define MAX_HITS 160
 #define MAX_EVENTS 8
 
-enum { S_SPLASH, S_HOME, S_DRAWER, S_LAUNCH, S_MENU, S_QUICK };
+enum { S_SPLASH, S_HOME, S_DRAWER, S_LAUNCH, S_MENU, S_QUICK, S_SETTINGS, S_GUIDE };
 enum {
 	H_DOCK, H_DIAL, H_MEDIA, H_DRAWER, H_APP, H_JUMP, H_HOME, H_PALETTE, H_AMOLED,
-	H_MENU_DONE, H_QUICK,
+	H_MENU_DONE, H_QUICK, H_SETTINGS, H_SET_ROW, H_SET_PAGE, H_GUIDE, H_GUIDE_NEXT, H_TEST_BANNERS,
+	H_METRO,
 };
 
 struct hit { float c0, r0, c1, r1; int act, arg; };
@@ -57,10 +58,25 @@ static const struct dm_bmp *const DOCK_ICON[5] = {
 	&dm_icons_cam, &dm_icons_web, &dm_icons_term, &dm_icons_chat, &dm_icons_music,
 };
 static const char *const DOCK_DEFAULT[5] = { "CAMERA", "BROWSER", "TERMINAL", "MESSAGES", "MUSIC" };
+/* what kind of app each dock slot takes, best first (resolveCameraApp and the rest) */
+static const char *const DOCK_WORDS[5][6] = {
+	{ "camera", NULL },
+	{ "superscan", "browser", "firefox", "chromium", NULL },
+	{ "terminal", "foot", "console", NULL },
+	{ "whatsapp", "messages", "telegram", "signal", NULL },
+	{ "music", "spotify", NULL },
+};
+static const char *const DOCK_LABELS[5] = { "DOCK 1 (CAM)", "DOCK 2 (WEB)", "DOCK 3 (TERM)", "DOCK 4 (CHAT)", "DOCK 5 (MUSIC)" };
+static const int LAUNCH_DELAYS[4] = { 800, 1000, 300, 600 };
+#define SET_PAGES 3
 
 struct dm_launcher {
 	struct dm_host host;
+	struct dm_config cfg;
 	struct dm_screen s;
+	struct dm_screen sh;		/* twice as fine, for the settings sheet's small type */
+	const struct dm_screen *last_scr;	/* last_grid's */
+	int set_page, guide_page;
 	int dy;				/* rows below the design's 152, bottom-anchored */
 	int screen;
 	int64_t t0, switch_at;
@@ -163,12 +179,14 @@ static void free_buffers(struct dm_launcher *L) {
 bool dm_launcher_resize(struct dm_launcher *L, float w, float h) {
 	if (L->s.content && L->s.w == w && L->s.h == h) return true;
 	dm_screen_finish(&L->s);
+	dm_screen_finish(&L->sh);
 	free_buffers(L);
 	/* the screens are laid out on 68 x 152; a pitch that fits both keeps a
 	 * tall phone from losing the middle widget, and gives it spare columns */
 	float pitch = fminf(w / 68, h / 152);
-	if (!dm_screen_init(&L->s, w, h, pitch, 68)) return false;
-	L->n = L->s.cols * L->s.rows;
+	if (!dm_screen_init(&L->s, w, h, pitch, 68) || !dm_screen_init(&L->sh, w, h, pitch / 2, 136)) return false;
+	L->n = L->sh.cols * L->sh.rows;		/* the bigger of the two */
+	L->last_scr = &L->s;
 	L->dy = L->s.rows - 152;
 	int n = L->n, cap = n + 64;
 	L->grid = calloc(n, 1);
@@ -178,8 +196,8 @@ bool dm_launcher_resize(struct dm_launcher *L, float w, float h) {
 	L->prev = calloc(cap, sizeof(*L->prev));
 	L->seed = calloc(cap, sizeof(*L->seed));
 	L->snap = calloc(cap, sizeof(*L->snap));
-	L->gmoved = calloc(L->s.n_ghost + 1, sizeof(*L->gmoved));
-	L->sparks = calloc(L->s.n_ghost + 1, sizeof(*L->sparks));
+	L->gmoved = calloc(n + 1, sizeof(*L->gmoved));
+	L->sparks = calloc(n + 1, sizeof(*L->sparks));
 	L->mid_cells = calloc(cap, sizeof(*L->mid_cells));
 	L->mid_prev = calloc(cap, sizeof(*L->mid_prev));
 	L->mid_tmp = calloc(cap, sizeof(*L->mid_tmp));
@@ -194,7 +212,7 @@ struct dm_launcher *dm_launcher_new(const struct dm_host *host, float w, float h
 	struct dm_launcher *L = calloc(1, sizeof(*L));
 	if (!L) return NULL;
 	L->host = *host;
-	if (!L->host.launch_delay) L->host.launch_delay = 800;
+	L->cfg = (struct dm_config){ .launch_delay = 800, .sys_stats = true, .event_banners = true };
 	if (!dm_launcher_resize(L, w, h)) {
 		dm_launcher_free(L);
 		return NULL;
@@ -203,6 +221,7 @@ struct dm_launcher *dm_launcher_new(const struct dm_host *host, float w, float h
 	L->wx_kind = DM_WX_NONE;
 	L->wx_temp = NAN;
 	for (int i = 0; i < 5; i++) snprintf(L->dock_name[i], sizeof(L->dock_name[i]), "%s", DOCK_DEFAULT[i]);
+	L->guide_page = 0;
 	L->screen = S_SPLASH;
 	L->boot_pending = true;
 	L->apps_build_at = 0;
@@ -212,12 +231,18 @@ struct dm_launcher *dm_launcher_new(const struct dm_host *host, float w, float h
 void dm_launcher_free(struct dm_launcher *L) {
 	if (!L) return;
 	dm_screen_finish(&L->s);
+	dm_screen_finish(&L->sh);
 	free_buffers(L);
 	free(L->apps);
 	free(L);
 }
 
 const struct dm_screen *dm_launcher_screen(const struct dm_launcher *L) { return &L->s; }
+const struct dm_screen *dm_launcher_screen2(const struct dm_launcher *L) { return &L->sh; }
+
+static const struct dm_screen *scr_of(const struct dm_launcher *L, int screen) {
+	return screen == S_SETTINGS || screen == S_GUIDE ? &L->sh : &L->s;
+}
 void dm_launcher_dirty(struct dm_launcher *L) { L->dirty = true; }
 int dm_launcher_palette(const struct dm_launcher *L) { return L->palette; }
 bool dm_launcher_amoled(const struct dm_launcher *L) { return L->amoled; }
@@ -234,7 +259,7 @@ void dm_launcher_set_palette(struct dm_launcher *L, int palette, bool amoled) {
 /* ---- data from the host ---------------------------------------------------- */
 
 static void enqueue(struct dm_launcher *L, const char *type, const char *title, const char *sub) {
-	if (!L->host.event_banners || L->n_evq >= MAX_EVENTS) return;
+	if (!L->cfg.event_banners || L->n_evq >= MAX_EVENTS) return;
 	struct event *e = &L->evq[L->n_evq++];
 	memset(e, 0, sizeof(*e));
 	snprintf(e->type, sizeof(e->type), "%s", type);
@@ -255,6 +280,8 @@ void dm_launcher_status(struct dm_launcher *L, const struct dm_status *s) {
 	L->st = *s;
 }
 
+static void resolve_dock(struct dm_launcher *L);
+
 void dm_launcher_apps(struct dm_launcher *L, const struct dm_app *apps, int n) {
 	free(L->apps);
 	L->apps = NULL;
@@ -264,14 +291,45 @@ void dm_launcher_apps(struct dm_launcher *L, const struct dm_app *apps, int n) {
 		L->n_apps = n;
 	}
 	L->apps_loaded = n > 0;
+	resolve_dock(L);
 	float max_top = fmaxf(0, L->n_apps - (L->s.rows - 30) / 7);
 	if (L->drawer_top > max_top) L->drawer_top = max_top;
 }
 
-void dm_launcher_dock(struct dm_launcher *L, int slot, const char *name, const char *act) {
-	if (slot < 0 || slot > 4) return;
-	upcase(L->dock_name[slot], sizeof(L->dock_name[slot]), name && *name ? name : DOCK_DEFAULT[slot]);
-	snprintf(L->dock_act[slot], sizeof(L->dock_act[slot]), "%s", act ? act : "");
+static bool has_word(const struct dm_app *a, const char *word) {
+	return strcasestr(a->label, word) || strcasestr(a->act, word);
+}
+
+/* the app a slot holds: the one chosen in settings, or the best of its kind */
+static void resolve_dock(struct dm_launcher *L) {
+	for (int slot = 0; slot < 5; slot++) {
+		const struct dm_app *found = NULL;
+		for (int i = 0; L->cfg.dock[slot][0] && i < L->n_apps && !found; i++) {
+			if (!strcmp(L->apps[i].act, L->cfg.dock[slot])) found = &L->apps[i];
+		}
+		for (int w = 0; !found && DOCK_WORDS[slot][w]; w++) {
+			for (int i = 0; i < L->n_apps && !found; i++) {
+				if (has_word(&L->apps[i], DOCK_WORDS[slot][w])) found = &L->apps[i];
+			}
+		}
+		upcase(L->dock_name[slot], 15, found ? found->label : DOCK_DEFAULT[slot]);
+		snprintf(L->dock_act[slot], sizeof(L->dock_act[slot]), "%s", found ? found->act : "");
+	}
+}
+
+const char *dm_launcher_dock_act(const struct dm_launcher *L, int slot) {
+	return slot >= 0 && slot < 5 ? L->dock_act[slot] : "";
+}
+
+void dm_launcher_set_config(struct dm_launcher *L, const struct dm_config *c) {
+	L->cfg = *c;
+	if (L->cfg.launch_delay <= 0) L->cfg.launch_delay = 800;
+	resolve_dock(L);
+	L->dirty = true;
+}
+
+void dm_launcher_get_config(const struct dm_launcher *L, struct dm_config *c) {
+	*c = L->cfg;
 }
 
 void dm_launcher_weather(struct dm_launcher *L, int kind, float temp_c) {
@@ -284,7 +342,7 @@ void dm_launcher_weather(struct dm_launcher *L, int kind, float temp_c) {
 /* the last drawn frame as dots: where the next morph flies from */
 static void snapshot(struct dm_launcher *L) {
 	if (L->last_valid) {
-		struct dm_grid g = { &L->s, L->last_grid, -DM_NO_CLIP, DM_NO_CLIP };
+		struct dm_grid g = { L->last_scr, L->last_grid, -DM_NO_CLIP, DM_NO_CLIP };
 		L->n_prev = dm_dots(&g, L->prev, L->n);
 	} else {
 		L->n_prev = 0;
@@ -365,7 +423,7 @@ static void open_act(struct dm_launcher *L, const char *act, const char *name, i
 	upcase(L->launch_name, sizeof(L->launch_name), name);
 	snprintf(L->launch_act, sizeof(L->launch_act), "%s", act);
 	L->launch_t = now;
-	L->launch_at = now + L->host.launch_delay;
+	L->launch_at = now + L->cfg.launch_delay;
 	L->launch_fired = false;
 	go(L, S_LAUNCH, now);
 }
@@ -378,7 +436,7 @@ static void draw_status_bar(struct dm_launcher *L, struct dm_grid *g, int64_t A)
 	const struct dm_status *st = &L->st;
 	struct tm tm = local(A);
 	char hh[4], mm[4];
-	if (L->host.h24) snprintf(hh, sizeof(hh), "%02d", tm.tm_hour);
+	if (L->cfg.h24) snprintf(hh, sizeof(hh), "%02d", tm.tm_hour);
 	else snprintf(hh, sizeof(hh), "%2d", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12);
 	snprintf(mm, sizeof(mm), "%02d", tm.tm_min);
 	dm_bmp(g, dm_b7(hh[0]), 25, 13, DM_MAIN);
@@ -466,7 +524,7 @@ static const char *mid_kind(struct dm_launcher *L, int64_t A, char *buf, size_t 
 	else if (st->playing) snprintf(buf, cap, "%s", st->bt_audio ? "btaudio" : "wave");
 	else if (st->charging) snprintf(buf, cap, "charge");
 	else if (batt_warn(L)) snprintf(buf, cap, "lowbatt");
-	else if (L->host.sys_stats) snprintf(buf, cap, "sys");
+	else if (L->cfg.sys_stats) snprintf(buf, cap, "sys");
 	else snprintf(buf, cap, "ctx:%s", context_of(L, A).gname);
 	return buf;
 }
@@ -667,7 +725,7 @@ static int compose_middle(struct dm_launcher *L, int64_t A, int cy, int bottom, 
 	else if (st->playing) draw_wave(&g, A, bottom);
 	else if (st->charging) draw_charging(L, &g, A, cy);
 	else if (batt_warn(L)) draw_low_battery(L, &g, A, cy);
-	else if (L->host.sys_stats) draw_system_stats(L, &g, A, cy);
+	else if (L->cfg.sys_stats) draw_system_stats(L, &g, A, cy);
 	else {
 		struct context c = context_of(L, A);
 		int top = cy - (int)lroundf((c.glyph->h + 16) / 2.0f);
@@ -688,7 +746,8 @@ static int compose_middle(struct dm_launcher *L, int64_t A, int cy, int bottom, 
 static bool dock_notif(const struct dm_launcher *L, int i) {
 	if (!L->dock_act[i][0]) return false;
 	for (int k = 0; k < L->st.n_notif && k < DM_MAX_NOTIF; k++) {
-		if (!strcmp(L->st.notif[k], L->dock_act[i])) return true;
+		const char *app = L->st.notif[k];
+		if (app[0] && (strcasestr(L->dock_name[i], app) || strcasestr(app, L->dock_name[i]))) return true;
 	}
 	return false;
 }
@@ -864,9 +923,159 @@ static void draw_menu(struct dm_launcher *L, struct dm_grid *g) {
 	dm_text3(g, am ? "ON" : "OFF", 53 - dm_width3(am ? "ON" : "OFF"), ay + 4, am ? DM_ACCENT : DM_DIM, DM_NO_CLIP);
 	add_hit(L, 10, ay, 57, ay + 12, H_AMOLED, 0);
 
-	dm_frame(g, 22, my + 38, 45, my + 48, DM_DIM);
-	dm_text3c(g, "DONE", 33.5f, my + 41, DM_MAIN);
-	add_hit(L, 22, my + 38, 45, my + 48, H_MENU_DONE, 0);
+	/* the settings sheet (three fingers up in the original), beside DONE */
+	dm_frame(g, 10, my + 38, 37, my + 48, DM_DIM);
+	dm_text3c(g, "SETTINGS", 23.5f, my + 41, DM_DIM);
+	add_hit(L, 10, my + 38, 37, my + 48, H_SETTINGS, 0);
+	dm_frame(g, 40, my + 38, 57, my + 48, DM_DIM);
+	dm_text3c(g, "DONE", 48.5f, my + 41, DM_MAIN);
+	add_hit(L, 40, my + 38, 57, my + 48, H_MENU_DONE, 0);
+}
+
+/* ---- the settings sheet, on the fine grid (136 columns) ---- */
+
+/* the apps a dock slot may hold: automatic, then every one of its kind */
+static int dock_candidates(const struct dm_launcher *L, int slot, int *out, int cap) {
+	int n = 0;
+	out[n++] = -1;
+	for (int w = 0; DOCK_WORDS[slot][w]; w++) {
+		for (int i = 0; i < L->n_apps && n < cap; i++) {
+			bool seen = false;
+			for (int k = 1; k < n; k++) seen |= out[k] == i;
+			if (!seen && has_word(&L->apps[i], DOCK_WORDS[slot][w])) out[n++] = i;
+		}
+	}
+	return n;
+}
+
+static void dock_value(const struct dm_launcher *L, int slot, char *out, size_t cap) {
+	if (!L->cfg.dock[slot][0]) {
+		snprintf(out, cap, "AUTO (%s)", L->dock_name[slot]);
+		return;
+	}
+	for (int i = 0; i < L->n_apps; i++) {
+		if (!strcmp(L->apps[i].act, L->cfg.dock[slot])) {
+			upcase(out, cap > 17 ? 17 : cap, L->apps[i].label);
+			return;
+		}
+	}
+	snprintf(out, cap, "NOT INSTALLED");
+}
+
+static void cycle_dock(struct dm_launcher *L, int slot) {
+	int c[64], n = dock_candidates(L, slot, c, 64), at = 0;
+	for (int k = 1; k < n; k++) {
+		if (L->cfg.dock[slot][0] && !strcmp(L->apps[c[k]].act, L->cfg.dock[slot])) at = k;
+	}
+	int next = c[(at + 1) % n];
+	snprintf(L->cfg.dock[slot], sizeof(L->cfg.dock[slot]), "%s", next < 0 ? "" : L->apps[next].act);
+	resolve_dock(L);
+}
+
+static void settings_row(struct dm_launcher *L, struct dm_grid *g, const char *label, const char *val, int y, int arg) {
+	int val_x = 125 - dm_width3(val);
+	dm_text3(g, label, 12, y, DM_DIM, val_x - 3);
+	dm_text3(g, val, val_x, y, DM_MAIN, DM_NO_CLIP);
+	add_hit(L, 8, y - 2, 127, y + 8, H_SET_ROW, arg);
+}
+
+static void settings_button(struct dm_launcher *L, struct dm_grid *g, int c0, int c1, int y, const char *label,
+		int tint, int act, int arg) {
+	dm_frame(g, c0, y, c1, y + 12, tint);
+	dm_text3c(g, label, (c0 + c1) / 2.0f, y + 4, DM_MAIN);
+	add_hit(L, c0, y, c1, y + 12, act, arg);
+}
+
+static void draw_settings(struct dm_launcher *L, struct dm_grid *g) {
+	static const char *const names[SET_PAGES] = { "DOCK SHORTCUTS", "SYSTEM", "TOOLS" };
+	int pi = L->set_page < 0 ? 0 : L->set_page >= SET_PAGES ? SET_PAGES - 1 : L->set_page;
+	dm_text3c(g, "SETTINGS", 67.5f, 12, DM_MAIN);
+	dm_text3c(g, names[pi], 67.5f, 20, DM_ACCENT);
+	/* the chevrons say the sheet moves sideways */
+	if (pi > 0) {
+		dm_text3(g, "<", 11, 20, DM_MAIN, DM_NO_CLIP);
+		add_hit(L, 8, 15, 22, 27, H_SET_PAGE, pi - 1);
+	}
+	if (pi < SET_PAGES - 1) {
+		dm_text3(g, ">", 124, 20, DM_MAIN, DM_NO_CLIP);
+		add_hit(L, 113, 15, 127, 27, H_SET_PAGE, pi + 1);
+	}
+	dm_hline(g, 8, 127, 28, DM_DIM, 2);
+	char val[48];
+	if (pi == 0) {
+		for (int i = 0; i < 5; i++) {
+			dock_value(L, i, val, sizeof(val));
+			settings_row(L, g, DOCK_LABELS[i], val, 44 + i * 14, i);
+		}
+	} else if (pi == 1) {
+		snprintf(val, sizeof(val), "%dMS", L->cfg.launch_delay);
+		settings_row(L, g, "LAUNCH DELAY", val, 44, 10);
+		settings_row(L, g, "SYSTEM STATS", L->cfg.sys_stats ? "ON" : "OFF", 58, 11);
+		settings_row(L, g, "EVENT BANNERS", L->cfg.event_banners ? "ON" : "OFF", 72, 12);
+		settings_row(L, g, "CLOCK", L->cfg.h24 ? "24 HOUR" : "12 HOUR", 86, 13);
+	} else {
+		settings_button(L, g, 16, 66, 48, "HOW TO USE", DM_DIM, H_GUIDE, 0);
+		settings_button(L, g, 70, 120, 48, "TEST BANNERS", DM_DIM, H_TEST_BANNERS, 0);
+		/* the way back: the shell's other style */
+		settings_button(L, g, 16, 120, 64, "SHELL STYLE: METRO", DM_DIM, H_METRO, 0);
+	}
+	/* page dots, tappable too */
+	int dot_y = 268, first = (int)lroundf(67.5f - (SET_PAGES - 1) * 3);
+	for (int i = 0; i < SET_PAGES; i++) {
+		int cx = first + i * 6;
+		dm_set(g, cx, dot_y, i == pi ? DM_MAIN : DM_DIM);
+		dm_set(g, cx + 1, dot_y, i == pi ? DM_MAIN : DM_DIM);
+		if (i == pi) {
+			dm_set(g, cx, dot_y + 1, DM_MAIN);
+			dm_set(g, cx + 1, dot_y + 1, DM_MAIN);
+		}
+		add_hit(L, cx - 2, dot_y - 5, cx + 4, dot_y + 6, H_SET_PAGE, i);
+	}
+	int done_y = 281;
+	dm_frame(g, 26, done_y, 110, done_y + 14, DM_MAIN);
+	dm_text3c(g, "DONE (RETURN HOME)", 67.5f, done_y + 5, DM_MAIN);
+	add_hit(L, 26, done_y, 110, done_y + 14, H_HOME, 0);
+}
+
+/* ---- the guide ---- */
+
+struct guide_page { const char *title; const char *lines[7][2]; };
+static const struct guide_page GUIDE[] = {
+	{ "GESTURES", { { "TAP", "RIPPLE / OPEN" }, { "HOLD", "THEME PICKER" }, { "CHEVRON", "APP DRAWER" },
+		{ "SWIPE RIGHT", "QUICK SETTINGS" }, { "3-FINGER UP", "SETTINGS" }, { "BACK", "RETURN HOME" }, { "", "" } } },
+	{ "HOME SCREEN", { { "TOP LEFT", "BATTERY SIGNAL" }, { "", "WIFI BLUETOOTH" }, { "TOP RIGHT", "CLOCK WEATHER" },
+		{ "MIDDLE", "LIVE WIDGET" }, { "DIALPAD", "OPEN PHONE" }, { "DOCK", "5 SHORTCUTS" }, { "CHEVRON", "APP DRAWER" } } },
+	{ "MIDDLE WIDGET", { { "SHOWS ONE OF", "" }, { "EVENT", "WIFI BT DATA" }, { "LOW BATT", "UNDER 25%" },
+		{ "FIRE", "AUDIO SPECTRUM" }, { "BLUETOOTH", "BT AUDIO OUT" }, { "CHARGING", "PLUGGED IN" }, { "SYS LOAD", "CPU GPU RAM" } } },
+	{ "SETTINGS", { { "DOCK 1-5", "PICK EACH APP" }, { "LAUNCH DELAY", "ANIMATION TIME" }, { "SYSTEM STATS", "IDLE WIDGET" },
+		{ "EVENT BANNERS", "CONNECT POPUPS" }, { "CLOCK", "12 OR 24 HOUR" }, { "METRO", "THE OTHER STYLE" },
+		{ "REACH", "3 FINGERS UP" } } },
+};
+#define GUIDE_PAGES (int)(sizeof(GUIDE) / sizeof(GUIDE[0]))
+
+static void draw_guide(struct dm_launcher *L, struct dm_grid *g) {
+	/* on the fine grid, so a line fits beside its label (the original's,
+	 * on the coarse one, cut most of them short) */
+	const struct guide_page *page = &GUIDE[L->guide_page % GUIDE_PAGES];
+	dm_text3c(g, "HOW TO USE", 67.5f, 22, DM_DIM);
+	dm_text3c(g, page->title, 67.5f, 38, DM_MAIN);
+	dm_hline(g, 10, 124, 54, DM_DIM, 2);
+	for (int i = 0; i < 7; i++) {
+		int y = 72 + i * 24;
+		if (page->lines[i][0][0]) dm_text3(g, page->lines[i][0], 10, y, DM_ACCENT, 60);
+		if (page->lines[i][1][0]) dm_text3(g, page->lines[i][1], 64, y, DM_MAIN, 126);
+	}
+	for (int k = 0; k < GUIDE_PAGES; k++) {
+		int c = 67 - (GUIDE_PAGES - 1) * 3 + k * 6, on = k == L->guide_page % GUIDE_PAGES;
+		dm_set(g, c, 256, on ? DM_MAIN : DM_DIM);
+		dm_set(g, c + 1, 256, on ? DM_MAIN : DM_DIM);
+	}
+	dm_frame(g, 10, 272, 60, 292, DM_DIM);
+	dm_text3c(g, "< BACK", 35.5f, 280, DM_DIM);
+	add_hit(L, 10, 272, 60, 292, H_SETTINGS, 0);
+	dm_frame(g, 74, 272, 124, 292, DM_MAIN);
+	dm_text3c(g, "NEXT >", 99.5f, 280, DM_MAIN);
+	add_hit(L, 74, 272, 124, 292, H_GUIDE_NEXT, 0);
 }
 
 static bool radio_on(const struct dm_launcher *L, int i) {
@@ -928,13 +1137,15 @@ static void draw_quick(struct dm_launcher *L, struct dm_grid *g, int64_t A) {
 }
 
 static void compose(struct dm_launcher *L, int screen, int64_t A, struct dm_grid *g) {
-	dm_grid_init(g, &L->s, L->grid);
+	dm_grid_init(g, scr_of(L, screen), L->grid);
 	L->n_hits = 0;
 	if (screen == S_HOME || screen == S_SPLASH) draw_home(L, g, A);
 	else if (screen == S_DRAWER) draw_drawer(L, g, A);
 	else if (screen == S_LAUNCH) draw_launch(L, g, A);
 	else if (screen == S_MENU) draw_menu(L, g);
 	else if (screen == S_QUICK) draw_quick(L, g, A);
+	else if (screen == S_SETTINGS) draw_settings(L, g);
+	else if (screen == S_GUIDE) draw_guide(L, g);
 }
 
 /* ---- input ----------------------------------------------------------------- */
@@ -977,6 +1188,51 @@ static void run_hit(struct dm_launcher *L, const struct hit *h, int64_t now) {
 		if (L->host.saved) L->host.saved(L->host.data);
 		nudge(L, 300, now);
 		break;
+	case H_SETTINGS:
+		go(L, S_SETTINGS, now);
+		break;
+	case H_SET_PAGE:
+		if (h->arg != L->set_page) {
+			L->set_page = h->arg;
+			nudge(L, 380, now);
+			haptic(L, DM_HAPTIC_TRANSITION, 0);
+		}
+		break;
+	case H_SET_ROW:
+		if (h->arg < 5) {
+			cycle_dock(L, h->arg);
+		} else if (h->arg == 10) {
+			int k = 0;
+			for (int i = 0; i < 4; i++) {
+				if (LAUNCH_DELAYS[i] == L->cfg.launch_delay) k = i;
+			}
+			L->cfg.launch_delay = LAUNCH_DELAYS[(k + 1) % 4];
+		} else if (h->arg == 11) {
+			L->cfg.sys_stats = !L->cfg.sys_stats;
+		} else if (h->arg == 12) {
+			L->cfg.event_banners = !L->cfg.event_banners;
+		} else if (h->arg == 13) {
+			L->cfg.h24 = !L->cfg.h24;
+		}
+		if (L->host.saved) L->host.saved(L->host.data);
+		nudge(L, 240, now);
+		break;
+	case H_GUIDE:
+		go(L, S_GUIDE, now);
+		break;
+	case H_GUIDE_NEXT:
+		L->guide_page = (L->guide_page + 1) % GUIDE_PAGES;
+		nudge(L, 260, now);
+		break;
+	case H_TEST_BANNERS:
+		enqueue(L, "wifi", "WIFI ACTIVE", "TEST NETWORK");
+		enqueue(L, "bt", "BLUETOOTH ACTIVE", "RADIO ON");
+		enqueue(L, "data", "DATA ACTIVE", "MOBILE DATA");
+		go(L, S_HOME, now);
+		break;
+	case H_METRO:
+		if (L->host.style) L->host.style(L->host.data, "metro");
+		break;
 	case H_QUICK: {
 		haptic(L, DM_HAPTIC_RIPPLE, 0);
 		if (L->host.toggle_radio) L->host.toggle_radio(L->host.data, QUICK_IDS[h->arg]);
@@ -987,8 +1243,9 @@ static void run_hit(struct dm_launcher *L, const struct hit *h, int64_t now) {
 }
 
 static void to_cell(const struct dm_launcher *L, float x, float y, float *c, float *r) {
-	*c = (x - L->s.ox) / L->s.pitch - L->s.coff;
-	*r = (y - L->s.oy) / L->s.pitch;
+	const struct dm_screen *s = scr_of(L, L->screen);
+	*c = (x - s->ox) / s->pitch - s->coff;
+	*r = (y - s->oy) / s->pitch;
 }
 
 static void tap(struct dm_launcher *L, float x, float y, int64_t now) {
@@ -1020,6 +1277,16 @@ static bool hold(struct dm_launcher *L, float x, float y, int64_t now) {
 }
 
 static void swipe(struct dm_launcher *L, int dir, int64_t now) {
+	if (L->screen == S_SETTINGS) {
+		/* a rightward swipe walks back toward the first page; no wrap */
+		int next = L->set_page - dir;
+		if (next >= 0 && next < SET_PAGES) {
+			L->set_page = next;
+			nudge(L, 380, now);
+			haptic(L, DM_HAPTIC_TRANSITION, 0);
+		}
+		return;
+	}
 	if (L->screen == S_HOME && dir > 0) go(L, S_QUICK, now);
 	else if (L->screen == S_QUICK && dir < 0) go(L, S_HOME, now);
 }
@@ -1032,9 +1299,11 @@ static void drag(struct dm_launcher *L, float dy_pt) {
 }
 
 void dm_launcher_three_up(struct dm_launcher *L, int64_t now) {
-	(void)now;
 	L->down = false;
-	if (L->host.settings) L->host.settings(L->host.data);
+	if (L->screen != S_SETTINGS) {
+		L->set_page = 0;
+		go(L, S_SETTINGS, now);
+	}
 }
 
 void dm_launcher_touch(struct dm_launcher *L, int phase, float x, float y, int64_t now) {
@@ -1154,21 +1423,26 @@ bool dm_launcher_frame(struct dm_launcher *L, int64_t A, struct dm_frame *out) {
 		dm_morph(L->seed, n, L->snap, n, u, 1, 0, 0, L->dots);
 		ghost_op = L->amoled ? 0 : 0.02f + 0.07f * u;
 		bloom_op = 0.35f + 0.35f * u;
-		memcpy(L->last_grid, L->grid, L->n);
+		memcpy(L->last_grid, L->grid, (size_t)L->s.cols * L->s.rows);
+		L->last_scr = &L->s;
 		L->last_valid = true;
 	} else {
 		compose(L, L->screen, A, &g);
+		const struct dm_screen *cs = g.s;
+		size_t gn = (size_t)cs->cols * cs->rows;
 		if (!switching && !live) {
 			/* the steady state: hand the grid straight over, or nothing at all */
 			bool same = L->last_valid && !L->dirty && !was_rippling && !L->last_dots && ghost_op == L->last_ghost_op &&
-				!memcmp(L->grid, L->last_grid, L->n);
-			memcpy(L->last_grid, L->grid, L->n);
+				L->last_scr == cs && !memcmp(L->grid, L->last_grid, gn);
+			memcpy(L->last_grid, L->grid, gn);
+			L->last_scr = cs;
 			L->last_valid = true;
 			L->dirty = false;
 			L->last_ghost_op = ghost_op;
 			L->last_bloom_op = bloom_op;
 			if (same) return false;
 			L->last_dots = false;
+			out->screen = cs;
 			out->grid = L->last_grid;
 			out->ghost_op = ghost_op;
 			out->bloom_op = bloom_op;
@@ -1176,20 +1450,23 @@ bool dm_launcher_frame(struct dm_launcher *L, int64_t A, struct dm_frame *out) {
 			return true;
 		}
 		n = dm_dots(&g, L->snap, L->n);
-		memcpy(L->last_grid, L->grid, L->n);
+		memcpy(L->last_grid, L->grid, gn);
+		L->last_scr = cs;
 		L->last_valid = true;
 		if (switching) dm_morph(L->prev, L->n_prev, L->snap, n, (float)(A - L->switch_at) / L->morph_ms, 5,
 			L->s.w / 2, L->s.h / 2, L->dots);
 		else memcpy(L->dots, L->snap, sizeof(*L->dots) * n);
 	}
-	n = dm_ripple_bend(&L->s, L->ripples, L->n_ripples, A, L->dots, n);
+	const struct dm_screen *fs = L->last_scr;
+	n = dm_ripple_bend(fs, L->ripples, L->n_ripples, A, L->dots, n);
 	int n_moved = 0, n_sparks = 0;
-	if (live) dm_ripple_ghosts(&L->s, L->ripples, L->n_ripples, A, L->gmoved, &n_moved, L->sparks, &n_sparks, L->s.n_ghost);
+	if (live) dm_ripple_ghosts(fs, L->ripples, L->n_ripples, A, L->gmoved, &n_moved, L->sparks, &n_sparks, L->n);
 	for (int i = 0; i < n_sparks && n < L->n + 64; i++) L->dots[n++] = L->sparks[i];
 	L->n_dots = n;
 	L->dirty = false;
 	L->last_dots = true;
 	L->last_ghost_op = ghost_op;
+	out->screen = fs;
 	out->dots = L->dots;
 	out->n_dots = n;
 	out->ghosts = n_moved ? L->gmoved : NULL;

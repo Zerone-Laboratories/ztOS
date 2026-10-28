@@ -528,13 +528,13 @@ struct zt_server {
 	bool dm_have_frame;
 	int dm_hidden;			/* what last covered it: 0 nothing, 1 the lock or the dark, 2 an app */
 	int dm_palette;
-	bool dm_amoled, dm_stats;
+	bool dm_amoled;
+	struct dm_config dm_cfg;	/* the launcher's settings sheet, kept in the config */
 	struct wl_event_source *dm_timer;
 	uint32_t dm_sample_ms, dm_frames;
 	unsigned long long dm_cpu_busy, dm_cpu_total;
 	int dm_cpu, dm_ram, dm_gpu;
 	uint32_t dm_launch_fired_ms;	/* the launcher asked for an app: when */
-	char dm_dock_name[5][64], dm_dock_cmd[5][256];	/* the dock's apps, found in the list */
 	struct dm_status dm_st;		/* what it was last told */
 	bool dm_fed;
 
@@ -2906,7 +2906,7 @@ static void load_config(struct zt_server *server) {
 	server->style = STYLE_METRO;
 	server->dm_palette = 0;
 	server->dm_amoled = false;
-	server->dm_stats = true;
+	server->dm_cfg = (struct dm_config){ .launch_delay = 800, .sys_stats = true, .event_banners = true };
 	FILE *f = fopen(path, "r");
 	if (!f) {
 		return;
@@ -3002,7 +3002,18 @@ static void load_config(struct zt_server *server) {
 		} else if (strcmp(key, "dotmatrix_amoled") == 0) {
 			server->dm_amoled = strcmp(value, "on") == 0 || strcmp(value, "1") == 0;
 		} else if (strcmp(key, "dotmatrix_stats") == 0) {
-			server->dm_stats = strcmp(value, "off") != 0 && strcmp(value, "0") != 0;
+			server->dm_cfg.sys_stats = strcmp(value, "off") != 0 && strcmp(value, "0") != 0;
+		} else if (strcmp(key, "dotmatrix_banners") == 0) {
+			server->dm_cfg.event_banners = strcmp(value, "off") != 0 && strcmp(value, "0") != 0;
+		} else if (strcmp(key, "dotmatrix_h24") == 0) {
+			server->dm_cfg.h24 = strcmp(value, "on") == 0 || strcmp(value, "1") == 0;
+		} else if (strcmp(key, "dotmatrix_launch_delay") == 0) {
+			int ms = atoi(value);
+			server->dm_cfg.launch_delay = ms < 0 ? 0 : ms > 3000 ? 3000 : ms;
+		} else if (strncmp(key, "dotmatrix_dock", 14) == 0 && key[14] >= '1' && key[14] <= '5' && !key[15]) {
+			/* a dock slot's app: its command, or "auto" */
+			char *slot = server->dm_cfg.dock[key[14] - '1'];
+			snprintf(slot, sizeof(server->dm_cfg.dock[0]), "%s", strcmp(value, "auto") == 0 ? "" : value);
 		}
 	}
 	fclose(f);
@@ -9136,13 +9147,6 @@ static const struct app_item *retro_find(struct zt_server *server, const char *c
 	return NULL;
 }
 
-static const char *const RETRO_DOCK[5][6] = {
-	{ "camera", NULL },
-	{ "superscan", "browser", "firefox", "chromium", NULL },
-	{ "terminal", "foot", "console", NULL },
-	{ "whatsapp", "messages", "telegram", "signal", NULL },
-	{ "music", "spotify", NULL },
-};
 static const char *const RETRO_PHONE[] = { "ztphone", "phone", "dialer", NULL };
 
 /* the app list and the dock, from the same list the Metro app list shows */
@@ -9161,14 +9165,8 @@ static void retro_apps(struct zt_server *server) {
 		snprintf(apps[n].act, sizeof(apps[n].act), "%s", it->command);
 		n++;
 	}
-	dm_launcher_apps(server->dm, apps, n);
+	dm_launcher_apps(server->dm, apps, n);	/* (the dock picks its apps from these) */
 	free(apps);
-	for (int slot = 0; slot < 5; slot++) {
-		const struct app_item *it = retro_find(server, RETRO_DOCK[slot]);
-		snprintf(server->dm_dock_name[slot], sizeof(server->dm_dock_name[slot]), "%s", it ? it->name : "");
-		snprintf(server->dm_dock_cmd[slot], sizeof(server->dm_dock_cmd[slot]), "%s", it ? it->command : "");
-		dm_launcher_dock(server->dm, slot, it ? it->name : NULL, it ? it->command : NULL);
-	}
 }
 
 static void retro_launch(void *data, const char *act, const char *name) {
@@ -9215,6 +9213,20 @@ static void retro_saved(void *data) {
 	server->dm_amoled = dm_launcher_amoled(server->dm);
 	config_keep("dotmatrix_palette", server->dm_palette);
 	config_keep("dotmatrix_amoled", server->dm_amoled);
+	struct dm_config c;
+	dm_launcher_get_config(server->dm, &c);
+	if (memcmp(&c, &server->dm_cfg, sizeof(c))) {
+		server->dm_cfg = c;
+		config_keep_text("dotmatrix_stats", c.sys_stats ? "on" : "off");
+		config_keep_text("dotmatrix_banners", c.event_banners ? "on" : "off");
+		config_keep_text("dotmatrix_h24", c.h24 ? "on" : "off");
+		config_keep("dotmatrix_launch_delay", c.launch_delay);
+		for (int i = 0; i < 5; i++) {
+			char key[24];
+			snprintf(key, sizeof(key), "dotmatrix_dock%d", i + 1);
+			config_keep_text(key, c.dock[i][0] ? c.dock[i] : "auto");
+		}
+	}
 	draw_status(server);
 	draw_nav(server);
 }
@@ -9232,6 +9244,30 @@ static void retro_haptic(void *data, int kind, int ms) {
 		hap(server, HAP_CLICK, HG_SYSTEM);
 		break;
 	}
+}
+
+static void retro_setup(struct zt_server *server);
+
+/* The settings sheet asked for Metro. Not from inside the launcher's own
+ * call: it is freed on the way, so the change waits for the loop to idle. */
+static void retro_style_idle(void *data) {
+	struct zt_server *server = data;
+	if (server->style == STYLE_METRO) {
+		retro_setup(server);
+		start_turn(server, false, 0);	/* Start comes in, as after an app */
+		damage(server);
+	}
+}
+
+static void retro_style(void *data, const char *name) {
+	struct zt_server *server = data;
+	if (strcmp(name, "metro") != 0) {
+		return;
+	}
+	wlr_log(WLR_INFO, "dotmatrix: back to the Metro style");
+	server->style = STYLE_METRO;
+	config_keep_text("style", "metro");
+	wl_event_loop_add_idle(server->loop, retro_style_idle, server);
 }
 
 static int retro_timer_fired(void *data) {
@@ -9271,8 +9307,7 @@ static void retro_setup(struct zt_server *server) {
 	retro_free(server);
 	struct dm_host host = {
 		.data = server, .launch = retro_launch, .media = retro_media, .toggle_radio = retro_radio,
-		.saved = retro_saved, .haptic = retro_haptic, .h24 = false, .version = "ztRetrofit",
-		.sys_stats = server->dm_stats, .event_banners = true, .launch_delay = 800,
+		.saved = retro_saved, .haptic = retro_haptic, .style = retro_style, .version = "ztRetrofit",
 	};
 	server->dm = dm_launcher_new(&host, w, h);
 	server->dm_fed = false;
@@ -9282,6 +9317,7 @@ static void retro_setup(struct zt_server *server) {
 	}
 	dm_launcher_set_palette(server->dm, server->dm_palette, server->dm_amoled);
 	retro_apps(server);
+	dm_launcher_set_config(server->dm, &server->dm_cfg);
 	if (!server->dm_timer) {
 		server->dm_timer = wl_event_loop_add_timer(server->loop, retro_timer_fired, server);
 	}
@@ -9347,16 +9383,15 @@ static void retro_feed(struct zt_server *server) {
 	st.cpu = server->dm_cpu;
 	st.ram = server->dm_ram;
 	st.gpu = server->dm_gpu;
-	/* a dock app with a notification waiting pulses */
-	for (int slot = 0; slot < 5 && st.n_notif < DM_MAX_NOTIF; slot++) {
-		const char *name = server->dm_dock_name[slot];
-		if (!name[0]) continue;
-		for (int k = 0; k < server->n_notes; k++) {
-			const char *app = server->notes[k].app;
-			if (app[0] && (word_in(name, app) || word_in(app, name))) {
-				snprintf(st.notif[st.n_notif++], sizeof(st.notif[0]), "%s", server->dm_dock_cmd[slot]);
-				break;
-			}
+	/* the apps with notifications waiting: their dock icons pulse */
+	for (int k = 0; k < server->n_notes && st.n_notif < DM_MAX_NOTIF; k++) {
+		const char *app = server->notes[k].app;
+		bool seen = !app[0];
+		for (int i = 0; i < st.n_notif && !seen; i++) {
+			seen = strcasecmp(st.notif[i], app) == 0;
+		}
+		if (!seen) {
+			snprintf(st.notif[st.n_notif++], sizeof(st.notif[0]), "%s", app);
 		}
 	}
 	if (!server->dm_fed || memcmp(&st, &server->dm_st, sizeof(st))) {
@@ -9383,7 +9418,8 @@ static void retro_draw(struct zt_server *server, int width_px, int height_px, bo
 	struct dm_launcher *L = server->dm;
 	int64_t now = wall_ms();
 	if (!server->dm_gl_ok) {
-		server->dm_gl_ok = dm_gl_init(&server->dm_gl, dm_launcher_screen(L));
+		server->dm_gl_ok = dm_gl_init(&server->dm_gl, dm_launcher_screen(L)) &&
+			dm_gl_screen2(&server->dm_gl, dm_launcher_screen2(L));
 		if (!server->dm_gl_ok) {
 			wlr_log(WLR_ERROR, "dotmatrix: the dot shader did not build");
 			server->style = STYLE_METRO;
@@ -9758,7 +9794,12 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 	}
 	if (!server->shown && retro_on(server)) {
 		p->role = ROLE_RETRO;
-		dm_launcher_touch(server->dm, DM_TOUCH_DOWN, (float)x, (float)y, wall_ms());
+		int fingers = 0;
+		for (int i = 0; i < MAX_TOUCH; i++) {
+			fingers += server->touches[i].used && server->touches[i].role == ROLE_RETRO;
+		}
+		/* one finger is the launcher's; more are a gesture (three up: its settings) */
+		dm_launcher_touch(server->dm, fingers == 1 ? DM_TOUCH_DOWN : DM_TOUCH_CANCEL, (float)x, (float)y, wall_ms());
 		damage(server);
 		return;
 	}
@@ -9884,7 +9925,26 @@ static void touch_update(struct zt_server *server, int32_t id, double x, double 
 	switch (p->role) {
 	case ROLE_RETRO:
 		if (server->dm) {
-			dm_launcher_touch(server->dm, DM_TOUCH_MOVE, (float)x, (float)y, wall_ms());
+			/* three fingers pushed up together: the launcher's settings */
+			int fingers = 0;
+			double rise = 0;
+			for (int i = 0; i < MAX_TOUCH; i++) {
+				struct touch_point *q = &server->touches[i];
+				if (q->used && q->role == ROLE_RETRO) {
+					fingers++;
+					rise += q->y0 - q->y;
+				}
+			}
+			if (fingers == 3 && rise / 3 > 50) {
+				for (int i = 0; i < MAX_TOUCH; i++) {
+					if (server->touches[i].used && server->touches[i].role == ROLE_RETRO) {
+						server->touches[i].role = ROLE_NONE;
+					}
+				}
+				dm_launcher_three_up(server->dm, wall_ms());
+			} else if (fingers == 1) {
+				dm_launcher_touch(server->dm, DM_TOUCH_MOVE, (float)x, (float)y, wall_ms());
+			}
 			damage(server);
 		}
 		break;
@@ -12330,6 +12390,7 @@ static int reload(int signal_number, void *data) {
 	retro_apps(server);
 	if (server->dm) {
 		dm_launcher_set_palette(server->dm, server->dm_palette, server->dm_amoled);
+		dm_launcher_set_config(server->dm, &server->dm_cfg);
 	}
 	if (strength != server->haptic_strength) {
 		hap(server, HAP_CLICK, HG_SYSTEM);	/* this is how it feels now */

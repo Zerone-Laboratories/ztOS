@@ -86,10 +86,11 @@ int main(int argc, char **argv) {
 		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
 	}
 
-	struct dm_host host = { .h24 = false, .version = "ztRetrofit", .sys_stats = true, .event_banners = true };
+	struct dm_host host = { .version = "ztRetrofit" };
 	struct dm_launcher *L = dm_launcher_new(&host, w, h);
 	struct dm_renderer r;
-	if (!L || !dm_gl_init(&r, dm_launcher_screen(L))) return fprintf(stderr, "init failed\n"), 1;
+	if (!L || !dm_gl_init(&r, dm_launcher_screen(L)) || !dm_gl_screen2(&r, dm_launcher_screen2(L)))
+		return fprintf(stderr, "init failed\n"), 1;
 	const struct dm_screen *s = dm_launcher_screen(L);
 	printf("screen %dx%d pitch %.3f coff %d\n", s->cols, s->rows, s->pitch, s->coff);
 
@@ -176,6 +177,33 @@ int main(int argc, char **argv) {
 	dm_launcher_touch(L, DM_TOUCH_UP, dc, dr, B + 11050);
 	draw(L, &r, B + 12000, w, h);
 	save(dir, "drawer", w, h);
+	/* the settings sheet (three fingers up) and its pages, and the guide */
+	dm_launcher_back(L, B + 12500);
+	dm_launcher_three_up(L, B + 12600);
+	draw(L, &r, B + 12700, w, h);
+	save(dir, "settings-flight", w, h);
+	draw(L, &r, B + 13500, w, h);
+	save(dir, "settings-dock", w, h);
+	dm_launcher_touch(L, DM_TOUCH_DOWN, 400, 600, B + 14000);
+	dm_launcher_touch(L, DM_TOUCH_MOVE, 300, 600, B + 14050);
+	dm_launcher_touch(L, DM_TOUCH_UP, 300, 600, B + 14060);
+	draw(L, &r, B + 15000, w, h);
+	save(dir, "settings-system", w, h);
+	dm_launcher_touch(L, DM_TOUCH_DOWN, 400, 600, B + 15500);
+	dm_launcher_touch(L, DM_TOUCH_MOVE, 300, 600, B + 15550);
+	dm_launcher_touch(L, DM_TOUCH_UP, 300, 600, B + 15560);
+	draw(L, &r, B + 16500, w, h);
+	save(dir, "settings-tools", w, h);
+	{
+		const struct dm_screen *s2 = dm_launcher_screen2(L);
+		float gx = (41 + s2->coff) * s2->pitch + s2->ox, gy = 54 * s2->pitch + s2->oy;
+		dm_launcher_touch(L, DM_TOUCH_DOWN, gx, gy, B + 17000);
+		dm_launcher_touch(L, DM_TOUCH_UP, gx, gy, B + 17050);
+	}
+	draw(L, &r, B + 18000, w, h);
+	save(dir, "guide", w, h);
+	dm_launcher_home(L, B + 18500);
+	B += 6000;
 	/* launch */
 	float ac = (20 + s->coff) * s->pitch + s->ox, ar = 23 * s->pitch + s->oy;
 	dm_launcher_touch(L, DM_TOUCH_DOWN, ac, ar, B + 13000);
@@ -185,7 +213,7 @@ int main(int argc, char **argv) {
 
 	/* the chrome: a phone of 411 x 846 points at 2 px a point, home above
 	 * a dot nav bar, and an app's dot status row */
-	{
+	if (w >= 411 * 2 && h >= 846 * 2) {	/* (run with W H of at least 822 1692) */
 		int pw = 411, ph = 846, nav = 40, sc = 2;
 		struct dm_host h2 = host;
 		struct dm_launcher *P = dm_launcher_new(&h2, pw, ph - nav);
