@@ -377,6 +377,11 @@ static struct {
 	 * and momentum, in points; WebKit is told where it ended */
 	bool snap, flinging;
 	double down_doc, pos, vel;	/* scroll position at touch-down; now; points per ms */
+	/* panning: the drag and its fling as touchpad scrolling (webview_pan),
+	 * where the page has no picture to move; `owed` is the travel not yet
+	 * handed to WebKit, given once a frame */
+	bool pan, pan_fling;
+	double owed, pan_x, pan_y;
 	gint64 move_us;
 } S;
 static guint spring_source, fling_source;
@@ -437,6 +442,9 @@ static void snap_show(struct webview *view, double h) {
 	zmc_present();
 }
 
+/* each frame while the picture moves (zmc_on_frame): a GLib timer stepped it
+ * out of step with the panel, 0-8 ms stale and uneven from frame to frame,
+ * and a drag drew only when a touch happened to come in before the vblank */
 static gboolean fling_tick(gpointer unused) {
 	(void)unused;
 	struct webview *view = B.n_tabs ? tab()->view : NULL;
@@ -447,6 +455,7 @@ static gboolean fling_tick(gpointer unused) {
 	S.move_us = now;
 	if (!view || (!S.flinging && !webview_snap_active(view))) {
 		fling_source = 0;
+		zmc_on_frame(NULL);
 		return G_SOURCE_REMOVE;
 	}
 	if (!S.flinging) {	/* resting: the picture fades into the live page */
@@ -480,10 +489,55 @@ static gboolean fling_tick(gpointer unused) {
 	return G_SOURCE_CONTINUE;
 }
 
+static void pan_end(struct webview *view) {
+	if (view) webview_pan(view, S.owed, S.pan_x, S.pan_y, true);
+	S.owed = 0;
+	S.pan = S.pan_fling = false;
+}
+
+/* a frame of panning: the finger's travel since the last frame, or the
+ * fling's, on the panel's clock */
+static void pan_step(void) {
+	struct webview *view = B.n_tabs ? tab()->view : NULL;
+	gint64 now = g_get_monotonic_time();
+	double dt = fmin(32.0, (now - S.move_us) / 1000.0);
+	if (S.pan_fling) {
+		S.move_us = now;
+		double before = S.vel;
+		S.vel *= pow(DECEL, dt);
+		S.owed += (before + S.vel) / 2 * dt;
+		double at = view ? webview_scroll_y(view) : 0, max = view ? webview_scroll_max(view) : 0;
+		bool edge = (S.vel < 0 && at <= 0.5) || (S.vel > 0 && at >= max - 0.5);
+		if (!view || fabs(S.vel) < 0.02 || edge) {
+			pan_end(view);
+			fling_source = 0;
+			zmc_on_frame(NULL);
+			return;
+		}
+		boost(1500);
+	}
+	if (view && S.owed != 0) {
+		webview_pan(view, S.owed, S.pan_x, S.pan_y, false);
+		S.owed = 0;
+	}
+	if (!S.pan) {
+		fling_source = 0;
+		zmc_on_frame(NULL);
+	}
+}
+
+static void frame_step(void) {
+	if (S.pan) pan_step();
+	else fling_tick(NULL);
+}
+
 static void fling_start(void) {
 	S.flinging = true;
 	S.move_us = g_get_monotonic_time();
-	if (!fling_source) fling_source = g_timeout_add(8, fling_tick, NULL);
+	if (!fling_source) {
+		fling_source = 1;	/* (a mark: the frames drive it now) */
+		zmc_on_frame(frame_step);
+	}
 }
 
 static void spring_back(double from) {
@@ -1394,6 +1448,9 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 			zmc_keyboard(false);
 			zmc_redraw();
 		}
+		if (S.pan_fling) {	/* a finger on a panning page stops it there */
+			pan_end(tab()->view);
+		}
 		if (S.flinging) {	/* a finger on a flinging page stops it there, as on iOS */
 			S.flinging = false;
 			S.down = true;
@@ -1450,6 +1507,42 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 			S.snap = true;
 			S.pos = S.down_doc + (S.down_y - py);
 			webview_snap_begin(view, fmax(0, S.pos));
+			if (!fling_source) {	/* a frame every vblank under the finger too */
+				fling_source = 1;
+				zmc_on_frame(frame_step);
+			}
+		}
+		if (!S.snap && !S.pan && !S.pulling && S.webkit && fabs(py - S.down_y) > 8) {
+			double at = webview_scroll_y(view), max = webview_scroll_max(view);
+			bool pull = (py > S.down_y && at <= 0.5) || (py < S.down_y && at >= max - 0.5);
+			if (!pull) {
+				/* a drag with no picture to move: WebKit scrolls it off its
+				 * main thread, a frame at a time */
+				webview_touch_cancel(view);
+				S.webkit = false;
+				S.pan = true;
+				S.vel = 0;
+				S.owed = S.down_y - py;	/* the 8 points already travelled */
+				S.pan_x = x - cx;
+				S.pan_y = py;
+				S.move_us = g_get_monotonic_time();
+				S.last_fwd_y = py;
+				if (!fling_source) {
+					fling_source = 1;
+					zmc_on_frame(frame_step);
+				}
+				return true;
+			}
+		}
+		if (S.pan) {
+			gint64 now = g_get_monotonic_time();
+			double d = S.last_fwd_y - py;
+			S.owed += d;
+			double dt = (now - S.move_us) / 1000.0;
+			if (dt > 0.5) S.vel = S.vel * 0.6 + d / dt * 0.4;
+			S.move_us = now;
+			S.last_fwd_y = py;
+			return true;
 		}
 		if (S.snap) {
 			gint64 now = g_get_monotonic_time();
@@ -1506,6 +1599,18 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 		}
 		S.last_fwd_y = py;
 	} else if (phase == 2) {
+		if (S.pan && S.down && id == S.id) {
+			S.down = false;
+			if (g_get_monotonic_time() - S.move_us > 60000) S.vel = 0;	/* held still before the lift */
+			S.vel = fmax(-8, fmin(8, S.vel));
+			S.move_us = g_get_monotonic_time();
+			if (fabs(S.vel) > 0.05) {
+				S.pan_fling = true;	/* the frames carry it on (pan_step) */
+			} else {
+				pan_end(view);
+			}
+			return true;
+		}
 		if (S.snap && S.down && id == S.id) {
 			S.down = false;
 			if (g_get_monotonic_time() - S.move_us > 60000) S.vel = 0;	/* held still before the lift */
@@ -1524,6 +1629,7 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 			boost(1500);	/* WebKit's fling runs on after the lift */
 		}
 	} else {
+		if (S.pan && S.down) { S.down = false; pan_end(view); return true; }
 		if (S.snap && S.down) { S.down = false; S.vel = 0; fling_start(); return true; }
 		if (S.webkit) webview_touch_cancel(view);
 		if (S.pulling) spring_back(S.shown);

@@ -33,6 +33,7 @@
 #include "webview.h"
 #include "zrnmetrocore.h"	/* zmc_gpu_quad, zmc_present, cairo */
 #include "zrnmetrogpu.h"
+#include "linux-dmabuf-v1-client-protocol.h"
 
 struct imported;
 static struct webview *views;
@@ -70,6 +71,7 @@ struct webview {
 	cairo_surface_t *snap;
 	unsigned snap_rev;
 	double snap_h;		/* its height in points */
+	int snap_px;		/* its pixels per point */
 	bool snap_busy, snap_dirty, snap_mode;
 	double snap_pos;	/* the scroll position it is shown at, points */
 	guint snap_timer;
@@ -77,6 +79,13 @@ struct webview {
 	unsigned live_after;	/* back to the live page once this many have come */
 	bool live_waiting;
 	gint64 fade_us;		/* the snapshot fading out over the live page since then */
+	/* direct: WebKit's frames go to the shell as they are, on a subsurface
+	 * over the page's box, instead of being drawn into Superscan's window
+	 * (one screen of GPU fill and a hand-off less a frame) */
+	struct wl_surface *direct_surface;
+	struct wl_subsurface *direct_sub;
+	bool direct_on;		/* a WebKit frame is on the subsurface */
+	int direct_x, direct_y;
 	unsigned prepared_rev;	/* the picture's revision already on the GPU */
 	int page_changes;	/* the page script's count of changes to the page */
 	struct wv_delegate d;
@@ -102,7 +111,7 @@ static const char scroll_script[] =
 	"s();try{new MutationObserver(c).observe(document.body||document.documentElement,"
 	"{childList:true,subtree:true,characterData:true});}catch(e){}});})();";
 
-#define SNAP_SCALE	2	/* pixels per point in the picture (the screen has 4) */
+#define SNAP_SCALE	2	/* pixels per point in the picture, at most (the S9's screen has 4) */
 #define SNAP_MAX_PX	(128 * 1024 * 1024)	/* WebKit's full-size picture, at most (bytes): briefly, then a quarter of it is kept */
 #define FADE_US		120000
 
@@ -115,14 +124,15 @@ static void snap_forget(struct webview *wv) {
 	wv->prepared_rev = 0;
 }
 
-/* WebKit hands the page over at the screen's scale; keep a quarter of it */
-static cairo_surface_t *snap_shrink(WebKitImage *image) {
+/* WebKit hands the page over at the screen's scale; keep SNAP_SCALE pixels
+ * a point of it: a quarter on the S9 (4), all of it on the J5 (2) */
+static cairo_surface_t *snap_shrink(WebKitImage *image, int scale) {
 	unsigned w = webkit_image_get_width(image), h = webkit_image_get_height(image);
 	unsigned stride = webkit_image_get_stride(image);
 	GBytes *bytes = webkit_image_as_bytes(image);
 	gsize size = 0;
 	const uint8_t *src = g_bytes_get_data(bytes, &size);
-	int k = 4 / SNAP_SCALE, ow = w / k, oh = h / k;
+	int k = scale > SNAP_SCALE ? scale / SNAP_SCALE : 1, ow = w / k, oh = h / k;
 	cairo_surface_t *out = ow > 0 && oh > 0 && src && size >= (gsize)stride * h ?
 		cairo_image_surface_create(CAIRO_FORMAT_ARGB32, ow, oh) : NULL;
 	if (out && cairo_surface_status(out) == CAIRO_STATUS_SUCCESS) {
@@ -131,6 +141,10 @@ static cairo_surface_t *snap_shrink(WebKitImage *image) {
 		for (int y = 0; y < oh; y++) {
 			const uint8_t *r0 = src + (size_t)(y * k) * stride, *r1 = r0 + stride;
 			uint8_t *d = dst + (size_t)y * ds;
+			if (k == 1) {
+				memcpy(d, r0, (size_t)ow * 4);
+				continue;
+			}
 			for (int x = 0; x < ow; x++, d += 4) {
 				const uint8_t *a = r0 + x * k * 4, *b = r1 + x * k * 4;
 				for (int c = 0; c < 4; c++) {
@@ -159,7 +173,8 @@ static void snap_done(GObject *source, GAsyncResult *result, gpointer data) {
 		webview_unref(wv);
 		return;
 	}
-	cairo_surface_t *picture = snap_shrink(image);
+	int k = wv->scale > SNAP_SCALE ? wv->scale / SNAP_SCALE : 1;
+	cairo_surface_t *picture = snap_shrink(image, wv->scale);
 	unsigned h = webkit_image_get_height(image);
 	g_object_unref(image);
 	if (picture && !wv->snap_mode) {	/* never swapped under a moving finger */
@@ -167,6 +182,7 @@ static void snap_done(GObject *source, GAsyncResult *result, gpointer data) {
 		wv->snap = picture;
 		wv->snap_rev++;
 		wv->snap_h = h / (double)wv->scale;
+		wv->snap_px = wv->scale / k;
 		if (getenv("ZTB_TRACE"))
 			fprintf(stderr, "superscan snapshot: %d x %d px, %.0f points\n",
 				cairo_image_surface_get_width(picture), cairo_image_surface_get_height(picture), wv->snap_h);
@@ -572,6 +588,7 @@ G_DEFINE_TYPE(ZtView, zt_view, WPE_TYPE_VIEW)
 G_DEFINE_TYPE(ZtDisplay, zt_display, WPE_TYPE_DISPLAY)
 
 static WPEScreen *the_screen;	/* one phone, one panel */
+static gint64 last_tick;	/* when the panel last ticked WebKit's clock (ZTB_TRACE) */
 
 /* WebKit's clock for animation frames, scrolling and requestAnimationFrame.
  * Left alone it is a free-running 60 Hz timer that drifts against the panel,
@@ -587,6 +604,8 @@ static gpointer sync_loop(gpointer p) {
 			g_usleep(16667);	/* panel off: keep a slow beat */
 		}
 		if (g_atomic_int_get(&s->running)) {
+			last_tick = g_get_monotonic_time();
+			if (getenv("ZTB_TIMELINE")) fprintf(stderr, "T tick %.1f\n", last_tick / 1000.0);
 			c->sync(WPE_SCREEN_SYNC_OBSERVER(s));
 		}
 	}
@@ -659,11 +678,129 @@ static void zt_toplevel_init(ZtToplevel *t) { (void)t; }
 
 static void glib_tick(void);
 
+/* ---- direct frames: WebKit's buffers on a subsurface ----------------------- */
+
+static struct wl_subcompositor *direct_subcompositor;
+static struct zwp_linux_dmabuf_v1 *direct_dmabuf;
+static int direct_state;	/* 0 not tried, 1 available, -1 not (ZTB_DIRECT=0, or no protocols) */
+
+static void direct_global(void *data, struct wl_registry *reg, uint32_t name, const char *iface, uint32_t version) {
+	(void)data;
+	if (strcmp(iface, wl_subcompositor_interface.name) == 0)
+		direct_subcompositor = wl_registry_bind(reg, name, &wl_subcompositor_interface, 1);
+	else if (strcmp(iface, zwp_linux_dmabuf_v1_interface.name) == 0 && version >= 2)
+		direct_dmabuf = wl_registry_bind(reg, name, &zwp_linux_dmabuf_v1_interface, 2);
+}
+static void direct_global_remove(void *data, struct wl_registry *reg, uint32_t name) { (void)data; (void)reg; (void)name; }
+static const struct wl_registry_listener direct_registry = { direct_global, direct_global_remove };
+
+static bool direct_available(void) {
+	if (direct_state == 0) {
+		const char *env = getenv("ZTB_DIRECT");
+		direct_state = -1;
+		if (!(env && strcmp(env, "0") == 0) && zmc.display) {
+			struct wl_registry *reg = wl_display_get_registry(zmc.display);
+			wl_registry_add_listener(reg, &direct_registry, NULL);
+			wl_display_roundtrip(zmc.display);
+			if (direct_subcompositor && direct_dmabuf) direct_state = 1;
+		}
+		fprintf(stderr, "superscan: direct frames %s\n", direct_state > 0 ? "on" : "off");
+	}
+	return direct_state > 0;
+}
+
+/* the shell is done with a frame: WebKit may draw into it again */
+static void direct_released(void *data, struct wl_buffer *wl) {
+	(void)wl;
+	WPEBuffer *buffer = data;
+	WPEView *view = g_object_get_data(G_OBJECT(buffer), "ztb-view");
+	if (view) wpe_view_buffer_released(view, buffer);
+}
+static const struct wl_buffer_listener direct_buffer_listener = { direct_released };
+
+static void direct_wl_free(gpointer p) { wl_buffer_destroy(p); }
+
+/* the frame as a wl_buffer, made once per WebKit buffer */
+static struct wl_buffer *direct_buffer(WPEView *view, WPEBuffer *buffer) {
+	struct wl_buffer *wl = g_object_get_data(G_OBJECT(buffer), "ztb-wl");
+	if (wl) return wl;
+	WPEBufferDMABuf *d = WPE_BUFFER_DMA_BUF(buffer);
+	struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(direct_dmabuf);
+	guint64 mod = wpe_buffer_dma_buf_get_modifier(d);
+	int n = (int)wpe_buffer_dma_buf_get_n_planes(d);
+	for (int i = 0; i < n; i++)
+		zwp_linux_buffer_params_v1_add(params, wpe_buffer_dma_buf_get_fd(d, i), (uint32_t)i,
+			wpe_buffer_dma_buf_get_offset(d, i), wpe_buffer_dma_buf_get_stride(d, i),
+			(uint32_t)(mod >> 32), (uint32_t)(mod & 0xffffffff));
+	wl = zwp_linux_buffer_params_v1_create_immed(params, wpe_buffer_get_width(buffer),
+		wpe_buffer_get_height(buffer), wpe_buffer_dma_buf_get_format(d), 0);
+	zwp_linux_buffer_params_v1_destroy(params);
+	wl_buffer_add_listener(wl, &direct_buffer_listener, buffer);
+	g_object_set_data_full(G_OBJECT(buffer), "ztb-wl", wl, direct_wl_free);
+	g_object_set_data(G_OBJECT(buffer), "ztb-view", view);
+	return wl;
+}
+
+/* the page goes direct when nothing of Superscan's has to be drawn over it
+ * or in its place: not while the picture scroller has it */
+static bool direct_wanted(struct webview *wv) {
+	return direct_available() && wv->shown && !wv->paused && !wv->snap_mode;
+}
+
+static void direct_place(struct webview *wv) {
+	int y = wv->y + (int)lround(wv->overscroll);
+	if (wv->direct_sub && (y != wv->direct_y || wv->x != wv->direct_x)) {
+		wl_subsurface_set_position(wv->direct_sub, wv->x, y);	/* with the window's next commit */
+		wv->direct_x = wv->x;
+		wv->direct_y = y;
+	}
+}
+
+/* a WebKit frame straight to the shell; false if it cannot go that way */
+static bool direct_frame(struct webview *wv, WPEBuffer *buffer) {
+	if (!WPE_IS_BUFFER_DMA_BUF(buffer) || !direct_wanted(wv)) return false;
+	if (!wv->direct_surface) {
+		wv->direct_surface = wl_compositor_create_surface(zmc.compositor);
+		wv->direct_sub = wl_subcompositor_get_subsurface(direct_subcompositor, wv->direct_surface, zmc.surface);
+		wl_subsurface_set_desync(wv->direct_sub);	/* its frames apply as they come */
+		wv->direct_x = wv->direct_y = -100000;
+	}
+	direct_place(wv);
+	wl_surface_set_buffer_scale(wv->direct_surface, wv->scale > 0 ? wv->scale : 1);
+	wl_surface_attach(wv->direct_surface, direct_buffer(wv->view, buffer), 0, 0);
+	wl_surface_damage_buffer(wv->direct_surface, 0, 0, INT32_MAX, INT32_MAX);
+	wl_surface_commit(wv->direct_surface);
+	wl_display_flush(zmc.display);
+	wpe_view_buffer_rendered(wv->view, buffer);	/* WebKit may start the next one now */
+	if (!wv->direct_on) {
+		wv->direct_on = true;
+		zmc_present();	/* Superscan's own frame, without the page, and the subsurface's place */
+	}
+	return true;
+}
+
+/* back to drawing the page ourselves (the picture scroller, a hidden tab) */
+static void direct_off(struct webview *wv) {
+	if (!wv->direct_on) return;
+	wv->direct_on = false;
+	wl_surface_attach(wv->direct_surface, NULL, 0, 0);
+	wl_surface_commit(wv->direct_surface);
+	zmc_present();
+}
+
+/* ZTB_LATE_ACK=1: the old lock-step, a frame acked once it is on screen */
+static bool early_ack(void) {
+	static int on = -1;
+	if (on < 0) on = !getenv("ZTB_LATE_ACK");
+	return on;
+}
+
 /* the frame went into one of ours: the one before it is free again, and
  * WebKit may start on the next */
 static void frame_shown(struct webview *wv) {
 	WPEBuffer *b = wv->pending;
 	wv->pending = NULL;
+	if (getenv("ZTB_TIMELINE")) fprintf(stderr, "T shown %.1f\n", g_get_monotonic_time() / 1000.0);
 	if (getenv("ZTB_TRACE")) {
 		static gint64 last;
 		gint64 now = g_get_monotonic_time();
@@ -674,7 +811,7 @@ static void frame_shown(struct webview *wv) {
 		wpe_view_buffer_released(wv->view, wv->on_screen);
 	}
 	wv->on_screen = b;
-	wpe_view_buffer_rendered(wv->view, b);
+	if (!early_ack()) wpe_view_buffer_rendered(wv->view, b);
 	/* the ack is GLib work (a message to the web process) that nothing would
 	 * wake the pump for: run it straight after this frame, not inside it */
 	zmc_every(1, glib_tick);
@@ -684,6 +821,19 @@ static gboolean view_render_buffer(WPEView *view, WPEBuffer *buffer, const WPERe
 				   guint n_damage, GError **error) {
 	(void)damage; (void)n_damage; (void)error;
 	struct webview *wv = ((ZtView *)view)->wv;
+	if (wv && !wv->destroying && direct_frame(wv, buffer)) {
+		if (getenv("ZTB_TRACE")) {
+			static gint64 last;
+			gint64 now = g_get_monotonic_time();
+			fprintf(stderr, "ztb-direct %.1f\n", last ? (now - last) / 1000.0 : 0.0);
+			last = now;
+		}
+		return TRUE;
+	}
+	if (wv) direct_off(wv);
+	if (getenv("ZTB_TRACE"))
+		fprintf(stderr, "ztb-webkit %.1f %p\n", (g_get_monotonic_time() - last_tick) / 1000.0, (void *)buffer);
+	if (getenv("ZTB_TIMELINE")) fprintf(stderr, "T webkit %.1f\n", g_get_monotonic_time() / 1000.0);
 	if (!wv || !take_frame(wv, buffer)) {
 		/* no one to show it to, or copied out already: done with it now */
 		wpe_view_buffer_rendered(view, buffer);
@@ -694,10 +844,16 @@ static gboolean view_render_buffer(WPEView *view, WPEBuffer *buffer, const WPERe
 		/* overtaken before it was ever shown */
 		WPEBuffer *old = wv->pending;
 		wv->pending = NULL;
-		wpe_view_buffer_rendered(view, old);
+		if (!early_ack()) wpe_view_buffer_rendered(view, old);
 		if (old != wv->on_screen) wpe_view_buffer_released(view, old);
 	}
 	wv->pending = buffer;
+	if (early_ack()) {
+		/* acked as it comes: WebKit draws the next frame while this one
+		 * waits for the screen (triple buffering). Acked only once shown,
+		 * a frame took two vblanks on the J5 however little each step took */
+		wpe_view_buffer_rendered(view, buffer);
+	}
 	zmc_present();	/* after pending is set: an idle zmc draws (and acks) at once */
 	return TRUE;
 }
@@ -1185,7 +1341,7 @@ void webview_pause(struct webview *wv, bool hidden) {
 		WPEBuffer *pending = wv->pending, *screen = wv->on_screen;
 		wv->pending = wv->on_screen = NULL;
 		wv->image = NULL;
-		if (pending) wpe_view_buffer_rendered(wv->view, pending);
+		if (pending && !early_ack()) wpe_view_buffer_rendered(wv->view, pending);
 		/* Import destruction does not release WebKit's buffer ownership. */
 		unsigned imports = 0;
 		while (wv->imports) { imports++; wpe_buffer_set_user_data(wv->imports->buffer, NULL, NULL); }
@@ -1260,6 +1416,18 @@ void webview_touch_cancel(struct webview *wv) {
 	touch(wv, WPE_EVENT_TOUCH_CANCEL, finger.id, finger.x, finger.y,
 	      (unsigned)(g_get_monotonic_time() / 1000));
 }
+/* The page moved by dy points as a touchpad would move it. WebKit scrolls
+ * these on its scrolling thread, without the web process's main thread,
+ * which on the J5 took about 24 ms for each step of a touch-driven scroll
+ * (frames every other vblank). stop ends the gesture: sent with nothing
+ * left to move, so WebKit adds no momentum of its own. */
+void webview_pan(struct webview *wv, double dy, double x, double y, bool stop) {
+	if (!wv || !wv->view) return;
+	send(wv, wpe_event_scroll_new(wv->view, WPE_INPUT_SOURCE_TOUCHPAD,
+		(guint32)(g_get_monotonic_time() / 1000), 0, 0, -dy, TRUE, stop, x, y));	/* (a touchpad's deltas point the other way) */
+	if (getenv("ZTB_DEBUG")) fprintf(stderr, "superscan: pan %.1f%s\n", dy, stop ? " stop" : "");
+}
+
 /* one key press and release; keycodes are evdev + 8, as XKB counts them */
 static void key_tap(struct webview *wv, guint keycode, guint keyval) {
 	guint32 t = (guint32)(g_get_monotonic_time() / 1000);
@@ -1333,6 +1501,18 @@ void webview_composite(struct webview *wv, int x, int y, int w, int h) {
 	if (!wv) {
 		return;
 	}
+	if (wv->direct_on) {
+		if (wv->snap_mode || !wv->shown) {
+			direct_off(wv);	/* the picture scroller draws it from here */
+		} else {
+			direct_place(wv);	/* the page itself is the subsurface's */
+			return;
+		}
+	}
+	if (getenv("ZTB_NODRAW")) {	/* (measuring: WebKit's and the shell's GPU time alone) */
+		if (wv->pending) frame_shown(wv);
+		return;
+	}
 	double dy = wv->overscroll;
 	double corners[4][3] = {
 		{ x, y + dy, 0 }, { x + w, y + dy, 0 }, { x, y + h + dy, 0 }, { x + w, y + h + dy, 0 },
@@ -1364,8 +1544,8 @@ void webview_composite(struct webview *wv, int x, int y, int w, int h) {
 		for (int i = 0; i < 4; i++) {
 			v[i] = (struct zmg_vertex){ (float)corners[i][0], (float)corners[i][1], 0 };
 		}
-		zmg_surface(wv->snap, wv->snap_rev, 0, wv->snap_pos * SNAP_SCALE,
-			w * SNAP_SCALE, (wv->snap_pos + h) * SNAP_SCALE, v, (float)snap_alpha);
+		zmg_surface(wv->snap, wv->snap_rev, 0, wv->snap_pos * wv->snap_px,
+			w * wv->snap_px, (wv->snap_pos + h) * wv->snap_px, v, (float)snap_alpha);
 		if (getenv("ZTB_TRACE")) {
 			static gint64 last;
 			gint64 now = g_get_monotonic_time();

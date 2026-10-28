@@ -120,8 +120,13 @@ store/ztstore: $(STORE) $(wildcard store/*.h) $(CORE_DEPS)
 # browser/README.md). Needs wpewebkit on the phone.
 BROWSER = browser/superscan.c browser/webview.c
 BROWSER_PKGS = wpe-webkit-2.0 wpe-platform-2.0 wpe-platform-headless-2.0 glib-2.0 gobject-2.0 libdrm
-browser/superscan: $(BROWSER) browser/webview.h $(CORE_DEPS)
-	$(APP_BUILD) $(shell pkg-config --cflags $(BROWSER_PKGS)) -o $@ $(BROWSER) $(CORE) $(APP_LIBS) \
+DMABUF_XML = $(shell pkg-config --variable=pkgdatadir wayland-protocols)/stable/linux-dmabuf/linux-dmabuf-v1.xml
+browser/linux-dmabuf-v1-client-protocol.h:
+	wayland-scanner client-header $(DMABUF_XML) $@
+browser/linux-dmabuf-v1-protocol.c:
+	wayland-scanner private-code $(DMABUF_XML) $@
+browser/superscan: $(BROWSER) browser/webview.h browser/linux-dmabuf-v1-client-protocol.h browser/linux-dmabuf-v1-protocol.c $(CORE_DEPS)
+	$(APP_BUILD) -Ibrowser $(shell pkg-config --cflags $(BROWSER_PKGS)) -o $@ $(BROWSER) browser/linux-dmabuf-v1-protocol.c $(CORE) $(APP_LIBS) \
 		$(shell pkg-config --libs $(BROWSER_PKGS))
 
 # kept out of `all`/`install` until WPE is confirmed on the phone, so a missing
