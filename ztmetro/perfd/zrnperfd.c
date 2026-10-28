@@ -1085,7 +1085,12 @@ static void apply(void) {
 	 * relocks; 8 ms still lets the clock follow a swipe instead of trailing it */
 	put_long(CPUFREQ "/schedutil/rate_limit_us", profile == POWERSAVE ? 40000 : 8000);
 	int n = points(perfial_gpu_file("available_frequencies"), table, 32);
-	if (n > 0) {
+	/* the GPU's limits only once ztMETRO has said it is up: by then its
+	 * renderer has brought the GPU up. On the J5 a new limit before that
+	 * (zrnperfd starts before the shell) read the Adreno's busy counters
+	 * on a GPU that was never started, an external abort that held
+	 * devfreq's lock, and the shell, logind and sshd hung behind it */
+	if (n > 0 && shell_pid > 0) {
 		long top = table[n - 1];
 		/* idle0's ceiling: the lowest step that can still draw Start, not the
 		 * lowest there is. The J5's Adreno lists only 19.2 MHz (the crystal,
@@ -1097,6 +1102,9 @@ static void apply(void) {
 		long max = idle0 ? rest : profile == POWERSAVE ? capped(table, n, 0.8) : top;
 		if (power_level >= 4 && max > capped(table, n, 0.6))
 			max = capped(table, n, 0.6);
+		/* and awake while they change: a new limit makes devfreq read the
+		 * busy counters, which a runtime-suspended GPU cannot answer */
+		put(perfial_gpu_file("device/power/control"), "on");
 		put(perfial_gpu_file("governor"), "simple_ondemand");
 		/* The floor, with the screen on: the same usable step. With only the
 		 * crystal's 19.2 MHz below 400 MHz (the J5), simple_ondemand dropped
@@ -1111,6 +1119,7 @@ static void apply(void) {
 		if (profile == PERFORMANCE && !idle0) {
 			put_long(perfial_gpu_file("min_freq"), top);
 		}
+		put(perfial_gpu_file("device/power/control"), "auto");
 	}
 	/* Programs on the efficiency cores only, and the spare big cores off,
 	 * until something needs more; coming up, the cores first and then the
@@ -1287,7 +1296,7 @@ static int command(char *line, bool persist) {
 			prioritise(shell_pid, SHELL_NICE, UI_UCLAMP);
 			fprintf(stderr, "zrnperfd: shell %d first in line\n", shell_pid);
 		}
-		return 0;
+		return 2;	/* the GPU's limits, held back until now */
 	}
 	if (strcmp(what, "tickle") == 0) {
 		for (int c = 0; c < 3; c++) {

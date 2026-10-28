@@ -82,6 +82,9 @@
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output.h>
+#include <wlr/types/wlr_output_layer.h>
+#include <wlr/types/wlr_buffer.h>
+#include <wlr/render/dmabuf.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_pointer_constraints_v1.h>
@@ -120,6 +123,10 @@ static bool demoloop_active(void) {
 
 /* All layout below is in logical points; the output scale turns them into pixels. */
 #define STATUS_H	28	/* status bar */
+/* the nav bar: none on phones with their own back, Start and search keys */
+#define NAV_BAR_H	40
+static int nav_h = NAV_BAR_H;
+#define NAV_H		nav_h
 #define DEFAULT_KEY_HEIGHT 56
 #define KEY_GAP		3	/* between keys: the gap is the border */
 #define TERM_ROW_H	38	/* the Esc / Tab / Ctrl / arrows row for terminals */
@@ -731,6 +738,15 @@ struct zt_server {
 	double turn_bottom, list_turn_bottom;	/* where the turnstile counts rows up from */
 	float scroll_v;		/* and how fast it is coasting, points per ms */
 	bool moving;		/* something coasts or settles: keep drawing frames */
+	uint32_t app_live_until;	/* the app sent a frame lately: a frame every vblank until then */
+	/* The page on a display plane: an app's DMA-BUF subsurface (Superscan's
+	 * WebKit frames) scanned out by the display controller, over the frame
+	 * the GPU draws, which then leaves it out. See plane_pick(). */
+	struct wlr_output_layer *plane_layer;
+	struct wlr_surface *plane_surface;	/* on the plane this frame, or NULL */
+	bool plane_off;		/* the backend refused it for 2 s on end: drawn by the GPU from then on */
+	int plane_refusals;	/* frames in a row the backend did not take the plane */
+	bool plane_shown;	/* the plane had a buffer at the last commit */
 	uint32_t physics_ms;
 
 	/* the app list, to the right of Start */
@@ -790,6 +806,9 @@ struct zt_server {
 	struct wl_event_source *long_press_timer;
 	struct wl_event_source *press_timer;	/* PRESS_DELAY_MS after a finger came down on Start */
 	int nav_pressed;		/* -1: none */
+	int hwkey_held;			/* the nav button whose own key is down; -1: none */
+	bool hwkey_long;		/* ... and held long enough to count as a long press */
+	struct wl_event_source *hwkey_timer;
 
 	/* on-screen keyboard */
 	struct wlr_keyboard vkbd;
@@ -2872,6 +2891,12 @@ static void load_config(struct zt_server *server) {
 			snprintf(server->start_wall_path, sizeof(server->start_wall_path), "%s", value);
 		} else if (strcmp(key, "lock_wallpaper") == 0) {
 			snprintf(server->lock_wall_path, sizeof(server->lock_wall_path), "%s", value);
+		} else if (strcmp(key, "nav_bar") == 0) {
+			if (strcmp(value, "on") == 0) {
+				nav_h = NAV_BAR_H;
+			} else if (strcmp(value, "off") == 0) {
+				nav_h = 0;
+			}
 		} else if (strcmp(key, "nav_center_icon") == 0) {
 			int n = atoi(value);
 			server->nav_center_icon = n < 0 ? 0 : n > 4 ? 4 : n;
@@ -5393,6 +5418,9 @@ static void load_logo(struct zt_server *server) {
 }
 
 static void draw_nav(struct zt_server *server) {
+	if (NAV_H == 0) {
+		return;
+	}
 	if (!server->navbar_enabled) {
 		return;
 	}
@@ -8369,6 +8397,90 @@ static int press_fired(void *data) {
 	return 0;
 }
 
+/* A nav button, or the phone's own key for it, pressed and let go. */
+static void nav_activate(struct zt_server *server, int index) {
+	if (server->switcher) {
+		switcher_close(server);	/* any button: back to where we were */
+		return;
+	}
+	if (index == NAV_SEARCH && server->osk_visible) {
+		wlr_log(WLR_INFO, "nav: search while the keyboard is up (keyboard dismissed)");
+		osk_show(server, false);
+		return;
+	}
+	if (server->hyper && index != NAV_SEARCH) {
+		hyper_close(server);	/* back, or Start: it goes, and nothing else */
+		if (index == NAV_BACK) {
+			return;
+		}
+	}
+	if (index == NAV_START) {
+		wlr_log(WLR_INFO, "nav: start");
+		if (server->shown) {
+			show_toplevel(server, NULL);
+		} else {
+			home_reset(server);
+		}
+	} else if (index == NAV_BACK) {
+		wlr_log(WLR_INFO, "nav: back");
+		if (server->shade_open || server->shade_h > 10.0f) {
+			shade_set_open(server, false);
+			return;
+		}
+		if (server->shown && server->shown->android_runtime && server->osk_visible) {
+			osk_show(server, false);
+			const char *id = server->shown->xdg_toplevel->app_id;
+			if (id && !strncmp(id, "waydroid.", 9)) {
+				vkbd_send(server, KEY_ESC, false);
+			}
+		} else if (server->shown && background_app(server->shown)) {
+                server->shown->background_hidden = true;
+                show_toplevel(server, NULL);
+            } else if (server->shown) {
+			vkbd_send(server, KEY_ESC, false);
+		} else if (server->menu_open) {
+			menu_hide(server);
+		} else if (server->searching) {
+			search_end(server);
+		} else if (server->editing) {
+			edit_end(server);
+		} else if (server->page > 0.5f) {
+			page_go(server, 0.0f, 0.0f);
+		}
+	} else {
+		wlr_log(WLR_INFO, "nav: search (Hyperscan)");
+		if (server->hyper) {
+			hyper_close(server);
+		} else {
+			if (server->shade_open || server->shade_h > 10.0f) {
+				shade_set_open(server, false);
+			}
+			if (server->searching) {
+				search_end(server);
+			}
+			hyper_open(server);
+		}
+	}
+}
+
+/* A nav button, or the phone's own key for it, held. */
+static void nav_hold(struct zt_server *server, int index) {
+	hap(server, HAP_HEAVY, HG_NAV);
+	if (index == NAV_BACK) {
+		wlr_log(WLR_INFO, "nav: long press on back");
+		show_next_app(server);
+	} else if (index == NAV_START) {
+		wlr_log(WLR_INFO, "nav: long press on start");
+		switcher_open(server);
+	} else if (index == NAV_SEARCH) {
+		/* held: the keyboard, for an app that does not ask for it */
+		wlr_log(WLR_INFO, "nav: long press on search (keyboard toggle)");
+		if (server->shown && !server->hyper) {
+			osk_show(server, !server->osk_visible);
+		}
+	}
+}
+
 static int long_press_fired(void *data) {
 	struct zt_server *server = data;
 	uint32_t now = now_ms();
@@ -8417,24 +8529,9 @@ static int long_press_fired(void *data) {
 			}
 			continue;
 		}
-		if (p->used && p->role == ROLE_NAV && p->index == NAV_BACK && !p->moved) {
+		if (p->used && p->role == ROLE_NAV && !p->moved) {
 			p->long_pressed = true;
-			hap(server, HAP_HEAVY, HG_NAV);
-			wlr_log(WLR_INFO, "nav: long press on back");
-			show_next_app(server);
-		} else if (p->used && p->role == ROLE_NAV && p->index == NAV_START && !p->moved) {
-			p->long_pressed = true;
-			hap(server, HAP_HEAVY, HG_NAV);
-			wlr_log(WLR_INFO, "nav: long press on start");
-			switcher_open(server);
-		} else if (p->used && p->role == ROLE_NAV && p->index == NAV_SEARCH && !p->moved) {
-			/* held: the keyboard, for an app that does not ask for it */
-			p->long_pressed = true;
-			hap(server, HAP_HEAVY, HG_NAV);
-			wlr_log(WLR_INFO, "nav: long press on search (keyboard toggle)");
-			if (server->shown && !server->hyper) {
-				osk_show(server, !server->osk_visible);
-			}
+			nav_hold(server, p->index);
 		}
 	}
 	return 0;
@@ -9865,68 +9962,7 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 		if (cancelled || p->moved || p->long_pressed) {
 			break;
 		}
-		if (server->switcher) {
-			switcher_close(server);	/* any button: back to where we were */
-			break;
-		}
-		if (p->index == NAV_SEARCH && server->osk_visible) {
-			wlr_log(WLR_INFO, "nav: search while the keyboard is up (keyboard dismissed)");
-			osk_show(server, false);
-			break;
-		}
-		if (server->hyper && p->index != NAV_SEARCH) {
-			hyper_close(server);	/* back, or Start: it goes, and nothing else */
-			if (p->index == NAV_BACK) {
-				break;
-			}
-		}
-		if (p->index == NAV_START) {
-			wlr_log(WLR_INFO, "nav: start");
-			if (server->shown) {
-				show_toplevel(server, NULL);
-			} else {
-				home_reset(server);
-			}
-		} else if (p->index == NAV_BACK) {
-			wlr_log(WLR_INFO, "nav: back");
-			if (server->shade_open || server->shade_h > 10.0f) {
-				shade_set_open(server, false);
-				break;
-			}
-			if (server->shown && server->shown->android_runtime && server->osk_visible) {
-				osk_show(server, false);
-				const char *id = server->shown->xdg_toplevel->app_id;
-				if (id && !strncmp(id, "waydroid.", 9)) {
-					vkbd_send(server, KEY_ESC, false);
-				}
-			} else if (server->shown && background_app(server->shown)) {
-                server->shown->background_hidden = true;
-                show_toplevel(server, NULL);
-            } else if (server->shown) {
-				vkbd_send(server, KEY_ESC, false);
-			} else if (server->menu_open) {
-				menu_hide(server);
-			} else if (server->searching) {
-				search_end(server);
-			} else if (server->editing) {
-				edit_end(server);
-			} else if (server->page > 0.5f) {
-				page_go(server, 0.0f, 0.0f);
-			}
-		} else {
-			wlr_log(WLR_INFO, "nav: search (Hyperscan)");
-			if (server->hyper) {
-				hyper_close(server);
-			} else {
-				if (server->shade_open || server->shade_h > 10.0f) {
-					shade_set_open(server, false);
-				}
-				if (server->searching) {
-					search_end(server);
-				}
-				hyper_open(server);
-			}
-		}
+		nav_activate(server, p->index);
 		break;
 	case ROLE_HYPER:
 		if (!cancelled && !p->moved) {
@@ -10612,6 +10648,74 @@ static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) 
 		&keyboard->wlr_keyboard->modifiers);
 }
 
+/* The nav button a phone's own key stands for: Samsung's are, from the left,
+ * recents (Hyperscan here), home (Start) and back. -1: not one of them. */
+static int hwkey_nav(uint32_t keycode) {
+	switch (keycode) {
+	case KEY_BACK:
+		return NAV_BACK;
+	case KEY_HOMEPAGE:
+		return NAV_START;
+	case KEY_APPSELECT:
+	case KEY_MENU:
+		return NAV_SEARCH;
+	}
+	return -1;
+}
+
+static int hwkey_held_fired(void *data) {
+	struct zt_server *server = data;
+	if (server->hwkey_held >= 0 && !server->hwkey_long) {
+		server->hwkey_long = true;
+		nav_hold(server, server->hwkey_held);
+	}
+	return 0;
+}
+
+/* Whether the phone has its own back and home keys, so it needs no nav bar.
+ * Read from sysfs (the session cannot open the event devices itself); USB
+ * keyboards, which may have both, do not count. */
+static bool hardware_nav_keys(void) {
+	bool back = false, home = false;
+	DIR *dir = opendir("/sys/class/input");
+	struct dirent *e;
+	while (dir && !(back && home) && (e = readdir(dir))) {
+		if (strncmp(e->d_name, "event", 5) != 0) {
+			continue;
+		}
+		char path[300], real[PATH_MAX], caps[1024];
+		snprintf(path, sizeof(path), "/sys/class/input/%s/device", e->d_name);
+		if (!realpath(path, real) || strstr(real, "/usb")) {
+			continue;
+		}
+		snprintf(path, sizeof(path), "/sys/class/input/%s/device/capabilities/key", e->d_name);
+		FILE *f = fopen(path, "r");
+		if (!f) {
+			continue;
+		}
+		bool ok = fgets(caps, sizeof(caps), f) != NULL;
+		fclose(f);
+		if (!ok) {
+			continue;
+		}
+		/* words of the key bitmap, the highest first */
+		unsigned long words[16];
+		int n = 0;
+		for (char *tok = strtok(caps, " \n"); tok && n < 16; tok = strtok(NULL, " \n")) {
+			words[n++] = strtoul(tok, NULL, 16);
+		}
+		int bits = sizeof(unsigned long) * 8;
+		#define HAS_KEY(k) ((k) / bits < n && (words[n - 1 - (k) / bits] >> ((k) % bits) & 1))
+		back |= HAS_KEY(KEY_BACK);
+		home |= HAS_KEY(KEY_HOMEPAGE);
+		#undef HAS_KEY
+	}
+	if (dir) {
+		closedir(dir);
+	}
+	return back && home;
+}
+
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 	struct zt_keyboard *keyboard = wl_container_of(listener, keyboard, key);
 	struct zt_server *server = keyboard->server;
@@ -10718,6 +10822,15 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 			return;
 		}
 	}
+	int nav = hwkey_nav(event->keycode);
+	if (nav == NAV_START && !server->screen_on &&
+	    event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		/* home wakes the screen, as the power key does */
+		screen_set(server, true);
+		activity(server);
+		server->hwkey_held = -1;	/* its release is not a Start press */
+		return;
+	}
 	if (!server->screen_on) {
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 			screen_set(server, true);
@@ -10726,6 +10839,30 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 		return;
 	}
 	activity(server);
+	if (nav >= 0) {
+		wlr_log(WLR_INFO, "nav: key %u %s", event->keycode,
+			event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "down" : "up");
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			/* the two touch keys answer every touch, locked or not: home
+			 * is a button that clicks by itself */
+			if (nav != NAV_START) {
+				hap(server, HAP_TAP, HG_NAV);
+			}
+			if (server->locked || server->auth_active) {
+				return;
+			}
+			server->hwkey_held = nav;
+			server->hwkey_long = false;
+			wl_event_source_timer_update(server->hwkey_timer, LONG_PRESS_MS);
+		} else if (server->hwkey_held == nav) {
+			wl_event_source_timer_update(server->hwkey_timer, 0);
+			server->hwkey_held = -1;
+			if (!server->hwkey_long && !server->locked) {
+				nav_activate(server, nav);
+			}
+		}
+		return;
+	}
 	if (event->keycode == KEY_VOLUMEUP || event->keycode == KEY_VOLUMEDOWN) {
 		/* DemoLoop owns volume down; three presses stop it, touches never do. */
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
@@ -11028,7 +11165,49 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 		keyboard->destroy.notify = keyboard_handle_destroy;
 		wl_signal_add(&device->events.destroy, &keyboard->destroy);
 		wl_list_insert(&server->keyboards, &keyboard->link);
+		wlr_log(WLR_INFO, "keys: %s", device->name);
 	}
+}
+
+static void constraint_destroy(struct wl_listener *listener, void *data);
+
+static void server_new_pointer_constraint(struct wl_listener *listener, void *data) {
+    struct wlr_pointer_constraint_v1 *constraint = data;
+    struct zt_server *server = wl_container_of(listener, server, new_constraint);
+
+    struct zt_pointer_constraint *c = calloc(1, sizeof(*c));
+    c->server = server;
+    c->constraint = constraint;
+    c->destroy.notify = constraint_destroy;
+    wl_signal_add(&constraint->events.destroy, &c->destroy);
+
+    struct wlr_surface *kb_focus = server->seat->keyboard_state.focused_surface;
+    struct wlr_surface *target_root = wlr_surface_get_root_surface(constraint->surface);
+
+    bool is_focused = (kb_focus && wlr_surface_get_root_surface(kb_focus) == target_root) ||
+                      (server->shown && server->shown->xdg_toplevel &&
+                       wlr_surface_get_root_surface(server->shown->xdg_toplevel->base->surface) == target_root);
+    if (is_focused) {
+        if (server->seat->pointer_state.focused_surface != constraint->surface) {
+            double sx = 0, sy = 0;
+            surface_at(server, server->pointer_x, server->pointer_y, &sx, &sy);
+            wlr_seat_pointer_notify_enter(server->seat, constraint->surface, sx, sy);
+        }
+        wlr_pointer_constraint_v1_send_activated(constraint);
+        server->active_constraint = constraint;
+    }
+}
+
+static void constraint_destroy(struct wl_listener *listener, void *data) {
+    struct zt_pointer_constraint *c = wl_container_of(listener, c, destroy);
+    struct zt_server *server = c->server; // <-- Retrieve server pointer
+    
+    if (server->active_constraint == c->constraint) {
+        wlr_pointer_constraint_v1_send_deactivated(c->constraint);
+        server->active_constraint = NULL;
+    }
+	wl_list_remove(&c->destroy.link);
+    free(c);
 }
 
 static void constraint_destroy(struct wl_listener *listener, void *data);
@@ -11082,6 +11261,7 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 
 struct app_draw {
 	struct zt_server *server;
+	struct wlr_surface *skip;	/* on a display plane: not drawn */
 	double ox, oy, fit;
 	float x, y, scale;	/* where the app area's corner goes, and how large */
 	float angle, alpha;
@@ -11091,6 +11271,9 @@ struct app_draw {
 static void draw_app_surface(struct wlr_surface *surface, int sx, int sy, void *data) {
 	struct app_draw *draw = data;
 	struct zt_server *server = draw->server;
+	if (surface == draw->skip) {
+		return;
+	}
 	struct wlr_texture *texture = wlr_surface_get_texture(surface);
 	if (!texture || !wlr_texture_is_gles2(texture)) {
 		return;
@@ -11395,6 +11578,82 @@ static void render_retry_later(struct zt_server *server) {
 	if (timer) wl_event_source_timer_update(timer, 100);
 }
 
+struct plane_find {
+	struct wlr_surface *root, *found;
+	struct wlr_buffer *buffer;
+	int sx, sy;
+};
+
+static void plane_find_surface(struct wlr_surface *surface, int sx, int sy, void *data) {
+	struct plane_find *f = data;
+	struct wlr_dmabuf_attributes attribs;
+	/* the client's own buffer: wlroots keeps it as the client buffer's source */
+	struct wlr_buffer *buf = surface->current.buffer ? surface->current.buffer :
+		surface->buffer ? surface->buffer->source : NULL;
+	if (surface != f->root && buf && surface->current.width >= 100 &&
+			surface->current.height >= 100 && wlr_buffer_get_dmabuf(buf, &attribs)) {
+		f->buffer = buf;
+		f->found = surface;
+		f->sx = sx;
+		f->sy = sy;
+	}
+}
+
+/* The page goes on a display plane when nothing of the shell's is drawn over
+ * it, the app is at rest in front, and every pixel the GPU would draw of it
+ * is drawn unchanged (no dimming tint): then a scroll frame is a plane flip,
+ * no composition. Superscan's frames on the J5: 3 ms of GPU each, and the
+ * shell's whole frame with them, saved. */
+static bool plane_pick(struct zt_server *server, struct zt_toplevel *app, const struct app_draw *draw,
+		bool app_covers, struct wlr_output_layer_state *ls) {
+	static const char *last_why;
+	const char *why = NULL;
+#define PLANE_NO(reason) do { why = reason; goto no; } while (0)
+	if (server->plane_off || getenv("ZTMETRO_NO_PLANE")) PLANE_NO("off");
+	if (!app_covers || !app || !app->mapped) PLANE_NO("no app at rest in front");
+	if (server->peek > 0.001f || server->shade_h > 0.5f || server->splash ||
+			server->sensorhub_fail_screen || server->osk_slide > 0.003f || server->hyper_t > 0.003f ||
+			server->locked || server->lock_y > 1.0f - server->height || server->call_over_lock ||
+			server->switch_t > 0.001f || server->keypop) {
+		PLANE_NO("something of the shell's over the app");
+	}
+	for (int i = 0; i < 3; i++) {
+		if (fabsf(server->tint[i] - 1.0f) > 0.002f) {
+			PLANE_NO("tinted");
+		}
+	}
+	struct plane_find f = { .root = app->xdg_toplevel->base->surface };
+	wlr_xdg_surface_for_each_surface(app->xdg_toplevel->base, plane_find_surface, &f);
+	if (!f.found) {
+		PLANE_NO("no DMA-BUF subsurface");
+	}
+	if (!server->plane_layer) {
+		server->plane_layer = wlr_output_layer_create(server->output->wlr_output);
+	}
+	double k = draw->fit * draw->scale * server->scale;
+	*ls = (struct wlr_output_layer_state){
+		.layer = server->plane_layer,
+		.buffer = f.buffer,
+		.dst_box = {
+			.x = (int)lround((draw->x + draw->fit * draw->scale * (draw->ox + f.sx)) * server->scale),
+			.y = (int)lround((draw->y + draw->fit * draw->scale * (draw->oy - STATUS_H + f.sy)) * server->scale),
+			.width = (int)lround(f.found->current.width * k),
+			.height = (int)lround(f.found->current.height * k),
+		},
+	};
+	wlr_surface_get_buffer_source_box(f.found, &ls->src_box);
+	server->plane_surface = f.found;
+	last_why = NULL;
+	return true;
+no:
+	if (why != last_why) {
+		wlr_log(WLR_INFO, "plane: not used: %s", why);
+		last_why = why;
+	}
+	return false;
+#undef PLANE_NO
+}
+
 static void render_frame(struct zt_server *server) {
 	struct wlr_output *output = server->output->wlr_output;
 	uint32_t now = now_ms();
@@ -11462,6 +11721,8 @@ static void render_frame(struct zt_server *server) {
 	struct app_draw draw = { .server = server, .x = 0, .y = STATUS_H - server->app_lift, .scale = 1.0f,
 		.angle = server->app_angle,
 		.alpha = fminf(1.0f, server->app_alpha * 4.0f) * turn_alpha(fabsf(server->app_angle) / TURN_OUT_DEG) };
+	struct wlr_output_layer_state plane_state = {0};
+	bool plane = false;	/* the page on a display plane this frame (plane_pick) */
 	/* The lock screen is opaque too: what it covers is not drawn, and while it
 	 * slides up only the strip below it is. Each screen of pixels costs the
 	 * J5's Adreno 306 about 3 ms, and Start, an app and the panel under a
@@ -11501,8 +11762,44 @@ static void render_frame(struct zt_server *server) {
 	}
 	/* The opaque boot splash covers these layers; avoid drawing them underneath. */
 	if (!server->splash && !lock_covers) {
+	/* An app at rest in front covers them as the lock screen does: Superscan
+	 * scrolling over a Start left in place drew 3.5 screens a frame, and the
+	 * GPU (about 3 ms a screen) ran out of frame before WebKit did */
+	bool app_covers = app && app->mapped && !server->leaving && server->switch_t <= 0.001f &&
+		draw.alpha >= 0.999f && fabsf(draw.angle) < 0.01f && server->app_lift == 0;
+	server->plane_surface = NULL;
+	if (app && app->mapped) {
+		app_origin(app, &draw.ox, &draw.oy);
+		draw.fit = app_fit(server, app);
+		plane = plane_pick(server, app, &draw, app_covers, &plane_state);
+	}
+	if (plane) {
+		wlr_output_state_set_buffer(&state, buffer);
+		wlr_output_state_set_layers(&state, &plane_state, 1);
+		bool tested = wlr_output_test_state(output, &state);
+		if (!tested || !plane_state.accepted) {
+			/* libliftoff ranks layers by how often they change: a new one
+			 * waits a few frames for a plane. Only a refusal that lasts 2 s
+			 * turns it off */
+			if (++server->plane_refusals == 120) {
+				wlr_log(WLR_INFO, "plane: refused (test %s, layer %s) for %dx%d at %d,%d; the GPU draws the page",
+					tested ? "passed" : "failed", plane_state.accepted ? "accepted" : "not accepted",
+					plane_state.dst_box.width, plane_state.dst_box.height, plane_state.dst_box.x, plane_state.dst_box.y);
+				server->plane_off = true;
+			}
+			plane = false;
+			server->plane_surface = NULL;
+		}
+	}
+	if (plane) {
+		server->plane_refusals = 0;
+		draw.skip = server->plane_surface;
+	} else if (server->plane_shown && server->plane_layer) {
+		plane_state = (struct wlr_output_layer_state){ .layer = server->plane_layer };	/* off */
+		wlr_output_state_set_layers(&state, &plane_state, 1);
+	}
 	/* Start and the app list beside it, unless they have swung away completely */
-	if (server->start_t < 0.999f) {
+	if (server->start_t < 0.999f && !app_covers) {
 		float page_dx = -server->page * (float)server->width;
 		int n = server->page < 0.999f ? server->n_tiles : 0, draw_order[n > 0 ? n : 1];
 		float turns[n > 0 ? n : 1];
@@ -11924,6 +12221,11 @@ static void render_frame(struct zt_server *server) {
 	if (!wlr_output_commit_state(output, &state)) {
 		wlr_log(WLR_ERROR, "output commit failed");
 	} else {
+		bool was = server->plane_shown;
+		server->plane_shown = plane;
+		if (plane != was) {
+			wlr_log(WLR_INFO, "plane: the page %s", plane ? "on a display plane" : "drawn by the GPU");
+		}
 		server->output->last_submitted = buffer;
 		ladder_committed();	/* the panel's level, behind the frame that matches it */
 	}
@@ -12004,10 +12306,40 @@ static void render_frame(struct zt_server *server) {
 static void output_frame(struct wl_listener *listener, void *data) {
 	struct zt_output *output = wl_container_of(listener, output, frame);
 	struct zt_server *server = output->server;
+	/* An app that is moving (a scroll, its own animation) gets a frame, and
+	 * its frame callback, on every vblank, not only when its commit came in
+	 * before this one: a commit just after it waited for the one after, and
+	 * Superscan's scroll fell into frames two vblanks apart */
+	bool app_live = (int32_t)(server->app_live_until - now_ms()) > 0;
 	/* nothing damaged and nothing moving: no frame, and no further wake-ups */
-	if (server->dirty || server->moving || loading_active(server) || animating(server, NULL)) {
+	if (server->dirty || server->moving || app_live || loading_active(server) || animating(server, NULL)) {
 		render_frame(server);
 	}
+	if (app_live) {
+		wlr_output_schedule_frame(output->wlr_output);
+	}
+}
+
+static int resize_debounced(void *data) {
+	struct zt_server *server = data;
+	server->resize_pending = false;
+
+	projection_set(server);
+
+	place_tiles(server);
+	draw_start(server);
+	draw_status(server);
+	draw_shade(server);
+	draw_nav(server);
+	draw_lock(server);
+	draw_rounds(server);
+	osk_layout(server);
+
+	wlr_xcursor_manager_load(server->cursor_mgr, server->scale);
+	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
+
+	damage(server);
+	return 0;
 }
 
 static int resize_debounced(void *data) {
@@ -12191,6 +12523,7 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 static void surface_commit(struct wl_listener *listener, void *data) {
 	struct zt_surface *zs = wl_container_of(listener, zs, commit);
 	if (zs->server->shown || zs->server->leaving) {
+		zs->server->app_live_until = now_ms() + 50;
 		damage(zs->server);
 	}
 }
@@ -12410,6 +12743,11 @@ int main(int argc, char *argv[]) {
 
 	struct zt_server server = {0};
 	server.nav_pressed = -1;
+	server.hwkey_held = -1;
+	if (hardware_nav_keys()) {
+		nav_h = 0;	/* until the config says otherwise */
+		wlr_log(WLR_INFO, "nav: the phone has its own keys; no nav bar");
+	}
 	server.osk_pressed = -1;
 	server.ctl_fd = -1;
     server.auth_fd = -1;
@@ -12550,6 +12888,7 @@ int main(int argc, char *argv[]) {
 	wlr_seat_set_keyboard(server.seat, &server.vkbd);
 
 	server.long_press_timer = wl_event_loop_add_timer(server.loop, long_press_fired, &server);
+	server.hwkey_timer = wl_event_loop_add_timer(server.loop, hwkey_held_fired, &server);
 	server.press_timer = wl_event_loop_add_timer(server.loop, press_fired, &server);
 	server.key_repeat_timer = wl_event_loop_add_timer(server.loop, key_repeat_fired, &server);
 	server.repeat_index = -1;

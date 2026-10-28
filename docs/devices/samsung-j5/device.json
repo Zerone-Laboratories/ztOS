@@ -1,0 +1,250 @@
+{
+  "id": "samsung-j5",
+  "name": "Galaxy J5 (2015)",
+  "maker": "Samsung",
+  "model": "SM-J500N0",
+  "codename": "j5",
+  "maintainer": "Ometh Abeyrathne",
+  "contact": "https://github.com/Zerone-Laboratories/ztos-devices/tree/main/devices/samsung-j5",
+  "added": "2026-10-28",
+  "summary": "ztOS on the Samsung Galaxy J5 (2015), the first port made with ztConflo: Arch Linux ARM with ztMETRO on postmarketOS's mainline msm8916 kernel (Linux 6.12), booted by lk2nd from the userdata partition. Snapdragon 410 with the Adreno 306 on Mesa's freedreno, so the whole UI runs on the GPU. The home key and the recents and back touch keys work as Windows Phone's hardware buttons, with haptics, so there is no on-screen nav bar. Wi-Fi, battery, vibration, torch and the speaker work; calls and the cameras are not done yet.",
+  "photo": "photo.jpg",
+  "photo_caption": "ztMETRO's Start on the Galaxy J5",
+  "specs": [
+    [
+      "SoC",
+      "Qualcomm Snapdragon 410 (MSM8916)"
+    ],
+    [
+      "CPU",
+      "4× Cortex-A53 at 1.2 GHz"
+    ],
+    [
+      "GPU",
+      "Adreno 306 (freedreno, OpenGL ES 3.1)"
+    ],
+    [
+      "RAM",
+      "1.5 GB"
+    ],
+    [
+      "Storage",
+      "16 GB eMMC"
+    ],
+    [
+      "Display",
+      "5.0 in, 720×1280 Super AMOLED"
+    ],
+    [
+      "Battery",
+      "2600 mAh, removable"
+    ],
+    [
+      "Kernel",
+      "Mainline Linux 6.12 (postmarketOS msm8916)"
+    ],
+    [
+      "Released",
+      "2015"
+    ],
+    [
+      "Device layer",
+      "[ztos-devices/samsung-j5](https://github.com/Zerone-Laboratories/ztos-devices/tree/main/devices/samsung-j5)"
+    ]
+  ],
+  "install": {
+    "markdown": "> **This erases the phone's user data.** ztOS is written to the userdata partition and lk2nd to BOOT. The modem, EFS (IMEI) and Samsung's bootloader are not touched. To go back, flash Samsung's stock firmware with Odin and factory-reset.\n>\n> **Tested on the SM-J500N0** (Snapdragon 410). Other Snapdragon J5 2015 models (J500F, J500FN, J500H is not Snapdragon) should work but are untested.\n\n## What you need\n\n- A Linux computer (x86-64) with **15 GB free** and an internet connection\n- A micro-USB **data** cable (some only charge)\n- The phone charged above **50%**\n- About **2 to 3 hours**, mostly waiting (the system image is built on your computer)\n\n## 1. Install the tools on your computer\n\nArch Linux:\n\n```sh\nsudo pacman -S --needed git python android-tools heimdall dtc e2fsprogs util-linux \\\n    libarchive dosfstools mtools arch-install-scripts zstd cpio \\\n    qemu-user-static qemu-user-static-binfmt\n```\n\nThe ztOS build runs as you, without `sudo`, so your account needs a range of user IDs. Check:\n\n```sh\ngrep $USER /etc/subuid\n```\n\nIf that prints nothing, add one, then **log out and back in**:\n\n```sh\nsudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER\n```\n\n## 2. Get ztConflo, the device registry and ztOS\n\n```sh\nmkdir -p ~/ztos && cd ~/ztos\ngit clone https://github.com/Zerone-Laboratories/ztconflo.git\ngit clone https://github.com/Zerone-Laboratories/ztos-devices.git\ngit clone --recurse-submodules https://github.com/Zerone-Laboratories/ztOS.git\n```\n\n## 2b. Build the ztOS system image (GSI)\n\nThe GSI is everything that is the same on every phone: ztMETRO, the apps, ztOSIAL, the performance and sensor services. ztConflo adds the J5's part to it.\n\n```sh\ncd ~/ztos/ztOS\ninstaller/ztos doctor\n```\n\n`doctor` should end with **this computer can build ztOS**. Install anything it says is missing, then:\n\n```sh\ninstaller/ztos build --target gsi\n```\n\nThis takes about 1 to 2 hours. It ends with `build/ztos/gsi/ztos-gsi-<version>-aarch64.tar.zst`.\n\n## 3. Put TWRP on the phone\n\n1. Download TWRP for the J5 (`twrp-3.7.0_9-0-j5lte.img.tar`) from https://twrp.me/samsung/samsunggalaxyj52015.html and unpack it:\n\n```sh\ncd ~/ztos\ntar xf ~/Downloads/twrp-3.7.0_9-0-j5lte.img.tar\n```\n\n2. Turn the phone off. Hold **Volume Down + Home + Power** until the warning screen shows, then press **Volume Up**: the phone is in Download mode.\n3. Connect it and flash TWRP:\n\n```sh\nheimdall flash --RECOVERY recovery.img --no-reboot\n```\n\n4. Hold **Power + Volume Down + Home** until the screen goes black, then at once switch to **Volume Up + Home + Power** and hold until TWRP shows. If Android starts instead, it replaces TWRP: do this step again.\n\n## 4. Build ztOS for the J5\n\n```sh\ncd ~/ztos/ztconflo\npython -m ztconflo build samsung-j5 --registry ../ztos-devices \\\n    --gsi ../ztOS/build/ztos/gsi/ztos-gsi-*-aarch64.tar.zst\n```\n\nIt asks for your password once (`sudo`). It adds the J5's kernel, its drivers (battery, vibration, panel, modem, audio, Wi-Fi) and its services to the GSI, checks them, and ends with the files in `out/samsung-j5/`. It takes about 15 minutes.\n\n## 5. Flash it\n\nWith the phone in TWRP and connected:\n\n```sh\nadb devices\n```\n\nThe phone must be listed as `recovery`. Then:\n\n```sh\npython -m ztconflo flash samsung-j5 --registry ../ztos-devices\n```\n\nIt shows the partitions it will overwrite and asks you to type `samsung-j5`. It writes lk2nd to BOOT and ztOS to userdata, reads each one back, and reboots.\n\n## 6. First boot\n\nThe first boot takes about a minute. The login is user `alarm`, password `alarm`. Over USB the phone is at `172.16.42.1`:\n\n```sh\nssh alarm@172.16.42.1\n```\n\nChange the password with `passwd`."
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage",
+      "status": "working",
+      "notes": "lk2nd on BOOT, ztOS from userdata through extlinux"
+    },
+    {
+      "category": "Display",
+      "feature": "Panel",
+      "status": "working",
+      "notes": "720×1280 Super AMOLED"
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": "Adreno 306 with freedreno (Mesa)"
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Home key",
+      "status": "working",
+      "notes": "Start; wakes the screen like the power key"
+    },
+    {
+      "category": "Input",
+      "feature": "Recents and back touch keys",
+      "status": "working",
+      "notes": "TC360 read by ztos-touchkeyd; recents opens Hyperscan; no on-screen nav bar"
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "working",
+      "notes": "SM5703 motor; haptics on the touch keys"
+    },
+    {
+      "category": "Power",
+      "feature": "CPU, frequency scaling",
+      "status": "working",
+      "notes": "zrnperfd profiles"
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charging",
+      "status": "working",
+      "notes": "SM5703 fuel gauge"
+    },
+    {
+      "category": "Power",
+      "feature": "Sleep (suspend)",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": "wcn36xx"
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking",
+      "status": "working",
+      "notes": "SSH at 172.16.42.1"
+    },
+    {
+      "category": "Modem",
+      "feature": "SIM and signal",
+      "status": "untested",
+      "notes": "The modem firmware loads; not tried with a SIM yet"
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphone",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Headphones",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient light",
+      "status": "broken",
+      "notes": "The J5 has no light sensor"
+    },
+    {
+      "category": "Camera",
+      "feature": "Cameras",
+      "status": "broken",
+      "notes": "Not supported yet"
+    },
+    {
+      "category": "Camera",
+      "feature": "Flashlight",
+      "status": "working",
+      "notes": "Torch in the action centre"
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "ztMETRO",
+      "status": "working",
+      "notes": "60 fps on Start and in the apps"
+    },
+    {
+      "category": "Software",
+      "feature": "Superscan (browser)",
+      "status": "partial",
+      "notes": "Pages work; scrolling runs at about 40-45 fps on the Adreno 306"
+    },
+    {
+      "category": "Software",
+      "feature": "Android apps (Waydroid)",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "ztOSIAL (ztos-ial test)",
+      "status": "untested",
+      "notes": ""
+    }
+  ],
+  "notes": [
+    {
+      "title": "Built with ztConflo",
+      "text": "The J5 has no hand-made device layer: ztConflo builds it from postmarketOS's port and the entry in ztos-devices, which adds the J5's battery, vibration, touch keys and modem memory fixes."
+    },
+    {
+      "title": "Scrolling in Superscan",
+      "text": "Web pages scroll at about 40-45 fps: WebKit's composition takes 8-12 ms of the Adreno 306 a frame. ztWebKitv1, a WebKit tuned for these GPUs, is being worked on."
+    }
+  ]
+}

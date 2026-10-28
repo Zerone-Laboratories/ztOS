@@ -500,9 +500,22 @@ static struct zmc_buffer *buffer_get(int width, int height) {
 	return buffer;
 }
 
+/* the app's step for each frame (zmc_on_frame), or none */
+static void (*frame_hook)(void);
+
+void zmc_on_frame(void (*step)(void)) {
+	frame_hook = step;
+	if (step) present();
+}
+
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time) {
 	wl_callback_destroy(callback);
 	zmc.frame = NULL;
+	if (getenv("ZTB_TIMELINE")) {
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		fprintf(stderr, "T done %.1f\n", ts.tv_sec * 1e3 + ts.tv_nsec / 1e6);
+	}
 	if (zmc.entrance && zmc.anim_active && (int32_t)(zmc.anim_start - now_ms()) > 0) {
 		return;	/* the first black frame is enough until Start has left */
 	}
@@ -510,13 +523,16 @@ static void frame_done(void *data, struct wl_callback *callback, uint32_t time) 
 	if (coasting) {
 		fling_step();
 	}
+	if (frame_hook) {
+		frame_hook();	/* may end itself (zmc_on_frame(NULL)) */
+	}
 	double p = press_amount();
 	bool tilting = p != zmc.press_to;
 	if (zmc.picker_until && (int32_t)(zmc.picker_until - now_ms()) > 0 && !zmc.anim_active) {
 		zmc.cache_stale = true;	/* a list picker is opening or closing: draw the page again */
 		zmc.dirty = true;
 	}
-	if (zmc.dirty || zmc.anim_active || zmc.anim_from_surface || coasting || zmc.busy || tilting ||
+	if (zmc.dirty || frame_hook || zmc.anim_active || zmc.anim_from_surface || coasting || zmc.busy || tilting ||
 			zmc.slide_active || zmc.spring) {
 		present();
 	}
@@ -1399,6 +1415,8 @@ static void present_gpu(uint32_t ms) {
 		zmc_trace(frames == 1 ? "first frame" : "frame");
 	}
 	zmc.dirty = false;
+	struct timespec t0, t1, t2;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 	zmg_begin(zmc.width, zmc.height, zmc.scale);
 	if (zmc.anim_active) {
 		zmc.anim_frames++;
@@ -1443,7 +1461,16 @@ static void present_gpu(uint32_t ms) {
 	}
 	zmc.frame = wl_surface_frame(zmc.surface);
 	wl_callback_add_listener(zmc.frame, &frame_listener, NULL);
-	if (!zmg_end()) {
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	bool ended = zmg_end();
+	clock_gettime(CLOCK_MONOTONIC, &t2);
+	if (zmc_perflog()) {
+		/* where a frame's time goes: building it, and the swap */
+		fprintf(stderr, "%s: frame %.1f ms, swap %.1f ms\n", zmc.app->app_id,
+			(t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
+			(t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6);
+	}
+	if (!ended) {
 		wl_callback_destroy(zmc.frame);
 		zmc.frame = NULL;
 		zmc.dirty = true;

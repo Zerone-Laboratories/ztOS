@@ -76,6 +76,8 @@ void webview_touch_down(struct webview *wv, int id, double x, double y, unsigned
 void webview_touch_motion(struct webview *wv, int id, double x, double y, unsigned time);
 void webview_touch_up(struct webview *wv, int id, unsigned time);
 void webview_touch_cancel(struct webview *wv);
+/* scroll the page by dy points on WebKit's scrolling thread (a touchpad's way) */
+void webview_pan(struct webview *wv, double dy, double x, double y, bool stop);
 /* typing into the page's focused text field: a char, "\b" or "\n" */
 void webview_key(struct webview *wv, const char *utf8);
 void webview_scroll(struct webview *wv, double dx, double dy);
