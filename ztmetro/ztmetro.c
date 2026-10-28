@@ -125,8 +125,6 @@ static bool demoloop_active(void) {
 #define STATUS_H	28	/* status bar */
 /* the nav bar: none on phones with their own back, Start and search keys */
 #define NAV_BAR_H	40
-static int nav_h = NAV_BAR_H;
-#define NAV_H		nav_h
 #define DEFAULT_KEY_HEIGHT 56
 #define KEY_GAP		3	/* between keys: the gap is the border */
 #define TERM_ROW_H	38	/* the Esc / Tab / Ctrl / arrows row for terminals */
@@ -2891,12 +2889,7 @@ static void load_config(struct zt_server *server) {
 			snprintf(server->start_wall_path, sizeof(server->start_wall_path), "%s", value);
 		} else if (strcmp(key, "lock_wallpaper") == 0) {
 			snprintf(server->lock_wall_path, sizeof(server->lock_wall_path), "%s", value);
-		} else if (strcmp(key, "nav_bar") == 0) {
-			if (strcmp(value, "on") == 0) {
-				nav_h = NAV_BAR_H;
-			} else if (strcmp(value, "off") == 0) {
-				nav_h = 0;
-			}
+
 		} else if (strcmp(key, "nav_center_icon") == 0) {
 			int n = atoi(value);
 			server->nav_center_icon = n < 0 ? 0 : n > 4 ? 4 : n;
@@ -11210,46 +11203,7 @@ static void constraint_destroy(struct wl_listener *listener, void *data) {
     free(c);
 }
 
-static void constraint_destroy(struct wl_listener *listener, void *data);
 
-static void server_new_pointer_constraint(struct wl_listener *listener, void *data) {
-    struct wlr_pointer_constraint_v1 *constraint = data;
-    struct zt_server *server = wl_container_of(listener, server, new_constraint);
-
-    struct zt_pointer_constraint *c = calloc(1, sizeof(*c));
-    c->server = server;
-    c->constraint = constraint;
-    c->destroy.notify = constraint_destroy;
-    wl_signal_add(&constraint->events.destroy, &c->destroy);
-
-    struct wlr_surface *kb_focus = server->seat->keyboard_state.focused_surface;
-    struct wlr_surface *target_root = wlr_surface_get_root_surface(constraint->surface);
-
-    bool is_focused = (kb_focus && wlr_surface_get_root_surface(kb_focus) == target_root) ||
-                      (server->shown && server->shown->xdg_toplevel &&
-                       wlr_surface_get_root_surface(server->shown->xdg_toplevel->base->surface) == target_root);
-    if (is_focused) {
-        if (server->seat->pointer_state.focused_surface != constraint->surface) {
-            double sx = 0, sy = 0;
-            surface_at(server, server->pointer_x, server->pointer_y, &sx, &sy);
-            wlr_seat_pointer_notify_enter(server->seat, constraint->surface, sx, sy);
-        }
-        wlr_pointer_constraint_v1_send_activated(constraint);
-        server->active_constraint = constraint;
-    }
-}
-
-static void constraint_destroy(struct wl_listener *listener, void *data) {
-    struct zt_pointer_constraint *c = wl_container_of(listener, c, destroy);
-    struct zt_server *server = c->server; // <-- Retrieve server pointer
-    
-    if (server->active_constraint == c->constraint) {
-        wlr_pointer_constraint_v1_send_deactivated(c->constraint);
-        server->active_constraint = NULL;
-    }
-	wl_list_remove(&c->destroy.link);
-    free(c);
-}
 
 static void seat_request_set_selection(struct wl_listener *listener, void *data) {
 	struct zt_server *server = wl_container_of(listener, server, request_set_selection);
@@ -12342,27 +12296,7 @@ static int resize_debounced(void *data) {
 	return 0;
 }
 
-static int resize_debounced(void *data) {
-	struct zt_server *server = data;
-	server->resize_pending = false;
 
-	projection_set(server);
-
-	place_tiles(server);
-	draw_start(server);
-	draw_status(server);
-	draw_shade(server);
-	draw_nav(server);
-	draw_lock(server);
-	draw_rounds(server);
-	osk_layout(server);
-
-	wlr_xcursor_manager_load(server->cursor_mgr, server->scale);
-	wlr_cursor_set_xcursor(server->cursor, server->cursor_mgr, "default");
-
-	damage(server);
-	return 0;
-}
 
 static void output_request_state(struct wl_listener *listener, void *data) {
 	struct zt_output *output = wl_container_of(listener, output, request_state);
@@ -12745,7 +12679,7 @@ int main(int argc, char *argv[]) {
 	server.nav_pressed = -1;
 	server.hwkey_held = -1;
 	if (hardware_nav_keys()) {
-		nav_h = 0;	/* until the config says otherwise */
+		server.navbar_enabled = false;	/* until the config says otherwise */
 		wlr_log(WLR_INFO, "nav: the phone has its own keys; no nav bar");
 	}
 	server.osk_pressed = -1;
