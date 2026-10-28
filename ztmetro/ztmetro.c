@@ -4472,12 +4472,18 @@ static bool on_charger(void) {
  * action centre has it: the charge in per cent under the battery and the date
  * under the clock.
  */
+static void status_row_w(struct zt_server *server, cairo_t *cr, bool details, bool live, double width);
+
 static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool live) {
+	status_row_w(server, cr, details, live, server->width);
+}
+
+static void status_row_w(struct zt_server *server, cairo_t *cr, bool details, bool live, double width) {
 	int offset = 0;
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	/* Sized against the screen, but capped so it never overflows STATUS_H (28pt) on widescreen/PC displays */
-	const double cell = fmin(11.5, fmax(8.0, round(server->width * 0.032 * 2) / 2));	/* battery cell height */
-	const double right = server->width - 14;			/* Start's own side margin */
+	const double cell = fmin(11.5, fmax(8.0, round(width * 0.032 * 2) / 2));	/* battery cell height */
+	const double right = width - 14;			/* Start's own side margin */
 	const double base = (STATUS_H + cell) / 2;	/* the baseline everything stands on */
 	double x = 14;
 	const double arrow = cell * 0.4;
@@ -5079,7 +5085,11 @@ static void shade_tile_rect_local(struct zt_server *server, int index, double *x
 	double panel_x, panel_w;
 	shade_panel_geom(server, &panel_x, &panel_w);
 	double avail_w = panel_w - 2 * SHADE_SIDE - 3 * SHADE_GAP;
-	*w = fmin(136.0, avail_w / 4.0);
+	if (!server->shade_compact) {
+		*w = avail_w / 4.0;
+	} else {
+		*w = fmin(136.0, avail_w / 4.0);
+	}
 	*h = round(*w * 0.66);		/* the quick actions are about 3:2 */
 	*x = SHADE_SIDE + (index % 4) * (*w + SHADE_GAP);
 	*y = SHADE_TOP + (index / 4) * (*h + SHADE_GAP);
@@ -5232,7 +5242,7 @@ static void draw_shade(struct zt_server *server) {
 	struct zt_buffer *buffer = zt_buffer_create(server, panel_w, height, &cr);
 	cairo_set_source_rgb(cr, 0, 0, 0);
 	cairo_paint(cr);
-	status_row(server, cr, true, false);
+	status_row_w(server, cr, true, false, panel_w);
 	/* rendering to a file has no quads to put them on: draw them in place */
 	for (int i = 0; i < 8 && g_dump_dir; i++) {
 		double x, y, w, h;
