@@ -202,6 +202,9 @@ void zmc_turn(int dir);			/* this page's content changes: its rows swivel out an
 void zmc_back(void);
 void zmc_quit(void);
 void zmc_busy(bool busy);		/* the dots across the top, while something loads */
+/* step() runs at the start of every frame, and a frame is drawn every time,
+ * until zmc_on_frame(NULL): motion on the panel's clock, not a timer's */
+void zmc_on_frame(void (*step)(void));
 /* call `ready` from the main loop when fd is readable; NULL removes it */
 void zmc_watch_fd(int fd, void (*ready)(int fd, void *data), void *data);
 /* call `tick` every `ms` from the main loop; 0 stops it. One timer per app. */
