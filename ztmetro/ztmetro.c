@@ -112,7 +112,10 @@ static bool demoloop_active(void) {
 
 /* All layout below is in logical points; the output scale turns them into pixels. */
 #define STATUS_H	28	/* status bar */
-#define NAV_H		40	/* nav bar */
+/* the nav bar: none on phones with their own back, Start and search keys */
+#define NAV_BAR_H	40
+static int nav_h = NAV_BAR_H;
+#define NAV_H		nav_h
 #define DEFAULT_KEY_HEIGHT 56
 #define KEY_GAP		3	/* between keys: the gap is the border */
 #define TERM_ROW_H	38	/* the Esc / Tab / Ctrl / arrows row for terminals */
@@ -765,6 +768,9 @@ struct zt_server {
 	struct wl_event_source *long_press_timer;
 	struct wl_event_source *press_timer;	/* PRESS_DELAY_MS after a finger came down on Start */
 	int nav_pressed;		/* -1: none */
+	int hwkey_held;			/* the nav button whose own key is down; -1: none */
+	bool hwkey_long;		/* ... and held long enough to count as a long press */
+	struct wl_event_source *hwkey_timer;
 
 	/* on-screen keyboard */
 	struct wlr_keyboard vkbd;
@@ -2824,6 +2830,12 @@ static void load_config(struct zt_server *server) {
 			snprintf(server->start_wall_path, sizeof(server->start_wall_path), "%s", value);
 		} else if (strcmp(key, "lock_wallpaper") == 0) {
 			snprintf(server->lock_wall_path, sizeof(server->lock_wall_path), "%s", value);
+		} else if (strcmp(key, "nav_bar") == 0) {
+			if (strcmp(value, "on") == 0) {
+				nav_h = NAV_BAR_H;
+			} else if (strcmp(value, "off") == 0) {
+				nav_h = 0;
+			}
 		} else if (strcmp(key, "nav_center_icon") == 0) {
 			int n = atoi(value);
 			server->nav_center_icon = n < 0 ? 0 : n > 4 ? 4 : n;
@@ -5245,6 +5257,9 @@ static void load_logo(struct zt_server *server) {
 }
 
 static void draw_nav(struct zt_server *server) {
+	if (NAV_H == 0) {
+		return;
+	}
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, NAV_H, &cr);
 	cairo_set_source_rgb(cr, 0, 0, 0);
@@ -8191,6 +8206,90 @@ static int press_fired(void *data) {
 	return 0;
 }
 
+/* A nav button, or the phone's own key for it, pressed and let go. */
+static void nav_activate(struct zt_server *server, int index) {
+	if (server->switcher) {
+		switcher_close(server);	/* any button: back to where we were */
+		return;
+	}
+	if (index == NAV_SEARCH && server->osk_visible) {
+		wlr_log(WLR_INFO, "nav: search while the keyboard is up (keyboard dismissed)");
+		osk_show(server, false);
+		return;
+	}
+	if (server->hyper && index != NAV_SEARCH) {
+		hyper_close(server);	/* back, or Start: it goes, and nothing else */
+		if (index == NAV_BACK) {
+			return;
+		}
+	}
+	if (index == NAV_START) {
+		wlr_log(WLR_INFO, "nav: start");
+		if (server->shown) {
+			show_toplevel(server, NULL);
+		} else {
+			home_reset(server);
+		}
+	} else if (index == NAV_BACK) {
+		wlr_log(WLR_INFO, "nav: back");
+		if (server->shade_open || server->shade_h > 10.0f) {
+			shade_set_open(server, false);
+			return;
+		}
+		if (server->shown && server->shown->android_runtime && server->osk_visible) {
+			osk_show(server, false);
+			const char *id = server->shown->xdg_toplevel->app_id;
+			if (id && !strncmp(id, "waydroid.", 9)) {
+				vkbd_send(server, KEY_ESC, false);
+			}
+		} else if (server->shown && background_app(server->shown)) {
+                server->shown->background_hidden = true;
+                show_toplevel(server, NULL);
+            } else if (server->shown) {
+			vkbd_send(server, KEY_ESC, false);
+		} else if (server->menu_open) {
+			menu_hide(server);
+		} else if (server->searching) {
+			search_end(server);
+		} else if (server->editing) {
+			edit_end(server);
+		} else if (server->page > 0.5f) {
+			page_go(server, 0.0f, 0.0f);
+		}
+	} else {
+		wlr_log(WLR_INFO, "nav: search (Hyperscan)");
+		if (server->hyper) {
+			hyper_close(server);
+		} else {
+			if (server->shade_open || server->shade_h > 10.0f) {
+				shade_set_open(server, false);
+			}
+			if (server->searching) {
+				search_end(server);
+			}
+			hyper_open(server);
+		}
+	}
+}
+
+/* A nav button, or the phone's own key for it, held. */
+static void nav_hold(struct zt_server *server, int index) {
+	hap(server, HAP_HEAVY, HG_NAV);
+	if (index == NAV_BACK) {
+		wlr_log(WLR_INFO, "nav: long press on back");
+		show_next_app(server);
+	} else if (index == NAV_START) {
+		wlr_log(WLR_INFO, "nav: long press on start");
+		switcher_open(server);
+	} else if (index == NAV_SEARCH) {
+		/* held: the keyboard, for an app that does not ask for it */
+		wlr_log(WLR_INFO, "nav: long press on search (keyboard toggle)");
+		if (server->shown && !server->hyper) {
+			osk_show(server, !server->osk_visible);
+		}
+	}
+}
+
 static int long_press_fired(void *data) {
 	struct zt_server *server = data;
 	uint32_t now = now_ms();
@@ -8239,24 +8338,9 @@ static int long_press_fired(void *data) {
 			}
 			continue;
 		}
-		if (p->used && p->role == ROLE_NAV && p->index == NAV_BACK && !p->moved) {
+		if (p->used && p->role == ROLE_NAV && !p->moved) {
 			p->long_pressed = true;
-			hap(server, HAP_HEAVY, HG_NAV);
-			wlr_log(WLR_INFO, "nav: long press on back");
-			show_next_app(server);
-		} else if (p->used && p->role == ROLE_NAV && p->index == NAV_START && !p->moved) {
-			p->long_pressed = true;
-			hap(server, HAP_HEAVY, HG_NAV);
-			wlr_log(WLR_INFO, "nav: long press on start");
-			switcher_open(server);
-		} else if (p->used && p->role == ROLE_NAV && p->index == NAV_SEARCH && !p->moved) {
-			/* held: the keyboard, for an app that does not ask for it */
-			p->long_pressed = true;
-			hap(server, HAP_HEAVY, HG_NAV);
-			wlr_log(WLR_INFO, "nav: long press on search (keyboard toggle)");
-			if (server->shown && !server->hyper) {
-				osk_show(server, !server->osk_visible);
-			}
+			nav_hold(server, p->index);
 		}
 	}
 	return 0;
@@ -9695,68 +9779,7 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 		if (cancelled || p->moved || p->long_pressed) {
 			break;
 		}
-		if (server->switcher) {
-			switcher_close(server);	/* any button: back to where we were */
-			break;
-		}
-		if (p->index == NAV_SEARCH && server->osk_visible) {
-			wlr_log(WLR_INFO, "nav: search while the keyboard is up (keyboard dismissed)");
-			osk_show(server, false);
-			break;
-		}
-		if (server->hyper && p->index != NAV_SEARCH) {
-			hyper_close(server);	/* back, or Start: it goes, and nothing else */
-			if (p->index == NAV_BACK) {
-				break;
-			}
-		}
-		if (p->index == NAV_START) {
-			wlr_log(WLR_INFO, "nav: start");
-			if (server->shown) {
-				show_toplevel(server, NULL);
-			} else {
-				home_reset(server);
-			}
-		} else if (p->index == NAV_BACK) {
-			wlr_log(WLR_INFO, "nav: back");
-			if (server->shade_open || server->shade_h > 10.0f) {
-				shade_set_open(server, false);
-				break;
-			}
-			if (server->shown && server->shown->android_runtime && server->osk_visible) {
-				osk_show(server, false);
-				const char *id = server->shown->xdg_toplevel->app_id;
-				if (id && !strncmp(id, "waydroid.", 9)) {
-					vkbd_send(server, KEY_ESC, false);
-				}
-			} else if (server->shown && background_app(server->shown)) {
-                server->shown->background_hidden = true;
-                show_toplevel(server, NULL);
-            } else if (server->shown) {
-				vkbd_send(server, KEY_ESC, false);
-			} else if (server->menu_open) {
-				menu_hide(server);
-			} else if (server->searching) {
-				search_end(server);
-			} else if (server->editing) {
-				edit_end(server);
-			} else if (server->page > 0.5f) {
-				page_go(server, 0.0f, 0.0f);
-			}
-		} else {
-			wlr_log(WLR_INFO, "nav: search (Hyperscan)");
-			if (server->hyper) {
-				hyper_close(server);
-			} else {
-				if (server->shade_open || server->shade_h > 10.0f) {
-					shade_set_open(server, false);
-				}
-				if (server->searching) {
-					search_end(server);
-				}
-				hyper_open(server);
-			}
-		}
+		nav_activate(server, p->index);
 		break;
 	case ROLE_HYPER:
 		if (!cancelled && !p->moved) {
@@ -10259,6 +10282,74 @@ static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) 
 		&keyboard->wlr_keyboard->modifiers);
 }
 
+/* The nav button a phone's own key stands for: Samsung's are, from the left,
+ * recents (Hyperscan here), home (Start) and back. -1: not one of them. */
+static int hwkey_nav(uint32_t keycode) {
+	switch (keycode) {
+	case KEY_BACK:
+		return NAV_BACK;
+	case KEY_HOMEPAGE:
+		return NAV_START;
+	case KEY_APPSELECT:
+	case KEY_MENU:
+		return NAV_SEARCH;
+	}
+	return -1;
+}
+
+static int hwkey_held_fired(void *data) {
+	struct zt_server *server = data;
+	if (server->hwkey_held >= 0 && !server->hwkey_long) {
+		server->hwkey_long = true;
+		nav_hold(server, server->hwkey_held);
+	}
+	return 0;
+}
+
+/* Whether the phone has its own back and home keys, so it needs no nav bar.
+ * Read from sysfs (the session cannot open the event devices itself); USB
+ * keyboards, which may have both, do not count. */
+static bool hardware_nav_keys(void) {
+	bool back = false, home = false;
+	DIR *dir = opendir("/sys/class/input");
+	struct dirent *e;
+	while (dir && !(back && home) && (e = readdir(dir))) {
+		if (strncmp(e->d_name, "event", 5) != 0) {
+			continue;
+		}
+		char path[300], real[PATH_MAX], caps[1024];
+		snprintf(path, sizeof(path), "/sys/class/input/%s/device", e->d_name);
+		if (!realpath(path, real) || strstr(real, "/usb")) {
+			continue;
+		}
+		snprintf(path, sizeof(path), "/sys/class/input/%s/device/capabilities/key", e->d_name);
+		FILE *f = fopen(path, "r");
+		if (!f) {
+			continue;
+		}
+		bool ok = fgets(caps, sizeof(caps), f) != NULL;
+		fclose(f);
+		if (!ok) {
+			continue;
+		}
+		/* words of the key bitmap, the highest first */
+		unsigned long words[16];
+		int n = 0;
+		for (char *tok = strtok(caps, " \n"); tok && n < 16; tok = strtok(NULL, " \n")) {
+			words[n++] = strtoul(tok, NULL, 16);
+		}
+		int bits = sizeof(unsigned long) * 8;
+		#define HAS_KEY(k) ((k) / bits < n && (words[n - 1 - (k) / bits] >> ((k) % bits) & 1))
+		back |= HAS_KEY(KEY_BACK);
+		home |= HAS_KEY(KEY_HOMEPAGE);
+		#undef HAS_KEY
+	}
+	if (dir) {
+		closedir(dir);
+	}
+	return back && home;
+}
+
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 	struct zt_keyboard *keyboard = wl_container_of(listener, keyboard, key);
 	struct zt_server *server = keyboard->server;
@@ -10285,10 +10376,41 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 			return;
 		}
 	}
+	int nav = hwkey_nav(event->keycode);
+	if (nav == NAV_START && !server->screen_on &&
+	    event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		/* home wakes the screen, as the power key does */
+		screen_set(server, true);
+		activity(server);
+		server->hwkey_held = -1;	/* its release is not a Start press */
+		return;
+	}
 	if (!server->screen_on) {
 		return;
 	}
 	activity(server);
+	if (nav >= 0) {
+		wlr_log(WLR_INFO, "nav: key %u %s", event->keycode,
+			event->state == WL_KEYBOARD_KEY_STATE_PRESSED ? "down" : "up");
+		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+			if (server->locked || server->auth_active) {
+				return;
+			}
+			if (nav != NAV_START) {
+				hap(server, HAP_TAP, HG_NAV);	/* the two touch keys */
+			}
+			server->hwkey_held = nav;
+			server->hwkey_long = false;
+			wl_event_source_timer_update(server->hwkey_timer, LONG_PRESS_MS);
+		} else if (server->hwkey_held == nav) {
+			wl_event_source_timer_update(server->hwkey_timer, 0);
+			server->hwkey_held = -1;
+			if (!server->hwkey_long && !server->locked) {
+				nav_activate(server, nav);
+			}
+		}
+		return;
+	}
 	if (event->keycode == KEY_VOLUMEUP || event->keycode == KEY_VOLUMEDOWN) {
 		/* DemoLoop owns volume down; three presses stop it, touches never do. */
 		if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
@@ -10381,6 +10503,7 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 		keyboard->destroy.notify = keyboard_handle_destroy;
 		wl_signal_add(&device->events.destroy, &keyboard->destroy);
 		wl_list_insert(&server->keyboards, &keyboard->link);
+		wlr_log(WLR_INFO, "keys: %s", device->name);
 	}
 }
 
@@ -11674,6 +11797,11 @@ int main(int argc, char *argv[]) {
 
 	struct zt_server server = {0};
 	server.nav_pressed = -1;
+	server.hwkey_held = -1;
+	if (hardware_nav_keys()) {
+		nav_h = 0;	/* until the config says otherwise */
+		wlr_log(WLR_INFO, "nav: the phone has its own keys; no nav bar");
+	}
 	server.osk_pressed = -1;
 	server.ctl_fd = -1;
     server.auth_fd = -1;
@@ -11801,6 +11929,7 @@ int main(int argc, char *argv[]) {
 	wlr_seat_set_keyboard(server.seat, &server.vkbd);
 
 	server.long_press_timer = wl_event_loop_add_timer(server.loop, long_press_fired, &server);
+	server.hwkey_timer = wl_event_loop_add_timer(server.loop, hwkey_held_fired, &server);
 	server.press_timer = wl_event_loop_add_timer(server.loop, press_fired, &server);
 	server.key_repeat_timer = wl_event_loop_add_timer(server.loop, key_repeat_fired, &server);
 	server.repeat_index = -1;

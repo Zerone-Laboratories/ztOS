@@ -1,0 +1,14 @@
+[Unit]
+Description=ztos-touchkeyd: the Galaxy J5's capacitive recents and back keys
+# only the J5 has this chip on these lines; anywhere else they are other things
+ConditionFirmware=device-tree-compatible(samsung,j5)
+# before the shell, so it finds the keys and leaves out its own nav bar
+Before=greetd.service
+
+[Service]
+ExecStart=/usr/local/sbin/ztos-touchkeyd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
