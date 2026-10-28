@@ -900,7 +900,27 @@ static gpointer dpy_egl(WPEDisplay *d, GError **error) {
 }
 static WPEKeymap *dpy_keymap(WPEDisplay *d) { return wpe_display_get_keymap(((ZtDisplay *)d)->inner); }
 static WPEBufferFormats *dpy_formats(WPEDisplay *d) {
-	return wpe_display_get_preferred_buffer_formats(((ZtDisplay *)d)->inner);
+	WPEBufferFormats *inner = wpe_display_get_preferred_buffer_formats(((ZtDisplay *)d)->inner);
+	/* ZTB_RGB565=1: WebKit composes into 16-bit frames first (measuring: the
+	 * Adreno 306's 128 KB of GMEM takes half the bins for them) */
+	if (!inner || !getenv("ZTB_RGB565")) return inner;
+	WPEBufferFormatsBuilder *b = wpe_buffer_formats_builder_new(wpe_buffer_formats_get_device(inner));
+	guint groups = wpe_buffer_formats_get_n_groups(inner);
+	for (guint g = 0; g < groups; g++) {
+		wpe_buffer_formats_builder_append_group(b, wpe_buffer_formats_get_group_device(inner, g),
+			wpe_buffer_formats_get_group_usage(inner, g));
+		if (g == 0) wpe_buffer_formats_builder_append_format(b, 0x36314752 /* RG16 */, 0 /* LINEAR */);
+		guint n = wpe_buffer_formats_get_group_n_formats(inner, g);
+		for (guint i = 0; i < n; i++) {
+			GArray *mods = wpe_buffer_formats_get_format_modifiers(inner, g, i);
+			for (guint m = 0; mods && m < mods->len; m++)
+				wpe_buffer_formats_builder_append_format(b, wpe_buffer_formats_get_format_fourcc(inner, g, i),
+					g_array_index(mods, guint64, m));
+		}
+	}
+	WPEBufferFormats *out = wpe_buffer_formats_builder_end(b);
+	wpe_buffer_formats_builder_unref(b);
+	return out;
 }
 static WPEDRMDevice *dpy_drm(WPEDisplay *d) { return wpe_display_get_drm_device(((ZtDisplay *)d)->inner); }
 static guint dpy_n_screens(WPEDisplay *d) { (void)d; return 1; }
