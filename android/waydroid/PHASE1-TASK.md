@@ -34,7 +34,7 @@ Goals (measure before/after each change, report numbers):
 3. Small footprint: build a stripped system image without Google/LineageOS apps the
    user does not need. Work on a copy (`/usr/share/waydroid-extra/images/system.img.stock`
    backup kept). Remove from the image: product/app {Aperture, ApertureLensLauncher,
-   Backgrounds, DeskClock, Etar, Gallery2, Jelly, LocalContactsBackup,
+   Backgrounds, DeskClock, Etar, ExactCalculator, Gallery2, Jelly, LocalContactsBackup,
    PhotoTable, Recorder}, product/priv-app {Eleven, Contacts}, system/app {BasicDreams,
    EasterEgg, PrintRecommendationService, NfcNci, SecureElement, WallpaperBackup,
    HTMLViewer, CameraExtensionsProxy}, system/priv-app {LiveWallpapersPicker,

@@ -45,7 +45,7 @@ fi
 # Also keep MmsService (telephony dependencies), providers and all framework files.
 removed=0
 for path in \
-    system/product/app/{Aperture,ApertureLensLauncher,Backgrounds,DeskClock,Etar,Gallery2,Jelly,LocalContactsBackup,PhotoTable,Recorder} \
+    system/product/app/{Aperture,ApertureLensLauncher,Backgrounds,DeskClock,Etar,ExactCalculator,Gallery2,Jelly,LocalContactsBackup,PhotoTable,Recorder} \
     system/product/priv-app/{Eleven,Contacts} \
     system/app/{BasicDreams,EasterEgg,PrintRecommendationService,NfcNci,SecureElement,WallpaperBackup,HTMLViewer,CameraExtensionsProxy} \
     system/priv-app/{LiveWallpapersPicker,ManagedProvisioning,BuiltInPrintService,DynamicSystemInstallationService,MtpService}; do
