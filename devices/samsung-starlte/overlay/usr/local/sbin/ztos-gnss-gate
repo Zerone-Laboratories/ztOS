@@ -15,38 +15,167 @@ it first as a proprietary sentence, $PZTLF,lat,lon,accuracy_m,unix_time,
 so that it can show a position at once; readers that do not know it skip
 it, as NMEA readers do with any P sentence. No position goes to the log.
 
+Sleep (zrn-sleepd). A SoC sleep while gpsd streams leaves the hub unable to
+answer (MCU_REQ_RESP timeout, then a hub reset, 2026-10-30), so while the
+engine runs for a reader the gate holds sleep off with a timed inhibit,
+/run/zrn-sleepd/inhibit/timed-gnss: its mtime is its expiry, renewed every
+HOLD_EVERY seconds HOLD_FOR ahead, so a dead gate holds nothing for long.
+With the screen off the engine stops IDLE_OFF seconds after its last
+reader, well before zrn-sleepd's 15 s; with the screen on, after IDLE. A
+reader that keeps it on with the screen off (a keep_awake app navigating)
+gets CAP seconds; then the engine stops ("screen-off location cap") and
+stays off until the screen is on, unless a ztOS keep flag
+(/run/ztos-gnss/keep-NAME) or a fresh ztos-waydroid-keep-screen says
+otherwise. All of these timers use CLOCK_BOOTTIME, which counts sleep.
+
+Accuracy: zrn-gnss-nmea sends $PZTFX,accuracy_m,, with the engine's own
+estimate; without one the gate falls back to HDOP x 4 m.
+
 It also stands in for Samsung's RIL (@VND_Multiclient, see ril_stand_in).
 """
-import os, socket, subprocess, sys, threading, time
+import glob, os, socket, subprocess, sys, threading, time
 
 PUBLIC_TCP = ("127.0.0.1", 10110)
 PUBLIC_UNIX = "/run/ztos-gnss/nmea.sock"
 INNER = ("127.0.0.1", 10111)
-IDLE = 120
+IDLE = 120     # screen on: engine kept this long after the last reader
+IDLE_OFF = 5   # screen off: stopped before zrn-sleepd may sleep (15 s)
+CAP = 600      # screen off this long with readers: engine off until screen on
 LAST = "/var/lib/ztos-gnss/last"
 SAVE_EVERY = 60  # seconds between writes of LAST while fixes come
+BACKLOG_MAX = 64 * 1024  # a reader this far behind is dropped
 
-lock = threading.Lock()
+# zrn-sleepd's inhibit (power/suspend/README.md; the interface is fixed:
+# written outside inhibit/, mtime set, then renamed in, so it never appears
+# already expired)
+SLEEPD = "/run/zrn-sleepd"
+INHIBIT_DIR = SLEEPD + "/inhibit"
+INHIBIT = INHIBIT_DIR + "/timed-gnss"
+INHIBIT_TMP = SLEEPD + "/.gnss.tmp"
+HOLD_FOR = 90     # each renewal holds sleep this far ahead (wall clock)
+HOLD_EVERY = 30   # renewed this often while the engine serves a reader
+STOP_HOLD = 35    # held while the engine stops (TimeoutStopSec is 20)
+START_HOLD = 90   # held this long after a start before the engine answers
+ENGINE_SEEN = 30  # held while the engine answered this recently
+KEEP_GLOB = "/run/ztos-gnss/keep-*"
+KEEP_SCREEN_GLOB = "/run/user/*/ztos-waydroid-keep-screen"
+KEEP_SCREEN_FRESH = 40  # the bridge touches it every 15 s (ztmetro.c)
+HUB_READY = "/sys/class/sec/sensorhub/ready"
+HUB_READY_HELD = 10  # the hub ready this long before the start limit is reset
+DRM_GLOB = "/sys/class/drm/card*-*/enabled"
+
+
+def now():
+    """Seconds on CLOCK_BOOTTIME: counts time asleep, unlike monotonic."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+lock = threading.RLock()
 clients = set()
-last_reader = time.monotonic()
+backlog = {}   # reader -> bytes still to send it (whole sentences only)
+last_reader = now()
 running = False
 arrived = threading.Event()  # set by accept_loop: wakes an idle pump
 last_start = 0.0
 RESTART = 30  # engine still unreachable this long after a start: ask again
+held_at = None     # now() of the last inhibit write, None when not held
+served_off_since = None  # now() since when readers are served, screen off
+capped = False     # screen-off cap reached: no engine until the screen is on
+refused_logged = False
+stop_gen = 0
+ready_since = None
+start_issued_at = -1e9  # now() of the last start that could work
+engine_seen = -1e9      # now() when the engine last answered (inner socket)
 
 
 def log(msg):
     print(f"ztos-gnss-gate: {msg}", file=sys.stderr, flush=True)
 
 
-def unit(action):
-    subprocess.run(["systemctl", "--no-block", action, "ztos-gnss.service"], check=False)
+def unit(action, wait=False):
+    subprocess.run(["systemctl"] + ([] if wait else ["--no-block"]) +
+                   [action, "ztos-gnss.service"], check=False)
+
+
+def spawn(fn, *args):
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+def screen_off():
+    """Every DRM connector disabled: the same test as zrn-sleepd's."""
+    states = []
+    for p in glob.glob(DRM_GLOB):
+        try:
+            with open(p) as f:
+                states.append(f.read().strip())
+        except OSError:
+            pass
+    return bool(states) and all(v == "disabled" for v in states)
+
+
+def kept():
+    """Something asked for location with the screen off on purpose."""
+    if glob.glob(KEEP_GLOB):
+        return True
+    t = time.time()
+    for p in glob.glob(KEEP_SCREEN_GLOB):
+        try:
+            if 0 <= t - os.stat(p).st_mtime < KEEP_SCREEN_FRESH:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def hub_ready():
+    try:
+        with open(HUB_READY) as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+# ---- zrn-sleepd's inhibit ----
+inhibit_error = None
+
+
+def hold(ahead=HOLD_FOR):
+    """Hold sleep off until `ahead` seconds from now. Called with lock held."""
+    global held_at, inhibit_error
+    try:
+        os.makedirs(INHIBIT_DIR, exist_ok=True)
+        fd = os.open(INHIBIT_TMP, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.close(fd)
+        exp = time.time() + ahead
+        os.utime(INHIBIT_TMP, (exp, exp))
+        os.replace(INHIBIT_TMP, INHIBIT)
+        held_at = now()
+        inhibit_error = None
+    except OSError as e:
+        if str(e) != inhibit_error:
+            inhibit_error = str(e)
+            log(f"cannot hold sleep off: {e}")
+
+
+def release():
+    """Called with lock held."""
+    global held_at
+    held_at = None
+    try:
+        os.unlink(INHIBIT)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(f"cannot let sleep go: {e}")
 
 
 # ---- the last fix ----
 last_fix = None      # (lat, lon, accuracy_m, unix_time)
+last_fix_at = -1e9   # now() of last_fix
 last_saved = 0.0
 hdop = None          # from the latest GGA with a fix
+engine_acc = None    # (accuracy_m, now()) from the latest $PZTFX
+ACC_FRESH = 2.0      # a $PZTFX this close to an RMC belongs to its fix
 
 
 def load_last():
@@ -65,7 +194,7 @@ def save_last():
     global last_saved
     if not last_fix:
         return
-    last_saved = time.monotonic()
+    last_saved = now()
     try:
         os.makedirs(os.path.dirname(LAST), exist_ok=True)
         tmp = LAST + ".new"
@@ -100,8 +229,8 @@ def degrees(v, hemi, width):
 
 
 def track(line):
-    """Remember the latest fix from GGA/RMC. Called with lock held."""
-    global last_fix, hdop
+    """Remember the latest fix from GGA/RMC/PZTFX. Called with lock held."""
+    global last_fix, last_fix_at, hdop, engine_acc
     if len(line) < 7 or line[0] != "$" or "*" not in line:
         return
     body, _, cs = line[1:].partition("*")
@@ -110,16 +239,28 @@ def track(line):
     f = body.split(",")
     kind = f[0][2:]
     try:
-        if kind == "GGA" and len(f) > 8:
+        if f[0] == "PZTFX" and len(f) > 1 and f[1]:
+            acc = float(f[1])
+            if not 0 < acc < 100000:
+                return
+            engine_acc = (acc, now())
+            # the engine's estimate may follow its RMC: give it to that fix
+            if last_fix and now() - last_fix_at < ACC_FRESH:
+                last_fix = last_fix[:2] + (max(1.0, acc),) + last_fix[3:]
+        elif kind == "GGA" and len(f) > 8:
             hdop = float(f[8]) if f[6] not in ("", "0") and f[8] else None
         elif kind == "RMC" and len(f) > 6 and f[2] == "A":
             lat, lon = degrees(f[3], f[4], 2), degrees(f[5], f[6], 3)
             if lat is None or lon is None:
                 return
-            # no error estimate in RMC/GGA: HDOP times a typical 4 m
-            acc = max(5.0, hdop * 4.0) if hdop else 20.0
+            if engine_acc and now() - engine_acc[1] < ACC_FRESH:
+                acc = max(1.0, engine_acc[0])   # the engine's own estimate
+            else:
+                # no error estimate in RMC/GGA: HDOP times a typical 4 m
+                acc = max(5.0, hdop * 4.0) if hdop else 20.0
             last_fix = (lat, lon, acc, time.time())
-            if time.monotonic() - last_saved > SAVE_EVERY:
+            last_fix_at = now()
+            if now() - last_saved > SAVE_EVERY:
                 save_last()
     except ValueError:
         pass
@@ -152,29 +293,99 @@ def ril_stand_in():
         threading.Thread(target=drain, args=(c,), daemon=True).start()
 
 
+def drop(c):
+    """Forget a reader. Called with lock held."""
+    global last_reader
+    try:
+        c.close()
+    except OSError:
+        pass
+    clients.discard(c)
+    backlog.pop(c, None)
+    if not clients:
+        last_reader = now()
+
+
+def feed(c, data):
+    """Send whole sentences to a reader, keeping what it cannot take yet.
+
+    Called with lock held. A partial send leaves the rest of its sentence at
+    the head of the reader's backlog, so no reader ever gets a spliced line;
+    one that falls BACKLOG_MAX behind is dropped (it reconnects if it wants).
+    """
+    buf = backlog.pop(c, b"") + data
+    if not buf:
+        return
+    try:
+        n = c.send(buf)
+    except BlockingIOError:
+        n = 0
+    except OSError:
+        drop(c)
+        return
+    buf = buf[n:]
+    if len(buf) > BACKLOG_MAX:
+        log("a reader fell too far behind; dropped it")
+        drop(c)
+    elif buf:
+        backlog[c] = buf
+
+
+def start_engine(why):
+    """Called with lock held."""
+    global running, last_start, refused_logged
+    if capped:
+        if not refused_logged:
+            refused_logged = True
+            log("screen-off location cap: GPS stays off until the screen is on")
+        return
+    global start_issued_at
+    running = True
+    last_start = start_issued_at = now()
+    log(why)
+    # someone asks: a start limit hit earlier (hub down, sleep)
+    # must not keep the GPS off until it times out
+    subprocess.run(["systemctl", "reset-failed", "ztos-gnss.service"],
+                   check=False, stderr=subprocess.DEVNULL)
+    unit("start")
+    if clients:
+        hold()  # before the engine comes up: no sleep lands in its start
+
+
+def stop_engine(why):
+    """Called with lock held. Sleep stays held (screen off) until the unit
+    has stopped: a sleep while gpsd winds down is a sleep while it runs."""
+    global running, stop_gen
+    running = False
+    log(why)
+    save_last()
+    if screen_off():
+        hold(STOP_HOLD)
+    else:
+        release()
+    stop_gen += 1
+    spawn(finish_stop, stop_gen)
+
+
+def finish_stop(gen):
+    unit("stop", wait=True)
+    with lock:
+        if not running and gen == stop_gen:
+            release()
+
+
 def accept_loop(server):
-    global running, last_start
     while True:
         conn, _ = server.accept()
         conn.setblocking(False)
         with lock:
+            clients.add(conn)
             hello = last_sentence()
             if hello:
-                try:
-                    conn.send(hello)
-                except OSError:
-                    pass
-            clients.add(conn)
+                feed(conn, hello)
             arrived.set()
             if not running:
-                running = True
-                last_start = time.monotonic()
-                log("reader arrived; GPS on")
-                # someone asks: a start limit hit earlier (hub down, sleep)
-                # must not keep the GPS off until it times out
-                subprocess.run(["systemctl", "reset-failed", "ztos-gnss.service"],
-                               check=False, stderr=subprocess.DEVNULL)
-                unit("start")
+                start_engine("reader arrived; GPS on")
 
 
 def prune_readers():
@@ -183,7 +394,6 @@ def prune_readers():
     Called with lock held. Drain client input: this is an output-only NMEA
     endpoint, and unread input must not hide a subsequent EOF.
     """
-    global last_reader
     for c in list(clients):
         try:
             if c.recv(4096):
@@ -192,34 +402,65 @@ def prune_readers():
             continue
         except OSError:
             pass
-        c.close()
-        clients.discard(c)
-        if not clients:
-            last_reader = time.monotonic()
+        drop(c)
+
+
+def policy():
+    """Idle stop, screen-off cap and the inhibit. Called with lock held,
+    about once a second while the engine is wanted. Returns `running`."""
+    global last_reader, served_off_since, capped, refused_logged
+    t = now()
+    off = screen_off()
+    if not off and capped:
+        capped = False
+        refused_logged = False
+        log("screen on: location allowed again")
+        if clients and not running:
+            start_engine("screen on; GPS on for the waiting readers")
+    if clients:
+        last_reader = t
+    if running and clients and off:
+        if served_off_since is None:
+            served_off_since = t
+    else:
+        served_off_since = None
+    if served_off_since is not None and t - served_off_since >= CAP and not kept():
+        capped = True
+        stop_engine(f"screen-off location cap: {CAP} s with the screen off; "
+                    "GPS off until the screen is on")
+    elif running and not clients and t - last_reader > (IDLE_OFF if off else IDLE):
+        stop_engine("no readers; GPS off")
+    # held only while there is an engine to protect: starting, or answering.
+    # A dead hub with a reader waiting must not keep the phone awake.
+    alive = t - engine_seen < ENGINE_SEEN or t - start_issued_at < START_HOLD
+    if running and clients and alive:
+        if held_at is None or t - held_at >= HOLD_EVERY or not os.path.exists(INHIBIT):
+            hold()
+    elif running and held_at is not None and (clients or not off):
+        # no engine to protect, or the last reader left with the screen on.
+        # (With the screen off and no reader the engine stops in IDLE_OFF s,
+        # and stop_engine holds sleep until it has.)
+        release()
+    return running
 
 
 def pump():
     """Copy inner NMEA to every reader; reconnect while the unit comes up."""
-    global last_reader, running, last_start
+    global last_start, ready_since, start_issued_at, engine_seen
     inner = None
     pending = b""
     while True:
         with lock:
             prune_readers()
-            if clients:
-                last_reader = time.monotonic()
-            elif running and time.monotonic() - last_reader > IDLE:
-                running = False
-                log("no readers; GPS off")
-                save_last()
-                unit("stop")
-            want = running
+            want = policy()
+            waiting = capped and bool(clients)
         if not want:
             if inner:
                 inner.close()
                 inner = None
             # idle: sleep until a reader connects, no periodic wakeups
-            arrived.wait()
+            # (readers held off by the cap: look at the screen every 2 s)
+            arrived.wait(2 if waiting else None)
             arrived.clear()
             continue
         if inner is None:
@@ -228,15 +469,29 @@ def pump():
                 inner.settimeout(1)
             except OSError:
                 # ztos-gnss.service gave up (hub down, start limit): readers
-                # are still waiting, so ask again; systemd's start limit keeps
-                # this to three tries in five minutes
+                # are still waiting, so ask again. The start limit is reset
+                # only once the hub has been ready HUB_READY_HELD s: a
+                # flapping hub must not restart gpsd every RESTART s.
                 # (only for readers still waiting, not during the idle hold)
-                if clients and time.monotonic() - last_start > RESTART:
-                    last_start = time.monotonic()
-                    log("engine unreachable; starting it again")
-                    unit("start")
+                with lock:
+                    t = now()
+                    if hub_ready():
+                        ready_since = t if ready_since is None else ready_since
+                    else:
+                        ready_since = None
+                    if running and clients and t - last_start > RESTART:
+                        last_start = t
+                        if ready_since is not None and t - ready_since >= HUB_READY_HELD:
+                            log("engine unreachable; starting it again")
+                            start_issued_at = t
+                            subprocess.run(["systemctl", "reset-failed", "ztos-gnss.service"],
+                                           check=False, stderr=subprocess.DEVNULL)
+                        else:
+                            log("engine unreachable; the sensor hub is not ready yet")
+                        unit("start")
                 time.sleep(1)
                 continue
+        engine_seen = now()   # connected: zrn-gnss-nmea (so gpsd) is up
         try:
             data = inner.recv(4096)
         except socket.timeout:
@@ -255,25 +510,18 @@ def pump():
                 pending = b""
             for raw in lines:
                 track(raw.decode("ascii", "replace").strip())
+            out = b"".join(raw + b"\n" for raw in lines)
             for c in list(clients):
-                try:
-                    c.send(data)
-                except BlockingIOError:
-                    pass  # slow reader: it misses a sentence
-                except OSError:
-                    c.close()
-                    clients.discard(c)
+                feed(c, out)
             # readers that hung up without being written to
             for c in list(clients):
                 try:
                     if c.recv(1, socket.MSG_PEEK) == b"":
-                        c.close()
-                        clients.discard(c)
+                        drop(c)
                 except BlockingIOError:
                     pass
                 except OSError:
-                    c.close()
-                    clients.discard(c)
+                    drop(c)
 
 
 def main():
@@ -291,6 +539,8 @@ def main():
     os.chmod(PUBLIC_UNIX, 0o666)
     ux.listen(8)
     load_last()
+    with lock:
+        release()  # a hold left by an earlier gate: nothing runs yet
     threading.Thread(target=ril_stand_in, daemon=True).start()
     for s in (tcp, ux):
         threading.Thread(target=accept_loop, args=(s,), daemon=True).start()

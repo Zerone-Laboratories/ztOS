@@ -45,10 +45,13 @@ case "${1:-}" in
 	# rewritten in place: a bind mount follows the file, not its name
 	cat $hosts.new > $hosts && rm -f $hosts.new
 	findmnt -n $R/system/etc/hosts >/dev/null 2>&1 || mount --bind $hosts $R/system/etc/hosts
-	# the hub (lhd) must already be serving: wait up to 60 s
+	# the hub must already be serving: lhd running and its firmware ready
+	# (ready=1 is set once the patch is in). Wait up to 60 s, for a start
+	# right after a hub restart. ready is cached: it cannot show a chip that
+	# lost its firmware in a sleep, which is why the gate holds sleep off.
 	i=0
-	while ! pgrep -x lhd >/dev/null; do
-		i=$((i + 1)); [ $i -gt 60 ] && { log "lhd not running; sensor hub down"; exit 1; }
+	while ! pgrep -x lhd >/dev/null || [ "$(cat /sys/class/sec/sensorhub/ready 2>/dev/null)" != 1 ]; do
+		i=$((i + 1)); [ $i -gt 60 ] && { log "sensor hub not ready (lhd or its firmware); not starting"; exit 1; }
 		sleep 1
 	done
 	;;

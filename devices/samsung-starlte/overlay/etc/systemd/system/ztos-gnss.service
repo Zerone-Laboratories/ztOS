@@ -1,7 +1,10 @@
 [Unit]
 Description=ztOS GNSS: Broadcom gpsd on the BCM4773, NMEA to ztos-gnss-gate
 # started and stopped by ztos-gnss-gate.service, only while something reads location
-Requires=ztoscsf-sensorhub.service
+# Requisite, not Requires: a GNSS start must never bring the hub up itself,
+# without ztoscsf's reset sequence; with the hub down it fails at once and
+# the gate tries again once the hub is back (ready for 10 s)
+Requisite=ztoscsf-sensorhub.service
 After=ztoscsf-sensorhub.service
 # a few tries only: a dead hub must not spin this forever
 StartLimitIntervalSec=300
@@ -15,8 +18,13 @@ RestartSec=10
 # SIGTERM to ztos-gnss only: it stops the HAL client, then gpsd (see there)
 KillMode=mixed
 TimeoutStopSec=20
+# The gate's sleep inhibit goes with the engine, however it ended (the gate
+# holds it only while the engine runs; see ztos-gnss-gate).
+ExecStopPost=-/bin/rm -f /run/zrn-sleepd/inhibit/timed-gnss
 # lhd passes GNSS data to gpsd through a pipe: once gpsd is gone, lhd blocks
 # writing to it and the whole sensor hub stops (2026-10-27). Restart the
 # whole framework after gpsd: a bare lhd restart without the hub's reset
 # sequence made the firmware assert (transport_layer.c line 165) a minute on.
+# Also today's recovery after a hub that died in a sleep: keep it until the
+# pin fix (zrn-sleep-init pdn table) has held across real doze cycles.
 ExecStopPost=/usr/bin/systemctl --no-block restart ztoscoresensorframework.service
