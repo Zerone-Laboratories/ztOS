@@ -78,6 +78,11 @@ void webview_touch_up(struct webview *wv, int id, unsigned time);
 void webview_touch_cancel(struct webview *wv);
 /* scroll the page by dy points on WebKit's scrolling thread (a touchpad's way) */
 void webview_pan(struct webview *wv, double dy, double x, double y, bool stop);
+/* step() on the main thread once each vblank of the panel (NULL: no more);
+ * false if there is no vblank to be had */
+bool webview_on_vblank(void (*step)(void));
+/* when the vblank that called the step was (g_get_monotonic_time's clock) */
+gint64 webview_vblank_us(void);
 /* typing into the page's focused text field: a char, "\b" or "\n" */
 void webview_key(struct webview *wv, const char *utf8);
 void webview_scroll(struct webview *wv, double dx, double dy);
@@ -98,6 +103,10 @@ bool webview_snap_active(struct webview *wv);
 /* Draw the latest page frame as a GPU quad over (x,y,w,h) in points. Call from
  * the app's .overlay hook. No-op until a frame has arrived. */
 void webview_composite(struct webview *wv, int x, int y, int w, int h);
+/* the page is not drawn this frame (Superscan has something of its own in its
+ * place): WebKit's frames on the shell go under Superscan's window until the
+ * next webview_composite */
+void webview_hide(struct webview *wv);
 
 /* Run WebKit's (GLib) work: call often from a zmc_every tick, since zmc's loop
  * is Wayland-only and would otherwise never service the engine. */

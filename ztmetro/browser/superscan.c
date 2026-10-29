@@ -382,6 +382,15 @@ static struct {
 	 * handed to WebKit, given once a frame */
 	bool pan, pan_fling;
 	double owed, pan_x, pan_y;
+	/* the finger's last few places and times while it pans, and the place
+	 * whose travel WebKit has been given: each vblank the page goes to where
+	 * the finger was a little before it (pan_finger), not by whatever travel
+	 * happened to come in since the last one (two touches or three, at 120
+	 * a second against 60 frames: steps 50% apart, the page juddered) */
+	double samp_y[8];
+	gint64 samp_us[8];
+	int samp_n;
+	double sent_y;
 	gint64 move_us;
 } S;
 static guint spring_source, fling_source;
@@ -489,10 +498,74 @@ static gboolean fling_tick(gpointer unused) {
 	return G_SOURCE_CONTINUE;
 }
 
+/* Panning steps on the panel's vblank, from WebKit's side (webview_on_vblank),
+ * not on this window's frames: stepped by zmc_on_frame, Superscan drew and
+ * sent the shell its whole window every frame of a scroll although nothing in
+ * it changed (the page is the shell's subsurface), about a third of a core;
+ * and the shell's frame callbacks are not the panel's vblanks, so a WebKit
+ * frame got two steps or none now and then: the page stuttered. */
+static bool pan_vblank;
+
+static void pan_step(void);
+static void frame_step(void);
+
+static void clock_start_pan(void) {
+	if (fling_source) return;
+	fling_source = 1;	/* (a mark: the clock drives it now) */
+	pan_vblank = webview_on_vblank(pan_step);
+	if (!pan_vblank) zmc_on_frame(frame_step);	/* (no vblank to be had: this window's frames) */
+}
+
+static void clock_stop(void) {
+	if (pan_vblank) webview_on_vblank(NULL);
+	else if (fling_source) zmc_on_frame(NULL);
+	pan_vblank = false;
+	fling_source = 0;
+}
+
+#define PAN_BEHIND_US	8000	/* a touch's interval: the place is between two of them */
+
+/* a touch at `time` (the shell's milliseconds, CLOCK_MONOTONIC): stamped
+ * when it happened, not when it got here (behind WebKit's work, now and then) */
+static void pan_sample(double y, uint32_t time) {
+	gint64 now = g_get_monotonic_time();
+	int32_t age = (int32_t)((uint32_t)(now / 1000) - time);
+	if (age < 0 || age > 500) age = 0;
+	if (S.samp_n == 8) {
+		memmove(S.samp_y, S.samp_y + 1, 7 * sizeof(S.samp_y[0]));
+		memmove(S.samp_us, S.samp_us + 1, 7 * sizeof(S.samp_us[0]));
+		S.samp_n = 7;
+	}
+	S.samp_y[S.samp_n] = y;
+	S.samp_us[S.samp_n] = now - (gint64)age * 1000;
+	S.samp_n++;
+}
+
+/* where the finger was at `at`, between the touches either side of it */
+static double pan_finger(gint64 at) {
+	if (S.samp_n == 0) return S.last_fwd_y;
+	if (at <= S.samp_us[0]) return S.samp_y[0];
+	for (int i = 1; i < S.samp_n; i++) {
+		if (at <= S.samp_us[i]) {
+			double f = (double)(at - S.samp_us[i - 1]) / (double)(S.samp_us[i] - S.samp_us[i - 1]);
+			return S.samp_y[i - 1] + (S.samp_y[i] - S.samp_y[i - 1]) * f;
+		}
+	}
+	return S.samp_y[S.samp_n - 1];
+}
+
+/* the finger is off: what it travelled that WebKit was not given yet */
+static void pan_catch_up(void) {
+	S.owed += S.sent_y - S.last_fwd_y;
+	S.sent_y = S.last_fwd_y;
+	S.samp_n = 0;
+}
+
 static void pan_end(struct webview *view) {
 	if (view) webview_pan(view, S.owed, S.pan_x, S.pan_y, true);
 	S.owed = 0;
 	S.pan = S.pan_fling = false;
+	if (pan_vblank) clock_stop();	/* (the picture scroller may want the frames next) */
 }
 
 /* a frame of panning: the finger's travel since the last frame, or the
@@ -510,20 +583,23 @@ static void pan_step(void) {
 		bool edge = (S.vel < 0 && at <= 0.5) || (S.vel > 0 && at >= max - 0.5);
 		if (!view || fabs(S.vel) < 0.02 || edge) {
 			pan_end(view);
-			fling_source = 0;
-			zmc_on_frame(NULL);
+			clock_stop();
 			return;
 		}
 		boost(1500);
+	} else if (S.pan && S.down) {
+		/* the place at the vblank this step is for, not when it ran */
+		gint64 at = pan_vblank ? webview_vblank_us() : 0;
+		if (at <= 0 || now - at > 20000) at = now;
+		double y = pan_finger(at - PAN_BEHIND_US);
+		S.owed += S.sent_y - y;
+		S.sent_y = y;
 	}
 	if (view && S.owed != 0) {
 		webview_pan(view, S.owed, S.pan_x, S.pan_y, false);
 		S.owed = 0;
 	}
-	if (!S.pan) {
-		fling_source = 0;
-		zmc_on_frame(NULL);
-	}
+	if (!S.pan) clock_stop();
 }
 
 static void frame_step(void) {
@@ -782,6 +858,14 @@ static void tab_close(int i) {
 	tab_select(B.cur);
 }
 
+/* to another of Superscan's pages: the page in front goes under the window
+ * first, as the turn's first frame has none of it (overlay is not called
+ * while pages turn) */
+static void go(int page, int direction) {
+	if (B.n_tabs && tab()->view) webview_hide(tab()->view);
+	zmc_go(page, direction);
+}
+
 /* turn what was typed into a URL or a search */
 static void navigate(const char *text) {
 	char url[1100];
@@ -948,6 +1032,9 @@ static double draw_tabs(cairo_t *cr, int page) {
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		zmc_text_line(cr, B.tabs[i].title[0] ? B.tabs[i].title : B.tabs[i].url,
 			FONT_SEMILIGHT, 14, x + 8, ty + ch + 2, cell - 16);
+		/* the cross's own hit first: the first hit that holds a tap takes
+		 * it, and the cell's covered the cross (a tab could not be closed) */
+		zmc_add_hit(x + cell - 30, ty, 30, 30, ACT_TAB_CLOSE, i);
 		zmc_add_hit(x, ty, cell, ch, ACT_TAB, i);
 		/* InPrivate tabs wear their tag inside their cell */
 		if (B.tabs[i].private) {
@@ -960,7 +1047,6 @@ static double draw_tabs(cairo_t *cr, int page) {
 		/* a close cross in the corner */
 		cairo_set_source_rgb(cr, 0.8, 0.8, 0.8);
 		zmc_text(cr, u8"", "Segoe MDL2 Assets", 13, x + cell - 22, ty + 6, 0);
-		zmc_add_hit(x + cell - 30, ty, 30, 30, ACT_TAB_CLOSE, i);
 	}
 	double ny = y + ((B.n_tabs + 1) / 2) * (ch + ZMC_MARGIN + 24);
 	accent(cr);
@@ -1223,12 +1309,12 @@ static void menu_pick(int which) {
 	suggest_reset();
 	B.hist_typing = false;
 	switch (which) {
-	case 0: zmc_go(P_TABS, 1); break;
-	case MENU_PRIVATE: tab_open("about:blank", true); zmc_go(P_WEB, -1); break;
+	case 0: go(P_TABS, 1); break;
+	case MENU_PRIVATE: tab_open("about:blank", true); go(P_WEB, -1); break;
 	case MENU_FAV_TOGGLE: favourite_toggle(tab()); break;
-	case 3: favourite_page=0; zmc_go(P_FAVOURITES, 1); break;
-	case 4: zmc_go(P_DOWNLOADS, 1); break;
-	case 5: history_page=0; zmc_go(P_HISTORY, 1); break;
+	case 3: favourite_page=0; go(P_FAVOURITES, 1); break;
+	case 4: go(P_DOWNLOADS, 1); break;
+	case 5: history_page=0; go(P_HISTORY, 1); break;
 	case 6: webview_load(tab()->view, "https://duckduckgo.com"); break;
 	case 7: if (webview_can_go_forward(tab()->view)) webview_forward(tab()->view); break;
 	}
@@ -1283,13 +1369,13 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_TABS:
 		B.editing=B.select_all=false; suggest_reset(); zmc_keyboard(false);
-		zmc_go(P_TABS, 1);
+		go(P_TABS, 1);
 		break;
 	case ACT_NEWTAB_PRIVATE:
-		suggest_reset(); tab_open("about:blank", true); zmc_go(P_WEB, -1); break;
+		suggest_reset(); tab_open("about:blank", true); go(P_WEB, -1); break;
 	case ACT_NEWTAB:
 		tab_open("about:blank", false);
-		zmc_go(P_WEB, -1);
+		go(P_WEB, -1);
 		break;
 	case ACT_SUGGEST:
 		if (arg < 0 || arg >= B.n_sugg) break;
@@ -1298,7 +1384,7 @@ static void activate(int action, int arg) {
 	case ACT_FAV_TOGGLE: favourite_toggle(tab()); zmc_redraw(); break;
 	case ACT_FAV_OPEN:
 		if (arg >= 0 && arg < favourites_count) {
-			webview_load(tab()->view, favourites[arg].url); zmc_go(P_WEB, -1);
+			webview_load(tab()->view, favourites[arg].url); go(P_WEB, -1);
 		} break;
 	case ACT_FAV_DELETE:
 		if (arg >= 0 && arg < favourites_count) {
@@ -1309,7 +1395,7 @@ static void activate(int action, int arg) {
 	case ACT_TAB:
 		suggest_reset();
 		tab_select(arg);
-		zmc_go(P_WEB, -1);
+		go(P_WEB, -1);
 		break;
 	case ACT_TAB_CLOSE:
 		tab_close(arg);
@@ -1317,7 +1403,7 @@ static void activate(int action, int arg) {
 	case ACT_HISTORY_OPEN:
 		if (arg<0 || arg>=history_count) break;
 		B.editing=B.select_all=false; zmc_keyboard(false);
-		webview_load(tab()->view,history[arg].url); zmc_go(P_WEB,-1); zmc_redraw(); break;
+		webview_load(tab()->view,history[arg].url); go(P_WEB,-1); zmc_redraw(); break;
 	case ACT_HISTORY_DELETE:
 		if (arg<0 || arg>=history_count) break;
 		memmove(&history[arg],&history[arg+1],(history_count-arg-1)*sizeof history[0]); history_count--;
@@ -1347,7 +1433,7 @@ static bool back(void) {
 	}
 	if (B.hist_typing) { B.hist_typing=false; zmc_keyboard(false); zmc_redraw(); return true; }
 	if (zmc.page == P_TABS || zmc.page == P_DOWNLOADS || zmc.page == P_HISTORY || zmc.page == P_FAVOURITES) {
-		zmc_go(P_WEB, -1);
+		go(P_WEB, -1);
 		return true;
 	}
 	if (webview_can_go_back(tab()->view)) {
@@ -1409,6 +1495,10 @@ static void text(const char *typed) {
 /* draw the current page's pixels over the content area, every frame at rest */
 static void overlay(int page) {
 	if (page != P_WEB || B.editing || B.menu_open || B.edit_menu || B.n_tabs == 0 || !tab()->view) {
+		/* WebKit's frames go straight to the shell, on a subsurface over
+		 * this window: not drawing the page is not enough, it has to go
+		 * under (or it stays over the address being typed, the menu) */
+		if (B.n_tabs && tab()->view) webview_hide(tab()->view);
 		return;
 	}
 	int x, y, w, h;
@@ -1522,22 +1612,22 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 				S.webkit = false;
 				S.pan = true;
 				S.vel = 0;
-				S.owed = S.down_y - py;	/* the 8 points already travelled */
+				S.owed = 0;
+				S.sent_y = S.down_y;	/* (the 8 points already travelled go with the first step) */
+				S.samp_n = 0;
+				pan_sample(py, time);
 				S.pan_x = x - cx;
 				S.pan_y = py;
 				S.move_us = g_get_monotonic_time();
 				S.last_fwd_y = py;
-				if (!fling_source) {
-					fling_source = 1;
-					zmc_on_frame(frame_step);
-				}
+				clock_start_pan();
 				return true;
 			}
 		}
 		if (S.pan) {
 			gint64 now = g_get_monotonic_time();
 			double d = S.last_fwd_y - py;
-			S.owed += d;
+			pan_sample(py, time);
 			double dt = (now - S.move_us) / 1000.0;
 			if (dt > 0.5) S.vel = S.vel * 0.6 + d / dt * 0.4;
 			S.move_us = now;
@@ -1601,6 +1691,7 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 	} else if (phase == 2) {
 		if (S.pan && S.down && id == S.id) {
 			S.down = false;
+			pan_catch_up();
 			if (g_get_monotonic_time() - S.move_us > 60000) S.vel = 0;	/* held still before the lift */
 			S.vel = fmax(-8, fmin(8, S.vel));
 			S.move_us = g_get_monotonic_time();
@@ -1629,7 +1720,7 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 			boost(1500);	/* WebKit's fling runs on after the lift */
 		}
 	} else {
-		if (S.pan && S.down) { S.down = false; pan_end(view); return true; }
+		if (S.pan && S.down) { S.down = false; pan_catch_up(); pan_end(view); return true; }
 		if (S.snap && S.down) { S.down = false; S.vel = 0; fling_start(); return true; }
 		if (S.webkit) webview_touch_cancel(view);
 		if (S.pulling) spring_back(S.shown);
