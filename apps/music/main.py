@@ -1,6 +1,7 @@
 """ztOS Music Streaming & Offline Player.
 Built with ztOS SDK, yt-dlp, and mpv.
 """
+import atexit
 import os
 from typing import List, Optional
 from PySide6.QtCore import Qt, QTimer
@@ -316,9 +317,28 @@ class MusicHome(ztos.Pivot):
     def _on_state_changed(self, is_playing: bool):
         self.btn_play.set_glyph(GLYPH_PAUSE if is_playing else GLYPH_PLAY)
         self.btn_play.set_label("pause" if is_playing else "play")
+        self._publish_tile()
 
     def _on_track_changed(self, track: dict):
         self._refresh_recent_list()
+        self._publish_tile()
+
+    def _publish_tile(self):
+        """Now playing on this app's Start tile (a tile signal): the track and
+        its artist on the back, a play or pause mark on the front. Sent when
+        the track or the play state changes, never on a timer."""
+        track = self.engine.current_track
+        if not track:
+            ztos.tile_clear()
+            return
+        playing = self.engine.is_playing
+        ztos.tile_update(
+            "Playing" if playing else "Paused",
+            [track.get("title", ""), track.get("artist", "")],
+            badge="play" if playing else "pause",
+        )
 
 
+# the tile goes back to its plain front when the app is closed
+atexit.register(ztos.tile_clear)
 app.run(MusicHome())

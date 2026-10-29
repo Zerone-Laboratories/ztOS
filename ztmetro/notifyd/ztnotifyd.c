@@ -13,7 +13,12 @@
  *  2. What is playing. It watches the media players on the bus (MPRIS) and
  *     tells the shell the track and whether it is playing, so that the volume
  *     banner can carry it and its three buttons. The shell works the player
- *     itself (playerctl).
+ *     itself (playerctl). Each player is also a tile signal ("signal NAME|
+ *     title=..|line=..|badge=play|image=..", see ztmetro/TILE-SIGNALS.md) for
+ *     the tile of the app it belongs to: the track on its back, play or pause
+ *     on its front, the album art when the player has any (a web address is
+ *     fetched once to $XDG_RUNTIME_DIR/ztos-art/). An Android app translated by
+ *     ATL is a player named by its package.
  *
  *  3. A push client. ~/.config/ztmetro/push names an ntfy server and one or
  *     more topics ("server = https://ntfy.sh", "topic = a,b"); the daemon keeps
@@ -152,18 +157,192 @@ static int media_changed(sd_bus_message *m, void *userdata, sd_bus_error *error)
 	return 0;
 }
 
-/* playerctl knows every player's dialect; asked once per change. */
+/* A field for a tile signal: nothing in it may end the field or the line.
+ * (Not clean(): a title with a "<" in it is a title.) */
+static void plain(char *out, size_t size, const char *in)
+{
+	size_t o = 0;
+	for (; in && *in && o + 1 < size; in++)
+		out[o++] = *in == '|' ? '/' : (*in == '\n' || *in == '\r' || *in == '\t') ? ' ' : *in;
+	out[o] = 0;
+}
+
+/* Album art by address: a file is used where it is; a web address is fetched
+ * once, in the background, to $XDG_RUNTIME_DIR/ztos-art/ (the media is looked
+ * at again when it has come). Returns the file's path, or "" until there is one. */
+#define MAX_ART 4
+static struct { pid_t pid; char url[300]; } art_job[MAX_ART];
+
+static void art_path(char *out, size_t size, const char *url)
+{
+	out[0] = 0;
+	if (!strncmp(url, "file://", 7)) {
+		/* percent-escapes undone */
+		size_t o = 0;
+		for (const char *p = url + 7; *p && o + 1 < size; p++) {
+			unsigned c;
+			if (*p == '%' && sscanf(p + 1, "%2x", &c) == 1) {
+				out[o++] = (char)c;
+				p += 2;
+			} else {
+				out[o++] = *p;
+			}
+		}
+		out[o] = 0;
+		return;
+	}
+	if (strncmp(url, "http://", 7) && strncmp(url, "https://", 8))
+		return;
+	unsigned long long h = 1469598103934665603ULL;
+	for (const char *p = url; *p; p++)
+		h = (h ^ (unsigned char)*p) * 1099511628211ULL;
+	char dir[300], path[330];
+	snprintf(dir, sizeof(dir), "%s/ztos-art", runtime_dir);
+	snprintf(path, sizeof(path), "%s/%016llx", dir, h);
+	if (access(path, R_OK) == 0) {
+		snprintf(out, size, "%s", path);
+		return;
+	}
+	for (int i = 0; i < MAX_ART; i++)
+		if (art_job[i].pid > 0 && !strcmp(art_job[i].url, url))
+			return;		/* on its way */
+	for (int i = 0; i < MAX_ART; i++) {
+		if (art_job[i].pid > 0)
+			continue;
+		mkdir(dir, 0700);
+		pid_t pid = fork();
+		if (pid == 0) {
+			char tmp[340];
+			snprintf(tmp, sizeof(tmp), "%s.part", path);
+			execlp("sh", "sh", "-c",
+				"curl -sfL --max-time 15 --max-filesize 3000000 -o \"$1\" \"$2\" && mv \"$1\" \"$3\" || rm -f \"$1\"",
+				"sh", tmp, url, path, (char *)NULL);
+			_exit(127);
+		}
+		if (pid > 0) {
+			art_job[i].pid = pid;
+			snprintf(art_job[i].url, sizeof(art_job[i].url), "%s", url);
+		}
+		return;
+	}
+}
+
+/* a fetch ended (reaped by the loop): look again, for the picture is there */
+static void art_done(pid_t pid)
+{
+	for (int i = 0; i < MAX_ART; i++) {
+		if (art_job[i].pid == pid) {
+			art_job[i].pid = 0;
+			if (!media_look_at)
+				media_look_at = now_ms() + 100;
+		}
+	}
+}
+
+/* Each player's tile: what a player plays is a tile signal for the app it
+ * belongs to (the shell finds the tile by the player's name: "spotify" for
+ * com.spotify.music, a translated Android app by its package), sent when it
+ * changes, and taken away when the player is gone. */
+#define MAX_PLAYERS 8
+static struct { char key[64]; char sent[900]; bool seen; } told[MAX_PLAYERS];
+
+static void signal_player(const char *name, const char *status, const char *title,
+			  const char *artist, const char *album, const char *art_url)
+{
+	char key[64], line[900], t[160], a[120], b[120], img[330] = "", p[330] = "";
+	size_t o = 0;
+	/* "firefox.instance_1_1234": the program, without its instance */
+	for (const char *c = name; *c && o + 1 < sizeof(key); c++) {
+		if (!strncmp(c, ".instance", 9))
+			break;
+		key[o++] = strchr("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-", *c) ? *c : '_';
+	}
+	key[o] = 0;
+	if (!key[0])
+		return;
+	art_path(p, sizeof(p), art_url);
+	if (p[0])
+		snprintf(img, sizeof(img), "|image=%s", p);
+	plain(t, sizeof(t), title[0] ? title : "Unknown");
+	plain(a, sizeof(a), artist);
+	plain(b, sizeof(b), album);
+	bool playing = !strcmp(status, "Playing");
+	snprintf(line, sizeof(line), "signal %s|title=%s|line=%s%s%s%s%s|badge=%s%s", key,
+		playing ? "Playing" : "Paused", t, a[0] ? "|line=" : "", a, b[0] ? "|line=" : "", b,
+		playing ? "play" : "pause", img);
+	int slot = -1;
+	for (int i = 0; i < MAX_PLAYERS; i++)
+		if (told[i].key[0] && !strcmp(told[i].key, key))
+			slot = i;
+	for (int i = 0; slot < 0 && i < MAX_PLAYERS; i++)
+		if (!told[i].key[0]) {
+			slot = i;
+			snprintf(told[i].key, sizeof(told[i].key), "%s", key);
+		}
+	if (slot < 0)
+		return;
+	told[slot].seen = true;
+	if (strcmp(told[slot].sent, line)) {
+		snprintf(told[slot].sent, sizeof(told[slot].sent), "%s", line);
+		shell_tell("%s", line);
+		fprintf(stderr, "ztnotifyd: tile %s: %s %.40s\n", key, status, title);
+	}
+}
+
+/* playerctl knows every player's dialect; asked once per change, for all of them. */
 static void media_look(void)
 {
-	char line[400] = "", out[400];
-	FILE *p = popen("playerctl metadata --format '{{status}}|{{title}}|{{artist}}|{{playerName}}' 2>/dev/null", "r");
-	if (p) {
-		if (!fgets(line, sizeof(line), p))
-			line[0] = 0;
-		pclose(p);
+	char line[1400], out[400], cur[400] = "";
+	int best = 0;
+	for (int i = 0; i < MAX_PLAYERS; i++)
+		told[i].seen = false;
+	FILE *p = popen("playerctl -a metadata --format "
+		"'{{playerInstance}}\x1f{{status}}\x1f{{title}}\x1f{{artist}}\x1f{{album}}\x1f{{mpris:artUrl}}' 2>/dev/null", "r");
+	while (p && fgets(line, sizeof(line), p)) {
+		char *f[6] = { line, "", "", "", "", "" };
+		line[strcspn(line, "\n")] = 0;
+		for (int k = 1; k < 6; k++) {
+			char *sep = strchr(f[k - 1], '\x1f');
+			if (!sep)
+				break;
+			*sep = 0;
+			f[k] = sep + 1;
+		}
+		if (strcmp(f[1], "Playing") && strcmp(f[1], "Paused"))
+			continue;	/* stopped: nothing to show */
+		signal_player(f[0], f[1], f[2], f[3], f[4], f[5]);
+		/* the banner shows one: the first that is playing, else the first */
+		int rank = !strcmp(f[1], "Playing") ? 2 : 1;
+		if (rank > best) {
+			best = rank;
+			snprintf(cur, sizeof(cur), "%s|%s|%s|%s", f[1], f[2], f[3], f[0]);
+		}
 	}
-	line[strcspn(line, "\n")] = 0;
-	snprintf(out, sizeof(out), "media %s", line[0] ? line : "none");
+	if (p)
+		pclose(p);
+	for (int i = 0; i < MAX_PLAYERS; i++) {
+		if (told[i].key[0] && !told[i].seen) {
+			shell_tell("signal %s", told[i].key);	/* gone: its tile goes back to its front */
+			told[i].key[0] = told[i].sent[0] = 0;
+		}
+	}
+	/* (clean: no "|" in a field, as the line before had it) */
+	char *fields[4] = { cur, NULL, NULL, NULL };
+	for (int k = 1; k < 4 && fields[k - 1]; k++) {
+		fields[k] = strchr(fields[k - 1], '|');
+		if (fields[k])
+			*fields[k]++ = 0;
+	}
+	if (best) {
+		char st[24], ti[100], ar[80], pl[40];
+		clean(st, sizeof(st), fields[0]);
+		clean(ti, sizeof(ti), fields[1] ? fields[1] : "");
+		clean(ar, sizeof(ar), fields[2] ? fields[2] : "");
+		clean(pl, sizeof(pl), fields[3] ? fields[3] : "");
+		snprintf(out, sizeof(out), "media %s|%s|%s|%s", st, ti, ar, pl);
+	} else {
+		snprintf(out, sizeof(out), "media none");
+	}
 	if (strcmp(out, media_told)) {
 		snprintf(media_told, sizeof(media_told), "%s", out);
 		shell_tell("%s", out);
@@ -370,6 +549,14 @@ static void on_hup(int sig)
 	reload = 1;
 }
 
+/* SIGUSR1: the shell has started again and knows nothing of what was told */
+static volatile sig_atomic_t resend;
+
+static void on_usr1(int sig)
+{
+	resend = 1;
+}
+
 /* ---- the loop --------------------------------------------------------------- */
 
 int main(void)
@@ -382,6 +569,7 @@ int main(void)
 	setvbuf(stderr, NULL, _IOLBF, 0);
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGHUP, on_hup);
+	signal(SIGUSR1, on_usr1);
 
 	int r = sd_bus_open_user(&bus);
 	if (r < 0) {
@@ -411,6 +599,13 @@ int main(void)
 	push_open();
 
 	for (;;) {
+		if (resend) {
+			resend = 0;
+			media_told[0] = 0;
+			for (int i = 0; i < MAX_PLAYERS; i++)
+				told[i].sent[0] = 0;
+			media_look_at = now_ms() + 300;
+		}
 		if (reload) {
 			reload = 0;
 			push_config();
@@ -465,8 +660,9 @@ int main(void)
 		if (push_at >= 0 && (fds[push_at].revents & (POLLIN | POLLHUP | POLLERR)))
 			push_readable();
 		(void)bus_at;
-		while (waitpid(-1, NULL, WNOHANG) > 0) {
-		}
+		pid_t gone;
+		while ((gone = waitpid(-1, NULL, WNOHANG)) > 0)
+			art_done(gone);
 	}
 	return 1;
 }

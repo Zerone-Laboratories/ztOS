@@ -667,6 +667,8 @@ static void draw_charging(struct dm_launcher *L, struct dm_grid *g, int64_t A, i
 	else snprintf(sub, sizeof(sub), "PLUGGED IN %d%%", batt);
 	dm_text3fit(g, "CHARGING", MID_L, MID_R, top + 18, DM_MAIN, A);
 	dm_text3fit(g, sub, MID_L, MID_R, top + 25, DM_DIM, A);
+	/* how fast, when the shell has read it */
+	if (L->st.power[0]) dm_text3fit(g, L->st.power, MID_L, MID_R, top + 32, DM_ACCENT, A);
 }
 
 static void draw_meter(struct dm_grid *g, int x1, int y1, int x2, int y2, int pct) {
@@ -799,6 +801,15 @@ static bool dock_notif(const struct dm_launcher *L, int i) {
 	return false;
 }
 
+/* whether the app in a dock slot has a tile signal (now playing, a figure) */
+static bool dock_signal(const struct dm_launcher *L, int i) {
+	char text[16];
+	if (!L->host.signal || !L->dock_act[i][0]) return false;
+	text[0] = 0;
+	L->host.signal(L->host.data, L->dock_act[i], text, sizeof(text));
+	return text[0] != 0;
+}
+
 static void draw_home(struct dm_launcher *L, struct dm_grid *g, int64_t A) {
 	const struct dm_status *st = &L->st;
 	int dy = L->dy;
@@ -867,6 +878,7 @@ static void draw_home(struct dm_launcher *L, struct dm_grid *g, int64_t A) {
 		bool notif = dock_notif(L, i);
 		dm_bmp2(g, ic, ix, iy, notif && fr(A, 420) ? DM_RED : DM_MAIN);
 		if (notif) dm_set(g, ix + w, iy - 1, DM_RED);
+		else if (dock_signal(L, i)) dm_set(g, ix + w, iy - 1, DM_ACCENT);	/* it has something live to show */
 		/* the terminal tile blinks its cursor in phase with the clock colon */
 		if (i == 2 && fr(A, 500)) dm_hline(g, ix + 6, ix + 9, iy + 10, DM_ACCENT, 1);
 	}
@@ -901,7 +913,16 @@ static void draw_drawer(struct dm_launcher *L, struct dm_grid *g, int64_t A) {
 		}
 		nm[k] = 0;
 		dm_rows(g, blob, 5, 5, r, strstr(a->act, "terminal") ? DM_ACCENT : DM_DIM);
-		dm_text3(g, k ? nm : "?", 13, r, DM_MAIN, 57);
+		/* an app with a live tile signal shows it at the row's end ("+4.1W", a count) */
+		char sig[16] = "";
+		if (L->host.signal) L->host.signal(L->host.data, a->act, sig, sizeof(sig));
+		char shown[16];
+		k = 0;
+		for (const char *p = sig; *p && k < 7; p++) shown[k++] = (char)toupper((unsigned char)*p);
+		shown[k] = 0;
+		int sw = k ? dm_width3(shown) : 0;
+		dm_text3(g, nm[0] ? nm : "?", 13, r, DM_MAIN, k ? 56 - sw - 2 : 57);
+		if (k) dm_text3(g, shown, 57 - sw, r, DM_ACCENT, 57);
 		add_hit(L, 4, r - 1, 57, r + 5, H_APP, top + i);
 	}
 	/* scroll bar and the letter index (tap a letter to jump) */

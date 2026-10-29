@@ -14,6 +14,7 @@
  */
 #pragma once
 #include "dotmatrix.h"
+#include <stddef.h>
 
 #define DM_MAX_NOTIF 16
 
@@ -31,6 +32,7 @@ struct dm_status {
 	int n_notif;
 	char notif[DM_MAX_NOTIF][64];	/* the names of apps with notifications waiting */
 	int notif_count[DM_MAX_NOTIF];	/* and how many each has */
+	char power[16];			/* the battery's draw, "+4.1W" ("" when not known) */
 };
 
 struct dm_app { char label[64]; char act[256]; };
@@ -48,6 +50,9 @@ struct dm_host {
 	void (*saved)(void *data);	/* palette or AMOLED changed: persist them */
 	void (*haptic)(void *data, int kind, int ms);
 	void (*style)(void *data, const char *name);	/* settings: another style ("metro") */
+	/* a tile signal's short text for an app (by its act): the badge, a value
+	 * or a count, "" when it has none. NULL: the host has no signals. */
+	void (*signal)(void *data, const char *act, char *out, size_t size);
 	const char *version;		/* under the boot wordmark */
 };
 
