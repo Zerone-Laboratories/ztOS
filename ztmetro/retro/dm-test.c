@@ -142,6 +142,28 @@ int main(int argc, char **argv) {
 	draw(L, &r, A + 20500, w, h);
 	save(dir, "event-wifi", w, h);
 
+	/* the boot splash's mark, on a field as wide as the screen (as the shell's) */
+	{
+		struct dm_screen ls;
+		dm_screen_init(&ls, w / ((float)w / dm_launcher_screen(L)->w), dm_launcher_screen(L)->h,
+			dm_launcher_screen(L)->pitch, 0);
+		uint8_t *lb = calloc((size_t)ls.cols * ls.rows, 1);
+		struct dm_grid lg;
+		dm_grid_init(&lg, &ls, lb);
+		dm_chrome_logo(&lg, "ALPHA");
+		cairo_surface_t *cs = cairo_image_surface_create(CAIRO_FORMAT_RGB24, (int)ls.w * 2, (int)ls.h * 2);
+		cairo_t *cc = cairo_create(cs);
+		cairo_scale(cc, 2, 2);
+		dm_cairo_paint(cc, &lg, 0, 0.09f, 0.7f);
+		char lp[512];
+		snprintf(lp, sizeof(lp), "%s/splash.png", dir);
+		cairo_surface_write_to_png(cs, lp);
+		cairo_destroy(cc);
+		cairo_surface_destroy(cs);
+		free(lb);
+		dm_screen_finish(&ls);
+	}
+
 	/* the lock screen: locking rearranges into it, a drag, unlocking flies back */
 	st.n_notif = 2;
 	snprintf(st.notif[0], 64, "WhatsApp");

@@ -5690,7 +5690,7 @@ static void draw_splash(struct zt_server *server) {
 		/* the DotMatrix style's: the mark in dots on the home's lattice */
 		struct dm_grid g;
 		dm_grid_init(&g, &field, buf);
-		dm_chrome_logo(&g);
+		dm_chrome_logo(&g, "ALPHA");	/* the DotMatrix style is still an alpha */
 		dm_cairo_paint(cr, &g, server->dm_palette, server->dm_amoled ? 0 : 0.09f, 0.7f);
 		free(buf);
 		dm_screen_finish(&field);

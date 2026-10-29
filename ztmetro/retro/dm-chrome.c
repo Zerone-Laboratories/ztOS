@@ -519,9 +519,16 @@ static const char *const LOGO[4][7] = {
 	{ ".XXXX", "X....", "X....", ".XXX.", "....X", "....X", "XXXX." },	/* S */
 };
 
-void dm_chrome_logo(struct dm_grid *g) {
-	/* each mark dot is two by two of the screen's: 46 columns across */
-	int c0 = (68 - 46) / 2, r0 = g->s->rows / 2 - 7;
+void dm_chrome_logo(struct dm_grid *g, const char *badge) {
+	/* each mark dot is two by two of the screen's: 46 columns across. It is
+	 * centred on the whole field (the grid may be wider than the design),
+	 * with the badge beside it when there is room, under it when not. */
+	const struct dm_screen *s = g->s;
+	int bw = badge && *badge ? dm_width3(badge) + 6 : 0, bh = 9;
+	bool beside = bw && s->cols >= 46 + 3 + bw + 2;
+	int total = beside ? 46 + 3 + bw : 46;
+	int c0 = (s->cols - total) / 2 - s->coff, r0 = s->rows / 2 - 7;
+	if (bw && !beside) r0 -= (bh + 4) / 2;
 	for (int k = 0; k < 4; k++) {
 		for (int r = 0; r < 7; r++) {
 			for (int c = 0; c < 5; c++) {
@@ -534,4 +541,13 @@ void dm_chrome_logo(struct dm_grid *g) {
 			}
 		}
 	}
+	if (!bw) return;
+	/* a square box, every corner lit, the word in the accent inside */
+	int bx = beside ? c0 + 46 + 3 : (s->cols - bw) / 2 - s->coff;
+	int by = beside ? r0 + 14 - bh : r0 + 14 + 4;	/* beside: on the mark's baseline */
+	dm_hline(g, bx, bx + bw - 1, by, DM_MAIN, 1);
+	dm_hline(g, bx, bx + bw - 1, by + bh - 1, DM_MAIN, 1);
+	dm_vline(g, bx, by, by + bh - 1, DM_MAIN, 1);
+	dm_vline(g, bx + bw - 1, by, by + bh - 1, DM_MAIN, 1);
+	dm_text3(g, badge, bx + 3, by + 2, DM_ACCENT, DM_NO_CLIP);
 }

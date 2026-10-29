@@ -67,5 +67,6 @@ extern uint32_t dm_wrap_main, dm_wrap_accent;	/* the palette dots are drawn in *
 /* the context's solid colour put into that palette (while dotting) */
 void dm_map_source(cairo_t *cr);
 extern int dm_map_raw;		/* above 0: dots keep their colour (a palette's swatch) */
-/* the ztOS mark, large, in the middle of the grid (the boot splash) */
-void dm_chrome_logo(struct dm_grid *g);
+/* the ztOS mark, large, in the middle of the grid (the boot splash), with a
+ * small boxed word beside it (the style's stage: "ALPHA"), or none */
+void dm_chrome_logo(struct dm_grid *g, const char *badge);
