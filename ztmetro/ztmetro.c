@@ -534,7 +534,8 @@ struct zt_server {
 	/* ztRetrofit: the shell's style. Metro is Start and its tiles; DotMatrix
 	 * (ZrnDotMatrix) puts its own dot-matrix home where Start was, over the
 	 * same apps, status and radios (see "ztRetrofit" below) */
-	int style;			/* STYLE_* */
+	int style;			/* STYLE_*: fixed for the session (ZTRF_SHELL_STYLE) */
+	int style_config;		/* the config file's: another one restarts the session */
 	struct dm_launcher *dm;
 	struct dm_renderer dm_gl;
 	bool dm_gl_ok;
@@ -3004,7 +3005,7 @@ static void load_config(struct zt_server *server) {
 	}
 	server->shade_pressed = -1;
 	memcpy(server->quick, QUICK_DEFAULT, sizeof(server->quick));
-	server->style = STYLE_METRO;
+	server->style_config = STYLE_METRO;
 	g_style = &server->style;
 	g_palette = &server->dm_palette;
 	server->quad_reveal = 1.0f;
@@ -3099,8 +3100,9 @@ static void load_config(struct zt_server *server) {
 		} else if (strcmp(key, "wifi_suspend") == 0) {
 			server->wifi_suspend = strcmp(value, "on") == 0 || strcmp(value, "1") == 0;
 		} else if (strcmp(key, "style") == 0) {
-			/* ztRetrofit's look: metro (Start), dotmatrix (ZrnDotMatrix) */
-			server->style = strcmp(value, "dotmatrix") == 0 || strcmp(value, "1") == 0 ?
+			/* ztRetrofit's look: metro (Start), dotmatrix (ZrnDotMatrix).
+			 * The session runs in one; this is the one the next starts in */
+			server->style_config = strcmp(value, "dotmatrix") == 0 || strcmp(value, "1") == 0 ?
 				STYLE_DOTMATRIX : STYLE_METRO;
 		} else if (strcmp(key, "dotmatrix_palette") == 0) {
 			int n = isdigit((unsigned char)value[0]) ? atoi(value) : dm_palette_index(value);
@@ -9422,24 +9424,26 @@ static void retro_setup(struct zt_server *server);
 
 /* The settings sheet asked for Metro. Not from inside the launcher's own
  * call: it is freed on the way, so the change waits for the loop to idle. */
-static void retro_style_idle(void *data) {
+/* Another style: kept for the next session, and the session started again
+ * in it (greetd runs ztmetro-session anew, which exports ZTRF_SHELL_STYLE;
+ * the apps go with the display and come back in the new style). */
+static void style_restart_idle(void *data) {
 	struct zt_server *server = data;
-	if (server->style == STYLE_METRO) {
-		retro_setup(server);
-		start_turn(server, false, 0);	/* Start comes in, as after an app */
-		damage(server);
+	wlr_log(WLR_INFO, "ztRetrofit: the session starts again in the %s style",
+		server->style_config == STYLE_DOTMATRIX ? "DotMatrix" : "Metro");
+	wl_display_terminate(server->wl_display);
+}
+
+static void style_switch(struct zt_server *server, int style) {
+	server->style_config = style;
+	config_keep_text("style", style == STYLE_DOTMATRIX ? "dotmatrix" : "metro");
+	if (style != server->style) {
+		wl_event_loop_add_idle(server->loop, style_restart_idle, server);
 	}
 }
 
 static void retro_style(void *data, const char *name) {
-	struct zt_server *server = data;
-	if (strcmp(name, "metro") != 0) {
-		return;
-	}
-	wlr_log(WLR_INFO, "dotmatrix: back to the Metro style");
-	server->style = STYLE_METRO;
-	config_keep_text("style", "metro");
-	wl_event_loop_add_idle(server->loop, retro_style_idle, server);
+	style_switch(data, strcmp(name, "dotmatrix") == 0 ? STYLE_DOTMATRIX : STYLE_METRO);
 }
 
 static int retro_timer_fired(void *data) {
@@ -9603,8 +9607,10 @@ static void retro_draw(struct zt_server *server, int width_px, int height_px, bo
 		server->dm_gl_ok = dm_gl_init(&server->dm_gl, dm_launcher_screen(L)) &&
 			dm_gl_screen2(&server->dm_gl, dm_launcher_screen2(L));
 		if (!server->dm_gl_ok) {
+			/* no dots to draw with: the session starts again in Metro,
+			 * rather than one style half over the other */
 			wlr_log(WLR_ERROR, "dotmatrix: the dot shader did not build");
-			server->style = STYLE_METRO;
+			if (server->style_config != STYLE_METRO) style_switch(server, STYLE_METRO);
 			return;
 		}
 		server->dm_gl.top_down = true;
@@ -10837,13 +10843,8 @@ static void ctl_command(struct zt_server *server, char *line) {
 		if (server->shown) show_toplevel(server, NULL);
 		home_reset(server);
 	} else if (strncmp(line, "style ", 6) == 0) {
-		/* ztRetrofit's look: style metro | style dotmatrix */
-		server->style = strcmp(line + 6, "dotmatrix") == 0 ? STYLE_DOTMATRIX : STYLE_METRO;
-		config_keep_text("style", server->style == STYLE_DOTMATRIX ? "dotmatrix" : "metro");
-		retro_setup(server);
-		retro_apps(server);
-		server->dm_hidden = 1;
-		damage(server);
+		/* ztRetrofit's look: style metro | style dotmatrix (the session restarts) */
+		style_switch(server, strcmp(line + 6, "dotmatrix") == 0 ? STYLE_DOTMATRIX : STYLE_METRO);
 	} else if (strcmp(line, "applist") == 0) {
 		if (!server->shown && !server->locked) page_go(server, 1.0f, 0.0f);
 	} else if (strcmp(line, "close_front") == 0) {
@@ -12618,6 +12619,11 @@ static int reload(int signal_number, void *data) {
 	int strength = server->haptic_strength;
 	int ring_before = server->ring_volume;
 	load_config(server);
+	if (server->style_config != server->style) {
+		/* the settings app chose the other style: the session starts again */
+		style_switch(server, server->style_config);
+		return 0;
+	}
 	if (ring_before > 0 && server->ring_volume == 0) hap(server, HAP_TAP, HG_SYSTEM);
 	server->scale = scale;
 	retro_setup(server);
@@ -12835,6 +12841,13 @@ int main(int argc, char *argv[]) {
 		server.shade_press[i] = 1.0f;
 	}
 	load_config(&server);
+	/* The style, once for the whole session: ztmetro-session exports it from
+	 * the config as ZTRF_SHELL_STYLE; every app started from here inherits it.
+	 * The two styles never meet: changing it starts the session again. */
+	const char *style = getenv("ZTRF_SHELL_STYLE");
+	server.style = style ? (strcmp(style, "dotmatrix") == 0 ? STYLE_DOTMATRIX : STYLE_METRO) : server.style_config;
+	setenv("ZTRF_SHELL_STYLE", server.style == STYLE_DOTMATRIX ? "dotmatrix" : "metro", 1);
+	wlr_log(WLR_INFO, "ztRetrofit: the %s style", server.style == STYLE_DOTMATRIX ? "DotMatrix" : "Metro");
 	const char *scale = getenv("ZTMETRO_SCALE");
 	if (scale) {
 		server.scale = strtof(scale, NULL);

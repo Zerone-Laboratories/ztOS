@@ -233,6 +233,13 @@ void zmc_config_style(void) {
 	if (f) {
 		fclose(f);
 	}
+	/* the session's style, which the shell was started in, over the file's:
+	 * after the file changes the session restarts, and until then an app
+	 * keeps the style everything else around it has */
+	const char *session = getenv("ZTRF_SHELL_STYLE");
+	if (session) {
+		zmc.style = strcmp(session, "dotmatrix") == 0 ? ZMC_STYLE_DOTMATRIX : ZMC_STYLE_METRO;
+	}
 	if (palette < 0 || palette >= DM_PALETTES) palette = 0;
 	zmc.dm_main = dm_palettes[palette][0];
 	zmc.dm_accent = dm_palettes[palette][1];

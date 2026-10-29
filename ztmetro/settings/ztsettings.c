@@ -1620,7 +1620,7 @@ static double draw_palettes(cairo_t *cr) {
 }
 
 static double draw_accents(cairo_t *cr) {
-	if (app.style) return draw_palettes(cr);
+	if (zmc.style == ZMC_STYLE_DOTMATRIX) return draw_palettes(cr);
 	double y = zmc_header(cr, "accents");
 	double gap = 10, side = (zmc.width - 2 * MARGIN - 3 * gap) / 4;
 	int rows = (N_ACCENTS + 3) / 4;
@@ -1649,7 +1649,7 @@ static double draw_accents(cairo_t *cr) {
 static double draw_theme(cairo_t *cr) {
 	double y = zmc_header(cr, "theme");
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, app.style ? "Palette" : "Accent colour", FONT_REGULAR, 13.5, MARGIN, y, 0);
+	zmc_text(cr, zmc.style == ZMC_STYLE_DOTMATRIX ? "Palette" : "Accent colour", FONT_REGULAR, 13.5, MARGIN, y, 0);
 	/* Windows Phone's list picker, collapsed: the box shows the choice and
 	 * opens the full-screen picker (UIXMobile!ListPicker in full mode) */
 	y += 20;
@@ -1657,13 +1657,13 @@ static double draw_theme(cairo_t *cr) {
 	cairo_set_line_width(cr, 2);
 	cairo_rectangle(cr, MARGIN + 1, y + 1, zmc.width - 2 * MARGIN - 2, 40);
 	cairo_stroke(cr);
-	if (app.style) dm_map_raw++;
-	zmc_set_rgb(cr, app.style ? dm_palettes[app.palette][0] : ACCENTS[app.accent].color);
+	if (zmc.style == ZMC_STYLE_DOTMATRIX) dm_map_raw++;
+	zmc_set_rgb(cr, zmc.style == ZMC_STYLE_DOTMATRIX ? dm_palettes[app.palette][0] : ACCENTS[app.accent].color);
 	cairo_rectangle(cr, MARGIN + 10, y + 10, 22, 22);
 	cairo_fill(cr);
-	if (app.style) dm_map_raw--;
+	if (zmc.style == ZMC_STYLE_DOTMATRIX) dm_map_raw--;
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, app.style ? dm_palette_names[app.palette] : ACCENTS[app.accent].name, FONT_REGULAR, 16, MARGIN + 42, y + 10, 0);
+	zmc_text(cr, zmc.style == ZMC_STYLE_DOTMATRIX ? dm_palette_names[app.palette] : ACCENTS[app.accent].name, FONT_REGULAR, 16, MARGIN + 42, y + 10, 0);
 	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPEN_PAGE, PAGE_ACCENTS);
 	y += 62;
 	double gap = 8;
@@ -1710,6 +1710,10 @@ static double draw_theme(cairo_t *cr) {
 		zmc_text(cr, styles[k], FONT_REGULAR, 13, bx + 10, y + 9, 0);
 		zmc_add_hit(bx, y, btn_w, 36, ACT_STYLE, k);
 	}
+	/* the two never share a screen: the whole session starts again */
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, "Changing it restarts the shell and closes open apps", FONT_REGULAR, 12, MARGIN, y + 42, zmc.width - 2 * MARGIN);
+	y += 20;
 	return draw_wall_row(cr, y + 60);	/* under the style row (36 high, 24 below) */
 }
 
@@ -3102,10 +3106,7 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_STYLE:
 		app.style = arg;
-		config_save();	/* the shell reads it on SIGHUP and changes at once */
-		zmc_config_style();	/* and this app with it */
-		zmc.accent = app.style ? zmc.dm_accent : ACCENTS[app.accent].color;
-		zmc_redraw();
+		config_save();	/* the shell reads it on SIGHUP and starts the session again in it */
 		break;
 	case ACT_HAPTICS:
 		app.haptics = !app.haptics;
