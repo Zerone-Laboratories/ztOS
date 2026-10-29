@@ -28,6 +28,17 @@ launch_in_progress() {
 	fi
 	return 1
 }
+# zrn-pushd thaws Android to hand an app a push message, and holds off the
+# freeze until the app has fetched it (the file holds the epoch it ends at);
+# it runs `sync` itself when the hold is over.
+push_hold_active() {
+	local hold=$runtime/ztos-waydroid-push-hold until=
+	[[ -r $hold ]] || return 1
+	read -r until < "$hold" || true
+	if [[ $until =~ ^[0-9]+$ ]] && (( until > $(date +%s) )); then return 0; fi
+	rm -f "$hold"
+	return 1
+}
 runtime=${XDG_RUNTIME_DIR:-$ZTOS_RUNTIME_DIR}
 policy="$runtime/ztos-waydroid-power-state"
 case ${1:-} in
@@ -48,9 +59,11 @@ for ((pass=0; pass<3; pass++)); do
         active) sudo -n /usr/local/libexec/ztos-waydroid-recover unfreeze ;;
         idle)
             launch_in_progress && exit 0
+            push_hold_active && exit 0
             if ! keep_awake_active; then sudo -n /usr/local/libexec/ztos-waydroid-recover freeze; fi
             ;;
         screen-off)
+            push_hold_active && exit 0
             if ! keep_awake_active; then sudo -n /usr/local/libexec/ztos-waydroid-recover freeze; fi
             ;;
         *) exit 2 ;;

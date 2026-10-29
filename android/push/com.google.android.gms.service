@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=com.google.android.gms
+Exec=/usr/local/bin/zrn-pushd
+SystemdService=zrn-pushd.service

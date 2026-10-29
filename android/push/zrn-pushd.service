@@ -1,0 +1,14 @@
+[Unit]
+Description=ztOS push messages (FCM) for Android apps
+Documentation=file:///usr/local/share/doc/zrn-pushd/README.md
+
+[Service]
+Type=dbus
+BusName=com.google.android.gms
+ExecStart=/usr/local/bin/zrn-pushd
+Restart=always
+RestartSec=5
+# no NoNewPrivileges: it would drop the binary's CAP_WAKE_ALARM
+
+[Install]
+WantedBy=default.target

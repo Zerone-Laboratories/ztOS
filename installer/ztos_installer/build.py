@@ -220,6 +220,16 @@ ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1; make -j"$(nproc)" &
 ch sh -c 'cd /usr/src/ztmetro && make install-browser'
 ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1' || true
 
+# push messages for Android apps in both runtimes (the sudoers rule comes
+# from the user templates in the rootfs overlay)
+step "building zrn-pushd (push for Android apps)"
+rm -rf "$R/usr/src/zrn-pushd"; mkdir -p "$R/usr/src"
+cp -a "$SRC/android/push" "$R/usr/src/zrn-pushd"
+ch sh -c 'cd /usr/src/zrn-pushd && make clean >/dev/null 2>&1; make && make install'
+install -Dm644 "$SRC/android/push/README.md" "$R/usr/local/share/doc/zrn-pushd/README.md"
+ch systemctl --global enable zrn-pushd.service
+rm -rf "$R/usr/src/zrn-pushd"
+
 step "adding ztOS's files"
 cp -a "$SRC/os/overlay/." "$R/"
 cp -a "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery

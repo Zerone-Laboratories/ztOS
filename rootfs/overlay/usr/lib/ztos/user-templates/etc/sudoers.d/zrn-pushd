@@ -1,0 +1,3 @@
+# zrn-pushd (the user's push daemon, android/push): a push message into
+# Waydroid, and microG's device identity. These two, and nothing else.
+@USER@ ALL=(root) NOPASSWD: /usr/local/libexec/ztos-waydroid-recover push *, /usr/local/libexec/ztos-waydroid-recover microg
