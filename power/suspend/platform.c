@@ -66,6 +66,14 @@ module_param(wake_stat, uint, 0444);
 module_param(wake_stat2, uint, 0444);
 module_param(wake_stat3, uint, 0444);
 module_param(bid_pending, uint, 0444);
+/* PMU_INTR_GEN GRP4 (0x14070408): ACPM's flexpmu reads it after the SoC
+ * down sequence and gives up the sleep ("upend_wk") while it is not zero.
+ * grp4_before is the word at the SMC; clear_grp4 clears what was latched. */
+static unsigned int grp4_before, grp4_cleared;
+static bool clear_grp4;
+module_param(grp4_before, uint, 0444);
+module_param(grp4_cleared, uint, 0444);
+module_param(clear_grp4, bool, 0600);
 module_param(region_count, uint, 0444);
 module_param(last_index, uint, 0444);
 module_param(last_error, int, 0444);
@@ -320,11 +328,22 @@ static int sleep_finisher(unsigned long state)
 	for (i = 0; i < 16; i++)
 		pending_before[i] = readl_relaxed(mapped_base(0x10100000) + 0x1200 + i * 4) & readl_relaxed(mapped_base(0x10100000) + 0x1100 + i * 4);
 	mif_requests_before = (readl_relaxed(mapped_base(0x02040000) + 0xf8ac) >> 16) & 0xff;
+	grp4_before = readl_relaxed(mapped_base(0x14070000) + 0x408);
+	grp4_cleared = 0;
+	if (clear_grp4 && grp4_before) {
+		/* write-one-to-clear, held until written back to zero (as
+		 * pmucal_apm_pmu_init does) */
+		writel_relaxed(grp4_before, mapped_base(0x14070000) + 0x40c);
+		wmb();
+		writel_relaxed(0, mapped_base(0x14070000) + 0x40c);
+		wmb();
+		grp4_cleared = readl_relaxed(mapped_base(0x14070000) + 0x408);
+	}
 	/* Keep this before enabling the MIF gate: retained console records must
 	 * distinguish a missing AP request from corruption of earlier log text. */
-	pr_info("zrn-system-sleep: handoff mif_sleep=%u requests=%02x gate=%u\n",
+	pr_info("zrn-system-sleep: handoff mif_sleep=%u requests=%02x gate=%u grp4=%08x->%08x\n",
 		mif_sleep, mif_requests_before,
-		readl_relaxed(mapped_base(0x02040000) + 0xf95c));
+		readl_relaxed(mapped_base(0x02040000) + 0xf95c), grp4_before, grp4_cleared);
 	/* Keep the enable/SMC/abort-disable instructions in one cache line.
 	 * x19 is preserved by the secure-call ABI. Do not call or delay in
 	 * the interval where ACPM is permitted to remove DRAM power. */
