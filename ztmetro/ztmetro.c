@@ -556,6 +556,7 @@ struct zt_server {
 
 	struct zt_layer osk_layer, nav_layer, status_layer, shade_layer;
 	struct zt_layer lock_layer, keypop_layer;
+	struct zt_layer lock_clock_layer, lock_note_layer;	/* the Metro lock's clock block and notification row */
 	/* wallpapers (config start_wallpaper, lock_wallpaper): Start's photo
 	 * as a texture taller than the screen for its parallax, the lock
 	 * screen's as an image painted under the clock */
@@ -672,6 +673,7 @@ struct zt_server {
 	bool wifi_suspend;
 	bool wifi_suspended_by_sleep;
 	float lock_y;			/* 0 covering the screen, -height pushed off the top */
+	float lock_lift;		/* the Metro lock's clock block: 0 low, 1 raised with the notification row shown */
 	bool keypop;			/* the pressed key shown enlarged above the finger */
 	float keypop_x, keypop_y;
 	float shade_h;			/* pull-down height of the Action Center shade */
@@ -5067,6 +5069,101 @@ static void retro_paint_lock(struct zt_server *server, cairo_t *cr) {
 	dm_screen_finish(&field);
 }
 
+/* The Metro lock's clock block (time, day, date) is drawn low on the screen,
+ * where Windows Phone has it. With notifications waiting it is raised by
+ * LOCK_LIFT, so the row of marks under the date clears the bottom edge by the
+ * nav bar's height and a little over: the row ends 43 points under the date
+ * at rest, and NAV_H + 16 is the room wanted below it. */
+#define LOCK_LIFT (NAV_H + 16 - 43)
+#define LOCK_CLOCK_Y(server) ((double)(server)->height - 280)	/* the clock layer's top */
+#define LOCK_CLOCK_H 220.0
+#define LOCK_NOTE_Y(server) ((double)(server)->height - 100)	/* the row layer's top */
+#define LOCK_NOTE_H 80.0
+
+static void draw_lock_clock(struct zt_server *server) {
+	double y0 = LOCK_CLOCK_Y(server);
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, server->width, LOCK_CLOCK_H, &cr);
+	cairo_translate(cr, 0, -y0);	/* drawn in screen coordinates, at rest (low) */
+	time_t now = time(NULL);
+	struct tm tm;
+	localtime_r(&now, &tm);
+	char line[64];
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	strftime(line, sizeof(line), "%H:%M", &tm);
+	draw_text(cr, line, FONT_LIGHT, 92, 16, server->height - 268, 0, 0, false);
+	strftime(line, sizeof(line), "%A", &tm);
+	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 156, 0, 0, false);
+	strftime(line, sizeof(line), "%B %-d", &tm);
+	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 120, 0, 0, false);
+	zt_buffer_show(server, &server->lock_clock_layer, buffer, cr, server->width, LOCK_CLOCK_H);
+}
+
+/* The row of each app's glyph (or initial) with its count, as Windows Phone's,
+ * at its place under the raised date. With no notifications the last row
+ * stays as it was, to fade out. */
+static void draw_lock_notes(struct zt_server *server) {
+	const char *names[5];
+	int counts[5];
+	int n = note_apps(server, names, counts, 5);
+	if (n == 0 && server->lock_note_layer.tex) {
+		return;
+	}
+	double y0 = LOCK_NOTE_Y(server);
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, server->width, LOCK_NOTE_H, &cr);
+	cairo_translate(cr, 0, -y0);
+	char line[64];
+	double x = 22, cy = server->height - 120 - LOCK_LIFT + 30 + 34;
+	for (int i = 0; i < n; i++) {
+		const char *glyph = note_glyph(names[i]);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		if (glyph) {
+			draw_icon(cr, glyph, x + 13, cy, 26);
+		} else {
+			char initial[2] = { (char)toupper((unsigned char)names[i][0]), 0 };
+			cairo_set_line_width(cr, 1.5);
+			cairo_rectangle(cr, x + 1, cy - 12, 24, 24);
+			cairo_stroke(cr);
+			draw_text(cr, initial, FONT_SEMIBOLD, 15, x + 1, cy - 12, 24, 24, true);
+		}
+		snprintf(line, sizeof(line), "%d", counts[i]);
+		draw_text(cr, line, FONT_SEMILIGHT, 22, x + 32, cy - 15, 0, 0, false);
+		x += 32 + text_width(line, FONT_SEMILIGHT, 22) + 22;
+	}
+	zt_buffer_show(server, &server->lock_note_layer, buffer, cr, server->width, LOCK_NOTE_H);
+}
+
+/* Raise the clock block (and show the row) while any notification waits, and
+ * lower it again with the last gone: eased out over 300 ms when the lock
+ * screen is in view and `animated`, else at once. */
+static void lock_lift_sync(struct zt_server *server, bool animated) {
+	const char *names[5];
+	int counts[5];
+	float to = note_apps(server, names, counts, 5) > 0 ? 1.0f : 0.0f;
+	if (anim_target(server, &server->lock_lift) == to) {
+		return;
+	}
+	if (animated && server->screen_on && server->locked && server->lock_y > -1.0f) {
+		animate_wplog(server, &server->lock_lift, to, 300, 0, 8.0f);
+	} else {
+		server->lock_lift = to;
+		if (animating(server, &server->lock_lift)) {
+			animate(server, &server->lock_lift, to, 1, 0, true);
+		}
+	}
+}
+
+/* The notifications changed (one arrived, or they were cleared). */
+static void lock_notes_changed(struct zt_server *server) {
+	if (server->width == 0 || retro_on(server) || !server->lock_layer.tex) {
+		return;
+	}
+	draw_lock_notes(server);
+	lock_lift_sync(server, true);
+	damage(server);
+}
+
 static void draw_lock(struct zt_server *server) {
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, server->height, &cr);
@@ -5103,44 +5200,12 @@ static void draw_lock(struct zt_server *server) {
 		cairo_pattern_destroy(shade);
 	}
 	status_row(server, cr, false, false);
-
-	time_t now = time(NULL);
-	struct tm tm;
-	localtime_r(&now, &tm);
-	char line[64];
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	/* the apps with notifications waiting: their row sits under the date, and
-	 * the clock and date rise just far enough to keep it on the screen (with
-	 * none, they stay where Windows Phone has them, low on the screen) */
-	const char *names[5];
-	int counts[5];
-	int n = note_apps(server, names, counts, 5);
-	int lift = n > 0 ? 30 : 0;
-	strftime(line, sizeof(line), "%H:%M", &tm);
-	draw_text(cr, line, FONT_LIGHT, 92, 16, server->height - 268 - lift, 0, 0, false);
-	strftime(line, sizeof(line), "%A", &tm);
-	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 156 - lift, 0, 0, false);
-	strftime(line, sizeof(line), "%B %-d", &tm);
-	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 120 - lift, 0, 0, false);
-	/* each app's glyph (or initial) with its count, as Windows Phone's */
-	double x = 22, cy = server->height - 120 - lift + 30 + 34;
-	for (int i = 0; i < n; i++) {
-		const char *glyph = note_glyph(names[i]);
-		cairo_set_source_rgb(cr, 1, 1, 1);
-		if (glyph) {
-			draw_icon(cr, glyph, x + 13, cy, 26);
-		} else {
-			char initial[2] = { (char)toupper((unsigned char)names[i][0]), 0 };
-			cairo_set_line_width(cr, 1.5);
-			cairo_rectangle(cr, x + 1, cy - 12, 24, 24);
-			cairo_stroke(cr);
-			draw_text(cr, initial, FONT_SEMIBOLD, 15, x + 1, cy - 12, 24, 24, true);
-		}
-		snprintf(line, sizeof(line), "%d", counts[i]);
-		draw_text(cr, line, FONT_SEMILIGHT, 22, x + 32, cy - 15, 0, 0, false);
-		x += 32 + text_width(line, FONT_SEMILIGHT, 22) + 22;
-	}
 	zt_buffer_show(server, &server->lock_layer, buffer, cr, server->width, server->height);
+	/* the clock block and the notification row are layers of their own, so
+	 * that a notification arriving moves them without redrawing the photo */
+	draw_lock_clock(server);
+	draw_lock_notes(server);
+	lock_lift_sync(server, false);
 }
 
 /* The system sounds (sounds/ztos-sounds.c plays them, indices as its
@@ -6968,6 +7033,7 @@ static void shade_activate(struct zt_server *server, int index) {
 		break;
 	case 8: /* CLEAR ALL */
 		server->n_notes = 0;
+		lock_notes_changed(server);
 		draw_shade(server);
 		damage(server);
 		break;
@@ -8883,6 +8949,7 @@ static void note_add(struct zt_server *server, const char *app, const char *titl
 	if (server->shade_open || server->shade_h > 0.1f) {
 		draw_shade(server);
 	}
+	lock_notes_changed(server);
 	hap(server, HAP_HEAVY, HG_SYSTEM);
 	damage(server);
 }
@@ -10953,6 +11020,14 @@ static void ctl_command(struct zt_server *server, char *line) {
                 damage(server);
             }
         }
+	} else if (strcmp(line, "clearnotes") == 0) {
+		/* as CLEAR ALL in the Action Center */
+		server->n_notes = 0;
+		lock_notes_changed(server);
+		if (server->shade_open || server->shade_h > 0.1f) {
+			draw_shade(server);
+		}
+		damage(server);
 	} else if (strncmp(line, "notify ", 7) == 0) {
 		/* notify APP|TITLE|TEXT, or notify TITLE|TEXT from the system */
 		char *bar = strchr(line + 7, '|'), *second = bar ? strchr(bar + 1, '|') : NULL;
@@ -12216,6 +12291,16 @@ static void render_frame(struct zt_server *server) {
 	}
 	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height) && !retro_on(server)) {
 		layer_draw(server, &server->lock_layer, 0, server->lock_y, 1.0f);
+		/* the clock block rises by LOCK_LIFT as the notification row comes in */
+		float lift = server->lock_lift < 0.0f ? 0.0f : server->lock_lift > 1.0f ? 1.0f : server->lock_lift;
+		if (server->lock_clock_layer.tex) {
+			layer_draw(server, &server->lock_clock_layer, 0,
+				server->lock_y + (float)LOCK_CLOCK_Y(server) - LOCK_LIFT * lift, 1.0f);
+		}
+		if (server->lock_note_layer.tex && lift > 0.0f) {
+			layer_draw(server, &server->lock_note_layer, 0,
+				server->lock_y + (float)LOCK_NOTE_Y(server) + LOCK_LIFT * (1.0f - lift), lift);
+		}
 		plug_over(server, server->lock_y);
 	}
 	if (server->call_over_lock && server->shown && server->shown->mapped &&
