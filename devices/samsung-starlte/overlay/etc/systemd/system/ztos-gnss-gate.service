@@ -3,6 +3,9 @@ Description=ztOS GNSS gate: GPS on only while something reads location (NMEA on 
 
 [Service]
 ExecStart=/usr/local/sbin/ztos-gnss-gate
+# /var/lib/ztos-gnss/last: the last fix, root only
+StateDirectory=ztos-gnss
+StateDirectoryMode=0700
 ExecStopPost=/usr/bin/systemctl --no-block stop ztos-gnss.service
 Restart=always
 RestartSec=5

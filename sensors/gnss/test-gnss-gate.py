@@ -48,7 +48,7 @@ class GateTests(unittest.TestCase):
 
         def tick(*args):
             now[0] += 1
-            if now[0] > 40:
+            if now[0] > gate.IDLE + 10:
                 raise StopPump()
 
         def unit(action):
@@ -74,7 +74,7 @@ class GateTests(unittest.TestCase):
                              {'side_effect': ConnectionRefusedError()})):
             with self.assertRaises(StopPump):
                 gate.pump()
-        self.assertEqual(actions, [('stop', 31)])
+        self.assertEqual(actions, [('stop', gate.IDLE + 1)])
         self.assertFalse(gate.running)
         self.assertFalse(gate.clients)
 
@@ -83,6 +83,33 @@ class GateTests(unittest.TestCase):
 
     def test_disconnect_stops_silent_engine(self):
         self.check_idle_stop(silent=True)
+
+    def sentence(self, body):
+        return '$%s*%s' % (body, self.gate.nmea_checksum(body))
+
+    def test_last_fix_from_nmea(self):
+        gate = self.gate
+        gate.last_fix = None
+        with patch.object(gate, 'save_last'):
+            # made-up position, not anyone's
+            gate.track(self.sentence('GPGGA,120000.00,1030.0000,S,02015.0000,E,1,07,1.5,10.0,M,,M,,'))
+            gate.track(self.sentence('GPRMC,120000.00,A,1030.0000,S,02015.0000,E,0.0,0.0,291026,,,A'))
+        lat, lon, acc, _ = gate.last_fix
+        self.assertAlmostEqual(lat, -10.5)
+        self.assertAlmostEqual(lon, 20.25)
+        self.assertEqual(acc, 6.0)
+        hello = gate.last_sentence().decode().strip()
+        body, _, cs = hello[1:].partition('*')
+        self.assertTrue(body.startswith('PZTLF,-10.500000,20.250000,6,'))
+        self.assertEqual(cs, gate.nmea_checksum(body))
+
+    def test_void_rmc_and_bad_checksum_ignored(self):
+        gate = self.gate
+        gate.last_fix = None
+        gate.track(self.sentence('GPRMC,120000.00,V,,,,,,,291026,,,N'))
+        gate.track('$GPRMC,120000.00,A,1030.0000,S,02015.0000,E,0.0,0.0,291026,,,A*00')
+        self.assertIsNone(gate.last_fix)
+        self.assertIsNone(gate.last_sentence())
 
 
 if __name__ == '__main__':

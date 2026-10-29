@@ -5,14 +5,26 @@ Owns the public NMEA sockets, 127.0.0.1:10110 and /run/ztos-gnss/nmea.sock
 (geoclue, Waydroid's location bridge, gpsd clients). The first reader starts
 ztos-gnss.service (the hub's GNSS engine and zrn-gnss-nmea on 10111); once
 the last reader has been gone IDLE seconds it is stopped again, so the
-GNSS radio is off unless something asks for location.
+GNSS radio is off unless something asks for location. IDLE is long enough
+that an app closed and opened again, or a look at another app, finds the
+engine still tracking instead of searching afresh.
+
+The last fix is kept in LAST ("lat lon accuracy_m unix_time", root only),
+for zrn-gnss-nmea to aid the next start with, and every new reader is sent
+it first as a proprietary sentence, $PZTLF,lat,lon,accuracy_m,unix_time,
+so that it can show a position at once; readers that do not know it skip
+it, as NMEA readers do with any P sentence. No position goes to the log.
+
+It also stands in for Samsung's RIL (@VND_Multiclient, see ril_stand_in).
 """
 import os, socket, subprocess, sys, threading, time
 
 PUBLIC_TCP = ("127.0.0.1", 10110)
 PUBLIC_UNIX = "/run/ztos-gnss/nmea.sock"
 INNER = ("127.0.0.1", 10111)
-IDLE = 30
+IDLE = 120
+LAST = "/var/lib/ztos-gnss/last"
+SAVE_EVERY = 60  # seconds between writes of LAST while fixes come
 
 lock = threading.Lock()
 clients = set()
@@ -31,18 +43,137 @@ def unit(action):
     subprocess.run(["systemctl", "--no-block", action, "ztos-gnss.service"], check=False)
 
 
+# ---- the last fix ----
+last_fix = None      # (lat, lon, accuracy_m, unix_time)
+last_saved = 0.0
+hdop = None          # from the latest GGA with a fix
+
+
+def load_last():
+    global last_fix
+    try:
+        with open(LAST) as f:
+            v = [float(x) for x in f.read().split()[:4]]
+        if len(v) == 4 and -90 <= v[0] <= 90 and -180 <= v[1] <= 180:
+            last_fix = tuple(v)
+    except (OSError, ValueError):
+        pass
+
+
+def save_last():
+    """Called with lock held."""
+    global last_saved
+    if not last_fix:
+        return
+    last_saved = time.monotonic()
+    try:
+        os.makedirs(os.path.dirname(LAST), exist_ok=True)
+        tmp = LAST + ".new"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write("%.6f %.6f %.0f %.0f\n" % last_fix)
+        os.replace(tmp, LAST)
+    except OSError as e:
+        log(f"cannot keep the last fix: {e}")
+
+
+def nmea_checksum(body):
+    x = 0
+    for ch in body.encode("ascii", "replace"):
+        x ^= ch
+    return "%02X" % x
+
+
+def last_sentence():
+    """$PZTLF for a new reader, or None. Called with lock held."""
+    if not last_fix:
+        return None
+    body = "PZTLF,%.6f,%.6f,%.0f,%.0f" % last_fix
+    return ("$%s*%s\r\n" % (body, nmea_checksum(body))).encode()
+
+
+def degrees(v, hemi, width):
+    if len(v) < width + 2:
+        return None
+    d = float(v[:width]) + float(v[width:]) / 60.0
+    return -d if hemi in ("S", "W") else d
+
+
+def track(line):
+    """Remember the latest fix from GGA/RMC. Called with lock held."""
+    global last_fix, hdop
+    if len(line) < 7 or line[0] != "$" or "*" not in line:
+        return
+    body, _, cs = line[1:].partition("*")
+    if nmea_checksum(body) != cs[:2].upper():
+        return
+    f = body.split(",")
+    kind = f[0][2:]
+    try:
+        if kind == "GGA" and len(f) > 8:
+            hdop = float(f[8]) if f[6] not in ("", "0") and f[8] else None
+        elif kind == "RMC" and len(f) > 6 and f[2] == "A":
+            lat, lon = degrees(f[3], f[4], 2), degrees(f[5], f[6], 3)
+            if lat is None or lon is None:
+                return
+            # no error estimate in RMC/GGA: HDOP times a typical 4 m
+            acc = max(5.0, hdop * 4.0) if hdop else 20.0
+            last_fix = (lat, lon, acc, time.time())
+            if time.monotonic() - last_saved > SAVE_EVERY:
+                save_last()
+    except ValueError:
+        pass
+
+
+def ril_stand_in():
+    """Accept and drain gpsd's connections to Samsung's RIL socket.
+
+    The vendor gpsd tries the abstract socket @VND_Multiclient (Samsung's
+    RIL, which ztOS does not run) once a second for 20 s before it turns
+    the engine on: the first 22 s of every start. Accepted, it sends two
+    small requests, needs no answer, and starts at once. Abstract sockets
+    belong to the network namespace, which gpsd shares with us.
+    """
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind("\0VND_Multiclient")
+        s.listen(4)
+    except OSError as e:
+        log(f"no RIL stand-in: {e}")
+        return
+
+    def drain(c):
+        with c:
+            while c.recv(4096):
+                pass
+
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=drain, args=(c,), daemon=True).start()
+
+
 def accept_loop(server):
     global running, last_start
     while True:
         conn, _ = server.accept()
         conn.setblocking(False)
         with lock:
+            hello = last_sentence()
+            if hello:
+                try:
+                    conn.send(hello)
+                except OSError:
+                    pass
             clients.add(conn)
             arrived.set()
             if not running:
                 running = True
                 last_start = time.monotonic()
                 log("reader arrived; GPS on")
+                # someone asks: a start limit hit earlier (hub down, sleep)
+                # must not keep the GPS off until it times out
+                subprocess.run(["systemctl", "reset-failed", "ztos-gnss.service"],
+                               check=False, stderr=subprocess.DEVNULL)
                 unit("start")
 
 
@@ -71,6 +202,7 @@ def pump():
     """Copy inner NMEA to every reader; reconnect while the unit comes up."""
     global last_reader, running, last_start
     inner = None
+    pending = b""
     while True:
         with lock:
             prune_readers()
@@ -79,6 +211,7 @@ def pump():
             elif running and time.monotonic() - last_reader > IDLE:
                 running = False
                 log("no readers; GPS off")
+                save_last()
                 unit("stop")
             want = running
         if not want:
@@ -97,7 +230,8 @@ def pump():
                 # ztos-gnss.service gave up (hub down, start limit): readers
                 # are still waiting, so ask again; systemd's start limit keeps
                 # this to three tries in five minutes
-                if time.monotonic() - last_start > RESTART:
+                # (only for readers still waiting, not during the idle hold)
+                if clients and time.monotonic() - last_start > RESTART:
                     last_start = time.monotonic()
                     log("engine unreachable; starting it again")
                     unit("start")
@@ -115,6 +249,12 @@ def pump():
             time.sleep(1)
             continue
         with lock:
+            pending += data
+            *lines, pending = pending.split(b"\n")
+            if len(pending) > 512:
+                pending = b""
+            for raw in lines:
+                track(raw.decode("ascii", "replace").strip())
             for c in list(clients):
                 try:
                     c.send(data)
@@ -150,6 +290,8 @@ def main():
     ux.bind(PUBLIC_UNIX)
     os.chmod(PUBLIC_UNIX, 0o666)
     ux.listen(8)
+    load_last()
+    threading.Thread(target=ril_stand_in, daemon=True).start()
     for s in (tcp, ux):
         threading.Thread(target=accept_loop, args=(s,), daemon=True).start()
     log("waiting for readers; GPS off")
