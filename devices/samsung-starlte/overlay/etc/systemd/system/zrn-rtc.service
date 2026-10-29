@@ -1,0 +1,16 @@
+[Unit]
+Description=RTC wake alarms (zrn-exynos-rtc) before Android starts, so its alarm clock can wake the phone
+# Android's AlarmManager asks for CLOCK_*_ALARM timers once, when
+# system_server starts; with no wake-capable RTC then, it never gets them,
+# and an alarm clock rings only at the next wake (up to 5 or 30 min late).
+# zrn-sleepd used to load the RTC only at its first sleep, minutes later.
+After=local-fs.target
+Before=waydroid-container.service zrn-sleepd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/zrn-rtc-load
+
+[Install]
+WantedBy=multi-user.target

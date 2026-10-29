@@ -160,6 +160,25 @@ standby bucket and a boot-time force-stop. Packages listed in `keep_awake` are
 excluded; foreground launches remain available. The cached-process and AppOps
 settings persist in Android user data, so rollback must restore them explicitly.
 
+## Alarm clocks cannot wake the phone (30 Oct)
+
+**An Android alarm rings only at the phone's next wake**: up to 5 min late
+with a doze app or zrn-pushd (DOZE_SLEEP_S), up to 30 min late without
+(MAX_SLEEP_S), or at screen-on if Waydroid is frozen. system_server's
+timerfds are CLOCK_REALTIME/MONOTONIC/BOOTTIME only (clockids 0, 1, 7), never
+CLOCK_*_ALARM (8, 9).
+
+Loading the RTC before the container (zrn-rtc.service, 30 Oct) does not
+change that: with rtc0 registered at 4 s and the container at 5 s, the
+clockids were still 0 x3, 1, 7 x2. The blocker is the capability:
+system_server's CapEff is 0x1002887420, without CAP_WAKE_ALARM (bit 35),
+because the container's bounding set (Android init, 0x144bac75ff) lacks
+exactly that one of lxc.cap.keep's list; init's effective set still has it.
+What drops it (LXC 7.0.0 or the image's init) is not found yet. A wake path
+for alarms needs either that capability back (then check the clockids
+again), or a native alarm service with a CLOCK_REALTIME_ALARM timerfd that
+thaws Waydroid and holds a timed inhibit.
+
 ## Measurements
 
 Memory is `lxc.payload.waydroid/memory.current`, **not** the small systemd manager

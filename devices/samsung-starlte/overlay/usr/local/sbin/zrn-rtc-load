@@ -1,0 +1,31 @@
+#!/bin/sh
+# Load the RTC wake driver early in boot (zrn-rtc.service). Unattended phone:
+# a mark is on the disk while it loads. Found at the next boot, the load never
+# finished (the phone froze or was cut off): never load it early again, until
+# someone removes the failed mark; zrn-sleepd still loads it at its first
+# sleep, as it always did.
+M=/var/lib/zrn-sleep/rtc-loading
+F=/var/lib/zrn-sleep/rtc-early-failed
+P=/usr/local/libexec/ztos-power/mif-trial
+[ -d /sys/module/zrn_exynos_rtc ] && exit 0
+mkdir -p /var/lib/zrn-sleep
+if [ -e "$M" ]; then
+	mv -f "$M" "$F"
+	sync
+fi
+if [ -e "$F" ]; then
+	echo "zrn-rtc: an early load never finished ($F): leaving it to zrn-sleepd"
+	exit 0
+fi
+date +%s > "$M"
+sync
+if insmod "$P/zrn-exynos-rtc.ko"; then
+	echo "zrn-rtc: loaded"
+else
+	echo "zrn-rtc: insmod failed; zrn-sleepd tries again at its first sleep"
+fi
+rm -f "$M"
+sync
+# the calendar, if it is not valid yet (as zrn-sleepd's setup does)
+python3 "$P/initialize-calendar.py" || true
+exit 0
