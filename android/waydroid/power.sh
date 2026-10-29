@@ -56,13 +56,21 @@ flock -w 30 8
 for ((pass=0; pass<3; pass++)); do
     state=$(cat "$policy")
     case $state in
-        active) sudo -n /usr/local/libexec/ztos-waydroid-recover unfreeze ;;
+        # Android's display is on while one of its windows is in front, and
+        # asleep otherwise, before any freeze: a hidden app is stopped, not
+        # left resumed (see ztos-waydroid-recover display).
+        active)
+            sudo -n /usr/local/libexec/ztos-waydroid-recover unfreeze
+            sudo -n /usr/local/libexec/ztos-waydroid-recover display on
+            ;;
         idle)
             launch_in_progress && exit 0
+            sudo -n /usr/local/libexec/ztos-waydroid-recover display off
             push_hold_active && exit 0
             if ! keep_awake_active; then sudo -n /usr/local/libexec/ztos-waydroid-recover freeze; fi
             ;;
         screen-off)
+            sudo -n /usr/local/libexec/ztos-waydroid-recover display off
             push_hold_active && exit 0
             if ! keep_awake_active; then sudo -n /usr/local/libexec/ztos-waydroid-recover freeze; fi
             ;;

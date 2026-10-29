@@ -27,9 +27,9 @@ android_sh() {
 #   ring stream, which follows the ztOS ringer, 0 at vibrate. Android's own
 #   touch, lock and charging sounds are off.
 # - Waydroid's keyboard gets a layout: without one, every time Android's
-#   display sleeps, Android posts "Configure physical keyboard" again, and ztOS
-#   chimes for it. There is no shell command for it
-#   in Android 13: IInputManager's setCurrentKeyboardLayoutForInputDevice is
+#   display sleeps (display off), Android posts "Configure physical keyboard"
+#   again, and ztOS chimes for it. There is no shell command for it in
+#   Android 13: IInputManager's setCurrentKeyboardLayoutForInputDevice is
 #   transaction 18 there (17 reads it), InputDeviceIdentifier written as
 #   descriptor, vendor, product.
 # What was given is kept by Android across boots; it is given again when the
@@ -79,6 +79,12 @@ settings() {
     fi
     exec 9>&-
 }
+display() {
+    [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == RUNNING ]] || return 0
+    local key=KEYCODE_SLEEP
+    [[ $1 == on ]] && key=KEYCODE_WAKEUP
+    android_sh '[ "$(getprop sys.boot_completed)" = 1 ] && cmd input keyevent '"$key" >/dev/null 2>&1 || true
+}
 case $1 in
     audio)
         [[ $# == 1 ]] || exit 2
@@ -88,6 +94,7 @@ case $1 in
         [[ $# == 1 ]] || exit 2
         systemctl start waydroid-container.service
         thaw
+        display on
         /usr/local/libexec/ztos-waydroid-audio
         ;;
     freeze)
@@ -101,6 +108,15 @@ case $1 in
         systemctl start waydroid-container.service
         thaw
         /usr/local/libexec/ztos-waydroid-audio
+        ;;
+    # Android's display is on only while one of its windows is in front in
+    # ztOS (ztos-waydroid-power). Asleep, its activities are stopped, as on a
+    # phone with the screen off: a chat left open on Home no longer reads the
+    # messages that come in. unfreeze leaves it asleep, so that zrn-pushd's
+    # thaw for a push message does not bring the app to the front again.
+    display)
+        [[ $# == 2 && ($2 == on || $2 == off) ]] || exit 2
+        display "$2"
         ;;
     settings)
         [[ $# == 1 ]] || exit 2

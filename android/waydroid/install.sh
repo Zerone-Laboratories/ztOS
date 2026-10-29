@@ -71,7 +71,7 @@ UNIT
 sudoers=$(mktemp)
 trap 'rm -f "$sudoers"' EXIT
 cat > "$sudoers" <<RULES
-$ZTOS_USER ALL=(root) NOPASSWD: /usr/local/libexec/ztos-waydroid-recover audio, /usr/local/libexec/ztos-waydroid-recover prepare, /usr/local/libexec/ztos-waydroid-recover ready, /usr/local/libexec/ztos-waydroid-recover recover, /usr/local/libexec/ztos-waydroid-recover freeze, /usr/local/libexec/ztos-waydroid-recover unfreeze, /usr/local/libexec/ztos-waydroid-recover settings, /usr/local/libexec/ztos-waydroid-recover install *, /usr/local/libexec/ztos-waydroid-recover remove *, /usr/local/libexec/ztos-waydroid-recover close *
+$ZTOS_USER ALL=(root) NOPASSWD: /usr/local/libexec/ztos-waydroid-recover audio, /usr/local/libexec/ztos-waydroid-recover prepare, /usr/local/libexec/ztos-waydroid-recover ready, /usr/local/libexec/ztos-waydroid-recover recover, /usr/local/libexec/ztos-waydroid-recover freeze, /usr/local/libexec/ztos-waydroid-recover unfreeze, /usr/local/libexec/ztos-waydroid-recover display on, /usr/local/libexec/ztos-waydroid-recover display off, /usr/local/libexec/ztos-waydroid-recover settings, /usr/local/libexec/ztos-waydroid-recover install *, /usr/local/libexec/ztos-waydroid-recover remove *, /usr/local/libexec/ztos-waydroid-recover close *
 RULES
 visudo -cf "$sudoers"
 install -m440 "$sudoers" /etc/sudoers.d/ztos-waydroid

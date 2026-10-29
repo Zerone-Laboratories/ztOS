@@ -351,6 +351,7 @@ struct zt_toplevel {
 	bool android_runtime;	/* resize Android layouts above the keyboard */
 	bool waydroid_ime;	/* Android IME visibility drives the host keyboard */
 	bool waydroid_boot;	/* temporary boot surface, never an app */
+	uint32_t commit_ms;	/* when it last committed a buffer */
 	char launch_command[256];	/* survives launcher exit / D-Bus handoff */
 	/* an SDK app, first time up: kept out of sight behind "Loading..." until
 	 * it says "ready" (its pages built, its entrance prepared), so that its
@@ -7121,9 +7122,18 @@ static void waydroid_visible(const char *runtime_app_id) {
 	}
 }
 
+/* When Android was last woken for one of its windows in front. Its display
+ * is asleep while none is (ztos-waydroid-power), so that a hidden app is
+ * stopped and does not act as seen: a chat left open marks no messages read. */
+static uint32_t waydroid_woke_ms;
+static bool waydroid_rewaking;	/* waiting for the app in front to come back (waydroid_rewake) */
+
 /* Publish policy before spawning: delayed children must apply the latest focus,
  * rather than replay an old thaw after Home or screen-off has frozen Android. */
 static void waydroid_power_request(const char *state) {
+	static char last[16];
+	if (!strcmp(state, "active") && strcmp(last, "active")) waydroid_woke_ms = now_ms() | 1;
+	snprintf(last, sizeof(last), "%s", state);
 	const char *runtime = getenv("XDG_RUNTIME_DIR");
 	if (!runtime) return;
 	char path[512], temporary[520];
@@ -7148,11 +7158,14 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 	}
 	wl_event_source_timer_update(server->launch_timer, 0);
 	server->shown = toplevel;
+	waydroid_rewaking = false;
 	const char *runtime_app_id = toplevel && toplevel->xdg_toplevel ?
 		toplevel->xdg_toplevel->app_id : NULL;
 	bool demoloop = demoloop_active();
 	if (runtime_app_id && strncmp(runtime_app_id, "waydroid.", 9) == 0) {
-		waydroid_power_request("active");
+		/* in front only where it is seen: not under the lock screen or with
+		 * the screen off (screen_set and unlocking wake Android then) */
+		waydroid_power_request(!server->screen_on ? "screen-off" : server->locked ? "idle" : "active");
 		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
 		waydroid_visible(runtime_app_id);
 	} else {
@@ -7405,6 +7418,18 @@ static void launch_item(struct zt_server *server, int index) {
 /* The app never showed a window: bring Start back. */
 static int launch_timed_out(void *data) {
 	struct zt_server *server = data;
+	if (waydroid_rewaking && !server->shown && server->pending_command[0]) {
+		/* No new window: the app went while Android slept (closed, or
+		 * stopped by Android), and is started again as from its tile. */
+		waydroid_rewaking = false;
+		char command[sizeof(server->pending_command)];
+		snprintf(command, sizeof(command), "%s", server->pending_command);
+		server->pending_command[0] = 0;
+		wlr_log(WLR_INFO, "Waydroid woke: no window came back, launching");
+		launch(server, command);
+		return 0;
+	}
+	waydroid_rewaking = false;
     /* A live application may still be doing a slow first launch. */
     if (server->pending_pid > 0 && kill(server->pending_pid, 0) == 0 && !server->shown) {
         wl_event_source_timer_update(server->launch_timer, 1000);
@@ -7417,6 +7442,9 @@ static int launch_timed_out(void *data) {
 	if (!server->shown) {
 		wlr_log(WLR_INFO, "launch: no window, back to Start");
 		start_turn(server, false, 0);
+		/* (Android may have been kept awake for a window: waydroid_rewake) */
+		waydroid_power_request(demoloop_active() ? "active" : "idle");
+		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
 	}
 	return 0;
 }
@@ -8471,6 +8499,37 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	if (matches || !server->pending_command[0]) show_toplevel(server, toplevel);
 }
 
+/* Waking Android takes its window in front away for a moment: its composer
+ * drops a window from the first frame without it, and the first frames after
+ * waking are such (the app is still stopped). The app comes back in a new
+ * window, so it is waited for as a launch is, behind "Loading...", and not
+ * left for Start; Android stays awake for it, and if no window comes in 2 s
+ * the app is launched (launch_timed_out). Only for a window that has drawn
+ * nothing since Android woke: one that goes later has closed. */
+static bool waydroid_rewake(struct zt_server *server, struct zt_toplevel *toplevel) {
+	const char *id = toplevel->xdg_toplevel->app_id;
+	uint32_t now = now_ms();
+	if (!id || strncmp(id, "waydroid.", 9) || !toplevel->launch_command[0] || !waydroid_woke_ms ||
+			now - waydroid_woke_ms > 4000 || (int32_t)(toplevel->commit_ms - waydroid_woke_ms) >= 0 ||
+			server->locked || server->switch_t > 0.001f) {
+		return false;
+	}
+	wlr_log(WLR_INFO, "Waydroid woke: waiting for '%s' in its new window", id);
+	snprintf(server->pending_command, sizeof(server->pending_command), "%s", toplevel->launch_command);
+	server->pending_pid = 0;
+	server->android_compiling = false;
+	server->launch_ms = server->loading_since = now;
+	prepare_loading(server);
+	server->shown = NULL;
+	server->leaving = NULL;
+	wlr_seat_keyboard_notify_clear_focus(server->seat);
+	text_inputs_focus(server, NULL);
+	osk_show(server, false);
+	waydroid_rewaking = true;
+	wl_event_source_timer_update(server->launch_timer, 2000);
+	return true;
+}
+
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	struct zt_toplevel *toplevel = wl_container_of(listener, toplevel, unmap);
 	struct zt_server *server = toplevel->server;
@@ -8490,6 +8549,10 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	switcher_forget(server, toplevel);
 	if (server->leaving == toplevel) {
 		server->leaving = NULL;
+	}
+	if (server->shown == toplevel && waydroid_rewake(server, toplevel)) {
+		damage(server);
+		return;
 	}
 	if (server->shown == toplevel) {
 		/* Closing an app lands on Start, as it does on the phone. */
@@ -8518,6 +8581,9 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 	if (toplevel->waydroid_boot && app_id && !strncmp(app_id, "waydroid.", 9) &&
 			xdg->surface->mapped) {
 		xdg_toplevel_map(&toplevel->map, NULL);
+	}
+	if (xdg->surface->current.committed & WLR_SURFACE_STATE_BUFFER) {
+		toplevel->commit_ms = now_ms();
 	}
 	if (toplevel->xdg_toplevel->base->initial_commit) {
 		/* Every app gets the whole app area, and is told it is maximised so
@@ -9977,7 +10043,9 @@ static void screen_set(struct zt_server *server, bool on) {
 		}
 	} else {
 		const char *id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
-		waydroid_power_request(demoloop || (id && !strncmp(id, "waydroid.", 9)) ? "active" : "idle");
+		/* an Android app under the lock screen (lock() below) is not in front */
+		bool locking = server->locked || (on && server->lock_enabled && server->width);
+		waydroid_power_request(demoloop || (id && !strncmp(id, "waydroid.", 9) && !locking) ? "active" : "idle");
 		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
 	}
 	if (on) {
@@ -11281,6 +11349,12 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 				/* the app that was open lights up again, dot by dot */
 				server->app_angle = TURN_IN_DEG;
 				animate(server, &server->app_angle, 0.0f, 450, 0, false);
+			}
+			const char *shown_id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
+			if (shown_id && !strncmp(shown_id, "waydroid.", 9)) {
+				/* the Android app that was open is in front again */
+				waydroid_power_request("active");
+				run_detached("ztos-waydroid-power", "sync", NULL, NULL);
 			}
 			wlr_log(WLR_INFO, "unlocked");
 		} else if (!p->moved) {

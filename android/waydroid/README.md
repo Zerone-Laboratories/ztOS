@@ -338,6 +338,15 @@ run background notifications, sync, or calls. A launch-in-progress marker preven
 the event-driven policy and Phase 1's zero-window fallback from freezing Android
 while its first session or APK installation is starting.
 
+Android's display is asleep whenever none of its windows is in front (Home, another
+app, the lock screen, screen off), kept-awake packages included, so a hidden app is
+stopped rather than left resumed: a chat left open no longer marks messages read.
+`ztos-waydroid-recover display on|off` does it (`input keyevent WAKEUP|SLEEP`);
+`unfreeze` leaves it asleep, so zrn-pushd's thaw for a push message does not bring
+an app back to the front. Waking makes Waydroid's composer drop the window in front
+and map a new one; ztMETRO waits for it behind "Loading..." and launches the app if
+none comes within 2 s.
+
 Android plays no notification sound of its own: ztOS chimes for each notification
 at the ztOS ringer. `ztos-waydroid-recover settings` keeps Android's notification
 stream at 0 and its ring stream (calls) at the ztOS ringer's level (0 at vibrate),
