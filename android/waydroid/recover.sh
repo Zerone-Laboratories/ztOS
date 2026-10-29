@@ -108,17 +108,23 @@ case $1 in
         [[ $# == 1 ]] || exit 2
         thaw
         [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == RUNNING ]] || exit 3
-        out=$(timeout 60 waydroid shell -- /system/bin/sh -c '
-            u=content://com.google.android.gms.microg.settings
-            content update --uri $u/gcm --bind gcm_enable_mcs_service:b:true --bind gcm_confirm_new_apps:b:false \
-                --bind gcm_network_mobile:i:-1 --bind gcm_network_wifi:i:-1 \
-                --bind gcm_network_roaming:i:-1 --bind gcm_network_other:i:-1 >/dev/null 2>&1 || exit
-            row=$(content query --uri $u/check-in --projection androidId:securityToken 2>/dev/null) || exit
-            a=${row#*androidId=}; a=${a%%,*}; a=${a%% *}
-            t=${row#*securityToken=}; t=${t%%,*}; t=${t%% *}
-            echo "android_id=$a"; echo "security_token=$t"' 2>/dev/null) || true
-        a=$(sed -n 's/^android_id=\(-\?[0-9]\{1,20\}\)$/\1/p' <<< "$out")
-        t=$(sed -n 's/^security_token=\(-\?[0-9]\{1,20\}\)$/\1/p' <<< "$out")
+        # microG's process may have to start for its provider first (the
+        # process limit is 0): the first call can fail, so three tries
+        for try in 1 2 3; do
+            out=$(timeout 60 waydroid shell -- /system/bin/sh -c '
+                u=content://com.google.android.gms.microg.settings
+                content update --uri $u/gcm --bind gcm_enable_mcs_service:b:true --bind gcm_confirm_new_apps:b:false \
+                    --bind gcm_network_mobile:i:-1 --bind gcm_network_wifi:i:-1 \
+                    --bind gcm_network_roaming:i:-1 --bind gcm_network_other:i:-1 >/dev/null 2>&1 || exit
+                row=$(content query --uri $u/check-in --projection androidId:securityToken 2>/dev/null) || exit
+                a=${row#*androidId=}; a=${a%%,*}; a=${a%% *}
+                t=${row#*securityToken=}; t=${t%%,*}; t=${t%% *}
+                echo "android_id=$a"; echo "security_token=$t"' 2>/dev/null) || true
+            a=$(sed -n 's/^android_id=\(-\?[0-9]\{1,20\}\)$/\1/p' <<< "$out")
+            t=$(sed -n 's/^security_token=\(-\?[0-9]\{1,20\}\)$/\1/p' <<< "$out")
+            [[ -n $a && -n $t ]] && break
+            sleep 3
+        done
         [[ -n $a && -n $t ]] || exit 6
         printf 'android_id=%s\nsecurity_token=%s\n' "$a" "$t"
         ;;
