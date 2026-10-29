@@ -237,8 +237,10 @@ void dm_chrome_lock(struct dm_grid *g, const struct dm_status *st, int64_t wall,
 	time_t t = (time_t)(wall / 1000);
 	struct tm tm;
 	localtime_r(&t, &tm);
-	/* the clock, twice the home's digits, a little above the middle */
-	int top = (int)lroundf(s->rows * 0.40f) - 11;
+	/* the clock, twice the home's digits, so the block (status icons, clock,
+	 * date, notification marks) sits a little below the middle and clear of
+	 * the swipe box */
+	int top = (int)lroundf(s->rows * 0.40f) - 1;
 	char hh[4], mm[4];
 	if (h24) snprintf(hh, sizeof(hh), "%02d", tm.tm_hour);
 	else snprintf(hh, sizeof(hh), "%2d", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12);

@@ -5109,9 +5109,13 @@ static void draw_lock(struct zt_server *server) {
 	localtime_r(&now, &tm);
 	char line[64];
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	/* the clock and the date sit higher to leave a row under the date for
-	 * the apps with notifications waiting (always, so they never jump) */
-	int lift = 56;
+	/* the apps with notifications waiting: their row sits under the date, and
+	 * the clock and date rise just far enough to keep it on the screen (with
+	 * none, they stay where Windows Phone has them, low on the screen) */
+	const char *names[5];
+	int counts[5];
+	int n = note_apps(server, names, counts, 5);
+	int lift = n > 0 ? 30 : 0;
 	strftime(line, sizeof(line), "%H:%M", &tm);
 	draw_text(cr, line, FONT_LIGHT, 92, 16, server->height - 268 - lift, 0, 0, false);
 	strftime(line, sizeof(line), "%A", &tm);
@@ -5119,9 +5123,6 @@ static void draw_lock(struct zt_server *server) {
 	strftime(line, sizeof(line), "%B %-d", &tm);
 	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 120 - lift, 0, 0, false);
 	/* each app's glyph (or initial) with its count, as Windows Phone's */
-	const char *names[5];
-	int counts[5];
-	int n = note_apps(server, names, counts, 5);
 	double x = 22, cy = server->height - 120 - lift + 30 + 34;
 	for (int i = 0; i < n; i++) {
 		const char *glyph = note_glyph(names[i]);
