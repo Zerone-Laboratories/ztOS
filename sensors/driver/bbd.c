@@ -998,8 +998,13 @@ static int bbd_suspend(pm_message_t state)
 	/* Call SSP suspend */
 	if (pssp_driver->driver.pm && pssp_driver->driver.pm->suspend)
 		pssp_driver->driver.pm->suspend(&dummy_spi.dev);
+#else
+	/* ztOS: Samsung's ssp_suspend is not built; its AP_SLEEP pulse is in
+	 * the board file (zrn_bbd_board.c) */
+	zrn_ssp_suspend();
 #endif
-	mdelay(20);
+	/* a PM notifier sleeps: no busy wait (it took 20-530 ms here) */
+	msleep(20);
 
 	pr_info("[SSPBBD]: %s --\n", __func__);
 	return 0;
@@ -1011,6 +1016,8 @@ static int bbd_resume(void)
 	/* Call SSP resume */
 	if (pssp_driver->driver.pm && pssp_driver->driver.pm->suspend)
 		pssp_driver->driver.pm->resume(&dummy_spi.dev);
+#else
+	zrn_ssp_resume();
 #endif
 #ifdef DEBUG_1HZ_STAT
 	bbd_enable_stat();

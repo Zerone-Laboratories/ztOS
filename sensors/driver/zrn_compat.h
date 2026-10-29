@@ -80,6 +80,11 @@ int zrn_named_gpio(const char *name);
 #define gpio_direction_output(n, v) gpiod_direction_output(zrn_gpios[n], v)
 #define gpio_direction_input(n) gpiod_direction_input(zrn_gpios[n])
 
+/* Samsung's ssp_suspend / ssp_resume (not built here), in the board file:
+ * the AP_SLEEP pulse, and the resume counter ztoscsf-sensord follows */
+void zrn_ssp_suspend(void);
+void zrn_ssp_resume(void);
+
 /* the SPI driver's registration, called from the board file */
 void bbd_exit(void);
 int zrn_bcm_spi_init(void);
