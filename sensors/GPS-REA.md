@@ -340,4 +340,95 @@ sensor framework is still restarted after each session.
 
 - SoC sleep (zrn-sleepd) with GPS in use kills the hub's lhd and gpsd; the
   gate restarts them on resume. With the screen on (navigation) the phone
-  does not sleep.
+  does not sleep. (Fixed on 30 October: section 8.)
+
+## 8. Sleep and GNSS, 30 October 2026
+
+### What broke
+
+Two faults, found together with the sleep work (power/suspend/README.md):
+
+- Every SoC sleep cut the BCM4773's enable pin (gpg0-2 in its power-down
+  setting: input, pull-down). The chip came back without its patch and the
+  first lhd exchange after the wake failed (OnCommunicationError,
+  ESW:CRASHED), with or without gpsd running. zrn-sleep-init.ko now holds
+  that pin (and gpg0-1) through the sleep; with GPS off the hub survives.
+- With gpsd streaming, a sleep still breaks the hub: `[SSPBBD]
+  MCU_REQ_RESP timeout` about 5 s after the wake, then `zrn-bbd: hub reset
+  (it had stopped answering)`. It recovers by itself, but the session is
+  lost. Stock never meets this: gpsd holds a "geo" wake lock while it runs,
+  which is a no-op here (no CONFIG_PM_WAKELOCKS, and none is wanted: a
+  kernel wake lock would be an invisible veto).
+
+### What holds now
+
+- ztos-gnss-gate holds `/run/zrn-sleepd/inhibit/timed-gnss` while the
+  engine serves a reader and is starting (90 s) or answering: written as
+  `/run/zrn-sleepd/.gnss.tmp`, dated now + 90 s, renamed in, renewed every
+  30 s. A dead gate holds nothing for more than 90 s; a dead hub with a
+  reader waiting holds nothing after 90 s.
+- With the screen off the engine stops 5 s after its last reader (120 s with
+  it on), before zrn-sleepd's 15 s; the hold lasts until the unit has
+  stopped (gpsd winding down is still gpsd). ztos-gnss.service removes the
+  file in ExecStopPost, however the engine ended.
+- A reader that keeps it on with the screen off (a keep_awake app sharing a
+  live location) gets 10 minutes, then "screen-off location cap": engine
+  off, hold gone, no start until the screen is on. A fresh
+  `ztos-waydroid-keep-screen` or a `/run/ztos-gnss/keep-NAME` file lifts it.
+  Cost of those 10 minutes: about 250 mA.
+- All of these timers count on CLOCK_BOOTTIME (the bridge's hold on
+  elapsedRealtime), so a sleep cannot stretch them.
+- ztos-gnss.service needs the hub with Requisite=, not Requires=: a GNSS
+  start never brings the hub up without ztoscsf's reset sequence; with it
+  down the start fails at once ("Dependency failed"). `--pre` waits up to
+  60 s for lhd and `ready=1`.
+- The gate's retry resets the unit's start limit only once the hub has been
+  ready for 10 s, so a reader that stays connected is not locked out for
+  five minutes, and a flapping hub cannot restart gpsd every 30 s.
+- A hub reset (ztoscsf-sensorhub's start, ztoscsf's power retry) holds
+  `timed-hub` (45 s) until `hub ready`.
+
+Measured on the phone (screen off, on the charger, so no real sleep):
+
+| Test | Result |
+|---|---|
+| reader with the hub stopped | `Dependency failed`, 70 ms; no hub start from the GNSS job |
+| hub reset | `timed-hub` present until `hub ready`, gone 0.5 s after it |
+| a reader, screen off | `timed-gnss` dated +90 s, renewed every 30 s; first fix 7-9 s |
+| reader leaves, screen off | engine stopped 6 s later, hold gone with the unit (1.5 s more) |
+| gpsd killed 4 times in 3.5 min, reader held | each time the gate restarted it at once; fix back 13-15 s after the kill; no start-limit-hit |
+
+### Constellations and SBAS (a 7-minute session, 30 October)
+
+GSV sentences by talker, with the satellites seen:
+
+| Talker | GSV | PRNs (NMEA numbering) | median SNR |
+|---|---|---|---|
+| GP (GPS) | 1181 | 14 (5-29) | 28 dB-Hz |
+| GL (GLONASS) | 788 | 9 (69-85) | 28 |
+| GA (Galileo) | 1556 | 14 (104-133, 100 + SV) | 25 |
+| BD (BeiDou) | 1895 | 19 (201-237, 200 + SV) | 30 |
+| QZ (QZSS) | 389 | 2 | 27 |
+
+GSA came for GP, QZ, BD, GA, GI (NavIC) and GN; NavIC never had a GSV (it
+is on L5/S, and the RF front end is L1 only, as on stock: L5 and NavIC stay
+out). GGA fix quality: 1 (autonomous) 352 times, 6 (estimated, after gpsd
+kills) 12, 0 (none) 26. Never 2: no SBAS correction in use, and no SBAS PRN
+(GAGAN 127/128/132, NMEA 40/41/45) in any GSV. SBASDisable stays unset: the
+engine decides, and turning it off would change nothing measured.
+
+### Accuracy
+
+zrn-gnss-nmea sends `$PZTFX,accuracy_m,,` for each HAL fix that carries one
+(GPS_LOCATION_HAS_ACCURACY); the gate and the bridge prefer it to HDOP x 4.
+Over the same session: 363 values, median 6.0 m, against a median of 2.4 m
+for HDOP x 4. HDOP x 4 was optimistic by about 2.5 times. First fixes come
+with 100 m. No position is in the sentence or the logs.
+
+### Native location
+
+Nothing native reads location today. geoclue and Linux gpsd are not
+installed on the phone (`pacman -Q`); only the overlay's
+`90-ztos-gnss.conf` and the gpsd drop-in wait for them. A draft interface,
+`ial/spec/org.ztos.ial.Location1.xml`, says what the GSI should get from a
+device (NMEA endpoint, engine state, fix age); it has no backend yet.

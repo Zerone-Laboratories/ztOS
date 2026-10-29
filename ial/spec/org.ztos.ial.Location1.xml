@@ -1,0 +1,28 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- org.ztos.ial.Location1: The phone's GNSS, for the GSI. DRAFT: no backend
+     yet and not in gsi.json; the names may still change.
+     Position never goes through this interface: readers take NMEA 0183 from
+     NmeaSocket (or NmeaTcp), and reading it is what powers the engine; the
+     device layer stops it again once nobody reads. geoclue's nmea-socket
+     source is the intended consumer.
+     NmeaSocket, NmeaTcp: where the NMEA is ("" if there is none).
+     EngineState: off, starting, tracking, capped (stopped by the device's
+     screen-off limit until the screen is on), failed.
+     Readers: how many read NMEA now.
+     FixAge: seconds since the last fix, -1 if there is none this boot.
+     Accuracy: the last fix's horizontal accuracy in metres, -1 if unknown.
+     Constellations: what the engine tracks, NMEA talkers (GP, GL, GA, BD, QZ).
+     Licence: LGPL-2.1-or-later. -->
+<node>
+  <interface name="org.ztos.ial.Location1">
+    <property name="Version" type="u" access="read"/>
+    <property name="NmeaSocket" type="s" access="read"/>
+    <property name="NmeaTcp" type="s" access="read"/>
+    <property name="EngineState" type="s" access="read"/>
+    <property name="Readers" type="u" access="read"/>
+    <property name="FixAge" type="d" access="read"/>
+    <property name="Accuracy" type="d" access="read"/>
+    <property name="Constellations" type="as" access="read"/>
+  </interface>
+</node>
