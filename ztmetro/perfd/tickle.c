@@ -484,6 +484,16 @@ static bool background_run(long now) {
          * IN_CLOSE_WRITE in the runtime directory we watch, and this loop
          * would wake itself for ever (flock needs no write access) */
         int lock = open(path, O_CREAT | O_RDONLY | O_CLOEXEC, 0600);
+        /* made here first (perfd is root, at boot): the session's own
+         * ztos-waydroid-power opens it for writing, so it must be the user's,
+         * or every policy change fails at its flock */
+        struct stat rt;
+        if (lock >= 0 && stat(background_runtime, &rt) == 0) {
+            struct stat ls;
+            if (fstat(lock, &ls) == 0 && ls.st_uid != rt.st_uid && fchown(lock, rt.st_uid, rt.st_gid) != 0) {
+                fprintf(stderr, "zrnperfd: tickle: %s: chown: %s\n", path, strerror(errno));
+            }
+        }
         if (lock >= 0 && flock(lock, LOCK_EX | LOCK_NB) == 0) {
             snprintf(path, sizeof(path), "%s/ztos-waydroid-power-state", background_runtime);
             FILE *f = fopen(path, "r");

@@ -4,6 +4,16 @@ set -euo pipefail
 [[ $EUID == 0 && $# -ge 1 ]] || exit 2
 . /usr/lib/ztos/user.sh
 lxc_args=(-P /var/lib/waydroid/lxc -n waydroid)
+# Frozen, or stuck half way (FREEZING: something thawed the cgroup under a
+# freeze LXC was still waiting on): running again either way.
+thaw() {
+    case $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) in
+        FROZEN|FREEZING)
+            timeout 10 waydroid container unfreeze || true
+            [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == RUNNING ]] || lxc-unfreeze "${lxc_args[@]}" || true
+            ;;
+    esac
+}
 case $1 in
     audio)
         [[ $# == 1 ]] || exit 2
@@ -12,9 +22,7 @@ case $1 in
     prepare)
         [[ $# == 1 ]] || exit 2
         systemctl start waydroid-container.service
-        if [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == FROZEN ]]; then
-            timeout 10 waydroid container unfreeze
-        fi
+        thaw
         /usr/local/libexec/ztos-waydroid-audio
         ;;
     freeze)
@@ -26,9 +34,7 @@ case $1 in
     unfreeze)
         [[ $# == 1 ]] || exit 2
         systemctl start waydroid-container.service
-        if [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == FROZEN ]]; then
-            timeout 10 waydroid container unfreeze
-        fi
+        thaw
         /usr/local/libexec/ztos-waydroid-audio
         ;;
     install)
@@ -56,9 +62,7 @@ case $1 in
         [[ $# == 1 ]] || exit 2
         deadline=$((SECONDS + 90))
         while (( SECONDS < deadline )); do
-            if [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == FROZEN ]]; then
-                timeout 5 waydroid container unfreeze || true
-            fi
+            thaw
             if [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == RUNNING ]] &&
                [[ $(timeout 3 lxc-attach "${lxc_args[@]}" --clear-env -v PATH=/system/bin:/system/xbin:/vendor/bin -- /system/bin/getprop sys.boot_completed 2>/dev/null) == 1 ]] &&
                timeout 3 lxc-attach "${lxc_args[@]}" --clear-env -v PATH=/system/bin:/system/xbin:/vendor/bin -- /system/bin/service check package 2>/dev/null | grep -q ': found$' &&
