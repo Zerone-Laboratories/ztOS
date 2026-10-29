@@ -1,0 +1,24 @@
+#!/bin/sh
+# ztos-gnss-lto: Broadcom's predicted orbits (LTO: GPS, GLONASS, BeiDou and
+# Galileo for 7 days, ~180 KB) for the vendor gpsd, which reads
+# /data/vendor/gps/lto2.dat when it starts. With it the engine knows where
+# every satellite is before it has heard any of them: indoors on 29 Oct 2026
+# it tracked 37 satellites half a minute in, against 14 to 16 without.
+# gpsd does not fetch the file itself here (it only asks for the integrity
+# file, rtistatus3.dat), so this does, at most every two days, when online.
+# A public file; nothing about the phone is sent but the request itself.
+D=/var/lib/zrn-android/data/vendor/gps
+URL=http://gllto.glpals.com/7day/v5/latest/lto2.dat
+F=$D/lto2.dat
+[ -d $D ] || exit 0
+if [ -s $F ] && [ -n "$(find $F -mmin -2880 2>/dev/null)" ]; then exit 0; fi
+curl -fsS -m 60 --retry 2 -o $F.new "$URL" || { rm -f $F.new; echo "ztos-gnss-lto: no LTO this time"; exit 0; }
+# the file starts with Broadcom's magic ff ca de 00; anything else (a captive
+# portal's page) is not kept
+if [ "$(head -c 4 $F.new | od -An -tx1 | tr -d ' \n')" = ffcade00 ]; then
+	chmod 0644 $F.new && mv -f $F.new $F
+	echo "ztos-gnss-lto: LTO updated ($(wc -c < $F) bytes)"
+else
+	rm -f $F.new
+	echo "ztos-gnss-lto: not an LTO file; kept the old one"
+fi

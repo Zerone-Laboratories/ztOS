@@ -33,7 +33,7 @@
     LtoDir="/data/vendor/gps/"
     LtoSyncThresholdDays="1"
 
-    IgnoreJniTime="true"
+    IgnoreJniTime="false"
     AssertEnabled="false"
 
     SensorsEnable="false"
@@ -56,6 +56,7 @@
     MultiCarrRFMode ="GL_MULTI_CARR_RF_MODE_L1"
     WarmStandbyTimeout1Seconds="10"
     WarmStandbyTimeout2Seconds="15"
+    NvmemWritePeriodMs="20000"
     RfPathLossDb_Cp="5.0"
     RfPathLossDb_Ap="5.0"
   >

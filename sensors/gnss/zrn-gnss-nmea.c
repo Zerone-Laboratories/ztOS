@@ -13,6 +13,13 @@
  * from libc is declared below with bionic's arm64 ABI.  See build.sh.
  * Layouts (sensors/GPS-REA.md): GpsInterface size 0x50 at 0x3c1a8 of
  * gps.default.so; GpsCallbacks is AOSP's (nmea_cb at +0x20, location_cb at +0x8).
+ *
+ * Start-up aiding: -t injects the host's clock (only passed when it is NTP
+ * synchronised), -l FILE the last fix ("lat lon accuracy_m unix_time", kept
+ * by ztos-gnss-gate), with an uncertainty that grows with its age.
+ * On SIGTERM the engine is stopped through the HAL and the HAL closed before
+ * exiting, after which gpsd exits by itself; killed together with us, it
+ * now and then crashed on its way out.
  */
 typedef unsigned long size_t;
 typedef long ssize_t;
@@ -45,6 +52,12 @@ extern char *strncpy(char *, const char *, size_t);
 extern void exit(int);
 extern int *__errno(void);
 extern void __libc_init(void *, void (*)(void), int (*)(int, char **, char **), const void *);
+extern void *signal(int, void (*)(int));
+extern int clock_gettime(int, void *);
+extern int open(const char *, int, ...);
+extern ssize_t read(int, void *, size_t);
+extern double strtod(const char *, char **);
+extern int usleep(unsigned);
 
 #define RTLD_NOW 2
 #define AF_UNIX 1
@@ -56,6 +69,12 @@ extern void __libc_init(void *, void (*)(void), int (*)(int, char **, char **), 
 #define SO_REUSEADDR 2
 #define MSG_NOSIGNAL 0x4000
 #define MSG_DONTWAIT 0x40
+#define SIGINT 2
+#define SIGTERM 15
+#define CLOCK_REALTIME 0
+#define CLOCK_BOOTTIME 7
+#define O_RDONLY 0
+struct timespec { long tv_sec, tv_nsec; };
 
 /* ---- program entry without crtbegin_dynamic.o ---- */
 static const void *structors[6];	/* preinit, init, fini (+ counts on newer bionic): all empty */
@@ -181,9 +200,12 @@ static void cb_location(GpsLocation *l)
 	else if (!fixes++)
 		dprintf(2, "zrn-gnss-nmea: first fix, accuracy %d m\n", (int)l->accuracy);
 }
+static volatile int engine_status;	/* GPS_STATUS_*: 1 session begin, 2 end, 3 engine on, 4 off */
 static void cb_status(void *st)
 {
-	if (st) dprintf(2, "zrn-gnss-nmea: status %d\n", (int)((uint16_t *)st)[4]);
+	if (!st) return;
+	engine_status = ((uint16_t *)st)[4];
+	dprintf(2, "zrn-gnss-nmea: status %d\n", engine_status);
 }
 static void cb_void(void) {}
 static void cb_ptr(void *p) { (void)p; }
@@ -208,11 +230,45 @@ static GpsCallbacks cbs = {
 	cb_void, cb_void, cb_thread, cb_void, cb_ptr, cb_ptr,
 };
 
+static volatile int stopping;
+static void on_term(int sig) { (void)sig; stopping = 1; }
+
+static int64_t clock_ms(int clock)
+{
+	struct timespec ts;
+	clock_gettime(clock, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* The last fix, "lat lon accuracy_m unix_time": aiding for a hot start. */
+static void inject_last(const GpsInterface *g, const char *path)
+{
+	char b[160];
+	int fd = open(path, O_RDONLY), n;
+	if (fd < 0) return;
+	n = (int)read(fd, b, sizeof b - 1);
+	close(fd);
+	if (n <= 0) return;
+	b[n] = 0;
+	char *e;
+	double lat = strtod(b, &e), lon = strtod(e, &e), acc = strtod(e, &e), t = strtod(e, &e);
+	double age = (double)clock_ms(CLOCK_REALTIME) / 1000.0 - t;
+	if (!(lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) || (lat == 0 && lon == 0)) return;
+	if (age < 0) age = 0;
+	/* moved since then at up to 30 m/s (a car); at most 300 km */
+	acc += age * 30;
+	if (acc > 300000) acc = 300000;
+	if (acc < 50) acc = 50;
+	g->inject_location(lat, lon, (float)acc);
+	dprintf(2, "zrn-gnss-nmea: injected the last fix, %ld s old, +-%ld m\n", (long)age, (long)acc);
+}
+
 int main(int argc, char **argv, char **envp)
 {
 	const char *hal = "/vendor/lib64/hw/gps.default.so";
 	const char *usock = "/data/vendor/gps/ztos-nmea.sock";
-	int port = 10110;
+	const char *last = 0;
+	int port = 10110, inject_clock = 0;
 	(void)envp;
 	/* -p PORT -u SOCKET: ztos-gnss-gate owns the public ones and starts us on demand */
 	for (int i = 1; i < argc; i++) {
@@ -221,7 +277,11 @@ int main(int argc, char **argv, char **envp)
 			port = 0;
 			for (const char *c = argv[++i]; *c >= '0' && *c <= '9'; c++) port = port * 10 + *c - '0';
 		} else if (!strcmp(argv[i], "-u") && i + 1 < argc) usock = argv[++i];
+		else if (!strcmp(argv[i], "-l") && i + 1 < argc) last = argv[++i];
+		else if (!strcmp(argv[i], "-t")) inject_clock = 1;
 	}
+	signal(SIGTERM, on_term);
+	signal(SIGINT, on_term);
 
 	int t = listen_tcp(port), u = listen_unix(usock);
 	if (t < 0 && u < 0) { dprintf(2, "zrn-gnss-nmea: no listening socket\n"); return 1; }
@@ -239,9 +299,21 @@ int main(int argc, char **argv, char **envp)
 		return 1;
 	}
 	if (g->init(&cbs)) { dprintf(2, "zrn-gnss-nmea: init failed (is gpsd up?)\n"); return 1; }
+	/* the host's clock (NTP), +-1 s; gps.xml must not set IgnoreJniTime */
+	if (inject_clock) {
+		g->inject_time(clock_ms(CLOCK_REALTIME), clock_ms(CLOCK_BOOTTIME), 1000);
+		dprintf(2, "zrn-gnss-nmea: injected the time\n");
+	}
+	if (last) inject_last(g, last);
 	/* standalone, periodic, 1 s; no SUPL (no RIL in ztOS) */
 	g->set_position_mode(0, 0, 1000, 0, 0, 0);
 	if (g->start()) { dprintf(2, "zrn-gnss-nmea: start failed\n"); return 1; }
 	dprintf(2, "zrn-gnss-nmea: started; NMEA on 127.0.0.1:%d and %s\n", port, usock);
-	for (;;) sleep(3600);
+	while (!stopping) sleep(1);
+	/* stop the engine so that gpsd saves what it knows, then let it go */
+	g->stop();
+	for (int i = 0; i < 50 && engine_status != 4; i++) usleep(100000);
+	dprintf(2, "zrn-gnss-nmea: stopped (engine %s)\n", engine_status == 4 ? "off" : "still on");
+	g->cleanup();
+	return 0;
 }
