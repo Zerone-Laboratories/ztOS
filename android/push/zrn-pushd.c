@@ -2413,8 +2413,13 @@ int main(int argc, char **argv)
 	SSL_CTX_set_default_verify_paths(tls);
 	SSL_CTX_set_verify(tls, SSL_VERIFY_PEER, NULL);
 
+	/* Only the heartbeat wakes the phone. A reconnect waits for it to be
+	 * awake: with Wi-Fi down for SoC sleep, the backoff's next try is due in
+	 * a second or two, and a wake alarm that close makes the kernel refuse
+	 * the sleep (alarmtimer -EBUSY) or wake straight out of it. The doze
+	 * window zrn-sleepd opens brings the network back, and rtnetlink tells. */
 	timer_init(&hb_timer, hb_fire, true);
-	timer_init(&reconnect_timer, reconnect_fire, true);
+	timer_init(&reconnect_timer, reconnect_fire, false);
 	timer_init(&step_timer, step_fire, false);
 	timer_init(&retry_timer, retry_fire, false);
 	timer_init(&hold_timer, hold_release, false);
