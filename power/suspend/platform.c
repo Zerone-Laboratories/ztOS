@@ -4,7 +4,10 @@
 #include <linux/cpu.h>
 #include <linux/cpu_pm.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/gpio/driver.h>
 #include <linux/io.h>
+#include <linux/irq.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/suspend.h>
@@ -177,6 +180,85 @@ static const struct kernel_param_ops hex32_ops = { .get = param_get_hex32 };
 module_param_cb(pdn_applied, &hex_ops, &pdn_applied, 0444);
 module_param_cb(chub_status_before, &hex32_ops, &chub_status_before, 0444);
 
+/* The sensor hub's host_req (gpa1-7, EINT bit 15) is masked by eint_wake
+ * (zrn-sleepd's 0xffe7bffd). Stock's EINT wake mask follows enable_irq_wake
+ * (exynos_wkup_irq_set_wake, 0x3e8e20 in stock's Image, clears the bit in
+ * the mask that exynos-powermode.c writes to PMU 0x60c), and bcm_gps_spi
+ * wake-enables host_req while lhd holds /dev/ttyBCM: on stock the hub wakes
+ * the AP. Ours slept through a pending host_req while GNSS ran, and the hub
+ * stopped answering 5 s after the wake (MCU_REQ_RESP timeout, J0c and J0d).
+ * eint_follow: the EINT bits (8 x gpaN + pin, gpa0-3) whose wake follows
+ * their IRQ's wake setting, as on stock. Resolved to IRQs at load; a bit
+ * written in later that was not resolved then is left to eint_wake. While a
+ * followed line is high (the hub is talking) the sleep is refused with
+ * EBUSY: stock never sleeps through a pending host_req, as it would wake at
+ * once. A latch with the line low is stale (the IRQ is level-triggered and
+ * bcm_spi_suspend disables it with disable_irq_nosync): it is cleared, and a
+ * new request then wakes the AP through the open bit. */
+static unsigned int eint_follow = 0x8000;
+module_param(eint_follow, uint, 0600);
+MODULE_PARM_DESC(eint_follow, "EINT bits whose wake follows their IRQ's enable_irq_wake (default: host_req)");
+static int follow_irq[32];	/* 0: that bit is not followed */
+static unsigned int eint_effective;	/* the PMU 0x60c word of the last sleep */
+module_param_cb(eint_effective, &hex32_ops, &eint_effective, 0444);
+static unsigned long hub_refused, hub_pend_cleared, grp4_stale_clears;
+module_param(hub_refused, ulong, 0444);
+module_param(hub_pend_cleared, ulong, 0444);
+module_param(grp4_stale_clears, ulong, 0444);
+/* Clear GRP4 at each attempt once the followed lines are low: a latch the
+ * hub's host_req left behind is stale by then. Not sticky: a live latch
+ * comes back and the firmware gives the sleep up (zrn-sleepd's
+ * FW_ABORT_LIMIT bounds that). */
+static bool grp4_stale_clear = true;
+module_param(grp4_stale_clear, bool, 0644);
+static unsigned int grp4_at_smc;	/* GRP4 read last, just before the SMC */
+module_param_cb(grp4_at_smc, &hex32_ops, &grp4_at_smc, 0444);
+
+static void follow_resolve(void)
+{
+	for (unsigned int b = 0; b < ARRAY_SIZE(follow_irq); b++) {
+		struct gpio_device *gdev;
+		char label[8];
+		int irq = -ENODEV;
+
+		if (!(eint_follow & BIT(b)))
+			continue;
+		snprintf(label, sizeof(label), "gpa%u", b / 8);
+		gdev = gpio_device_find_by_label(label);
+		if (gdev) {
+			struct gpio_desc *desc = gpio_device_get_desc(gdev, b % 8);
+
+			if (!IS_ERR_OR_NULL(desc))
+				irq = gpiod_to_irq(desc);
+			gpio_device_put(gdev);
+		}
+		if (irq <= 0) {
+			pr_warn("zrn-sleep-init: cannot follow eint bit %u\n", b);
+			continue;
+		}
+		follow_irq[b] = irq;
+		pr_info("zrn-sleep-init: eint bit %u (%s-%u) follows IRQ %d's wake setting\n",
+			b, label, b % 8, irq);
+	}
+}
+
+/* eint_wake with the followed bits whose IRQ is wake-enabled opened */
+static unsigned int effective_wake(void)
+{
+	unsigned int eff = eint_wake;
+
+	for (unsigned int b = 0; b < ARRAY_SIZE(follow_irq); b++) {
+		struct irq_data *d;
+
+		if (!(eint_follow & BIT(b)) || !follow_irq[b])
+			continue;
+		d = irq_get_irq_data(follow_irq[b]);
+		if (d && irqd_is_wakeup_set(d))
+			eff &= ~BIT(b);
+	}
+	return eff;
+}
+
 static void __iomem *mapped_base(u32 base);
 
 static void gpio_save(void)
@@ -305,11 +387,13 @@ static void restore_platform(void)
 static int prepare_platform(void)
 {
 	void __iomem *pmu = mapped_base(0x14060000);
+	unsigned int eff;
 	int ret, i;
 	if (pm_suspend_target_state != PM_SUSPEND_MEM || dry_run)
 		return 0;
 	if (num_online_cpus() != 1 || raw_smp_processor_id() != 0)
 		return -EBUSY;
+	eff = eint_effective = effective_wake();
 	for (i = 0; i < ARRAY_SIZE(usi_base); i++)
 		saved_usi[i] = readl_relaxed(mapped_base(usi_base[i]) + usi_offset[i]);
 	gpio_save();
@@ -317,7 +401,7 @@ static int prepare_platform(void)
 		saved_wdt0[i] = readl_relaxed(mapped_base(0x10050000) + i * 4);
 	for (i = 0; i < ARRAY_SIZE(eint_offset); i++) {
 		saved_eint_mask[i] = readl_relaxed(mapped_base(0x14050000) + 0x900 + eint_offset[i]);
-		writel_relaxed(saved_eint_mask[i] | (i == 4 ? 0xff : ((eint_wake >> (i * 8)) & 0xff)), mapped_base(0x14050000) + 0x900 + eint_offset[i]);
+		writel_relaxed(saved_eint_mask[i] | (i == 4 ? 0xff : ((eff >> (i * 8)) & 0xff)), mapped_base(0x14050000) + 0x900 + eint_offset[i]);
 	}
 	saved_eint = readl_relaxed(pmu + 0x60c);
 	saved_eint2 = readl_relaxed(pmu + 0x61c);
@@ -331,7 +415,7 @@ static int prepare_platform(void)
 		writel_relaxed(i == 0 ? ((usbl2 ? 0xd00d7e7e : 0xd00f7e7e) & ~BIT(1)) :
 			       (i == 3 ? 0 : 0xffff00ff), pmu + wake_offsets[i]);
 	}
-	writel_relaxed(eint_wake, pmu + 0x60c);
+	writel_relaxed(eff, pmu + 0x60c);
 	writel_relaxed(~0U, pmu + 0x61c);
 	writel_relaxed(usbl2 ? 5 : 4, pmu + 0x860);
 	prepared = true;
@@ -376,7 +460,10 @@ static int sleep_finisher(unsigned long state)
 	register unsigned long a6 asm("x6");
 	register unsigned long a7 asm("x7");
 	void __iomem *gate = mapped_base(0x02040000) + 0xf95c;
+	void __iomem *grp4 = mapped_base(0x14070000) + 0x408;
 	unsigned long enable = mif_sleep;
+	unsigned int b, low = 0, grp4_now;
+	int hub_line = -1;
 	int i, ret = prepare_platform();
 	if (ret)
 		return ret;
@@ -384,35 +471,64 @@ static int sleep_finisher(unsigned long state)
 		restore_platform();
 		return -EAGAIN;
 	}
-	/* Discard only latched events from explicitly masked diagnostic sources;
-	 * preserve the power-key latch and all enabled wake sources. */
+	/* A followed line (host_req) that is wake-enabled and high: the hub is
+	 * talking now. Going down would only wake at once (or sleep through it,
+	 * with the bit masked): refuse, and zrn-sleepd tries again. DAT of gpaN
+	 * is at 0x14050004 + N x 0x20. */
+	for (b = 0; b < ARRAY_SIZE(follow_irq); b++) {
+		u32 dat;
+
+		if (!(eint_follow & BIT(b)) || !follow_irq[b] || (eint_effective & BIT(b)))
+			continue;
+		dat = readl_relaxed(mapped_base(0x14050000) + (b / 8) * 0x20 + 4);
+		if (hub_line < 0)
+			hub_line = (dat >> (b % 8)) & 1;
+		if ((dat >> (b % 8)) & 1) {
+			hub_refused++;
+			pr_info("zrn-system-sleep: refused: host_req high (eint bit %u)\n", b);
+			restore_platform();
+			return -EBUSY;
+		}
+		low |= BIT(b);
+	}
+	/* Discard only latched events from explicitly masked diagnostic sources
+	 * and the stale latches of followed lines that are low; preserve the
+	 * power-key latch and all enabled wake sources. */
 	for (i = 0; i < ARRAY_SIZE(eint_offset); i++) {
-		u32 mask = i == 4 ? 0xff : ((eint_wake >> (i * 8)) & 0xff);
+		u32 mask = i == 4 ? 0xff : (((eint_wake | low) >> (i * 8)) & 0xff);
 		eint_before[i] = readl_relaxed(mapped_base(0x14050000) + 0xa00 + eint_offset[i]);
+		if (i < 4 && (eint_before[i] & (low >> (i * 8)) & 0xff))
+			hub_pend_cleared++;
 		writel_relaxed(eint_before[i] & mask, mapped_base(0x14050000) + 0xa00 + eint_offset[i]);
 	}
 	wmb();
 	for (i = 0; i < 16; i++)
 		pending_before[i] = readl_relaxed(mapped_base(0x10100000) + 0x1200 + i * 4) & readl_relaxed(mapped_base(0x10100000) + 0x1100 + i * 4);
 	mif_requests_before = (readl_relaxed(mapped_base(0x02040000) + 0xf8ac) >> 16) & 0xff;
-	grp4_before = readl_relaxed(mapped_base(0x14070000) + 0x408);
+	grp4_before = readl_relaxed(grp4);
 	chub_status_before = readl_relaxed(mapped_base(0x14060000) + 0x4084);
 	grp4_cleared = 0;
-	if (clear_grp4 && grp4_before) {
+	/* the followed lines are low by now (else refused above) */
+	if (grp4_before && (clear_grp4 || grp4_stale_clear)) {
 		/* write-one-to-clear, held until written back to zero (as
 		 * pmucal_apm_pmu_init does) */
 		writel_relaxed(grp4_before, mapped_base(0x14070000) + 0x40c);
 		wmb();
 		writel_relaxed(0, mapped_base(0x14070000) + 0x40c);
 		wmb();
-		grp4_cleared = readl_relaxed(mapped_base(0x14070000) + 0x408);
+		grp4_cleared = readl_relaxed(grp4);
+		if (grp4_stale_clear)
+			grp4_stale_clears++;
 	}
+	grp4_now = readl_relaxed(grp4);
 	/* Keep this before enabling the MIF gate: retained console records must
 	 * distinguish a missing AP request from corruption of earlier log text. */
-	pr_info("zrn-system-sleep: handoff mif_sleep=%u requests=%02x gate=%u grp4=%08x->%08x chub=%08x\n",
+	pr_info("zrn-system-sleep: handoff mif_sleep=%u requests=%02x gate=%u grp4=%08x->%08x chub=%08x eint_eff=%08x hub_line=%d grp4_at_smc=%08x\n",
 		mif_sleep, mif_requests_before,
 		readl_relaxed(mapped_base(0x02040000) + 0xf95c), grp4_before, grp4_cleared,
-		chub_status_before);
+		chub_status_before, eint_effective, hub_line, grp4_now);
+	/* again, after the console: what ACPM will find (zrn-sleepd's fw-abort) */
+	grp4_at_smc = readl_relaxed(grp4);
 	/* Keep the enable/SMC/abort-disable instructions in one cache line.
 	 * x19 is preserved by the secure-call ABI. Do not call or delay in
 	 * the interval where ACPM is permitted to remove DRAM power. */
@@ -667,6 +783,7 @@ static int __init system_sleep_init(void)
 			goto fail;
 		if (pdn)
 			apply_pdn();
+		follow_resolve();
 		wdt_cover.wdt = mapped_base(0x10060000);
 		wdt_cover.pmu = mapped_base(0x14060000);
 		register_pm_notifier(&wdt_notifier);
