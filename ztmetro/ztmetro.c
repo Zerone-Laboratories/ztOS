@@ -10111,9 +10111,30 @@ static void activity(struct zt_server *server) {
 	}
 }
 
+/* An Android app in front keeps its screen on (FLAG_KEEP_SCREEN_ON, as a map
+ * does while it navigates). Waydroid does not pass that on; the location
+ * bridge (android/waydroid/location) looks at Android's wake locks while it
+ * serves location to a shown app and touches ztos-waydroid-keep-screen every
+ * 15 s while one is held, so a stale file counts for nothing. */
+static bool waydroid_keeps_screen_on(struct zt_server *server) {
+	const char *id = server->shown && server->shown->xdg_toplevel ?
+		server->shown->xdg_toplevel->app_id : NULL;
+	if (!id || strncmp(id, "waydroid.", 9) || server->locked) return false;
+	char path[256];
+	struct stat st;
+	if (stat(runtime_file(path, sizeof(path), "ztos-waydroid-keep-screen"), &st) != 0) return false;
+	time_t age = time(NULL) - st.st_mtime;
+	return age >= 0 && age < 40;
+}
+
 static int idle_fired(void *data) {
 	struct zt_server *server = data;
 	if (server->screen_timeout > 0) {
+		if (server->screen_on && waydroid_keeps_screen_on(server)) {
+			/* look again soon: the screen sleeps once the app lets go */
+			wl_event_source_timer_update(server->idle_timer, 15000);
+			return 0;
+		}
 		screen_set(server, false);
 	}
 	return 0;
