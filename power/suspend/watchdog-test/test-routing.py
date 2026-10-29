@@ -94,3 +94,54 @@ with tempfile.TemporaryDirectory() as directory:
     subprocess.run(['cc', '-std=gnu11', str(test), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 print('PASS: arm, wake restore, abort restore, masked-route refusal, inactive no-op')
+
+# zrn-sleep-init's resume-window cover (power/suspend/wdt-resume.h)
+cover = Path(__file__).resolve().parents[1].joinpath('wdt-resume.h').read_text()
+cover_prefix = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+typedef uint32_t u32;
+#define __iomem
+#define BIT(n) (1U << (n))
+static u32 wdt[4], pmu[0x1000 / 4];
+static u32 readl_relaxed(void *p) { return *(u32 *)p; }
+static void writel_relaxed(u32 v, void *p) { *(u32 *)p = v; }
+"""
+cover_checks = r"""
+int main(void) {
+ struct zrn_wdt_cover c = { .wdt = wdt, .pmu = pmu };
+ /* off: nothing touched */
+ pmu[0x408 / 4] = BIT(23) | BIT(7);
+ pmu[0x40c / 4] = BIT(23) | BIT(9);
+ zrn_wdt_arm(&c, 0);
+ assert(!c.armed && wdt[0] == 0 && pmu[0x408 / 4] == (BIT(23) | BIT(7)));
+ /* armed: 60 s, reset on, route open, other PMU bits kept */
+ zrn_wdt_arm(&c, 60);
+ assert(c.armed && c.arms == 1);
+ assert(wdt[0] == 0xff39 && wdt[1] == 60 * 793 && wdt[2] == 60 * 793);
+ assert(pmu[0x408 / 4] == BIT(7) && pmu[0x40c / 4] == BIT(9));
+ /* no driver took it: stopped, route as before */
+ pmu[0x408 / 4] |= BIT(8);
+ zrn_wdt_release(&c);
+ assert(!c.armed && c.stopped == 1 && wdt[0] == 0);
+ assert(pmu[0x408 / 4] == (BIT(23) | BIT(7) | BIT(8)) && pmu[0x40c / 4] == (BIT(23) | BIT(9)));
+ zrn_wdt_release(&c);
+ assert(c.stopped == 1);
+ /* over 82 s: the longest count */
+ zrn_wdt_arm(&c, 600);
+ assert(wdt[1] == 0xffff);
+ /* the driver took it back (systemd's 30 s): left alone */
+ wdt[0] = 0x5c39; wdt[1] = 0xfff5; pmu[0x408 / 4] = 0; pmu[0x40c / 4] = 0;
+ zrn_wdt_release(&c);
+ assert(c.handed == 1 && wdt[0] == 0x5c39 && pmu[0x408 / 4] == 0 && pmu[0x40c / 4] == 0);
+ return 0;
+}
+"""
+with tempfile.TemporaryDirectory() as directory:
+    test = Path(directory) / 'cover.c'
+    binary = Path(directory) / 'cover'
+    test.write_text(cover_prefix + cover + cover_checks)
+    subprocess.run(['cc', '-std=gnu11', str(test), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+print('PASS: resume cover off, arm, stop and route restore, 82 s cap, driver hand-over')

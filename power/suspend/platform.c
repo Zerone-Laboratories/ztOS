@@ -8,10 +8,12 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/suspend.h>
+#include <linux/sysfs.h>
 #include <asm/memory.h>
 #include "sequence.h"
 #include "sleep-tables.h"
 #include "init-memory.h"
+#include "wdt-resume.h"
 
 static bool enable_deep, dry_run = true, usbl2, probe_save;
 static bool prepare_only = true;
@@ -131,6 +133,50 @@ static u32 saved_gpio[ARRAY_SIZE(gpio_banks)][7][4];
 static bool restore_gpio = true;
 module_param(restore_gpio, bool, 0644);
 
+/* What a TOP pin does while the SoC sleeps: CON_PDN (+0x10, 2 bits a pin:
+ * 0 out 0, 1 out 1, 2 input, 3 hold the level it had) and PUD_PDN (+0x14,
+ * 4 bits a pin: 0 none, 1 down, 3 up). SYS_SLEEP puts these banks into
+ * power-down mode before ACPM's GRP4 check, so even a sleep the firmware
+ * gives up runs on them. Left at the reset values (input, pull-down), pins
+ * that power a chip let it go: gpg0-2, GPS_PWR_EN, and the BCM4773 sensor
+ * hub came back from every sleep in ROM, without its patch (lhd's
+ * OnCommunicationError, ESW:CRASHED on the next use; 29 Oct, 9 of 9).
+ * Stock's DT holds them (samsung,pin-con-pdn = <3>). Mainline pinctrl saves
+ * and restores these registers across suspend, and gpio_restore() above
+ * touches only CON/DAT/PUD/DRV, so a write at load lasts the boot.
+ * Bluetooth's own two pins stay in zrn-bt. One row a pin; later stages only
+ * add rows. Not here, on purpose: gpg0-5 (WL_REG_ON: Wi-Fi is unbound for
+ * every sleep), gpg1-0 (codec reset), gpg2-0 and gpg3-6 (zrn-bt's). */
+static const struct pdn_pin {
+	u32 base;		/* pin controller, one of gpio_banks[] */
+	u8 bank, pin;		/* bank index in it (0x20 apart), pin in the bank */
+	u8 con, pud;		/* CON_PDN, PUD_PDN */
+	const char *name;
+} pdn_pins[] = {
+	{ 0x10430000, 4, 2, 3, 0, "gpg0-2" },	/* GPS_PWR_EN: the sensor hub's power */
+	{ 0x10430000, 4, 1, 3, 0, "gpg0-1" },	/* pm-wrsti: the PMIC's WRSTBI, as stock */
+};
+static bool pdn = true;
+module_param(pdn, bool, 0444);
+MODULE_PARM_DESC(pdn, "apply the pin power-down table at load (0: leave the pins as found)");
+/* bit 8 x bank + pin of PERIC0 (gpg0-2: bit 34) for each row applied */
+static unsigned long pdn_applied;
+/* PMU CHUB_STATUS (0x14064084) at the SMC: is the hub's block up */
+static unsigned int chub_status_before;
+
+static int param_get_hex(char *buffer, const struct kernel_param *parameter)
+{
+	return sysfs_emit(buffer, "%#lx\n", *(unsigned long *)parameter->arg);
+}
+static int param_get_hex32(char *buffer, const struct kernel_param *parameter)
+{
+	return sysfs_emit(buffer, "%#010x\n", *(unsigned int *)parameter->arg);
+}
+static const struct kernel_param_ops hex_ops = { .get = param_get_hex };
+static const struct kernel_param_ops hex32_ops = { .get = param_get_hex32 };
+module_param_cb(pdn_applied, &hex_ops, &pdn_applied, 0444);
+module_param_cb(chub_status_before, &hex32_ops, &chub_status_before, 0444);
+
 static void __iomem *mapped_base(u32 base);
 
 static void gpio_save(void)
@@ -203,6 +249,25 @@ static int run_table(unsigned int index, enum zrn_seq_phase phase)
 	return ret;
 }
 
+/* 0: off (the default). Seconds the cluster-1 watchdog runs, reset on,
+ * from the tables' return to the watchdog driver's resume (wdt-resume.h);
+ * 82 s at most. */
+static unsigned int wdt_resume_s;
+module_param(wdt_resume_s, uint, 0600);
+MODULE_PARM_DESC(wdt_resume_s, "arm the cluster-1 watchdog this long over the resume window (0: off)");
+static struct zrn_wdt_cover wdt_cover;
+module_param_named(wdt_arms, wdt_cover.arms, uint, 0444);
+module_param_named(wdt_handed, wdt_cover.handed, uint, 0444);
+module_param_named(wdt_stopped, wdt_cover.stopped, uint, 0444);
+
+static int wdt_notify(struct notifier_block *nb, unsigned long event, void *data)
+{
+	if (event == PM_POST_SUSPEND)
+		zrn_wdt_release(&wdt_cover);
+	return NOTIFY_OK;
+}
+static struct notifier_block wdt_notifier = { .notifier_call = wdt_notify };
+
 static void restore_platform(void)
 {
 	void __iomem *pmu = mapped_base(0x14060000);
@@ -215,6 +280,8 @@ static void restore_platform(void)
 	last_restore_error = run_table(1, ZRN_RESTORE);
 	if (!last_restore_error)
 		last_restore_error = ret;
+	/* the clocks are back: from here to the driver's resume, a hang resets */
+	zrn_wdt_arm(&wdt_cover, wdt_resume_s);
 	for (i = 0; i < ARRAY_SIZE(wake_offsets); i++) {
 		writel_relaxed(saved_wake[i], pmu + wake_offsets[i]);
 		writel_relaxed(saved_idle[i], pmu + 0x3f0 + 4 * i);
@@ -329,6 +396,7 @@ static int sleep_finisher(unsigned long state)
 		pending_before[i] = readl_relaxed(mapped_base(0x10100000) + 0x1200 + i * 4) & readl_relaxed(mapped_base(0x10100000) + 0x1100 + i * 4);
 	mif_requests_before = (readl_relaxed(mapped_base(0x02040000) + 0xf8ac) >> 16) & 0xff;
 	grp4_before = readl_relaxed(mapped_base(0x14070000) + 0x408);
+	chub_status_before = readl_relaxed(mapped_base(0x14060000) + 0x4084);
 	grp4_cleared = 0;
 	if (clear_grp4 && grp4_before) {
 		/* write-one-to-clear, held until written back to zero (as
@@ -341,9 +409,10 @@ static int sleep_finisher(unsigned long state)
 	}
 	/* Keep this before enabling the MIF gate: retained console records must
 	 * distinguish a missing AP request from corruption of earlier log text. */
-	pr_info("zrn-system-sleep: handoff mif_sleep=%u requests=%02x gate=%u grp4=%08x->%08x\n",
+	pr_info("zrn-system-sleep: handoff mif_sleep=%u requests=%02x gate=%u grp4=%08x->%08x chub=%08x\n",
 		mif_sleep, mif_requests_before,
-		readl_relaxed(mapped_base(0x02040000) + 0xf95c), grp4_before, grp4_cleared);
+		readl_relaxed(mapped_base(0x02040000) + 0xf95c), grp4_before, grp4_cleared,
+		chub_status_before);
 	/* Keep the enable/SMC/abort-disable instructions in one cache line.
 	 * x19 is preserved by the secure-call ABI. Do not call or delay in
 	 * the interval where ACPM is permitted to remove DRAM power. */
@@ -488,6 +557,28 @@ static int initialize_sleep_defaults(void)
 	return 0;
 }
 
+static void apply_pdn(void)
+{
+	for (int i = 0; i < ARRAY_SIZE(pdn_pins); i++) {
+		const struct pdn_pin *p = &pdn_pins[i];
+		void __iomem *bank = mapped_base(p->base) + p->bank * 0x20;
+		u32 con = readl_relaxed(bank + 0x10), pud = readl_relaxed(bank + 0x14);
+		u32 new_con = (con & ~(3U << 2 * p->pin)) | (u32)p->con << 2 * p->pin;
+		u32 new_pud = (pud & ~(0xfU << 4 * p->pin)) | (u32)p->pud << 4 * p->pin;
+
+		writel_relaxed(new_con, bank + 0x10);
+		writel_relaxed(new_pud, bank + 0x14);
+		new_con = readl_relaxed(bank + 0x10);
+		new_pud = readl_relaxed(bank + 0x14);
+		pr_info("zrn-sleep-init: pdn %s conpdn %08x->%08x pudpdn %08x->%08x\n",
+			p->name, con, new_con, pud, new_pud);
+		if (p->base == 0x10430000 &&
+		    ((new_con >> 2 * p->pin) & 3) == p->con &&
+		    ((new_pud >> 4 * p->pin) & 0xf) == p->pud)
+			pdn_applied |= 1UL << (8 * p->bank + p->pin);
+	}
+}
+
 static int __init system_sleep_init(void)
 {
 	unsigned int mode, table, index;
@@ -541,6 +632,12 @@ static int __init system_sleep_init(void)
 	ret = map_base(0x10050000);
 	if (ret)
 		goto fail;
+	ret = map_base(0x10060000);
+	if (ret)
+		goto fail;
+	ret = map_base(0x14060000);
+	if (ret)
+		goto fail;
 	ret = map_base(0x14050000);
 	if (ret)
 		goto fail;
@@ -568,6 +665,11 @@ static int __init system_sleep_init(void)
 		ret = initialize_sleep_defaults();
 		if (ret)
 			goto fail;
+		if (pdn)
+			apply_pdn();
+		wdt_cover.wdt = mapped_base(0x10060000);
+		wdt_cover.pmu = mapped_base(0x14060000);
+		register_pm_notifier(&wdt_notifier);
 		__module_get(THIS_MODULE);
 		suspend_set_ops(&platform_ops);
 	}
@@ -578,6 +680,8 @@ fail:
 }
 static void __exit system_sleep_exit(void)
 {
+	if (enable_deep)
+		unregister_pm_notifier(&wdt_notifier);
 	if (dbg_peric1)
 		iounmap(dbg_peric1);
 	if (dbg_uartbt)

@@ -1,3 +1,120 @@
+# Pins while the SoC sleeps; sleeps the firmware gives up — 2026-10-30
+
+**The sensor hub died after every SoC sleep because its power pin let go.**
+In SYS_SLEEP the TOP pin banks run on their power-down settings (CON_PDN
++0x10, 2 bits a pin: 0 out 0, 1 out 1, 2 input, 3 hold; PUD_PDN +0x14, 4 bits
+a pin). gpg0-2 (GPS_PWR_EN, the BCM4773's enable) was at the reset value,
+input with a pull-down, so the hub lost power for every sleep that reached
+the SoC sequence, aborted ones too, and came back in ROM without its patch
+(lhd OnCommunicationError, ESW:CRASHED at the next use; 9 of 9 on 29 Oct).
+Stock's DT holds it (pin-con-pdn 3, pud-pdn 0).
+
+zrn-sleep-init now applies a pin table at load (`pdn_pins[]` in platform.c,
+one row a pin; later stages only add rows):
+
+| pin | what | CON_PDN | PUD_PDN |
+|---|---|---|---|
+| gpg0-2 | GPS_PWR_EN, the sensor hub's power | 3 (hold) | 0 |
+| gpg0-1 | pm-wrsti, the PMIC's WRSTBI (stock's setting) | 3 (hold) | 0 |
+
+Not in it, on purpose: gpg0-5 (WL_REG_ON; Wi-Fi is unbound for every sleep,
+keeping it powered belongs to the WoWLAN work), gpg1-0 (codec reset),
+gpg2-0 and gpg3-6 (zrn-bt's own). Mainline pinctrl saves and restores the
+PDN registers across suspend, and gpio_restore() touches only CON, DAT, PUD
+and DRV, so the write lasts the boot.
+
+Outputs: one dmesg line a pin (`zrn-sleep-init: pdn gpg0-2 conpdn
+00002aaa->00002aba pudpdn 01111111->01111011`); read-only `pdn_applied` (bit
+8 x bank + pin of PERIC0: gpg0-1 is bit 33, gpg0-2 bit 34) and
+`chub_status_before` (PMU 0x14064084 at the SMC, also in the handoff line).
+`pdn=0` switches the table off. zrn-sleepd loads the module with insmod,
+which does not read modprobe.d, so zrn-sleepd passes it any
+`options zrn_sleep_init ...` line from /etc/modprobe.d itself.
+
+Proof, before the module (J0: a live read-modify-write of only those bits,
+then bench sleeps, `zrn-sleepd once`, a 45 s NMEA read after the wake):
+
+| run | GNSS during the sleep | pins held | result |
+|---|---|---|---|
+| J0a | off | gpg0-2 | 60 s RTC sleep; fix 10 s after the start; no hub errors |
+| J0b | on | gpg0-2 | firmware gave the sleep up at once (grp4=00000001, EINT gpa1-7 pending); GPS fine |
+| J0c | on (clear_grp4=1) | gpg0-2 | 60 s RTC sleep; 5 s after the wake `MCU_REQ_RESP timeout`, `hub reset`; gpsd restarted, fix 7 s later |
+| J0d | on | + gph0-4 0/0, gph0-5 1/0 (stock's CHUB rows) | the same `MCU_REQ_RESP timeout`: the CHUB rows do not help; put back |
+| J0e | off | gpg0-1, gpg0-2 | 120 s RTC sleep; fix 8 s; no hub errors; PMIC fine |
+| J1 (new module, after a reboot) | off | the table | woke by the modem after 16.5 s; fix 14 s; no hub errors |
+
+Before the fix every sleep that reached the SoC killed the hub, GNSS on or
+off. With it, an idle hub (lhd up, no gpsd) lives through sleeps. **A hub
+streaming GNSS still does not**: the SPI handshake (MCU_REQ gph0-5 / MCU_RESP
+gph0-4) times out after the wake and zrn-bbd resets the hub. Stock never
+sleeps while its engine runs (gps.xml WakeLock="geo"), and neither may ours:
+ztos-gnss-gate holds `timed-gnss` while it has readers.
+
+**What GRP4 bit 0 is (J0b).** A sleep with gpsd running found PMU_INTR_GEN
+GRP4 = 00000001 at the handoff, came straight back (wake_stat 0x80000001,
+smc 0) with gpa1-7 (the hub's host_req) pending in the EINT. So the hub's
+data line latches GRP4 bit 0 even though gpa1-7 is masked as a wake source
+in EINT_WAKE, and ACPM then gives the sleep up ('upend_wk'). The whole boot
+of aborted sleeps on 29 Oct (grp4 was not logged then) may well have been a
+hub holding host_req: a chip in ROM after the first sleep fits.
+
+## Sleeps the firmware gives up (zrn-sleepd)
+
+A sleep with smc 0, no wake source (wake_stat & 0x7fffffff, wake_stat2/3 and
+every EINT word 0) and under 2 s of boot time asleep, or any sleep with
+grp4_before set, is `fw-abort`: not a wake, no doze window. The first sets
+clear_grp4 and retries after 5 s; three in a row pause sleeping for the boot
+(/run/zrn-sleepd/paused; `zrn-sleepd enable` or a reboot clears it) with the
+shell told "Sleep paused". The log line names grp4_before's set bits and the
+EINT words.
+
+Also in zrn-sleepd now: the conditions are read again after the settle,
+between reading and writing wakeup_count (`cancelled`, 5 s, J3 below); the
+failure backoff counts failures in a row (30, 60, 120, 240, 300 s), reset by a
+real wake; an alarm due within 2 s (EBUSY from alarmtimer) is `alarm-due`, a
+3 s retry; the settle is 1 s when nothing was unbound; at 10 % battery sleeps
+last at most 600 s, at 4 % 120 s; a doze window ends PUSH_GRACE_S after the
+wake if zrn-pushd's connection lived through the sleep, and at 15 s if
+zrn-pushd has no network to try; each sleep logs charge_now in and out; an
+hourly summary line (cycles, fw-aborts, wakes by reason, % awake, mAh asleep
+and awake); `wakes=` and `woke_at=` in /run/zrn-sleepd/status; the wakeup
+sources on a refused or stalled sleep; any inhibit held over an hour.
+
+J3 (live): an inhibit file made during the preparations: `sleep cancelled:
+inhibit team-test`, no `PM: suspend entry`, Wi-Fi bound again, the RTC alarm
+cleared, entries unchanged.
+
+## The watchdog over the resume window (off)
+
+`wdt_resume_s` (0, off, by default; at most 82 s) arms the cluster-1
+watchdog (0x10060000) with reset on and its PMU route (bit 23 of
+0x14060408/0x1406040c) open, right after the exit tables return, so a hang
+before the watchdog driver's own resume resets the phone. After the resume
+(PM_POST_SUSPEND) it is left to the driver if the driver took it back, or
+stopped with the route bits put back. wdt-resume.h; host test in
+watchdog-test/test-routing.py. Not enabled: no real watchdog-expiry reset
+has been seen on this kernel yet, and the first test needs someone there.
+
+## Pin power-down audit (read-only, 30 Oct)
+
+Live CON/DAT/CON_PDN/PUD_PDN of PERIC0, PERIC1, FSYS0, FSYS1 and CHUB,
+against stock (sensors/stock-state/pinctrl.txt for PERIC0 and CHUB, the
+vendor DT's pin-con-pdn entries otherwise): 31 of 104 pins with a stock
+power-down setting differ (everything not in the table is at the reset
+value, input with a pull-down). Staged, not applied:
+
+| pins | stock | ours | what to do |
+|---|---|---|---|
+| gph0-4, gph0-5 (MCU_RESP, MCU_REQ) | 0/0, 1/0 | 2/1 | tried in J0d: no help for a hub streaming GNSS through a sleep; only if an idle hub ever fails again |
+| gpg0-5 (WL_REG_ON), gpf2-2 (pcie0_perst) | 3/1, 3 | 2/1 | the WoWLAN and host-wake work, step 0 |
+| gpg1-0 (codec reset) | 3/0 | 2/1 | the audio work: would the DSP keep its codec through a sleep |
+| gpf0-0, gpf0-1 (FSYS0, function 2) | 3/0 | 2/1 | storage: UFS resumes today; only with a reason |
+| gpd0-0 (function 2), gpd0-2 (out, high) | 3/0, 0/0 | 2/1 | look up what they drive first |
+| gpg1-7 (out, high) | 0/0 | 2/1 | as above |
+| gpg3-4, gpg3-5 | 0/1 | 2/1 | next to zrn-bt's gpg3-6: check with the expander |
+| gpp5-0/1, gpp6-0..3, gpc0-0/1, gpg3-0..3, gpf2-0 | 2/0 | 2/1 | pull only: a pull-down against an external pull-up leaks while asleep; a candidate once the sleep floor is measured |
+| gpf1-0..5 | 0/0 | 2/1 | unused pins; no change expected |
+
 # Full MIF sleep: stock's suspend path against ours — 2026-10-29
 
 The vendor kernel checkout (third_party/vendor-kernel, LineageOS
