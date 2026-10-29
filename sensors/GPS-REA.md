@@ -242,7 +242,7 @@ Pull these from `/mnt/vendor` on the phone:
 ```
 lhd -> gpsd -> zrn-gnss-nmea (127.0.0.1:10111)
   -> ztos-gnss-gate (127.0.0.1:10110, /run/ztos-gnss/nmea.sock)
-       starts ztos-gnss.service on the first reader, stops it 30 s after the last
+       starts ztos-gnss.service on the first reader, stops it 120 s after the last
   -> ztos-waydroid-location (Waydroid), Linux gpsd or geoclue if installed
 ```
 
@@ -280,3 +280,64 @@ lhd -> gpsd -> zrn-gnss-nmea (127.0.0.1:10111)
   ztoscoresensorframework (see the unit).
 - The bridge holds about 27 MB of anonymous memory while Android runs.
 - Logs carry no positions; `ZTOS_GNSS_DEBUG=1` prints every fix.
+
+### Every start was a cold one (fixed the same evening)
+
+Measured indoors, near a window: 71 s to a first fix from cold, and 64 s a
+minute after a session had ended. Four causes, each seen with strace on gpsd:
+
+| Cause | Evidence | Fix |
+|---|---|---|
+| gpsd never wrote its store, `gldata.sto` (its directory is on ext4, `/var/lib/zrn-android/data`, and persists) | it opened the file for reading at each start (ENOENT) and never for writing, not even at a clean engine stop | `NvmemWritePeriodMs="20000"` in `gps.xml`: written every 20 s while it runs |
+| 22 s waiting for Samsung's RIL | `connect(@VND_Multiclient)` refused once a second for 20 s, then `GPSD:CORE_ON` | ztos-gnss-gate listens on that abstract socket and drains what gpsd sends (two 32-byte requests needing no answer); engine on 4 s after the start |
+| no predicted orbits (LTO) | bionic tried `/dev/socket/dnsproxyd` (netd, absent) and found nothing in `/system/etc/hosts`; even with a name gpsd fetched only `rtistatus3.dat`, never `lto2.dat` | ztos-gnss binds a hosts file with `gllto.glpals.com` over the chroot's; `ztos-gnss-lto.timer` fetches `7day/v5/latest/lto2.dat` (182 KB) at most every two days; gpsd reads it at start (37 satellites tracked half a minute in, against 14 to 16) |
+| no time or position aiding | `IgnoreJniTime="true"`, nothing injected | zrn-gnss-nmea `-t` (host clock, only when NTP-synchronised) and `-l` (the last fix, uncertainty growing 30 m/s with its age) |
+
+Broadcom's LBS servers (`lbs.glpals.com`, `BCMLS2.glpals.com`) were reachable
+for one test and answered; they are left out of the hosts file, as they
+trade the phone's data for aiding.
+
+After: 7 to 11 s from gpsd's start to a first fix, after a session ended 1
+to 20 minutes before and after a reboot; under 1 s when the gate still held
+the engine. Not measured: a cold start outdoors after days off (no store,
+old LTO).
+
+### Not dropping it
+
+- ztos-gnss-gate keeps the engine 120 s after its last reader (was 30 s),
+  keeps the last fix in `/var/lib/ztos-gnss/last` (root only) and sends each
+  new reader `$PZTLF,lat,lon,accuracy,unix_time` first. A reader arriving
+  resets the unit's start limit, which a hub lost to SoC sleep used to hit.
+- The bridge holds its reader 60 s when the request ends or the window goes
+  out of sight, pushing nothing into a possibly frozen Android; the screen
+  going off lets go at once. It gives Android the gate's last fix at once
+  (its real age, accuracy growing 2 m/s): Maps Go showed a position in the
+  second it asked, a live fix +-3 m 7 s later.
+- The 17:04 "flapping" was not the shell's policy: Maps Go's window went
+  away 10 s after it opened with no Home press logged (Mali page faults
+  from an Android render thread just before), and the user went Home 11 s
+  after reopening it. Each cut then meant a cold start.
+- Navigation: ztMETRO timed the screen out after 60 s whatever Android
+  wanted (Waydroid does not pass FLAG_KEEP_SCREEN_ON on), and screen-off
+  stops Android. The bridge now touches `ztos-waydroid-keep-screen` while
+  Android holds a screen wake lock or, as Maps Go does not navigate
+  itself, while moving faster than 3 m/s with a location app in front;
+  ztMETRO does not time out while that file is fresh.
+- Verified: 25 minutes with Maps Go in front and that file fresh (as a
+  navigating app would keep it), no touches: the screen stayed on, one
+  gpsd throughout, Android's last location never more than 1 s old. Not
+  verified: the bridge seeing a real navigation wake lock or speed (no
+  navigation app is installed and the phone did not move).
+
+### Stopping
+
+The HAL client is stopped first (engine stop, HAL cleanup), then gpsd exits
+by itself with status 0. Killed together, gpsd had now and then died of
+SIGSEGV on its way out; its store was never at stake (it had none). The
+sensor framework is still restarted after each session.
+
+### Open
+
+- SoC sleep (zrn-sleepd) with GPS in use kills the hub's lhd and gpsd; the
+  gate restarts them on resume. With the screen on (navigation) the phone
+  does not sleep.
