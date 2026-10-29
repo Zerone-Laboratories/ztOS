@@ -341,6 +341,24 @@ sensor framework is still restarted after each session.
 - SoC sleep (zrn-sleepd) with GPS in use kills the hub's lhd and gpsd; the
   gate restarts them on resume. With the screen on (navigation) the phone
   does not sleep. (Fixed on 30 October: section 8.)
+- Light, proximity and rotation after a sleep (J7, 30 October, after the
+  pin table): measured only after it, since zrn-sleep-init.ko with the pin
+  table was already loaded; the "before" case is the 29 October one (the
+  hub back in ROM after every sleep, 9 of 9), which took every sensor with
+  it. After a 57 s and a 297 s SoC sleep with GPS off, the screen on: the
+  accelerometer streamed at once (fresh readings each second), proximity
+  published, and a light reading arrived (OpenTone set the screen to
+  5000 K); lhd, the hub daemon and ztoscsf-sensord kept their PIDs. The
+  room was dark (0 lux), so auto brightness had nothing to react to: it
+  held its low level (backlight 15). Nothing in ztOS reads the
+  accelerometer or proximity yet (no rotation, no call proximity), only
+  zrndevtest's `watch`. And that `watch` has its own fault, unrelated to
+  sleep: taking accel or prox off the hub, as sensord does at screen-off,
+  asserts the hub's firmware (transport_layer.c line 165, Arg2=5) every
+  time, 8 of 8, also with the sensor's delay in the REMOVE payload as
+  Samsung's driver sends it; light alone never does (2 of 2). The hub
+  recovers by itself in about 18 s. `sensors/gnss/test-hub-screen-off.sh`
+  reproduces it.
 
 ## 8. Sleep and GNSS, 30 October 2026
 
@@ -397,6 +415,26 @@ Measured on the phone (screen off, on the charger, so no real sleep):
 | a reader, screen off | `timed-gnss` dated +90 s, renewed every 30 s; first fix 7-9 s |
 | reader leaves, screen off | engine stopped 6 s later, hold gone with the unit (1.5 s more) |
 | gpsd killed 4 times in 3.5 min, reader held | each time the gate restarted it at once; fix back 13-15 s after the kill; no start-limit-hit |
+
+### Joint end-to-end run (30 October, on the charger)
+
+`sensors/gnss/test-sleep-e2e.sh`, one sequence with GPS, sleep, Wi-Fi and
+push together; `zrn-sleepd once`, so real SoC sleeps on RTC alarms:
+
+| Phase | Result |
+|---|---|
+| A: GPS off, 60 s sleep | 57.2 s asleep; Wi-Fi associated 5.4 s after the wake, zrn-pushd logged in 7.3 s after; a reader 0.3 s after the wake got its first fix in 10.7 s; hub PIDs unchanged, 0 crash lines |
+| B: a reader held, screen off | `sleep cancelled: inhibit timed-gnss`, no suspend entry; Wi-Fi back in 5.3 s, push in 10.6 s from the unbind; the reader leaving: 'no readers; GPS off' 7 s later, unit stopped and hold gone 1.1 s after that |
+| C: reader leaves with the screen on (idle hold), sleep at once | the gate stopped the engine at the screen-off, then a full 57.5 s sleep; 0 crash lines; fix 7.2 s after the next start |
+| D: a reader at the 'settle' step | `sleep cancelled: inhibit timed-gnss` 3.3 s later, no suspend; Wi-Fi 5.2 s, push 7 s; fix 12.8 s |
+| E: GPS off, 300 s sleep | 297.2 s asleep; Wi-Fi 5.3 s, push 7.1 s; reader 0.4 s after the wake: first fix 9.6 s |
+| F: kill -9 the gate while it holds | engine stopped 0.1 s later (the gate unit's ExecStopPost), hold gone 5.8 s later (the new gate's start) |
+| G: reader over 10 min, screen off | cap 601.5 s after the reader, engine off, hold gone; screen on: engine back in 1.8 s, fix 10.9 s after the screen came on |
+
+Every handoff logged `grp4=00000000->00000000 chub=0010000f`; no GRP4
+latch, so no firmware abort, in this run. The only hub crashes in the run
+were the two `watch` asserts above (phases A and E end with a sensors
+check), not the sleeps.
 
 ### Constellations and SBAS (a 7-minute session, 30 October)
 
