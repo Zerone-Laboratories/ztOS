@@ -338,6 +338,14 @@ run background notifications, sync, or calls. A launch-in-progress marker preven
 the event-driven policy and Phase 1's zero-window fallback from freezing Android
 while its first session or APK installation is starting.
 
+Android plays no notification sound of its own: ztOS chimes for each notification
+at the ztOS ringer. `ztos-waydroid-recover settings` keeps Android's notification
+stream at 0 and its ring stream (calls) at the ztOS ringer's level (0 at vibrate),
+switches off Android's touch, lock and charging sounds, and gives Waydroid's
+keyboard a layout (without one Android posts "Configure physical keyboard" each time its
+display sleeps). It runs when Android is ready, at every thaw (only if the ringer
+changed or Android restarted since) and when the ringer changes in ztMETRO.
+
 Opening an APK in ztMETRO Files offers ATL, Waydroid, and both remember-as-default
 choices. Updating the default preserves the other `android.conf` entries.
 

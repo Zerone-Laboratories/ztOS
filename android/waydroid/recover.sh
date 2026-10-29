@@ -13,6 +13,71 @@ thaw() {
             [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == RUNNING ]] || lxc-unfreeze "${lxc_args[@]}" || true
             ;;
     esac
+    settings
+}
+# A command in Android, at once (lxc-attach: `waydroid shell` costs ~2 s). It
+# reads nothing: push's records on stdin are not its.
+android_sh() {
+    timeout 10 lxc-attach "${lxc_args[@]}" --clear-env -v PATH=/system/bin:/system/xbin:/vendor/bin -- /system/bin/sh -c "$@" < /dev/null
+}
+# Android's settings as ztOS has them.
+# - Sounds: ztOS chimes for every notification itself, at its ringer, so
+#   Android's notification stream is kept at 0 (it is not linked to the ring
+#   stream here: volume_separate_notification). Calls ring through Android's
+#   ring stream, which follows the ztOS ringer, 0 at vibrate. Android's own
+#   touch, lock and charging sounds are off.
+# - Waydroid's keyboard gets a layout: without one, every time Android's
+#   display sleeps, Android posts "Configure physical keyboard" again, and ztOS
+#   chimes for it. There is no shell command for it
+#   in Android 13: IInputManager's setCurrentKeyboardLayoutForInputDevice is
+#   transaction 18 there (17 reads it), InputDeviceIdentifier written as
+#   descriptor, vendor, product.
+# What was given is kept by Android across boots; it is given again when the
+# ringer changes or Android has started again since (its init's pid is in the
+# stamp). A frozen Android is left as it is: thaw() calls this again.
+settings() {
+    [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == RUNNING ]] || return 0
+    local stamp=/run/ztos-waydroid-settings percent ring want
+    exec 9>"$stamp.lock"
+    flock -w 15 9 || return 0
+    percent=$(sed -n 's/^[[:space:]]*ring_volume[[:space:]]*=[[:space:]]*\([0-9]\{1,3\}\)[[:space:]]*$/\1/p' \
+        "$ZTOS_HOME/.config/ztmetro/config" 2>/dev/null | tail -n 1) || true
+    [[ -n $percent ]] || percent=70	# ztmetro's own default, 21 of 30
+    percent=$((10#$percent))
+    (( percent <= 100 )) || percent=100
+    ring=$(( (percent * 7 + 50) / 100 ))
+    (( percent == 0 || ring > 0 )) || ring=1
+    want="$(lxc-info "${lxc_args[@]}" -pH 2>/dev/null) $ring"
+    if [[ $(cat "$stamp" 2>/dev/null) != "$want" ]] &&
+       [[ $(android_sh '
+            [ "$(getprop sys.boot_completed)" = 1 ] || exit
+            [ "$(cmd device_config get systemui volume_separate_notification)" = true ] ||
+                cmd device_config put systemui volume_separate_notification true
+            # the ring stream first: leaving vibrate unmutes notifications at 1
+            cmd media_session volume --stream 2 --set "$1" || exit
+            cmd media_session volume --stream 5 --set 0 || exit
+            settings put system sound_effects_enabled 0
+            settings put system lockscreen_sounds_enabled 0
+            settings put system dtmf_tone 0
+            settings put global charging_sounds_enabled 0
+            settings put global power_sounds_enabled 0
+            if [ "$(getprop ro.build.version.sdk)" = 33 ]; then
+                k=$(dumpsys input | grep -A12 ": wayland_keyboard$")
+                d=$(echo "$k" | sed -n "s/^ *Descriptor: \([0-9a-f]*\)$/\1/p" | head -n 1)
+                v=$(echo "$k" | sed -n "s/.*vendor=0x\([0-9a-f]*\),.*/\1/p" | head -n 1)
+                r=$(echo "$k" | sed -n "s/.*product=0x\([0-9a-f]*\),.*/\1/p" | head -n 1)
+                if [ -n "$d" ] && [ -n "$v" ] && [ -n "$r" ]; then
+                    id="i32 1 s16 $d i32 $((0x$v)) i32 $((0x$r))"
+                    case $(service call input 17 $id) in
+                        *ffffffff*) service call input 18 $id s16 \
+                            com.android.inputdevices/com.android.inputdevices.InputDeviceReceiver/keyboard_layout_english_us >/dev/null ;;
+                    esac
+                fi
+            fi
+            echo zrn-settings=ok' sh "$ring" 2>/dev/null) == *zrn-settings=ok* ]]; then
+        printf '%s\n' "$want" > "$stamp"
+    fi
+    exec 9>&-
 }
 case $1 in
     audio)
@@ -36,6 +101,10 @@ case $1 in
         systemctl start waydroid-container.service
         thaw
         /usr/local/libexec/ztos-waydroid-audio
+        ;;
+    settings)
+        [[ $# == 1 ]] || exit 2
+        settings
         ;;
     install)
         [[ $# == 2 ]] || exit 2
@@ -137,6 +206,7 @@ case $1 in
                [[ $(timeout 3 lxc-attach "${lxc_args[@]}" --clear-env -v PATH=/system/bin:/system/xbin:/vendor/bin -- /system/bin/getprop sys.boot_completed 2>/dev/null) == 1 ]] &&
                timeout 3 lxc-attach "${lxc_args[@]}" --clear-env -v PATH=/system/bin:/system/xbin:/vendor/bin -- /system/bin/service check package 2>/dev/null | grep -q ': found$' &&
                timeout 3 lxc-attach "${lxc_args[@]}" -- /system/bin/service check waydroidplatform 2>/dev/null | grep -q ': found$'; then
+                settings
                 /usr/local/libexec/ztos-waydroid-audio
                 exit 0
             fi

@@ -9866,8 +9866,15 @@ static int volume_hide(void *data) {
 	return 0;
 }
 
+/* Android rings for its calls at the ringer's level (and plays no sound of
+ * its own for notifications): ztos-waydroid-recover settings. */
+static void waydroid_ringer(void) {
+    run_detached("sudo", "-n", "/usr/local/libexec/ztos-waydroid-recover", "settings");
+}
+
 static int volume_pip(void *data) {
     ui_sound(data, UIS_PIP);	/* once, at the level the keys came to rest on */
+    waydroid_ringer();
     return 0;
 }
 
@@ -13506,6 +13513,7 @@ static int reload(int signal_number, void *data) {
 		return 0;
 	}
 	if (ring_before > 0 && server->ring_volume == 0) hap(server, HAP_TAP, HG_SYSTEM);
+	if (ring_before != server->ring_volume) waydroid_ringer();
 	server->scale = scale;
 	retro_setup(server);
 	retro_apps(server);
