@@ -16,6 +16,7 @@ void sleep(){} void strcmp(){} void strlen(){} void strncpy(){} void exit(){}
 void __errno(){} void __libc_init(){} void pthread_create(){}
 void pthread_mutex_lock(){} void pthread_mutex_unlock(){}
 void signal(){} void clock_gettime(){} void open(){} void read(){} void strtod(){} void usleep(){}
+void snprintf(){}
 X
 cat >"$O/libdl.c" <<'X'
 void dlopen(){} void dlsym(){} void dlerror(){}

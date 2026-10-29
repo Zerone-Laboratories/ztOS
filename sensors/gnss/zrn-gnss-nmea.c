@@ -20,6 +20,16 @@
  * On SIGTERM the engine is stopped through the HAL and the HAL closed before
  * exiting, after which gpsd exits by itself; killed together with us, it
  * now and then crashed on its way out.
+ *
+ * Accuracy: NMEA from this engine has no error estimate (no GST), so each
+ * fix that carries one (GPS_LOCATION_HAS_ACCURACY) also goes out as
+ * $PZTFX,accuracy_m,, (horizontal, metres; the two empty fields are kept for
+ * vertical and speed accuracy, which GpsLocation does not have). It holds no
+ * position. Readers that do not know it skip it, as with any P sentence.
+ *
+ * Readers get whole sentences only: what a slow reader cannot take yet waits
+ * in its own backlog (BACKLOG bytes), and a reader that falls further behind
+ * is dropped.
  */
 typedef unsigned long size_t;
 typedef long ssize_t;
@@ -58,6 +68,7 @@ extern int open(const char *, int, ...);
 extern ssize_t read(int, void *, size_t);
 extern double strtod(const char *, char **);
 extern int usleep(unsigned);
+extern int snprintf(char *, size_t, const char *, ...);
 
 #define RTLD_NOW 2
 #define AF_UNIX 1
@@ -69,6 +80,8 @@ extern int usleep(unsigned);
 #define SO_REUSEADDR 2
 #define MSG_NOSIGNAL 0x4000
 #define MSG_DONTWAIT 0x40
+#define EAGAIN 11
+#define GPS_LOCATION_HAS_ACCURACY 0x0010
 #define SIGINT 2
 #define SIGTERM 15
 #define CLOCK_REALTIME 0
@@ -125,19 +138,59 @@ typedef struct {
 
 /* ---- NMEA fan-out ---- */
 #define MAXC 16
+#define BACKLOG 65536
 static int clients[MAXC];
+static char backlog[MAXC][BACKLOG];	/* what each reader has not taken yet */
+static int queued[MAXC];
 static long lock[8];			/* pthread_mutex_t, 40 bytes on arm64 bionic; zero = default */
 static int debug;
+
+static void drop(int i)
+{
+	close(clients[i]);
+	clients[i] = 0;
+	queued[i] = 0;
+}
+
+/* send what reader i takes of buf; -1: it is gone; else the bytes sent */
+static int put(int i, const char *buf, int n)
+{
+	int done = 0;
+	while (done < n) {
+		ssize_t k = send(clients[i], buf + done, n - done, MSG_NOSIGNAL | MSG_DONTWAIT);
+		if (k < 0)
+			return *__errno() == EAGAIN ? done : -1;
+		done += (int)k;
+	}
+	return done;
+}
+
+/* one whole sentence (or more) to every reader; called with the lock held */
+static void fanout_locked(const char *s, int n)
+{
+	for (int i = 0; i < MAXC; i++) {
+		if (clients[i] <= 0) continue;
+		if (queued[i]) {
+			int k = put(i, backlog[i], queued[i]);
+			if (k < 0) { drop(i); continue; }
+			for (int j = k; j < queued[i]; j++) backlog[i][j - k] = backlog[i][j];
+			queued[i] -= k;
+		}
+		int k = queued[i] ? 0 : put(i, s, n);
+		if (k < 0) { drop(i); continue; }
+		if (n - k > BACKLOG - queued[i]) {
+			dprintf(2, "zrn-gnss-nmea: a reader fell too far behind; dropped it\n");
+			drop(i);
+			continue;
+		}
+		for (int j = k; j < n; j++) backlog[i][queued[i]++] = s[j];
+	}
+}
 
 static void fanout(const char *s, int n)
 {
 	pthread_mutex_lock(lock);
-	for (int i = 0; i < MAXC; i++)
-		if (clients[i] > 0 && send(clients[i], s, n, MSG_NOSIGNAL | MSG_DONTWAIT) < 0 &&
-		    *__errno() != 11 /* EAGAIN: slow reader loses a line */) {
-			close(clients[i]);
-			clients[i] = 0;
-		}
+	fanout_locked(s, n);
 	pthread_mutex_unlock(lock);
 }
 
@@ -150,7 +203,7 @@ static void *acceptor(void *arg)
 		pthread_mutex_lock(lock);
 		int i;
 		for (i = 0; i < MAXC && clients[i] > 0; i++);
-		if (i < MAXC) clients[i] = c; else close(c);
+		if (i < MAXC) { clients[i] = c; queued[i] = 0; } else close(c);
 		pthread_mutex_unlock(lock);
 	}
 	return 0;
@@ -183,8 +236,18 @@ static void cb_nmea(int64_t ts, const char *s, int n)
 {
 	(void)ts;
 	if (n <= 0) return;
-	fanout(s, n);
-	if (s[n - 1] != '\n') fanout("\r\n", 2);
+	/* the sentence and its line end in one piece */
+	char b[512];
+	if (s[n - 1] != '\n' && n + 2 <= (int)sizeof b) {
+		for (int i = 0; i < n; i++) b[i] = s[i];
+		b[n] = '\r'; b[n + 1] = '\n';
+		fanout(b, n + 2);
+	} else {
+		pthread_mutex_lock(lock);
+		fanout_locked(s, n);
+		if (s[n - 1] != '\n') fanout_locked("\r\n", 2);
+		pthread_mutex_unlock(lock);
+	}
 	if (debug) dprintf(2, "%.*s%s", n, s, s[n - 1] == '\n' ? "" : "\n");
 }
 static int fixes;
@@ -194,11 +257,22 @@ static void cb_location(GpsLocation *l)
 	 * journal gets the first fix of a session without its position (the
 	 * owner's whereabouts do not belong in logs); -d prints every fix. */
 	if (!l) return;
+	if ((l->flags & GPS_LOCATION_HAS_ACCURACY) && l->accuracy > 0 && l->accuracy < 100000) {
+		char body[48], out[64];
+		int n = snprintf(body, sizeof body, "PZTFX,%.1f,,", (double)l->accuracy);
+		if (n > 0 && n < (int)sizeof body) {
+			unsigned x = 0;
+			for (int i = 0; i < n; i++) x ^= (unsigned char)body[i];
+			n = snprintf(out, sizeof out, "$%s*%02X\r\n", body, x);
+			if (n > 0 && n < (int)sizeof out) fanout(out, n);
+		}
+	}
 	if (debug)
 		dprintf(2, "zrn-gnss-nmea: fix flags=0x%x lat=%f lon=%f acc=%f\n",
 			l->flags, l->latitude, l->longitude, (double)l->accuracy);
 	else if (!fixes++)
-		dprintf(2, "zrn-gnss-nmea: first fix, accuracy %d m\n", (int)l->accuracy);
+		dprintf(2, "zrn-gnss-nmea: first fix, accuracy %d m%s\n", (int)l->accuracy,
+			l->flags & GPS_LOCATION_HAS_ACCURACY ? "" : " (flag not set: no estimate)");
 }
 static volatile int engine_status;	/* GPS_STATUS_*: 1 session begin, 2 end, 3 engine on, 4 off */
 static void cb_status(void *st)

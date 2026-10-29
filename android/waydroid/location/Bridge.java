@@ -45,8 +45,9 @@ import java.util.TimeZone;
  * window goes out of sight, the reader stays connected for HOLD_MS (not
  * pushing anything into Android, which may be frozen by then), so going
  * Home and back, or an app re-making its request, finds the engine still
- * tracking. Turning the screen off lets go at once (ztos-gnss-gate still
- * keeps the engine running for a while after its last reader).
+ * tracking. Turning the screen off lets go at once (ztos-gnss-gate then
+ * stops the engine within seconds, before the phone may sleep). Timers that
+ * must count time asleep use elapsedRealtime, not uptimeMillis.
  *
  * A position at once: ztos-gnss-gate sends a new reader the last fix it
  * knows ($PZTLF), which goes to Android with its real age and an accuracy
@@ -86,7 +87,7 @@ public final class Bridge {
 
     static final Object state = new Object();
     static boolean want;             // an app has an active request on one of PROVIDERS
-    static long holdUntil;           // uptime: keep the reader connected until then, see HOLD_MS
+    static long holdUntil;           // elapsedRealtime (counts sleep): keep the reader connected until then, see HOLD_MS
     static String keepScreen = "/proc/self/fd/3/ztos-waydroid-keep-screen";
     /** provider -> WorkSource text of its active request (null: none, or interval too long) */
     static final java.util.HashMap<String, String> wanted = new java.util.HashMap<>();
@@ -124,7 +125,7 @@ public final class Bridge {
         }
         if (any != want) {
             // a short hold, except when the screen went off: then the user is done
-            holdUntil = !any && !ui.equals("screen-off") ? SystemClock.uptimeMillis() + HOLD_MS : 0;
+            holdUntil = !any && !ui.equals("screen-off") ? SystemClock.elapsedRealtime() + HOLD_MS : 0;
             log((any ? "GPS on: " : holdUntil != 0 ? "GPS held " + HOLD_MS / 1000 + " s: " : "GPS off: ") + why + " (Waydroid " + ui + ")");
         }
         want = any;
@@ -212,6 +213,10 @@ public final class Bridge {
 
     // ---- NMEA ----
     static double lastGgaTime = -1, alt = Double.NaN, hdop = Double.NaN;
+    /** The engine's own accuracy ($PZTFX from zrn-gnss-nmea) and when it came (elapsedRealtime). */
+    static double engineAcc = Double.NaN;
+    static long engineAccAt;
+    static final long ACC_FRESH_MS = 2000;
     static int sats;
     static long lastPush;
     static Location live;            // the latest live fix of this connection
@@ -269,6 +274,13 @@ public final class Bridge {
             }
             return;
         }
+        if (f[0].equals("PZTFX") && f.length >= 2) {
+            double a = num(f[1]);
+            if (!(a > 0 && a < 100000)) return;
+            engineAcc = a;
+            engineAccAt = SystemClock.elapsedRealtime();
+            return;
+        }
         if (type.equals("GGA") && f.length >= 10) {
             if (f[6].isEmpty() || f[6].equals("0")) { lastGgaTime = -1; return; }
             lastGgaTime = num(f[1]);
@@ -288,8 +300,11 @@ public final class Bridge {
             if (!Double.isNaN(knots) && knots * 0.514444 > MOVING_MS) movingUntil = SystemClock.uptimeMillis() + 20000;
             double course = num(f[8]);
             if (!Double.isNaN(course)) l.setBearing((float) course);
-            // no error estimate in RMC/GGA: HDOP times a typical 4 m UERE
-            float acc = same && !Double.isNaN(hdop) ? (float) Math.max(3.0, hdop * 4.0) : 20f;
+            // the engine's own estimate when it came with this fix; else, as
+            // RMC/GGA carry none, HDOP times a typical 4 m UERE
+            float acc = SystemClock.elapsedRealtime() - engineAccAt < ACC_FRESH_MS && !Double.isNaN(engineAcc)
+                    ? (float) Math.max(1.0, engineAcc)
+                    : same && !Double.isNaN(hdop) ? (float) Math.max(3.0, hdop * 4.0) : 20f;
             l.setAccuracy(acc);
             l.setTime(System.currentTimeMillis());
             l.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
@@ -433,7 +448,7 @@ public final class Bridge {
             synchronized (state) {
                 for (;;) {
                     w = want && !stalled;
-                    long left = holdUntil - SystemClock.uptimeMillis();
+                    long left = holdUntil - SystemClock.elapsedRealtime();
                     keep = w || (left > 0 && !stalled);
                     if (keep || sock != null) break;
                     state.wait(60000);
