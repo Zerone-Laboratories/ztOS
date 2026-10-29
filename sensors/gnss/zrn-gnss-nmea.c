@@ -168,11 +168,18 @@ static void cb_nmea(int64_t ts, const char *s, int n)
 	if (s[n - 1] != '\n') fanout("\r\n", 2);
 	if (debug) dprintf(2, "%.*s%s", n, s, s[n - 1] == '\n' ? "" : "\n");
 }
+static int fixes;
 static void cb_location(GpsLocation *l)
 {
-	/* layout of broadcom::GpsLocation assumed AOSP; diagnostic only */
-	if (l) dprintf(2, "zrn-gnss-nmea: fix flags=0x%x lat=%f lon=%f acc=%f\n",
-		       l->flags, l->latitude, l->longitude, (double)l->accuracy);
+	/* layout of broadcom::GpsLocation assumed AOSP; diagnostic only. The
+	 * journal gets the first fix of a session without its position (the
+	 * owner's whereabouts do not belong in logs); -d prints every fix. */
+	if (!l) return;
+	if (debug)
+		dprintf(2, "zrn-gnss-nmea: fix flags=0x%x lat=%f lon=%f acc=%f\n",
+			l->flags, l->latitude, l->longitude, (double)l->accuracy);
+	else if (!fixes++)
+		dprintf(2, "zrn-gnss-nmea: first fix, accuracy %d m\n", (int)l->accuracy);
 }
 static void cb_status(void *st)
 {
@@ -207,8 +214,14 @@ int main(int argc, char **argv, char **envp)
 	const char *usock = "/data/vendor/gps/ztos-nmea.sock";
 	int port = 10110;
 	(void)envp;
-	for (int i = 1; i < argc; i++)
+	/* -p PORT -u SOCKET: ztos-gnss-gate owns the public ones and starts us on demand */
+	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-d")) debug = 1;
+		else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
+			port = 0;
+			for (const char *c = argv[++i]; *c >= '0' && *c <= '9'; c++) port = port * 10 + *c - '0';
+		} else if (!strcmp(argv[i], "-u") && i + 1 < argc) usock = argv[++i];
+	}
 
 	int t = listen_tcp(port), u = listen_unix(usock);
 	if (t < 0 && u < 0) { dprintf(2, "zrn-gnss-nmea: no listening socket\n"); return 1; }

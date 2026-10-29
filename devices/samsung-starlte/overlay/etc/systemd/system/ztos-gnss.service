@@ -1,5 +1,6 @@
 [Unit]
-Description=ztOS GNSS: Broadcom gpsd on the BCM4773, NMEA on 127.0.0.1:10110
+Description=ztOS GNSS: Broadcom gpsd on the BCM4773, NMEA to ztos-gnss-gate
+# started and stopped by ztos-gnss-gate.service, only while something reads location
 Requires=ztoscsf-sensorhub.service
 After=ztoscsf-sensorhub.service
 # a few tries only: a dead hub must not spin this forever
@@ -18,6 +19,3 @@ TimeoutStopSec=5
 # whole framework after gpsd: a bare lhd restart without the hub's reset
 # sequence made the firmware assert (transport_layer.c line 165) a minute on.
 ExecStopPost=/usr/bin/systemctl --no-block restart ztoscoresensorframework.service
-
-[Install]
-WantedBy=graphical.target

@@ -36,6 +36,8 @@
     IgnoreJniTime="true"
     AssertEnabled="false"
 
+    SensorsEnable="false"
+
     IgnoreFwConfig="false"
     DisablePglorNmeaCallback="true"
 

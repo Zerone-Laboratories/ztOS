@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""ztos-gnss-gate: GPS on demand.
+
+Owns the public NMEA sockets, 127.0.0.1:10110 and /run/ztos-gnss/nmea.sock
+(geoclue, Waydroid's location bridge, gpsd clients). The first reader starts
+ztos-gnss.service (the hub's GNSS engine and zrn-gnss-nmea on 10111); once
+the last reader has been gone IDLE seconds it is stopped again, so the
+GNSS radio is off unless something asks for location.
+"""
+import os, socket, subprocess, sys, threading, time
+
+PUBLIC_TCP = ("127.0.0.1", 10110)
+PUBLIC_UNIX = "/run/ztos-gnss/nmea.sock"
+INNER = ("127.0.0.1", 10111)
+IDLE = 30
+
+lock = threading.Lock()
+clients = set()
+last_reader = time.monotonic()
+running = False
+arrived = threading.Event()  # set by accept_loop: wakes an idle pump
+last_start = 0.0
+RESTART = 30  # engine still unreachable this long after a start: ask again
+
+
+def log(msg):
+    print(f"ztos-gnss-gate: {msg}", file=sys.stderr, flush=True)
+
+
+def unit(action):
+    subprocess.run(["systemctl", "--no-block", action, "ztos-gnss.service"], check=False)
+
+
+def accept_loop(server):
+    global running, last_start
+    while True:
+        conn, _ = server.accept()
+        conn.setblocking(False)
+        with lock:
+            clients.add(conn)
+            arrived.set()
+            if not running:
+                running = True
+                last_start = time.monotonic()
+                log("reader arrived; GPS on")
+                unit("start")
+
+
+def prune_readers():
+    """Detect disconnects even before the engine produces its first sentence.
+
+    Called with lock held. Drain client input: this is an output-only NMEA
+    endpoint, and unread input must not hide a subsequent EOF.
+    """
+    global last_reader
+    for c in list(clients):
+        try:
+            if c.recv(4096):
+                continue
+        except BlockingIOError:
+            continue
+        except OSError:
+            pass
+        c.close()
+        clients.discard(c)
+        if not clients:
+            last_reader = time.monotonic()
+
+
+def pump():
+    """Copy inner NMEA to every reader; reconnect while the unit comes up."""
+    global last_reader, running, last_start
+    inner = None
+    while True:
+        with lock:
+            prune_readers()
+            if clients:
+                last_reader = time.monotonic()
+            elif running and time.monotonic() - last_reader > IDLE:
+                running = False
+                log("no readers; GPS off")
+                unit("stop")
+            want = running
+        if not want:
+            if inner:
+                inner.close()
+                inner = None
+            # idle: sleep until a reader connects, no periodic wakeups
+            arrived.wait()
+            arrived.clear()
+            continue
+        if inner is None:
+            try:
+                inner = socket.create_connection(INNER, timeout=2)
+                inner.settimeout(1)
+            except OSError:
+                # ztos-gnss.service gave up (hub down, start limit): readers
+                # are still waiting, so ask again; systemd's start limit keeps
+                # this to three tries in five minutes
+                if time.monotonic() - last_start > RESTART:
+                    last_start = time.monotonic()
+                    log("engine unreachable; starting it again")
+                    unit("start")
+                time.sleep(1)
+                continue
+        try:
+            data = inner.recv(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            data = b""
+        if not data:
+            inner.close()
+            inner = None
+            time.sleep(1)
+            continue
+        with lock:
+            for c in list(clients):
+                try:
+                    c.send(data)
+                except BlockingIOError:
+                    pass  # slow reader: it misses a sentence
+                except OSError:
+                    c.close()
+                    clients.discard(c)
+            # readers that hung up without being written to
+            for c in list(clients):
+                try:
+                    if c.recv(1, socket.MSG_PEEK) == b"":
+                        c.close()
+                        clients.discard(c)
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    c.close()
+                    clients.discard(c)
+
+
+def main():
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp.bind(PUBLIC_TCP)
+    tcp.listen(8)
+    os.makedirs(os.path.dirname(PUBLIC_UNIX), exist_ok=True)
+    try:
+        os.unlink(PUBLIC_UNIX)
+    except FileNotFoundError:
+        pass
+    ux = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    ux.bind(PUBLIC_UNIX)
+    os.chmod(PUBLIC_UNIX, 0o666)
+    ux.listen(8)
+    for s in (tcp, ux):
+        threading.Thread(target=accept_loop, args=(s,), daemon=True).start()
+    log("waiting for readers; GPS off")
+    pump()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+[Unit]
+Description=ztOS GNSS gate: GPS on only while something reads location (NMEA on 127.0.0.1:10110)
+
+[Service]
+ExecStart=/usr/local/sbin/ztos-gnss-gate
+ExecStopPost=/usr/bin/systemctl --no-block stop ztos-gnss.service
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

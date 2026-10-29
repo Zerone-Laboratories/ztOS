@@ -5,7 +5,9 @@
 #   -> gpsd (vendor, /vendor/bin/hw/gpsd, Broadcom's GLL engine) over the
 #      named pipe /data/vendor/gps/.pipe.gpsd_to_lhd
 #   -> zrn-gnss-nmea (ours: loads /vendor/lib64/hw/gps.default.so)
-#   -> NMEA on 127.0.0.1:10110 and /var/lib/zrn-android/data/vendor/gps/ztos-nmea.sock
+#   -> NMEA on 127.0.0.1:10111 (inner)
+#   -> ztos-gnss-gate: 127.0.0.1:10110 and /run/ztos-gnss/nmea.sock; it starts
+#      this unit on the first reader and stops it when the last one leaves
 # Needs the sensor hub up (lhd: ESW:READY). Evidence: sensors/GPS-REA.md.
 R=/run/android
 D=/var/lib/zrn-android/data/vendor/gps
@@ -35,7 +37,7 @@ case "${1:-}" in
 	sleep 3
 	kill -0 $gpsd_pid 2>/dev/null || { log "vendor gpsd exited"; exit 1; }
 	# bridge in the foreground: if either dies, the unit restarts both
-	/usr/bin/chroot $R /data/local/zrn-gnss-nmea ${ZTOS_GNSS_DEBUG:+-d} &
+	/usr/bin/chroot $R /data/local/zrn-gnss-nmea -p 10111 -u /data/vendor/gps/.nmea-inner.sock ${ZTOS_GNSS_DEBUG:+-d} &
 	nmea_pid=$!
 	trap 'kill $gpsd_pid $nmea_pid 2>/dev/null' EXIT
 	while kill -0 $gpsd_pid 2>/dev/null && kill -0 $nmea_pid 2>/dev/null; do sleep 2; done
