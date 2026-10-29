@@ -1,3 +1,36 @@
+# Full MIF sleep: stock's suspend path against ours — 2026-10-29
+
+The vendor kernel checkout (third_party/vendor-kernel, LineageOS
+exynos9810, 4.9.118) was sparse: only drivers/soc, sensorhub and the DT.
+Added drivers/devfreq, drivers/memory, drivers/thermal, drivers/mfd,
+drivers/regulator, drivers/soc/samsung, include/soc/samsung, drivers/clk.
+
+What stock's TWRP sleep (build/power-analysis/twrp-stock-sleep.log, MIF down
+1) runs before the firmware call, and ours:
+
+| stock | ours (mif-trial.sh) |
+|---|---|
+| exynos_tmu_suspend: ACPM TMU plugin IPC TMU_IPC_AP_SUSPEND (0x04, rsvd = cp net connected) on channel 12; TMU_IPC_AP_RESUME (0x10) after; TMU_IPC_INIT per zone at boot | plugin 7 copied and attached by load-acpm-tmu.py, never initialised, never told AP_SUSPEND/RESUME |
+| devfreq suspend: mif 421000, int 107000, fsys0 73000, cam 590000, intcam 630000, disp 200000, aud 0 (through ACPM DVFS, after DATA_INIT/SET_CONST at boot) | MIF 421 / INT 107 through s9p-acpm FVP; the others untouched |
+| s2mps18_pmic_suspend adc_mode 2 | none |
+| modem_suspend pda_active 0 (modem left running) | modem powered off |
+| etspi suspend SMC, mpsd (TEE), madera, dwc3, sec_ts, hall, fimc_is sensors, iva_ctl | none (their blocks are off or absent in ours) |
+| MIF req_Master 0x10 | 0x13 awake (modem bits) |
+
+The TMU row is the lead: the plugin runs on ACPM through the sleep; told
+nothing, it may keep polling or act on hardware in the domain going down.
+Not proof: trials before 18 Oct hung without the plugin loaded at all.
+
+ACPM SRAM plugin slots (initdata 0x5a0c, 48-byte entries; ACPM address =
+offset from 0x02039000): 1 0x1f800+0x800, 2 0x16c00+0x8c00, 4 0xc400+0x2800,
+5 0xb400+0x1000, 6 0xec00+0x8000, 7 (TMU, loaded by us) 0xd800+0x1400.
+The zero stretch 0xcbc0..0xd800 is inside plugin 4's slot: not a free place
+for the sleep log.
+
+Next trial (phone free, someone there for the key reset): send TMU INIT
+after loading the plugin, AP_SUSPEND before the sleep, AP_RESUME after
+(`s9p-acpm ipc 12 0 0x04 0 0` / `... 0 0x10 0 0`; INIT is `0 0x01 0 0`).
+
 # Current-install AP sleep verification — 2026-10-22
 
 Kernel #55 (`7.1.0-zboot`) completed two consecutive AP-only RTC suspend
