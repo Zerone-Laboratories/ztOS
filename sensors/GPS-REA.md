@@ -3,9 +3,10 @@
 **Answer:** stock GNSS is four processes in a chain, and three of them already
 run, or can run, unchanged in `/run/android`. ztOS needs one tiny bionic
 program (`zrn-gnss-nmea`, written and built here) that loads the stock HAL
-`gps.default.so` and serves its NMEA. **No zrn-bbd change is needed.** Nothing
-here has run on the phone yet. Everything is blocked on the sensor hub being
-up, because GNSS data reaches userspace only through `lhd`.
+`gps.default.so` and serves its NMEA. **No zrn-bbd change is needed.** It
+works on the phone (section 7): a fix in about 1 to 2 minutes indoors near a
+window, and Android apps in Waydroid get it. Everything still depends on the
+sensor hub being up, because GNSS data reaches userspace only through `lhd`.
 
 **Nothing has to be pulled from the phone to run it.** `zrn-android-root`
 bind-mounts the whole VENDOR partition, so `/vendor/bin/hw/gpsd` is already in
@@ -233,3 +234,49 @@ Pull these from `/mnt/vendor` on the phone:
 7. **Power.** gpsd's `LPmode` and `EnableLowPowerPmm` are left at stock.
    **Measure the drain before enabling the service by default**, given
    `zrn-sleepd`.
+
+## 7. Status, 29 October 2026
+
+**GPS works end to end**, on demand only.
+
+```
+lhd -> gpsd -> zrn-gnss-nmea (127.0.0.1:10111)
+  -> ztos-gnss-gate (127.0.0.1:10110, /run/ztos-gnss/nmea.sock)
+       starts ztos-gnss.service on the first reader, stops it 30 s after the last
+  -> ztos-waydroid-location (Waydroid), Linux gpsd or geoclue if installed
+```
+
+### The crash that hid every fix
+
+- Vendor gpsd died with SIGSEGV about 23 s after start, right after its first
+  NMEA burst, every time.
+- gdb: `NdkSensorsInfo` in gpsd's sensor thread dereferences the
+  `ISensorManager` it gets from `android.frameworks.sensorservice@1.0`. There
+  is no hwservicemanager in the chroot, so it is null.
+- Fix: `SensorsEnable="false"` in our `gps.xml`. The engine then runs without
+  dead reckoning. First run after the fix: a fix within 60 s, 7 to 15
+  satellites, accuracy 6 to 24 m.
+
+### Android in Waydroid
+
+- Waydroid has no GNSS HAL, so Android had no `gps` provider at all.
+- microG's `network` provider has no Wi-Fi or cell data in the container and
+  never produced a location. Google Maps Go asks only `network` (BALANCED).
+- `android/waydroid/location/Bridge.java`, run by app_process as root inside
+  the container's mount and pid namespaces but in the host network namespace,
+  replaces both with test providers and listens for their ProviderRequests.
+  It opens the gate only while a request is active (interval up to 5 min)
+  and either a Waydroid window is shown (`ztos-waydroid-power-state` is
+  `active`) or the request is for a keep_awake app. Without that check, an
+  app left open in a hidden window would hold the GPS on for good, because
+  Android still sees it as resumed.
+- `/usr/local/sbin/ztos-waydroid-location` (ztos-waydroid-location.service)
+  starts the bridge whenever Android is up and again after every Android
+  restart. It allows MOCK_LOCATION for uid 0.
+
+### Costs
+
+- Each GPS session ends with ztos-gnss's ExecStopPost restarting
+  ztoscoresensorframework (see the unit).
+- The bridge holds about 27 MB of anonymous memory while Android runs.
+- Logs carry no positions; `ZTOS_GNSS_DEBUG=1` prints every fix.

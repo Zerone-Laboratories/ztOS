@@ -1,0 +1,39 @@
+#!/bin/sh
+# ztos-waydroid-location: the phone's GNSS for Android apps in Waydroid.
+# Waydroid has no GNSS HAL. Whenever Android runs, this starts the location
+# bridge (android/waydroid/location/Bridge.java) with app_process inside the
+# container's mount and pid namespaces but in the host's network namespace,
+# so it reaches ztos-gnss-gate on 127.0.0.1:10110. The bridge registers
+# "gps" and "network" test providers and opens the gate only while an Android app asks for
+# location while its window is shown (or for a user-picked background app);
+# the gate powers the GNSS engine only while a reader is connected.
+# Android restarts (new zygote) end the bridge; this loop starts it again.
+. /usr/lib/ztos/user.sh
+DEX=/usr/local/lib/ztos-gnss/ztos-waydroid-location.dex
+TMP=$ZTOS_HOME/.local/share/waydroid/data/local/tmp
+log() { echo "ztos-waydroid-location: $*"; }
+in_android() {
+	nsenter -e -t "$Z" -m -p -r -w -- /system/bin/sh -c "export PATH=/system/bin:/system/xbin; $1"
+}
+while :; do
+	Z=$(pgrep -f '^zygote64$' | head -1)
+	# a frozen container blocks binder calls: time out and look again later
+	if [ -z "$Z" ] || ! timeout 5 nsenter -e -t "$Z" -m -p -r -w -- /system/bin/service check location 2>/dev/null | grep -q ': found$'; then
+		sleep 15
+		continue
+	fi
+	if [ -d "$TMP" ] && ! cmp -s "$DEX" "$TMP/ztos-waydroid-location.dex"; then
+		install -m 0644 -o 2000 -g 2000 "$DEX" "$TMP/ztos-waydroid-location.dex"
+	fi
+	# test providers need the mock-location app op; the bridge runs as root (uid 0)
+	timeout 10 nsenter -e -t "$Z" -m -p -r -w -- /system/bin/cmd appops set --uid 0 MOCK_LOCATION allow 2>/dev/null
+	log "Android up (zygote $Z); starting the bridge"
+	# the bridge sees host paths only through these: the Waydroid power state
+	# (ztos-waydroid-power) and android.conf's keep_awake list
+	if [ -d "$ZTOS_RUNTIME_DIR" ]; then exec 3<"$ZTOS_RUNTIME_DIR"; else exec 3</dev/null; fi
+	if [ -d "$ZTOS_HOME/.config/ztos" ]; then exec 4<"$ZTOS_HOME/.config/ztos"; else exec 4</dev/null; fi
+	in_android 'CLASSPATH=/data/local/tmp/ztos-waydroid-location.dex exec app_process /system/bin org.ztos.location.Bridge --package com.android.shell'
+	exec 3<&- 4<&-
+	log "bridge exited ($?)"
+	sleep 5
+done
