@@ -33,10 +33,13 @@ IAL_LIBS := $(shell pkg-config --exists ztos-ial 2>/dev/null && pkg-config --lib
 # ztRetrofit's styles beside Metro: retro/ (DotMatrix: the dot engine and its launcher)
 RETRO = retro/dotmatrix.c retro/dm-launcher.c retro/dm-chrome.c
 RETRO_DEPS = $(RETRO) retro/dotmatrix.h retro/dm-launcher.h retro/dm-chrome.h retro/dm-glyphs.h
+# every cairo fill and stroke through retro/dm-wrap.c: the style's dots
+DM_WRAP = retro/dm-wrap.c
+DM_WRAP_LDFLAGS = -Wl,--wrap=cairo_fill,--wrap=cairo_fill_preserve,--wrap=cairo_stroke,--wrap=cairo_stroke_preserve,--wrap=cairo_paint
 
-ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h $(RETRO_DEPS)
+ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h $(RETRO_DEPS) $(DM_WRAP)
 	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(IAL_FLAGS) \
-		-o $@ ztmetro.c $(RETRO) $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
+		-o $@ ztmetro.c $(RETRO) $(DM_WRAP) $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
 
 # the DotMatrix screens rendered offscreen to PNG files, to check them without a phone
 retro/dm-test: retro/dm-test.c $(RETRO_DEPS)
@@ -54,10 +57,10 @@ apps/ztapps: apps/ztapps.c
 # ZrnMetroCore: the window, motion and widgets our own apps share
 VIEWPORTER := $(WP)/stable/viewporter/viewporter.xml
 CORE = core/zrnmetrocore.c core/zrnmetrogpu.c core/xdg-shell-protocol.c core/viewporter-protocol.c \
-	retro/dotmatrix.c retro/dm-chrome.c
+	retro/dotmatrix.c retro/dm-chrome.c $(DM_WRAP)
 CORE_DEPS = $(CORE) retro/dotmatrix.h retro/dm-chrome.h retro/dm-glyphs.h core/zrnmetrocore.h core/zrnmetrogpu.h core/zrnmetrorender.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
 APP_BUILD = $(CC) $(CFLAGS) $(WARN) -Icore $(shell pkg-config --cflags $(APP_PKGS)) $(IAL_FLAGS)
-APP_LIBS = $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS) -lm
+APP_LIBS = $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS) -lm
 
 # ztCamera: the camera, in the Lumia Camera look (see camera/CAMERA-DRIVERS.md
 # for why its viewfinder runs against a source that is not a sensor)

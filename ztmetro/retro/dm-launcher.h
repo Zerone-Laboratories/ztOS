@@ -30,6 +30,7 @@ struct dm_status {
 	int cpu, ram, gpu;		/* load, percent */
 	int n_notif;
 	char notif[DM_MAX_NOTIF][64];	/* the names of apps with notifications waiting */
+	int notif_count[DM_MAX_NOTIF];	/* and how many each has */
 };
 
 struct dm_app { char label[64]; char act[256]; };
@@ -68,6 +69,18 @@ const struct dm_screen *dm_launcher_screen(const struct dm_launcher *L);
 const struct dm_screen *dm_launcher_screen2(const struct dm_launcher *L);
 
 void dm_launcher_status(struct dm_launcher *L, const struct dm_status *st);
+
+/* The lock screen is one of the launcher's screens: the clock, the status
+ * icons, the waiting apps and a box to swipe across. Locking and unlocking
+ * rearrange the dots into the other screen. */
+void dm_launcher_lock(struct dm_launcher *L, bool locked, int64_t now);
+bool dm_launcher_locked(const struct dm_launcher *L);
+/* the swipe box, in points, and how far across it the finger is (0..1) */
+void dm_launcher_unlock_box(const struct dm_launcher *L, float *x0, float *y0, float *x1, float *y1);
+void dm_launcher_unlock_drag(struct dm_launcher *L, float progress);
+/* the same without the event banners: while the system is still starting,
+ * radios coming up are not news */
+void dm_launcher_seed(struct dm_launcher *L, const struct dm_status *st);
 void dm_launcher_apps(struct dm_launcher *L, const struct dm_app *apps, int n);	/* in display order */
 void dm_launcher_set_config(struct dm_launcher *L, const struct dm_config *c);
 void dm_launcher_get_config(const struct dm_launcher *L, struct dm_config *c);

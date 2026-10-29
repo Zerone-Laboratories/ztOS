@@ -35,5 +35,8 @@ void zmg_dmabuf_free(void *image);
 void zmg_dmabuf_draw(void *image, const struct zmg_vertex corners[4], float alpha);
 void zmg_report(const char *app_id);
 void zmg_fini(void);
+/* below 1: what zmg_surface and zmg_dmabuf_draw draw shows through that share
+ * of a lattice of dots zmg_dot_pitch points apart (the DotMatrix style) */
+extern float zmg_reveal, zmg_dot_pitch;
 
 #endif

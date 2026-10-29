@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 #include "dm-launcher.h"
+#include "dm-chrome.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -38,7 +39,7 @@
 #define MAX_HITS 160
 #define MAX_EVENTS 8
 
-enum { S_SPLASH, S_HOME, S_DRAWER, S_LAUNCH, S_MENU, S_QUICK, S_SETTINGS, S_GUIDE };
+enum { S_SPLASH, S_HOME, S_DRAWER, S_LAUNCH, S_MENU, S_QUICK, S_SETTINGS, S_GUIDE, S_LOCK };
 enum {
 	H_DOCK, H_DIAL, H_MEDIA, H_DRAWER, H_APP, H_JUMP, H_HOME, H_PALETTE, H_AMOLED,
 	H_MENU_DONE, H_QUICK, H_SETTINGS, H_SET_ROW, H_SET_PAGE, H_GUIDE, H_GUIDE_NEXT, H_TEST_BANNERS,
@@ -79,6 +80,8 @@ struct dm_launcher {
 	int set_page, guide_page;
 	int dy;				/* rows below the design's 152, bottom-anchored */
 	int screen;
+	bool locked;			/* the lock screen is the screen there is */
+	float unlock_p;			/* the finger across its box, 0..1 */
 	int64_t t0, switch_at;
 	int morph_ms;
 	bool boot_pending, resume_pending, boot_haptic, sweep_haptic, had_ripples, dirty;
@@ -280,6 +283,11 @@ void dm_launcher_status(struct dm_launcher *L, const struct dm_status *s) {
 	L->st = *s;
 }
 
+void dm_launcher_seed(struct dm_launcher *L, const struct dm_status *s) {
+	L->st_init = true;
+	L->st = *s;
+}
+
 static void resolve_dock(struct dm_launcher *L);
 
 void dm_launcher_apps(struct dm_launcher *L, const struct dm_app *apps, int n) {
@@ -395,6 +403,10 @@ void dm_launcher_wake(struct dm_launcher *L, int64_t now) {
 }
 
 void dm_launcher_resume(struct dm_launcher *L, int64_t now) {
+	if (L->locked) {
+		L->dirty = true;
+		return;
+	}
 	if (L->screen == S_QUICK) {		/* a radio panel took the screen: come back to it */
 		L->dirty = true;
 		return;
@@ -408,13 +420,48 @@ void dm_launcher_resume(struct dm_launcher *L, int64_t now) {
 	L->dirty = true;
 }
 
+void dm_launcher_lock(struct dm_launcher *L, bool locked, int64_t now) {
+	if (locked == L->locked) return;
+	L->locked = locked;
+	L->unlock_p = 0;
+	L->n_ripples = 0;
+	if (L->screen == S_SPLASH) {
+		L->dirty = true;	/* still arranging: it lands on the right screen */
+		return;
+	}
+	go(L, locked ? S_LOCK : S_HOME, now);
+	L->morph_ms = 650;		/* the dots fly the whole screen over */
+	L->dirty = true;
+}
+
+bool dm_launcher_locked(const struct dm_launcher *L) { return L->locked; }
+
+/* the box: design columns 4..63, BOX_H rows a few above the bottom */
+#define BOX_H 13
+static int box_top(const struct dm_launcher *L) { return L->s.rows - BOX_H - 7; }
+
+void dm_launcher_unlock_box(const struct dm_launcher *L, float *x0, float *y0, float *x1, float *y1) {
+	const struct dm_screen *s = &L->s;
+	*x0 = s->ox + (s->coff + 4) * s->pitch - s->pitch / 2;
+	*x1 = s->ox + (s->coff + 63) * s->pitch + s->pitch / 2;
+	*y0 = s->oy + box_top(L) * s->pitch - s->pitch / 2;
+	*y1 = s->oy + (box_top(L) + BOX_H - 1) * s->pitch + s->pitch / 2;
+}
+
+void dm_launcher_unlock_drag(struct dm_launcher *L, float p) {
+	p = p < 0 ? 0 : p > 1 ? 1 : p;
+	if (p != L->unlock_p) L->dirty = true;
+	L->unlock_p = p;
+}
+
 void dm_launcher_home(struct dm_launcher *L, int64_t now) {
+	if (L->locked) return;
 	if (L->screen != S_HOME && L->screen != S_SPLASH) go(L, S_HOME, now);
 	else ripple(L, L->s.w / 2, L->s.h / 2, now, true);
 }
 
 bool dm_launcher_back(struct dm_launcher *L, int64_t now) {
-	if (L->screen == S_HOME || L->screen == S_SPLASH) return false;
+	if (L->locked || L->screen == S_HOME || L->screen == S_SPLASH) return false;
 	go(L, S_HOME, now);
 	return true;
 }
@@ -1136,6 +1183,34 @@ static void draw_quick(struct dm_launcher *L, struct dm_grid *g, int64_t A) {
 	}
 }
 
+/* The lock screen: the face the shell's cairo lock has (dm_chrome_lock),
+ * and under it a square box to swipe across, its thumb following the finger
+ * and the way to go marching in it. */
+static void draw_lock(struct dm_launcher *L, struct dm_grid *g, int64_t A) {
+	struct dm_lock_app apps[DM_LOCK_APPS];
+	int n = 0;
+	for (int i = 0; i < L->st.n_notif && n < DM_LOCK_APPS; i++) {
+		apps[n].name = L->st.notif[i];
+		apps[n++].count = L->st.notif_count[i] > 0 ? L->st.notif_count[i] : 1;
+	}
+	dm_chrome_lock(g, &L->st, A, L->cfg.h24, apps, n);
+	int top = box_top(L), bot = top + BOX_H - 1;
+	/* square: every corner dot lit */
+	dm_hline(g, 4, 63, top, DM_MAIN, 1);
+	dm_hline(g, 4, 63, bot, DM_MAIN, 1);
+	dm_vline(g, 4, top, bot, DM_MAIN, 1);
+	dm_vline(g, 63, top, bot, DM_MAIN, 1);
+	/* the thumb: a solid block that the finger drags to the right */
+	int span = 63 - 4 - 2 - 6, tx = 6 + (int)lroundf(L->unlock_p * span);
+	for (int c = 6; c < tx; c++) dm_vline(g, c, top + 2, bot - 2, DM_DIM, 2);
+	for (int c = tx; c < tx + 5; c++) dm_vline(g, c, top + 2, bot - 2, DM_ACCENT, 1);
+	/* the way to go: chevrons marching right, ahead of the thumb */
+	static const char *const chev[] = { "X..", ".X.", "..X", ".X.", "X.." };
+	int step = (int)(A / 160 % 6);
+	for (int k = 0, x = tx + 8; x + 3 <= 61; k++, x += 5) dm_rows(g, chev, 5, x, top + 4, k % 6 == step ? DM_MAIN : DM_DIM);
+	dm_text3c(g, "SWIPE TO UNLOCK", 33.5f, top - 8, DM_DIM);
+}
+
 static void compose(struct dm_launcher *L, int screen, int64_t A, struct dm_grid *g) {
 	dm_grid_init(g, scr_of(L, screen), L->grid);
 	L->n_hits = 0;
@@ -1146,6 +1221,7 @@ static void compose(struct dm_launcher *L, int screen, int64_t A, struct dm_grid
 	else if (screen == S_QUICK) draw_quick(L, g, A);
 	else if (screen == S_SETTINGS) draw_settings(L, g);
 	else if (screen == S_GUIDE) draw_guide(L, g);
+	else if (screen == S_LOCK) draw_lock(L, g, A);
 }
 
 /* ---- input ----------------------------------------------------------------- */
@@ -1410,12 +1486,12 @@ bool dm_launcher_frame(struct dm_launcher *L, int64_t A, struct dm_frame *out) {
 	int n;
 	if (arranging) {
 		/* straight from scatter into the finished home screen */
-		if (L->screen == S_SPLASH) L->screen = S_HOME;
+		if (L->screen == S_SPLASH) L->screen = L->locked ? S_LOCK : S_HOME;
 		if (!L->boot_haptic) {
 			L->boot_haptic = true;
 			haptic(L, DM_HAPTIC_ARRANGE, BOOT_ARRANGE_MS);
 		}
-		compose(L, S_HOME, A, &g);
+		compose(L, L->screen, A, &g);
 		L->n_hits = 0;				/* nothing is tappable mid-flight */
 		n = dm_dots(&g, L->snap, L->n);
 		float u = fminf(1, (float)t / BOOT_ARRANGE_MS);
@@ -1487,7 +1563,10 @@ int dm_launcher_next_wake(struct dm_launcher *L, int64_t A) {
 		ms = h <= 0 ? 0 : (int)h;
 	}
 	if (L->n_evq) return 0;
-	if (L->screen == S_HOME) {
+	if (L->screen == S_LOCK) {
+		int m = until(A, 160);			/* the chevrons */
+		if (m < ms) ms = m;
+	} else if (L->screen == S_HOME) {
 		int m = until(A, 500);			/* colon, dock cursor, weather */
 		if (m < ms) ms = m;
 		if (L->st.n_notif && (m = until(A, 420)) < ms) ms = m;

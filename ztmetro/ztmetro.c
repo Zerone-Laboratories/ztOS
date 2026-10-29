@@ -413,6 +413,18 @@ struct zt_pointer_device {
 };
 
 enum shell_style { STYLE_METRO, STYLE_DOTMATRIX };
+/* The shell's style, for the drawing helpers that have no server to ask:
+ * under DotMatrix their text and glyphs come out as dots. */
+static const int *g_style;
+static const int *g_palette;		/* and its palette */
+static bool dots(void) {
+	bool on = g_style && *g_style == STYLE_DOTMATRIX;
+	if (on && g_palette && *g_palette >= 0 && *g_palette < DM_PALETTES) {
+		dm_wrap_main = dm_palettes[*g_palette][0];	/* what the dots are drawn in */
+		dm_wrap_accent = dm_palettes[*g_palette][1];
+	}
+	return on;
+}
 
 enum touch_role {
 	ROLE_NONE,
@@ -515,6 +527,8 @@ struct zt_server {
 	uint32_t anim_frames, anim_last_ms, anim_worst_ms, anim_first_ms;
 	double anim_draw_ms, anim_finish_ms, anim_commit_ms;	/* where the frame time goes */
 	float uv_off[2];		/* where in its texture the next quad starts (0, 0 but for a cropped surface) */
+	float quad_reveal;		/* below 1: quads show through dots (the DotMatrix style's arrival) */
+	float quad_dpitch;		/* those dots' spacing, in pixels */
 	bool sweeping;			/* a live tile's long line is moving: keep drawing */
 
 	/* ztRetrofit: the shell's style. Metro is Start and its tiles; DotMatrix
@@ -537,6 +551,7 @@ struct zt_server {
 	uint32_t dm_launch_fired_ms;	/* the launcher asked for an app: when */
 	struct dm_status dm_st;		/* what it was last told */
 	bool dm_fed;
+	uint32_t boot_done_ms;		/* when the boot splash went away */
 
 	struct zt_layer osk_layer, nav_layer, status_layer, shade_layer;
 	struct zt_layer lock_layer, keypop_layer;
@@ -873,6 +888,8 @@ static void retro_draw(struct zt_server *server, int width_px, int height_px, bo
 static int64_t wall_ms(void);
 static void retro_paint_status(struct zt_server *server, cairo_t *cr);
 static void retro_paint_nav(struct zt_server *server, cairo_t *cr);
+static bool retro_strip(struct zt_server *server, float h, struct dm_screen *strip, uint8_t **buf);
+static void retro_feed(struct zt_server *server);
 
 static void auth_input(struct zt_server *, uint32_t, const char *);
 static void auth_submit(struct zt_server *);
@@ -1209,21 +1226,39 @@ static GLuint gl_program(const char *fragment_head, const char *sampler) {
 		"	uv = uv_off + pos * uv_scale;\n"
 		"	gl_Position = mvp * vec4(pos, 0.0, 1.0);\n"
 		"}\n";
-	char fragment[1024];
+	char fragment[2048];
 	snprintf(fragment, sizeof(fragment),
 		"%s"
 		"precision mediump float;\n"
+		"#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+		"#define HP highp\n"
+		"#else\n"
+		"#define HP mediump\n"
+		"#endif\n"
 		"varying vec2 uv;\n"
 		"uniform %s tex;\n"
 		"uniform float alpha;\n"
 		"uniform float swap_rb;\n"
 		"uniform float opaque;\n"
 		"uniform vec3 tint;\n"
+		/* the DotMatrix style's arrival: below 1 the picture shows only
+		 * through some of a lattice of round dots, `dpitch` pixels apart,
+		 * more of them as it grows, and then the dots swell into it */
+		"uniform float reveal;\n"
+		"uniform float dpitch;\n"
 		"void main() {\n"
 		"	vec4 c = texture2D(tex, uv);\n"
 		"	if (swap_rb > 0.5) c = c.bgra;\n"
 		"	if (opaque > 0.5) c.a = 1.0;\n"
 		"	c.rgb *= tint;\n"
+		"	if (reveal < 0.999) {\n"
+		"		HP vec2 q = gl_FragCoord.xy / dpitch;\n"
+		"		HP vec2 cell = floor(q);\n"
+		"		HP float h = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);\n"
+		"		float r = 0.36 + max(0.0, reveal - 0.7) * 1.5;\n"
+		"		float m = step(h, reveal / 0.7) * (1.0 - smoothstep(r - 0.08, r, length(fract(q) - 0.5)));\n"
+		"		c *= m;\n"
+		"	}\n"
 		"	gl_FragColor = c * alpha;\n"	/* premultiplied throughout */
 		"}\n", fragment_head, sampler);
 	const char *sources[2] = { vertex, fragment };
@@ -1348,6 +1383,8 @@ static void quad(struct zt_server *server, GLenum target, GLuint tex, const floa
 	glUniform1f(glGetUniformLocation(program, "swap_rb"), swap_rb ? 1.0f : 0.0f);
 	glUniform1f(glGetUniformLocation(program, "opaque"), opaque ? 1.0f : 0.0f);
 	glUniform3f(glGetUniformLocation(program, "tint"), server->tint[0], server->tint[1], server->tint[2]);
+	glUniform1f(glGetUniformLocation(program, "reveal"), server->quad_reveal);
+	glUniform1f(glGetUniformLocation(program, "dpitch"), server->quad_dpitch > 0 ? server->quad_dpitch : 1);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(target, tex);
 	/* App textures arrive with GL's default filter, which wants mipmaps that
@@ -1603,6 +1640,11 @@ static void draw_loading(struct zt_server *server) {
 }
 
 static void set_rgb(cairo_t *cr, uint32_t color) {
+	if (dots()) {
+		/* the palette's two colours, whatever Metro's accent is */
+		int p = g_palette && *g_palette >= 0 && *g_palette < DM_PALETTES ? *g_palette : 0;
+		color = dm_palette_colour(color, dm_palettes[p][0], dm_palettes[p][1]);
+	}
 	cairo_set_source_rgb(cr, ((color >> 16) & 0xff) / 255.0,
 		((color >> 8) & 0xff) / 255.0, (color & 0xff) / 255.0);
 }
@@ -1611,6 +1653,10 @@ static void set_rgb(cairo_t *cr, uint32_t color) {
  * box_w x box_h when centre is set. */
 static void draw_text(cairo_t *cr, const char *text, const char *font, double size,
 		double x, double y, double box_w, double box_h, bool centre) {
+	if (dots()) {
+		dm_type(cr, text, size, x, y, box_w, box_h, centre, 0);
+		return;
+	}
 	PangoLayout *layout = pango_cairo_create_layout(cr);
 	PangoFontDescription *desc = pango_font_description_from_string(font);
 	/* sizes are in points of our own coordinate space, not typographic ones */
@@ -1631,6 +1677,44 @@ static void draw_text(cairo_t *cr, const char *text, const char *font, double si
 	pango_cairo_show_layout(cr, layout);
 	pango_font_description_free(desc);
 	g_object_unref(layout);
+}
+
+/* Text wrapped word by word in `width`, top left at x, y; returns its
+ * height. cr NULL only measures. */
+static double wrap_text(cairo_t *cr, const char *text, const char *font, double size,
+		double x, double y, double width, bool centre) {
+	if (dots()) {
+		return dm_type(cr, text, size, x, y, 0, 0, false, width);
+	}
+	cairo_surface_t *scratch = NULL;
+	cairo_t *m = cr;
+	if (!m) {
+		scratch = cairo_image_surface_create(CAIRO_FORMAT_A8, 1, 1);
+		m = cairo_create(scratch);
+	}
+	PangoLayout *layout = pango_cairo_create_layout(m);
+	PangoFontDescription *desc = pango_font_description_from_string(font);
+	pango_font_description_set_absolute_size(desc, size * PANGO_SCALE);
+	pango_layout_set_font_description(layout, desc);
+	pango_layout_set_width(layout, (int)(width * PANGO_SCALE));
+	pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+	if (centre) {
+		pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+	}
+	pango_layout_set_text(layout, text, -1);
+	int tw, th;
+	pango_layout_get_pixel_size(layout, &tw, &th);
+	if (cr) {
+		cairo_move_to(cr, x, y);
+		pango_cairo_show_layout(cr, layout);
+	}
+	pango_font_description_free(desc);
+	g_object_unref(layout);
+	if (scratch) {
+		cairo_destroy(m);
+		cairo_surface_destroy(scratch);
+	}
+	return th;
 }
 
 static void shift_arrow_path(cairo_t *cr, double u) {
@@ -1690,7 +1774,19 @@ static bool draw_icon_symbol(cairo_t *cr, const char *name, double cx, double cy
 	return true;
 }
 
+struct icon_args { const char *name; double cx, cy, s; };
+static bool g_dotting;		/* drawing a glyph's shape for dm_dotify */
+static void icon_shape(cairo_t *cr, void *data);
+
 static void draw_icon_vector(cairo_t *cr, const char *name, double cx, double cy, double s) {
+	if (dots() && !g_dotting) {
+		/* the same glyph, as dots about nine across */
+		struct icon_args a = { name, cx, cy, s };
+		g_dotting = true;
+		dm_dotify(cr, cx - s * 0.6, cy - s * 0.6, s * 1.2, s * 1.2, s / 9, icon_shape, &a);
+		g_dotting = false;
+		return;
+	}
 	if (draw_icon_symbol(cr, name, cx, cy, s)) {
 		return;
 	}
@@ -2127,6 +2223,11 @@ static void draw_icon_vector(cairo_t *cr, const char *name, double cx, double cy
 
 /* Every glyph is drawn by draw_icon_vector(), at whatever size and scale it is
  * needed: nothing is loaded from bitmap files. */
+static void icon_shape(cairo_t *cr, void *data) {
+	const struct icon_args *a = data;
+	draw_icon_vector(cr, a->name, a->cx, a->cy, a->s);
+}
+
 static void draw_icon(cairo_t *cr, const char *name, double cx, double cy, double s) {
 	if (strcmp(name, "settings") == 0) {
 		name = "gear";
@@ -2904,6 +3005,11 @@ static void load_config(struct zt_server *server) {
 	server->shade_pressed = -1;
 	memcpy(server->quick, QUICK_DEFAULT, sizeof(server->quick));
 	server->style = STYLE_METRO;
+	g_style = &server->style;
+	g_palette = &server->dm_palette;
+	server->quad_reveal = 1.0f;
+	dm_wrap_active = dots;		/* the shell's own fills and strokes as dots in the style */
+	dm_wrap_pitch = 2.3;
 	server->dm_palette = 0;
 	server->dm_amoled = false;
 	server->dm_cfg = (struct dm_config){ .launch_delay = 800, .sys_stats = true, .event_banners = true };
@@ -3358,6 +3464,10 @@ static const char *app_symbol_name(const char *label) {
 static void draw_glyph(struct zt_server *server, cairo_t *cr, const char *icon,
 		const char *label, double cx, double cy, double s) {
 	const char *sym = label ? app_symbol_name(label) : NULL;
+	if (sym && dots()) {
+		draw_icon_vector(cr, sym, cx, cy, s);	/* the same glyph, dotted */
+		return;
+	}
 	if (sym && draw_icon_symbol(cr, sym, cx, cy, s)) {
 		return;	/* a known Windows Phone app: its real tile glyph */
 	}
@@ -3805,6 +3915,9 @@ static void draw_start(struct zt_server *server) {
 /* ---- the app list ----------------------------------------------------------- */
 
 static double text_width(const char *text, const char *font, double size) {
+	if (dots()) {
+		return dm_type_width(text, size);
+	}
 	static cairo_surface_t *surface;
 	static cairo_t *cr;
 	if (!cr) {
@@ -4881,15 +4994,87 @@ static int peek_timed_out(void *data) {
  * out (the lock screen's, the action centre's): the same layer and the
  * same once-a-second toggle as the status bar's. */
 static void plug_over(struct zt_server *server, float oy) {
+	if (retro_on(server)) {
+		return;		/* the DotMatrix rows show charging in their own battery */
+	}
 	if (server->charging && !server->battery_full && server->plug_layer.tex &&
 	    server->st_plug > 0.5f) {
 		layer_draw(server, &server->plug_layer, server->plug_x, server->plug_y + oy, 1.0f);
 	}
 }
 
+/* The apps with notifications waiting, newest first, and how many each has:
+ * the lock screen's row of marks. Returns how many apps (at most cap). */
+static int note_apps(struct zt_server *server, const char **names, int *counts, int cap) {
+	int n = 0;
+	for (int i = 0; i < server->n_notes; i++) {
+		const char *app = server->notes[i].app[0] ? server->notes[i].app : "System";
+		int k = 0;
+		while (k < n && strcmp(names[k], app) != 0) k++;
+		if (k < n) {
+			counts[k]++;
+		} else if (n < cap) {
+			names[n] = app;
+			counts[n++] = 1;
+		}
+	}
+	return n;
+}
+
+/* the Metro lock screen's glyph for an app, by what kind of app it is;
+ * NULL: none fits (its initial is drawn instead) */
+static const char *note_glyph(const char *app) {
+	static const struct { const char *word, *icon; } KINDS[] = {
+		{ "whatsapp", "message" }, { "message", "message" }, { "chat", "message" }, { "sms", "message" },
+		{ "telegram", "message" }, { "signal", "message" }, { "phone", "phone" }, { "call", "phone" },
+		{ "mail", "mail" }, { "music", "music" }, { "calendar", "calendar" }, { "alarm", "calendar" },
+		{ "camera", "camera" }, { "photo", "photo" }, { "gallery", "photo" }, { "store", "store" },
+		{ "browser", "globe" }, { "web", "globe" }, { "people", "people" }, { "contact", "people" },
+		{ "map", "map" }, { "terminal", "terminal" }, { "setting", "gear" }, { "system", "gear" },
+	};
+	for (size_t i = 0; i < sizeof(KINDS) / sizeof(KINDS[0]); i++) {
+		if (strcasestr(app, KINDS[i].word)) return KINDS[i].icon;
+	}
+	return NULL;
+}
+
+/* The DotMatrix style's lock screen: dots on black, the clock in the middle
+ * with the status icons over it and the waiting apps under the date. */
+static void retro_paint_lock(struct zt_server *server, cairo_t *cr) {
+	struct dm_screen field;
+	uint8_t *buf;
+	if (!retro_strip(server, server->height, &field, &buf)) {
+		return;
+	}
+	retro_feed(server);
+	const char *names[DM_LOCK_APPS];
+	int counts[DM_LOCK_APPS];
+	int n = note_apps(server, names, counts, DM_LOCK_APPS);
+	struct dm_lock_app apps[DM_LOCK_APPS];
+	for (int i = 0; i < n; i++) {
+		apps[i].name = names[i];
+		apps[i].count = counts[i];
+	}
+	struct dm_grid g;
+	dm_grid_init(&g, &field, buf);
+	struct dm_config cfg;
+	dm_launcher_get_config(server->dm, &cfg);
+	dm_chrome_lock(&g, &server->dm_st, wall_ms(), cfg.h24, apps, n);
+	dm_cairo_paint(cr, &g, server->dm_palette, server->dm_amoled ? 0 : 0.09f, 0.7f);
+	free(buf);
+	dm_screen_finish(&field);
+}
+
 static void draw_lock(struct zt_server *server) {
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, server->height, &cr);
+	if (retro_on(server)) {
+		cairo_set_source_rgb(cr, 0, 0, 0);
+		cairo_paint(cr);
+		retro_paint_lock(server, cr);
+		zt_buffer_show(server, &server->lock_layer, buffer, cr, server->width, server->height);
+		return;
+	}
 	double r = ((server->accent >> 16) & 0xff) / 255.0, g = ((server->accent >> 8) & 0xff) / 255.0,
 		b = (server->accent & 0xff) / 255.0;
 	cairo_pattern_t *fade = cairo_pattern_create_linear(0, 0, 0, server->height);
@@ -4922,12 +5107,36 @@ static void draw_lock(struct zt_server *server) {
 	localtime_r(&now, &tm);
 	char line[64];
 	cairo_set_source_rgb(cr, 1, 1, 1);
+	/* the clock and the date sit higher to leave a row under the date for
+	 * the apps with notifications waiting (always, so they never jump) */
+	int lift = 56;
 	strftime(line, sizeof(line), "%H:%M", &tm);
-	draw_text(cr, line, FONT_LIGHT, 92, 16, server->height - 268, 0, 0, false);
+	draw_text(cr, line, FONT_LIGHT, 92, 16, server->height - 268 - lift, 0, 0, false);
 	strftime(line, sizeof(line), "%A", &tm);
-	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 156, 0, 0, false);
+	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 156 - lift, 0, 0, false);
 	strftime(line, sizeof(line), "%B %-d", &tm);
-	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 120, 0, 0, false);
+	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 120 - lift, 0, 0, false);
+	/* each app's glyph (or initial) with its count, as Windows Phone's */
+	const char *names[5];
+	int counts[5];
+	int n = note_apps(server, names, counts, 5);
+	double x = 22, cy = server->height - 120 - lift + 30 + 34;
+	for (int i = 0; i < n; i++) {
+		const char *glyph = note_glyph(names[i]);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		if (glyph) {
+			draw_icon(cr, glyph, x + 13, cy, 26);
+		} else {
+			char initial[2] = { (char)toupper((unsigned char)names[i][0]), 0 };
+			cairo_set_line_width(cr, 1.5);
+			cairo_rectangle(cr, x + 1, cy - 12, 24, 24);
+			cairo_stroke(cr);
+			draw_text(cr, initial, FONT_SEMIBOLD, 15, x + 1, cy - 12, 24, 24, true);
+		}
+		snprintf(line, sizeof(line), "%d", counts[i]);
+		draw_text(cr, line, FONT_SEMILIGHT, 22, x + 32, cy - 15, 0, 0, false);
+		x += 32 + text_width(line, FONT_SEMILIGHT, 22) + 22;
+	}
 	zt_buffer_show(server, &server->lock_layer, buffer, cr, server->width, server->height);
 }
 
@@ -5298,20 +5507,8 @@ static void draw_shade(struct zt_server *server) {
 			cairo_set_source_rgb(cr, 0.62, 0.62, 0.62);
 			if (server->notes[i].expanded) {
 				/* all of it, on as many lines as it takes */
-				PangoLayout *layout = pango_cairo_create_layout(cr);
-				PangoFontDescription *desc = pango_font_description_from_string(FONT_REGULAR);
-				pango_font_description_set_absolute_size(desc, 13.5 * PANGO_SCALE);
-				pango_layout_set_font_description(layout, desc);
-				pango_layout_set_width(layout, (int)((server->width - 28) * PANGO_SCALE));
-				pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
-				pango_layout_set_text(layout, server->notes[i].text, -1);
-				int tw, th;
-				pango_layout_get_pixel_size(layout, &tw, &th);
-				cairo_move_to(cr, 14, note_y);
-				pango_cairo_show_layout(cr, layout);
-				pango_font_description_free(desc);
-				g_object_unref(layout);
-				note_y += th;
+				note_y += wrap_text(cr, server->notes[i].text, FONT_REGULAR, 13.5, 14, note_y,
+					server->width - 28, false);
 			} else {
 				draw_text(cr, server->notes[i].text, FONT_REGULAR, 13.5, 14, note_y,
 					server->width - 28 - when_w - 12, 0, false);
@@ -5485,9 +5682,21 @@ static void draw_splash(struct zt_server *server) {
 	cairo_set_source_rgb(cr, 0, 0, 0);
 	cairo_paint(cr);
 
-	/* Plain ztOS logo: thin text, white on black */
-	cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
-	draw_text(cr, "ztOS", FONT_LIGHT, 56.0, 0, 0, server->width, server->height, true);
+	struct dm_screen field;
+	uint8_t *buf;
+	if (retro_on(server) && retro_strip(server, server->height, &field, &buf)) {
+		/* the DotMatrix style's: the mark in dots on the home's lattice */
+		struct dm_grid g;
+		dm_grid_init(&g, &field, buf);
+		dm_chrome_logo(&g);
+		dm_cairo_paint(cr, &g, server->dm_palette, server->dm_amoled ? 0 : 0.09f, 0.7f);
+		free(buf);
+		dm_screen_finish(&field);
+	} else {
+		/* Plain ztOS logo: thin text, white on black */
+		cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+		draw_text(cr, "ztOS", FONT_LIGHT, 56.0, 0, 0, server->width, server->height, true);
+	}
 
 	zt_buffer_show(server, &server->splash_layer, buffer, cr, server->width, server->height);
 }
@@ -5525,23 +5734,10 @@ static void draw_sensorhub_fail(struct zt_server *server) {
 	double content_w = server->width - 2 * pad;
 	double text_y = cy + tri_h / 2.0 + 36.0;
 
-	PangoLayout *layout = pango_cairo_create_layout(cr);
-	PangoFontDescription *desc = pango_font_description_from_string(FONT_REGULAR);
-	pango_font_description_set_absolute_size(desc, 17.0 * PANGO_SCALE);
-	pango_layout_set_font_description(layout, desc);
-	pango_layout_set_width(layout, (int)(content_w * PANGO_SCALE));
-	pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
-	pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
-	pango_layout_set_text(layout,
-		"ztOSCoreSensorFramework failed to initialize Samsung SensorHub. "
-		"Please do a hot reboot (Go to twrp -> Reboot -> System). "
-		"This will initialize the SensorHub.", -1);
-
 	cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
-	cairo_move_to(cr, pad, text_y);
-	pango_cairo_show_layout(cr, layout);
-	pango_font_description_free(desc);
-	g_object_unref(layout);
+	wrap_text(cr, "ztOSCoreSensorFramework failed to initialize Samsung SensorHub. "
+		"Please do a hot reboot (Go to twrp -> Reboot -> System). "
+		"This will initialize the SensorHub.", FONT_REGULAR, 17.0, pad, text_y, content_w, true);
 
 	/* Buttons: Reboot & Continue Anyway, positioned comfortably above nav bar */
 	double btn_h = 48.0;
@@ -8700,21 +8896,7 @@ static void draw_dialog(struct zt_server *server) {
 	double content_w = w - 2 * pad;
 
 	/* Measure text height */
-	cairo_surface_t *dummy_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
-	cairo_t *dummy_cr = cairo_create(dummy_surf);
-	PangoLayout *layout = pango_cairo_create_layout(dummy_cr);
-	PangoFontDescription *desc = pango_font_description_from_string(FONT_REGULAR);
-	pango_font_description_set_absolute_size(desc, 15.0 * PANGO_SCALE);
-	pango_layout_set_font_description(layout, desc);
-	pango_layout_set_width(layout, (int)(content_w * PANGO_SCALE));
-	pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
-	pango_layout_set_text(layout, server->dialog_text, -1);
-	int tw, th;
-	pango_layout_get_pixel_size(layout, &tw, &th);
-	pango_font_description_free(desc);
-	g_object_unref(layout);
-	cairo_destroy(dummy_cr);
-	cairo_surface_destroy(dummy_surf);
+	int th = (int)ceil(wrap_text(NULL, server->dialog_text, FONT_REGULAR, 15.0, 0, 0, content_w, false));
 
 	double title_y = 40.0;
 	double title_h = 28.0;
@@ -8757,17 +8939,7 @@ static void draw_dialog(struct zt_server *server) {
 
 	/* Body text: FONT_REGULAR, 15pt, pure white */
 	cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
-	layout = pango_cairo_create_layout(cr);
-	desc = pango_font_description_from_string(FONT_REGULAR);
-	pango_font_description_set_absolute_size(desc, 15.0 * PANGO_SCALE);
-	pango_layout_set_font_description(layout, desc);
-	pango_layout_set_width(layout, (int)(content_w * PANGO_SCALE));
-	pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
-	pango_layout_set_text(layout, server->dialog_text, -1);
-	cairo_move_to(cr, pad, text_y);
-	pango_cairo_show_layout(cr, layout);
-	pango_font_description_free(desc);
-	g_object_unref(layout);
+	wrap_text(cr, server->dialog_text, FONT_REGULAR, 15.0, pad, text_y, content_w, false);
 
 	/* Buttons: QPushButton style: 2px solid white border, transparent background, white text */
 	cairo_set_line_width(cr, 2.0);
@@ -9294,6 +9466,8 @@ static void retro_setup(struct zt_server *server) {
 			retro_free(server);
 			draw_status(server);	/* Metro's own again */
 			draw_nav(server);
+			if (server->splash) draw_splash(server);
+			if (server->locked) draw_lock(server);
 		}
 		return;
 	}
@@ -9325,6 +9499,7 @@ static void retro_setup(struct zt_server *server) {
 	wlr_log(WLR_INFO, "dotmatrix: %dx%d dots, pitch %.2f points", s->cols, s->rows, s->pitch);
 	draw_status(server);
 	draw_nav(server);
+	if (server->splash) draw_splash(server);	/* the mark in dots */
 }
 
 /* CPU and memory once a second for the load meters; the GPU's is how much
@@ -9385,19 +9560,26 @@ static void retro_feed(struct zt_server *server) {
 	st.gpu = server->dm_gpu;
 	/* the apps with notifications waiting: their dock icons pulse */
 	for (int k = 0; k < server->n_notes && st.n_notif < DM_MAX_NOTIF; k++) {
-		const char *app = server->notes[k].app;
-		bool seen = !app[0];
-		for (int i = 0; i < st.n_notif && !seen; i++) {
-			seen = strcasecmp(st.notif[i], app) == 0;
-		}
-		if (!seen) {
+		const char *app = server->notes[k].app[0] ? server->notes[k].app : "System";
+		int i = 0;
+		while (i < st.n_notif && strcasecmp(st.notif[i], app) != 0) i++;
+		if (i < st.n_notif) {
+			st.notif_count[i]++;
+		} else {
+			st.notif_count[st.n_notif] = 1;
 			snprintf(st.notif[st.n_notif++], sizeof(st.notif[0]), "%s", app);
 		}
 	}
 	if (!server->dm_fed || memcmp(&st, &server->dm_st, sizeof(st))) {
 		server->dm_st = st;
 		server->dm_fed = true;
-		dm_launcher_status(server->dm, &st);
+		/* the radios report in during the first seconds after the shell
+		 * starts: those are not events */
+		if (server->splash || !server->boot_done_ms || now_ms() - server->boot_done_ms < 20000) {
+			dm_launcher_seed(server->dm, &st);
+		} else {
+			dm_launcher_status(server->dm, &st);
+		}
 	}
 }
 
@@ -9425,6 +9607,7 @@ static void retro_draw(struct zt_server *server, int width_px, int height_px, bo
 			server->style = STYLE_METRO;
 			return;
 		}
+		server->dm_gl.top_down = true;
 	}
 	/* uncovered: from the dark (or the lock) the boot plays, from an app
 	 * the launch runs backwards into home */
@@ -9434,6 +9617,9 @@ static void retro_draw(struct zt_server *server, int width_px, int height_px, bo
 		dm_launcher_resume(L, now);
 	}
 	server->dm_hidden = 0;
+	if (dm_launcher_locked(L) != server->locked) {
+		dm_launcher_lock(L, server->locked, now);	/* the dots rearrange */
+	}
 	if (dm_launcher_waiting(L) && !server->shown && !loading_active(server) &&
 			now_ms() - server->dm_launch_fired_ms > 1500) {
 		dm_launcher_launch_failed(L, now);	/* nothing came */
@@ -9446,8 +9632,9 @@ static void retro_draw(struct zt_server *server, int width_px, int height_px, bo
 		server->dm_have_frame = true;
 	}
 	if (server->dm_have_frame) {
+		/* the output's first row is the top: the field ends above the nav bar */
 		int nav_px = (int)lroundf(NAV_H * server->scale);
-		glViewport(0, nav_px, width_px, height_px - nav_px);
+		glViewport(0, 0, width_px, height_px - nav_px);
 		dm_gl_draw(&server->dm_gl, &server->dm_last, dm_launcher_palette(L), server->scale, server->tint, 0);
 		glViewport(0, 0, width_px, height_px);
 	}
@@ -9696,6 +9883,13 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 	}
 	if (server->locked) {
 		p->role = ROLE_LOCK;	/* nothing under it can be reached */
+		p->index = -1;
+		if (retro_on(server)) {
+			/* the DotMatrix lock: only its box unlocks, swiped across */
+			float x0, y0, x1, y1;
+			dm_launcher_unlock_box(server->dm, &x0, &y0, &x1, &y1);
+			if (x >= x0 - 12 && x <= x1 && y >= y0 - 16 && y <= y1 + 16) p->index = 1;
+		}
 		return;
 	}
 
@@ -9982,6 +10176,15 @@ static void touch_update(struct zt_server *server, int32_t id, double x, double 
 		damage(server);
 		break;
 	case ROLE_LOCK:
+		if (retro_on(server)) {
+			if (p->index == 1 && server->locked) {
+				float x0, y0, x1, y1;
+				dm_launcher_unlock_box(server->dm, &x0, &y0, &x1, &y1);
+				dm_launcher_unlock_drag(server->dm, (float)((x - p->x0) / (x1 - x0)));
+				damage(server);
+			}
+			break;
+		}
 		if (p->moved && server->locked) {
 			/* it goes up with the finger, and no lower than where it sits */
 			server->lock_y = y < p->y0 ? (float)(y - p->y0) : 0.0f;
@@ -10211,16 +10414,32 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 		if (!server->locked) {
 			break;
 		}
-		if (!cancelled && p->y - p->y0 < -server->height / 5.0) {
+		bool dm_swiped = false;
+		if (retro_on(server)) {
+			float x0, y0, x1, y1;
+			dm_launcher_unlock_box(server->dm, &x0, &y0, &x1, &y1);
+			dm_swiped = p->index == 1 && !cancelled && p->x - p->x0 > (x1 - x0) * 0.6;
+			if (!dm_swiped) {
+				dm_launcher_unlock_drag(server->dm, 0);	/* the thumb goes back */
+				damage(server);
+				break;
+			}
+		}
+		if (dm_swiped || (!retro_on(server) && !cancelled && p->y - p->y0 < -server->height / 5.0)) {
 			server->locked = false;
 			if (!server->boot_logo_done) {
 				char marker[256];
 				if (access(runtime_file(marker, sizeof(marker), "ztmetro-logo-unlocked"), F_OK) == 0) server->boot_logo_done = true;
-				else boot_logo_prepare(server);
+				else if (!retro_on(server)) boot_logo_prepare(server);	/* (DotMatrix: its home's own) */
 			}
 			hap(server, HAP_TAP, HG_SLIDE);
 			ui_sound(server, UIS_UNLOCK);
 			animate(server, &server->lock_y, (float)-server->height, 200, 0, false);
+			if (retro_on(server) && server->shown) {
+				/* the app that was open lights up again, dot by dot */
+				server->app_angle = TURN_IN_DEG;
+				animate(server, &server->app_angle, 0.0f, 450, 0, false);
+			}
 			wlr_log(WLR_INFO, "unlocked");
 		} else if (!p->moved) {
 			/* a tap: it lifts a little and drops, to show which way it goes */
@@ -11591,7 +11810,9 @@ static void render_frame(struct zt_server *server) {
 	 * slides up only the strip below it is. Each screen of pixels costs the
 	 * J5's Adreno 306 about 3 ms, and Start, an app and the panel under a
 	 * resting lock screen were 4.5 screens a frame. */
-	bool lock_shown = server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height);
+	/* (the DotMatrix style's lock is a screen of its home, not this picture) */
+	bool lock_shown = server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height) &&
+		!retro_on(server);
 	float under = lock_shown ? server->lock_y + server->height : 0.0f;	/* the first row it leaves */
 	bool lock_covers = lock_shown && under >= server->height - 0.5f;
 	int under_top = lock_shown && under > 0.5f ? (int)floorf(under * server->scale) : 0;
@@ -11630,10 +11851,12 @@ static void render_frame(struct zt_server *server) {
 	/* An app at rest in front covers them as the lock screen does: Superscan
 	 * scrolling over a Start left in place drew 3.5 screens a frame, and the
 	 * GPU (about 3 ms a screen) ran out of frame before WebKit did */
+	/* (the DotMatrix lock is the home's screen: what is under it is not drawn) */
+	bool dm_lock = retro_on(server) && server->locked;
 	bool app_covers = app && app->mapped && !server->leaving && server->switch_t <= 0.001f &&
-		draw.alpha >= 0.999f && fabsf(draw.angle) < 0.01f && server->app_lift == 0;
+		draw.alpha >= 0.999f && fabsf(draw.angle) < 0.01f && server->app_lift == 0 && !dm_lock;
 	server->plane_surface = NULL;
-	if (app && app->mapped) {
+	if (app && app->mapped && !dm_lock) {
 		app_origin(app, &draw.ox, &draw.oy);
 		draw.fit = app_fit(server, app);
 		plane = plane_pick(server, app, &draw, app_covers, &plane_state);
@@ -11867,10 +12090,19 @@ static void render_frame(struct zt_server *server) {
 					d.y + d.scale * (server->height - STATUS_H - NAV_H) + 8, t * d.alpha);
 			}
 		}
-	} else if (app && app->mapped) {
+	} else if (app && app->mapped && !dm_lock) {
 		app_origin(app, &draw.ox, &draw.oy);
 		draw.fit = app_fit(server, app);
+		if (retro_on(server)) {
+			/* no turn in this style: the app lights up dot by dot as it
+			 * arrives and goes out the same way, on the turn's clock */
+			server->quad_reveal = 1.0f - fminf(1.0f, fabsf(server->app_angle) / TURN_IN_DEG);
+			server->quad_dpitch = dm_launcher_screen(server->dm)->pitch * server->scale;
+			draw.angle = 0;
+			draw.alpha = server->app_alpha > 0.001f ? 1.0f : 0.0f;
+		}
 		wlr_xdg_surface_for_each_surface(app->xdg_toplevel->base, draw_app_surface, &draw);
+		server->quad_reveal = 1.0f;
 	}
 	draw_loading(server);
 
@@ -11884,7 +12116,8 @@ static void render_frame(struct zt_server *server) {
 			(float)(server->height - NAV_H - server->osk_h * server->osk_slide), 1.0f);
 	}
 	boot_logo_draw(server, now);
-	bool retro_home = retro_home_shown(server) && !lock_shown;	/* it has its own status column */
+	bool retro_home = (retro_home_shown(server) && !lock_shown) ||
+		(retro_on(server) && server->locked);	/* it has its own status column, as its lock has */
 	if (!retro_home) {
 		layer_draw(server, &server->status_layer, 0, 0, 1.0f);
 	}
@@ -11973,13 +12206,13 @@ static void render_frame(struct zt_server *server) {
 		draw_nav(server);
 	}
 	/* the nav bar stays on top: the panel comes down behind it */
-	if (!server->sensorhub_fail_screen) {
+	if (!server->sensorhub_fail_screen && !(retro_on(server) && server->locked)) {
 		layer_draw(server, &server->nav_layer, 0, server->height - NAV_H, 1.0f);
 	}
 	if (server->keypop && server->osk_visible && server->keypop_layer.tex) {
 		layer_draw(server, &server->keypop_layer, server->keypop_x, server->keypop_y, 1.0f);
 	}
-	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height)) {
+	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height) && !retro_on(server)) {
 		layer_draw(server, &server->lock_layer, 0, server->lock_y, 1.0f);
 		plug_over(server, server->lock_y);
 	}
@@ -12002,6 +12235,7 @@ static void render_frame(struct zt_server *server) {
 	}
 	if (server->splash && !animating(server, &server->lock_y) && server->lock_y >= 0.0f) {
 		server->splash = false;
+		server->boot_done_ms = now_ms();
 		wlr_log(WLR_INFO, "boot: transition complete, splash removed");
 		ui_sound(server, UIS_NOTIFY);	/* a chime as the phone finishes starting */
 	}

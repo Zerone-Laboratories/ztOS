@@ -213,6 +213,10 @@ uint32_t zmc_config_accent(void) {
 	return color;
 }
 
+static bool dotmatrix(void) {
+	return zmc.style == ZMC_STYLE_DOTMATRIX;
+}
+
 void zmc_config_style(void) {
 	char path[512], line[256], value[32];
 	snprintf(path, sizeof(path), "%s/.config/ztmetro/config", getenv("HOME") ? getenv("HOME") : "");
@@ -235,11 +239,13 @@ void zmc_config_style(void) {
 	if (zmc.style == ZMC_STYLE_DOTMATRIX) {
 		zmc.accent = zmc.dm_accent;
 	}
+	/* what the app fills and strokes comes out as dots in the style */
+	dm_wrap_active = dotmatrix;
+	dm_wrap_main = zmc.dm_main;
+	dm_wrap_accent = zmc.dm_accent;
+	dm_wrap_pitch = 2.3;
 }
 
-static bool dotmatrix(void) {
-	return zmc.style == ZMC_STYLE_DOTMATRIX;
-}
 
 /* the dim of an unlit-but-there dot, as on the home screen */
 #define DM_DIM_ALPHA	0.42
@@ -291,6 +297,9 @@ void zmc_busy(bool busy) {
 }
 
 void zmc_set_rgb(cairo_t *cr, uint32_t color) {
+	if (dotmatrix() && !dm_map_raw) {
+		color = dm_palette_colour(color, zmc.dm_main, zmc.dm_accent);	/* the palette's two */
+	}
 	cairo_set_source_rgb(cr, ((color >> 16) & 0xff) / 255.0,
 		((color >> 8) & 0xff) / 255.0, (color & 0xff) / 255.0);
 }
@@ -347,6 +356,9 @@ static PangoFontDescription *font_at(const char *font, double size) {
 
 double zmc_text(cairo_t *cr, const char *s, const char *font, double size,
 		double x, double y, double wrap_width) {
+	if (dotmatrix()) {
+		return dm_type(cr, s, size, x, y, 0, 0, false, wrap_width);
+	}
 	PangoLayout *layout = steady_layout(cr);
 	pango_layout_set_font_description(layout, font_at(font, size));
 	pango_layout_set_text(layout, s, -1);
@@ -364,6 +376,10 @@ double zmc_text(cairo_t *cr, const char *s, const char *font, double size,
 
 /* One line of it, with an ellipsis where it would not fit in the width. */
 void zmc_text_line(cairo_t *cr, const char *s, const char *font, double size, double x, double y, double width) {
+	if (dotmatrix()) {
+		dm_type(cr, s, size, x, y, width, 0, false, 0);
+		return;
+	}
 	PangoLayout *layout = steady_layout(cr);
 	pango_layout_set_font_description(layout, font_at(font, size));
 	pango_layout_set_text(layout, s, -1);
@@ -398,6 +414,9 @@ void zmc_add_hit(double x, double y, double w, double h, int action, int arg) {
  */
 /* How wide a pivot title is, set in the title face. */
 static int pivot_title_width(cairo_t *cr, const char *text) {
+	if (dotmatrix()) {
+		return (int)ceil(dm_type_width(text, 48));
+	}
 	PangoLayout *layout = steady_layout(cr);
 	PangoFontDescription *desc = pango_font_description_from_string(FONT_SEMILIGHT);
 	pango_font_description_set_absolute_size(desc, 48 * PANGO_SCALE);
@@ -700,6 +719,23 @@ static void turned_strip_motion(cairo_t *cr, cairo_surface_t *source, double y0,
 		double degrees, double alpha, double dx, double depth) {
 	if (alpha <= 0.01) {
 		return;
+	}
+	if (dotmatrix() && (fabs(degrees) >= 0.05 || alpha < 1)) {
+		/* no turn in this style: the row lights up, or goes out, dot by dot,
+		 * on the turn's clock */
+		double reveal = alpha * (1 - fmin(1, fabs(degrees) / TURN_IN_DEG));
+		if (reveal <= 0.001) return;
+		degrees = 0;
+		if (!cr) {
+			zmg_reveal = (float)reveal;
+			double w = zmc.width;
+			struct zmg_vertex q[4] = { {dx,y0,depth}, {dx+w,y0,depth}, {dx,y1,depth}, {dx+w,y1,depth} };
+			zmg_surface(source, source == zmc.cache ? cache_gen : 0,
+				0, y0 * ANIM_SCALE, w * ANIM_SCALE, y1 * ANIM_SCALE, q, 1);
+			zmg_reveal = 1;
+			return;
+		}
+		alpha = reveal;		/* (no dots without the GPU: a fade) */
 	}
 	if (!cr) {
 		double a = degrees * M_PI / 180.0, w = zmc.width;
@@ -2757,6 +2793,9 @@ void zmc_osk_box(int bottom) {
 }
 
 double zmc_text_width(const char *s, const char *font, double size) {
+	if (dotmatrix()) {
+		return dm_type_width(s, size);
+	}
 	cairo_surface_t *scratch = cairo_image_surface_create(CAIRO_FORMAT_A8, 1, 1);
 	cairo_t *cr = cairo_create(scratch);
 	PangoLayout *layout = pango_cairo_create_layout(cr);
@@ -2777,7 +2816,21 @@ void zmc_text_centred(cairo_t *cr, const char *s, const char *font, double size,
 	zmc_text(cr, s, font, size, cx - zmc_text_width(s, font, size) / 2, y, 0);
 }
 
+struct wifi_args { double x, y, size; int bars; };
+static void wifi_shape(cairo_t *cr, void *data) {
+	const struct wifi_args *a = data;
+	int saved = zmc.style;
+	zmc.style = ZMC_STYLE_METRO;	/* the shape itself, to be dotted */
+	zmc_wifi_glyph(cr, a->x, a->y, a->size, a->bars);
+	zmc.style = saved;
+}
+
 void zmc_wifi_glyph(cairo_t *cr, double x, double y, double size, int bars) {
+	if (dotmatrix()) {
+		struct wifi_args a = { x, y, size, bars };
+		dm_dotify(cr, x, y, size, size, size / 7, wifi_shape, &a);
+		return;
+	}
 	/* a quarter fan standing on its point at the bottom middle */
 	double cx = x + size / 2, cy = y + size * 0.86, r = size * 0.78;
 	double red, green, blue, alpha;
@@ -3075,9 +3128,33 @@ double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, 
 	return y + h + 12;
 }
 
+struct round_args { double cx, y; const char *glyph; };
+static void round_shape(cairo_t *cr, void *data) {
+	const struct round_args *a = data;
+	const double d = 44;
+	cairo_set_line_width(cr, 2.6);
+	cairo_new_path(cr);
+	cairo_arc(cr, a->cx, a->y + d / 2, d / 2 - 1.3, 0, 2 * M_PI);
+	cairo_stroke(cr);
+	cairo_save(cr);
+	cairo_translate(cr, a->cx, a->y + d / 2);
+	round_glyph(cr, a->glyph);
+	cairo_restore(cr);
+}
+
 void zmc_round_button(cairo_t *cr, double cx, double y, const char *glyph, const char *label,
 		int action, int arg) {
 	const double d = 44;
+	if (dotmatrix()) {
+		/* the ring and its glyph as dots */
+		struct round_args a = { cx, y, glyph };
+		dm_dotify(cr, cx - d / 2 - 2, y - 2, d + 4, d + 4, 2.4, round_shape, &a);
+		if (label && label[0]) {
+			zmc_text_centred(cr, label, FONT_REGULAR, 11.5, cx, y + d + 3);
+		}
+		zmc_add_hit(cx - 34, y - 4, 68, d + (label && label[0] ? 26 : 8), action, arg);
+		return;
+	}
 	cairo_save(cr);
 	cairo_set_line_width(cr, 2.2);
 	cairo_new_path(cr);	/* (text leaves a current point: the ring would be joined to it) */

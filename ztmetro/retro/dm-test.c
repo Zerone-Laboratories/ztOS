@@ -142,6 +142,29 @@ int main(int argc, char **argv) {
 	draw(L, &r, A + 20500, w, h);
 	save(dir, "event-wifi", w, h);
 
+	/* the lock screen: locking rearranges into it, a drag, unlocking flies back */
+	st.n_notif = 2;
+	snprintf(st.notif[0], 64, "WhatsApp");
+	st.notif_count[0] = 3;
+	snprintf(st.notif[1], 64, "Mail");
+	st.notif_count[1] = 1;
+	dm_launcher_status(L, &st);
+	int64_t K = A + 24000;
+	dm_launcher_lock(L, true, K);
+	draw(L, &r, K + 300, w, h);
+	save(dir, "lock-flight", w, h);
+	draw(L, &r, K + 1000, w, h);
+	save(dir, "lock", w, h);
+	dm_launcher_unlock_drag(L, 0.45f);
+	draw(L, &r, K + 1200, w, h);
+	save(dir, "lock-drag", w, h);
+	dm_launcher_lock(L, false, K + 1300);
+	draw(L, &r, K + 1600, w, h);
+	save(dir, "unlock-flight", w, h);
+	st.n_notif = 0;
+	dm_launcher_status(L, &st);
+	draw(L, &r, K + 2600, w, h);
+
 	/* quick settings: swipe right */
 	int64_t B = A + 30000;
 	dm_launcher_touch(L, DM_TOUCH_DOWN, 100, 600, B);

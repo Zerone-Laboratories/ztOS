@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include "../retro/dm-chrome.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +90,7 @@ enum action {
 	ACT_OPEN_PAGE,
 	ACT_BACK,
 	ACT_ACCENT,
+	ACT_PALETTE,	/* the DotMatrix style's palette, as the accent is Metro's */
 	ACT_WALL,		/* arg: 0 none, else the photo walls[arg - 1] */
 	ACT_WALL_TARGET,	/* arg: 0 start and lock, 1 start, 2 lock */
 	ACT_WALL_CAT,		/* arg: the category to open (a folder of photos) */
@@ -207,6 +209,7 @@ static const struct { const char *name; unsigned color; } ACCENTS[] = {
 static struct {
 	/* Settings state */
 	int accent;
+	int palette;		/* dotmatrix_palette */
 	char start_wall[256], lock_wall[256];	/* the photos, or "" */
 	int wall_target;			/* 0 both, 1 Start, 2 lock screen */
 	int columns;
@@ -347,6 +350,9 @@ static void config_load(void) {
 			snprintf(app.lock_wall, sizeof(app.lock_wall), "%s", val);
 		} else if (strcmp(key, "nav_center_icon") == 0) {
 			int n = atoi(val); app.nav_icon_idx = n < 0 ? 0 : n > 4 ? 4 : n;
+		} else if (strcmp(key, "dotmatrix_palette") == 0) {
+			int n = isdigit((unsigned char)val[0]) ? atoi(val) : dm_palette_index(val);
+			app.palette = n < 0 || n >= DM_PALETTES ? 0 : n;
 		} else if (strcmp(key, "accent") == 0) {
 			for (int i = 0; i < N_ACCENTS; i++) {
 				if (strcmp(ACCENTS[i].name, val) == 0) {
@@ -544,7 +550,7 @@ static void auto_load(void) {
 
 static void config_save(void) {
 	static const int timeouts[] = { 30, 60, 180, 300, 0 };
-	enum { N_KEYS = 22 + N_HAPTIC_GROUPS };
+	enum { N_KEYS = 23 + N_HAPTIC_GROUPS };
 	struct { const char *key; char value[300]; bool written; } keys[N_KEYS] = {
 		{ .key = "accent" }, { .key = "columns" }, { .key = "haptics" },
 		{ .key = "brightness" }, { .key = "timeout" }, { .key = "demo_tiles" },
@@ -579,6 +585,8 @@ static void config_save(void) {
 	snprintf(keys[20 + N_HAPTIC_GROUPS].value, 32, "%s", sizes[app.scale_idx]);
 	keys[21 + N_HAPTIC_GROUPS].key = "style";
 	snprintf(keys[21 + N_HAPTIC_GROUPS].value, 32, "%s", app.style ? "dotmatrix" : "metro");
+	keys[22 + N_HAPTIC_GROUPS].key = "dotmatrix_palette";
+	snprintf(keys[22 + N_HAPTIC_GROUPS].value, 32, "%s", dm_palette_names[app.palette]);
 	snprintf(keys[0].value, 32, "%s", ACCENTS[app.accent].name);
 	snprintf(keys[1].value, 32, "%d", app.columns);
 	snprintf(keys[2].value, 32, "%s", app.haptics ? "on" : "off");
@@ -1583,7 +1591,36 @@ static double draw_wall_row(cairo_t *cr, double y) {
 /* The accent picker, as the phone's: four swatches a row, each row a strip
  * that the page change turns in on its own, 33 ms after the one above
  * (TurnstileFeatherList in UIXMobile; the core's ROW_STAGGER_MS). */
+/* The DotMatrix style's palettes in the accent picker's place: each its two
+ * colours as dots, its name under them. */
+static double draw_palettes(cairo_t *cr) {
+	double y = zmc_header(cr, "palettes");
+	double gap = 10, side = (zmc.width - 2 * MARGIN - 2 * gap) / 3;
+	for (int i = 0; i < DM_PALETTES; i++) {
+		double x = MARGIN + (i % 3) * (side + gap), sy = y + (i / 3) * (side + 34 + gap);
+		dm_map_raw++;	/* its own colours, not the palette in use */
+		zmc_set_rgb(cr, dm_palettes[i][0]);
+		cairo_rectangle(cr, x, sy, side, side * 0.66);
+		cairo_fill(cr);
+		zmc_set_rgb(cr, dm_palettes[i][1]);
+		cairo_rectangle(cr, x, sy + side * 0.72, side, side * 0.28);
+		cairo_fill(cr);
+		dm_map_raw--;
+		cairo_set_source_rgb(cr, i == app.palette ? 1 : 0.6, i == app.palette ? 1 : 0.6, i == app.palette ? 1 : 0.6);
+		zmc_text(cr, dm_palette_names[i], FONT_REGULAR, 14, x, sy + side + 6, 0);
+		if (i == app.palette) {
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			cairo_set_line_width(cr, 3);
+			cairo_rectangle(cr, x - 4, sy - 4, side + 8, side + 30);
+			cairo_stroke(cr);
+		}
+		zmc_add_hit(x, sy, side, side + 30, ACT_PALETTE, i);
+	}
+	return y + 2 * (side + 34 + gap) + 20;
+}
+
 static double draw_accents(cairo_t *cr) {
+	if (app.style) return draw_palettes(cr);
 	double y = zmc_header(cr, "accents");
 	double gap = 10, side = (zmc.width - 2 * MARGIN - 3 * gap) / 4;
 	int rows = (N_ACCENTS + 3) / 4;
@@ -1612,7 +1649,7 @@ static double draw_accents(cairo_t *cr) {
 static double draw_theme(cairo_t *cr) {
 	double y = zmc_header(cr, "theme");
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "Accent colour", FONT_REGULAR, 13.5, MARGIN, y, 0);
+	zmc_text(cr, app.style ? "Palette" : "Accent colour", FONT_REGULAR, 13.5, MARGIN, y, 0);
 	/* Windows Phone's list picker, collapsed: the box shows the choice and
 	 * opens the full-screen picker (UIXMobile!ListPicker in full mode) */
 	y += 20;
@@ -1620,11 +1657,13 @@ static double draw_theme(cairo_t *cr) {
 	cairo_set_line_width(cr, 2);
 	cairo_rectangle(cr, MARGIN + 1, y + 1, zmc.width - 2 * MARGIN - 2, 40);
 	cairo_stroke(cr);
-	zmc_set_rgb(cr, ACCENTS[app.accent].color);
+	if (app.style) dm_map_raw++;
+	zmc_set_rgb(cr, app.style ? dm_palettes[app.palette][0] : ACCENTS[app.accent].color);
 	cairo_rectangle(cr, MARGIN + 10, y + 10, 22, 22);
 	cairo_fill(cr);
+	if (app.style) dm_map_raw--;
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, ACCENTS[app.accent].name, FONT_REGULAR, 16, MARGIN + 42, y + 10, 0);
+	zmc_text(cr, app.style ? dm_palette_names[app.palette] : ACCENTS[app.accent].name, FONT_REGULAR, 16, MARGIN + 42, y + 10, 0);
 	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPEN_PAGE, PAGE_ACCENTS);
 	y += 62;
 	double gap = 8;
@@ -3013,6 +3052,16 @@ static void activate(int action, int arg) {
 		}
 		zmc_go(arg, 1);
 		break;
+	case ACT_PALETTE:
+		app.palette = arg;
+		config_save();
+		zmc_config_style();	/* this app's dots in it at once */
+		if (zmc.page == PAGE_ACCENTS) {
+			zmc_go(PAGE_THEME, -1);
+		} else {
+			zmc_redraw();
+		}
+		break;
 	case ACT_ACCENT:
 		app.accent = arg;
 		config_save();
@@ -3054,6 +3103,9 @@ static void activate(int action, int arg) {
 	case ACT_STYLE:
 		app.style = arg;
 		config_save();	/* the shell reads it on SIGHUP and changes at once */
+		zmc_config_style();	/* and this app with it */
+		zmc.accent = app.style ? zmc.dm_accent : ACCENTS[app.accent].color;
+		zmc_redraw();
 		break;
 	case ACT_HAPTICS:
 		app.haptics = !app.haptics;

@@ -118,11 +118,12 @@ struct dm_frame {
 struct dm_renderer {
 	GLuint prog, gbuf, dbuf, gbuf2;
 	GLint a_pos, a_state;
-	GLint u_res, u_size, u_main, u_acc, u_ghost, u_face, u_glow, u_tint, u_off;
+	GLint u_res, u_size, u_main, u_acc, u_ghost, u_face, u_glow, u_tint, u_off, u_flip;
 	float *dyn;
 	int cap;
 	int n_ghost, n_ghost2;
 	const struct dm_screen *s, *s2;
+	bool top_down;			/* the framebuffer's first row is the top (a compositor's) */
 };
 bool dm_gl_init(struct dm_renderer *r, const struct dm_screen *s);
 void dm_gl_finish(struct dm_renderer *r);
@@ -130,6 +131,7 @@ void dm_gl_finish(struct dm_renderer *r);
 bool dm_gl_screen2(struct dm_renderer *r, const struct dm_screen *s2);
 /* Draws into the bound framebuffer, whose viewport covers the screen.
  * scale: pixels per point; tint: what every colour is multiplied by;
- * y_off: points the whole field is moved down (a screen sliding). */
+ * y_off: points the whole field is moved down (a screen sliding).
+ * With top_down set, row 0 of the viewport is the top of the screen. */
 void dm_gl_draw(struct dm_renderer *r, const struct dm_frame *f, int palette, float scale,
 	const float tint[3], float y_off);

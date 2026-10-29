@@ -442,7 +442,7 @@ int dm_palette_index(const char *name) {
  * added on top; ghosts and dim dots do not glow. */
 static const char *vs_src =
 	"attribute vec2 aPos; attribute float aState;"
-	"uniform vec2 uRes; uniform float uSize, uOff; uniform vec3 uMain, uAcc, uTint; uniform vec3 uPal[6];"
+	"uniform vec2 uRes; uniform float uSize, uOff, uFlip; uniform vec3 uMain, uAcc, uTint; uniform vec3 uPal[6];"
 	"varying float vS; varying vec3 vCol;"
 	"void main() {"
 	"  vS = aState; vCol = uMain;"
@@ -450,7 +450,7 @@ static const char *vs_src =
 	"  if (aState > 3.5) { int i = int(aState - 3.5); for (int k = 0; k < 6; k++) { if (k == i) vCol = uPal[k]; } }"
 	"  vCol *= uTint;"
 	"  vec2 p = vec2(aPos.x, aPos.y + uOff) / uRes * 2.0 - 1.0;"
-	"  gl_Position = vec4(p.x, -p.y, 0.0, 1.0); gl_PointSize = uSize;"
+	"  gl_Position = vec4(p.x, -p.y * uFlip, 0.0, 1.0); gl_PointSize = uSize;"
 	"}";
 static const char *fs_src =
 	"precision mediump float; varying float vS; varying vec3 vCol; uniform float uGhost, uFace, uGlow;"
@@ -547,6 +547,7 @@ bool dm_gl_init(struct dm_renderer *r, const struct dm_screen *s) {
 	r->u_glow = glGetUniformLocation(r->prog, "uGlow");
 	r->u_tint = glGetUniformLocation(r->prog, "uTint");
 	r->u_off = glGetUniformLocation(r->prog, "uOff");
+	r->u_flip = glGetUniformLocation(r->prog, "uFlip");
 	glUseProgram(r->prog);
 	float pal[DM_PALETTES * 3];
 	for (int i = 0; i < DM_PALETTES; i++) rgb(dm_palettes[i][0], pal + 3 * i);
@@ -625,6 +626,7 @@ void dm_gl_draw(struct dm_renderer *r, const struct dm_frame *f, int palette, fl
 	glUniform3f(r->u_acc, a[0], a[1], a[2]);
 	glUniform3f(r->u_tint, tint ? tint[0] : 1, tint ? tint[1] : 1, tint ? tint[2] : 1);
 	glUniform1f(r->u_off, y_off);
+	glUniform1f(r->u_flip, r->top_down ? -1.0f : 1.0f);
 	glUniform1f(r->u_face, f->face_op);
 	glUniform1f(r->u_ghost, f->ghost_op);
 	glEnableVertexAttribArray(r->a_pos);
