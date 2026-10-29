@@ -10,7 +10,9 @@ It sleeps once all of these hold:
     music going the same way, by not sleeping while it plays);
   - no call is up (ztoscorenetworkingd's call=);
   - no charger (a cable means power, and USB networking for the bench);
-  - nothing has asked it not to (/run/zrn-sleepd/inhibit/NAME files);
+  - nothing has asked it not to (/run/zrn-sleepd/inhibit/NAME files; a
+    file named timed-NAME holds only until its modification time, so a
+    short job, such as a push message handed to an app, needs no cleanup);
   - it is switched on (/var/lib/zrn-sleep/enabled).
 
 What wakes it: the power key (EINT 20), the modem's mailbox (an incoming
@@ -24,7 +26,10 @@ suspends its streams and restarts the DSP on resume, Wi-Fi off its PCIe link (th
 take D3), UFS at spm_lvl 5, the suspend-aware hotplug, the MIF gate shut.
 
 Unattended phone: a mark is on the disk while it sleeps. Found at start, the
-last sleep never came back; sleeping is switched off and the shell told.
+last sleep never came back; sleeping is switched off and the shell told. A
+clean stop (a reboot, systemctl stop) removes the mark (ExecStopPost) and
+undoes a half-prepared sleep: a reboot during the preparations used to look
+like a hang and switched sleeping off (26 Oct, three times).
 
   zrn-sleepd            run (systemd)
   zrn-sleepd once       one cycle now, conditions or not (screen must be off)
@@ -51,6 +56,7 @@ UFS = Path('/sys/devices/platform/soc@0/11120000.ufs/spm_lvl')
 WIFI = Path('/sys/bus/pci/drivers/brcmfmac')
 WIFI_DEV = '0000:01:00.0'
 PERF = Path('/run/zrnperfd.status')
+PUSH = Path(ztos_user.RUNTIME_DIR) / 'zrn-pushd.status'
 MODEM = Path('/run/ztoscorenetworking/status')
 
 SCREEN_OFF_S = 15	# off this long before the first sleep
@@ -59,8 +65,14 @@ MAX_SLEEP_S = 1800	# an RTC alarm at the latest after this
 # It sleeps at most DOZE_SLEEP_S, then stays up DOZE_AWAKE_S with Wi-Fi back,
 # so the app (WhatsApp through microG) can fetch what came in. Calls and SMS
 # still wake it at once through the modem.
+# zrn-pushd counts too: its connection is down while Wi-Fi sleeps, so Google
+# holds the messages until a doze window lets it log in again. A window lasts
+# until zrn-pushd is back (and PUSH_GRACE_S more, for what Google had held to
+# arrive), DOZE_AWAKE_S at the least and DOZE_AWAKE_MAX_S at the most.
 DOZE_SLEEP_S = 300
-DOZE_AWAKE_S = 30
+DOZE_AWAKE_S = 10
+DOZE_AWAKE_MAX_S = 45
+PUSH_GRACE_S = 8
 AWAKE_AFTER = {'rtc': 3, 'modem': 15, 'bt': 5, 'key': 0, 'other': 8}
 # EINT_WAKEUP_MASK (PMU 0x60c, bit = 8 x gpaN + pin, 0 = may wake): open
 # 1 PMIC (gpa0-1), 14 MAX77705 charger (gpa1-6), 19 BT HOST_WAKE (gpa2-3),
@@ -135,6 +147,22 @@ class BackgroundApps:
 
 
 _background_apps = None
+
+
+def push_active():
+	"""zrn-pushd holds the device's push connection (it knows the identity)."""
+	return kv(PUSH).get('identity') == 'known'
+
+
+def push_online_since():
+	"""When zrn-pushd last logged in (wall clock), or 0 while it is not."""
+	status = kv(PUSH)
+	if status.get('state') != 'online':
+		return 0
+	try:
+		return int(status.get('since', '0') or 0)
+	except ValueError:
+		return 0
 
 
 def background_apps_active(fresh=False):
@@ -304,7 +332,17 @@ def why_awake():
 	except ValueError:
 		pass
 	if INHIBIT.exists():
-		held = sorted(p.name for p in INHIBIT.iterdir())
+		held = []
+		now = time.time()
+		for p in sorted(INHIBIT.iterdir()):
+			if p.name.startswith('timed-'):
+				try:
+					if p.stat().st_mtime <= now:
+						p.unlink(missing_ok=True)
+						continue
+				except OSError:
+					continue
+			held.append(p.name)
 		if held:
 			return 'inhibit ' + ','.join(held)
 	return None
@@ -357,7 +395,7 @@ def wake_reason(before):
 
 def cycle():
 	"""One sleep and the way back. Returns why it woke."""
-	dozing = background_apps_active(fresh=True)
+	dozing = background_apps_active(fresh=True) or push_active()
 	alarm_s = min(MAX_SLEEP_S, DOZE_SLEEP_S) if dozing else MAX_SLEEP_S
 	user_env = ['env', 'XDG_RUNTIME_DIR=' + ztos_user.RUNTIME_DIR]
 	user = ztos_user.USER
@@ -399,9 +437,6 @@ def cycle():
 			write('/sys/class/rtc/rtc0/wakealarm', f'+{alarm_s}')
 			step('dry_run 0')
 			write(SLEEP / 'dry_run', 0)
-			step('mark and sync')
-			MARK.write_text(str(time.time()))
-			os.sync()
 			if controller:
 				step('usb gadget off')
 				for _ in range(10):
@@ -417,6 +452,9 @@ def cycle():
 			# give it its idle threshold (600 ms) and some to go quiet.
 			step('settle')
 			time.sleep(3)
+			step('mark and sync')
+			MARK.write_text(str(time.time()))
+			os.sync()
 			step('wakeup_count')
 			write('/sys/power/wakeup_count', read('/sys/power/wakeup_count'))
 			signal.alarm(0)		# the sleep itself may last MAX_SLEEP_S
@@ -477,6 +515,10 @@ def status(**fields):
 
 
 def main():
+	# systemctl stop, a reboot: SystemExit unwinds a cycle through its
+	# restores (Wi-Fi bound again, dry_run back on) before the unit's
+	# ExecStopPost removes the mark
+	signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
 	STATE.mkdir(parents=True, exist_ok=True)
 	INHIBIT.mkdir(parents=True, exist_ok=True)
 	if MARK.exists():
@@ -488,12 +530,24 @@ def main():
 	off_since = None
 	backoff = 0
 	sleeps = 0
+	window = None		# a doze window: (woke, wall clock woke, its end at the latest)
 	while True:
 		why = why_awake()
 		if screen_off():
 			off_since = off_since or time.monotonic()
 		else:
 			off_since = None
+		if why is None and window:
+			woke, woke_wall, latest = window
+			online = push_online_since()
+			if time.monotonic() >= latest:
+				window = None
+			elif online >= woke_wall - 1 and time.time() >= online + PUSH_GRACE_S:
+				window = None
+			elif not push_active():
+				window = None
+			else:
+				why = 'doze window'
 		if why is None and off_since and time.monotonic() - off_since >= SCREEN_OFF_S and \
 				time.monotonic() >= backoff:
 			if not ready:
@@ -512,8 +566,10 @@ def main():
 				backoff = time.monotonic() + min(300, 30 * 2 ** min(4, sleeps % 5))
 			else:
 				backoff = time.monotonic() + AWAKE_AFTER.get(reason, 8)
-				if last_dozing and reason == 'rtc':
+				if last_dozing and reason in ('rtc', 'other'):
 					backoff = time.monotonic() + DOZE_AWAKE_S
+					window = (time.monotonic(), time.time(),
+						  time.monotonic() + DOZE_AWAKE_MAX_S)
 			if reason == 'key':
 				# gpio-keys may hand the shell the press itself, which toggles
 				# the screen: only light it if that did not

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-SOURCE = Path(__file__).resolve().parents[2] / 'rootfs/overlay/usr/local/sbin/zrn-sleepd'
+SOURCE = Path(__file__).resolve().parents[2] / 'devices/samsung-starlte/overlay/usr/local/sbin/zrn-sleepd'
 # its ztos_user, from the tree rather than /usr/lib/ztos/python
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'os/overlay/usr/lib/ztos/python'))
 loader = importlib.machinery.SourceFileLoader('sleepd', str(SOURCE))

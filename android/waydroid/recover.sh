@@ -151,6 +151,10 @@ case $1 in
     push)
         [[ $# == 2 && $2 =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$ ]] || exit 2
         thaw
+        # The app fetches what the message announced: a phone that sleeps
+        # (zrn-sleepd's timed inhibit, where there is one) waits a minute.
+        [[ -d /run/zrn-sleepd/inhibit ]] &&
+            touch -d "@$(( $(date +%s) + 60 ))" /run/zrn-sleepd/inhibit/timed-push 2>/dev/null
         [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == RUNNING ]] || exit 3
         extras=()
         while IFS= read -r -d '' type && IFS= read -r -d '' key && IFS= read -r -d '' value; do
