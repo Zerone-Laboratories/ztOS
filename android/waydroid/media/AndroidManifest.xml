@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.ztos.mediabridge">
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="28" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application android:label="ztOS media bridge" android:usesCleartextTraffic="true" android:allowBackup="false">
+        <service android:name=".MediaListener" android:label="ztOS media bridge" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" android:exported="true">
+            <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
+        </service>
+        <activity android:name=".Probe" android:exported="true" android:theme="@android:style/Theme.NoDisplay" />
+    </application>
+</manifest>

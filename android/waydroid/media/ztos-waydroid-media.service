@@ -1,0 +1,16 @@
+[Unit]
+Description=ztOS Waydroid media bridge (what Android apps play, for their tiles)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/ztos-waydroid-media --token-file %h/.config/ztos/media-bridge.token
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t
+
+# Blocked in accept() between events. Enabled by setup.sh.
+[Install]
+WantedBy=default.target
