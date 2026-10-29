@@ -35,7 +35,7 @@ like a hang and switched sleeping off (26 Oct, three times).
   zrn-sleepd once       one cycle now, conditions or not (screen must be off)
   zrn-sleepd enable | disable | status
 """
-import ctypes, json, os, signal, socket, struct, subprocess, sys, time
+import ctypes, errno, json, os, signal, socket, struct, subprocess, sys, time
 from pathlib import Path
 
 sys.path.insert(0, '/usr/lib/ztos/python')
@@ -78,6 +78,24 @@ AWAKE_AFTER = {'rtc': 3, 'modem': 15, 'bt': 5, 'key': 0, 'other': 8}
 # 1 PMIC (gpa0-1), 14 MAX77705 charger (gpa1-6), 19 BT HOST_WAKE (gpa2-3),
 # 20 power key (gpa2-4)
 EINT_WAKE = 0xffe7bffd
+# A sleep the firmware gave up (ACPM 'upend_wk': PMU_INTR_GEN GRP4 latched,
+# 29 Oct, a whole boot): smc 0, no wake source, back at once. Not a wake:
+# clear GRP4 and try again soon; FW_ABORT_LIMIT in a row and sleeping
+# pauses for the boot (PAUSED, in /run: a reboot clears it), rather than
+# churning Wi-Fi, the DSP and the sensor hub every few seconds.
+FW_ABORT_LIMIT = 3
+FW_ABORT_RETRY_S = 5
+FW_ABORT_SLEPT_S = 2
+PAUSED = Path('/run/zrn-sleepd/paused')
+CANCEL_RETRY_S = 5	# something woke up during the preparations
+ALARM_RETRY_S = 3	# an alarm due within 2 s refused the suspend (EBUSY)
+DOZE_NO_NET_S = 15	# a doze window where zrn-pushd gets nowhere ends here
+# Low battery: shorter sleeps, so ztoscsf (which polls only while awake)
+# sees 2 % and shuts down cleanly before the cell cuts out.
+BATTERY = Path('/sys/class/power_supply/max170xx_battery')
+LOW_BATTERY = ((4, 120), (10, 600))	# (at or below %, longest sleep s)
+SUMMARY_S = 3600	# a line of totals this often, and at stop
+INHIBIT_OLD_S = 3600	# an inhibit held this long gets a line in the log
 
 
 class BackgroundApps:
@@ -260,6 +278,23 @@ def kv(path):
 
 # ---- once a boot ----------------------------------------------------------
 
+def module_options(name='zrn_sleep_init', directory=Path('/etc/modprobe.d')):
+	"""`options zrn_sleep_init ...` from modprobe.d: insmod does not read it,
+	so a parameter (pdn=0, wdt_resume_s=60) is set there without a rebuild."""
+	words = []
+	try:
+		files = sorted(directory.glob('*.conf'))
+	except OSError:
+		return words
+	for f in files:
+		for line in read(f).splitlines():
+			fields = line.split('#', 1)[0].split()
+			if len(fields) > 2 and fields[0] == 'options' and \
+					fields[1].replace('-', '_') == name:
+				words += fields[2:]
+	return words
+
+
 def setup():
 	"""The backend and what it leans on, as mif-trial.sh brings them up."""
 	if SLEEP.exists():
@@ -293,7 +328,8 @@ def setup():
 		return False
 	r = run('insmod', D / 'zrn-sleep-init.ko', 'enable_deep=1', 'psci_system=0', 'dry_run=1',
 		'prepare_only=0', f'eint_wake={EINT_WAKE:#x}',
-		f'suspend_enter=0x{syms["cpu_suspend"]}', f'resume=0x{syms["cpu_resume"]}')
+		f'suspend_enter=0x{syms["cpu_suspend"]}', f'resume=0x{syms["cpu_resume"]}',
+		*module_options())
 	if r is None or r.returncode or not SLEEP.exists():
 		log('backend did not load:', r.stdout.strip() if r else '')
 		return False
@@ -316,35 +352,56 @@ def plugged():
 	return False
 
 
-def why_awake():
-	"""None when it may sleep; else what keeps it up."""
-	if not ENABLED.exists():
-		return 'switched off'
-	if not screen_off():
-		return 'screen on'
-	if plugged():
-		return 'charger'
-	if kv(MODEM).get('call', 'idle') not in ('', 'idle'):
-		return 'call'
-	try:
-		if int(kv(PERF).get('tickle_audio', '0') or 0) > 0:
-			return 'audio'
-	except ValueError:
-		pass
-	if INHIBIT.exists():
-		held = []
-		now = time.time()
-		for p in sorted(INHIBIT.iterdir()):
-			if p.name.startswith('timed-'):
-				try:
-					if p.stat().st_mtime <= now:
-						p.unlink(missing_ok=True)
-						continue
-				except OSError:
+_held_since = {}	# inhibit name: when it was first seen (monotonic)
+
+
+def inhibits():
+	"""The inhibit files that hold; expired timed- ones are removed."""
+	held = []
+	if not INHIBIT.exists():
+		return held
+	now = time.time()
+	for p in sorted(INHIBIT.iterdir()):
+		if p.name.startswith('timed-'):
+			try:
+				if p.stat().st_mtime <= now:
+					p.unlink(missing_ok=True)
 					continue
-			held.append(p.name)
-		if held:
-			return 'inhibit ' + ','.join(held)
+			except OSError:
+				continue
+		held.append(p.name)
+	mono = time.monotonic()
+	for name in list(_held_since):
+		if name not in held:
+			del _held_since[name]
+	for name in held:
+		since = _held_since.setdefault(name, mono)
+		if since is not None and mono - since >= INHIBIT_OLD_S:
+			log(f'inhibit {name} held over {INHIBIT_OLD_S // 60} min')
+			_held_since[name] = None	# once
+	return held
+
+
+def why_awake(ignore=()):
+	"""None when it may sleep; else what keeps it up. `ignore`: reasons
+	that do not count (`once` ignores the charger and the switch)."""
+	def audio():
+		try:
+			return int(kv(PERF).get('tickle_audio', '0') or 0) > 0
+		except ValueError:
+			return False
+	for name, holds in (
+			('switched off', lambda: not ENABLED.exists()),
+			('paused', PAUSED.exists),
+			('screen on', lambda: not screen_off()),
+			('charger', plugged),
+			('call', lambda: kv(MODEM).get('call', 'idle') not in ('', 'idle')),
+			('audio', audio)):
+		if name not in ignore and holds():
+			return name
+	held = inhibits()
+	if held:
+		return 'inhibit ' + ','.join(held)
 	return None
 
 
@@ -375,13 +432,27 @@ def bt_sleep_mode():
 		log('bt sleep mode:', e)
 
 
-def wake_reason(before):
-	stat = int(read(SLEEP / 'wake_stat', '0') or 0)
+def number(path):
+	try:
+		return int(read(path, '0') or 0, 0)
+	except ValueError:
+		return 0
+
+
+def wake_reason(before, slept=None):
+	stat = number(SLEEP / 'wake_stat')
 	# EINT pending, one word a bank: gpa0, gpa1, gpa2, gpa3, gpa4
 	eint = [int(x or 0) for x in read(SLEEP / 'eint_pending', '0').split(',')]
 	gpa2 = eint[2] if len(eint) > 2 else 0
-	if int(read(SLEEP / 'entries', '0')) <= before:
+	if number(SLEEP / 'entries') <= before:
 		return 'aborted', stat
+	# the firmware gave the sleep up: GRP4 latched at the handoff, or back
+	# at once with no wake source at all (bit 31 is only a status flag)
+	if number(SLEEP / 'grp4_before') or (
+			number(SLEEP / 'last_smc') == 0 and not stat & 0x7fffffff and
+			not number(SLEEP / 'wake_stat2') and not number(SLEEP / 'wake_stat3') and
+			not any(eint) and slept is not None and slept < FW_ABORT_SLEPT_S):
+		return 'fw-abort', stat
 	if gpa2 & (1 << 4):
 		return 'key', stat
 	if gpa2 & (1 << 3):
@@ -393,10 +464,62 @@ def wake_reason(before):
 	return 'other', stat
 
 
-def cycle():
+class Cancelled(Exception):
+	pass
+
+
+def battery_cap():
+	"""The longest sleep the battery's charge allows, or None."""
+	try:
+		capacity = int(read(BATTERY / 'capacity', ''))
+	except ValueError:
+		return None
+	for percent, longest in LOW_BATTERY:
+		if capacity <= percent:
+			return longest
+	return None
+
+
+def charge_uah():
+	try:
+		return int(read(BATTERY / 'charge_now', ''))
+	except ValueError:
+		return None
+
+
+def wakeup_sources():
+	"""Wakeup sources active now or changed in the last 10 s, for the log."""
+	now_ms = time.clock_gettime(time.CLOCK_MONOTONIC) * 1000
+	out = []
+	for p in Path('/sys/class/wakeup').glob('wakeup*'):
+		try:
+			active = int(read(p / 'active_time_ms', '0') or 0)
+			change = int(read(p / 'last_change_ms', '0') or 0)
+		except ValueError:
+			continue
+		if active or now_ms - change < 10000:
+			out.append(f'{read(p / "name")}(active_count={read(p / "active_count")} '
+				   f'last_change={change})')
+	return ' '.join(out) or 'none'
+
+
+def failed_device():
+	return read('/sys/power/suspend_stats/last_failed_dev')
+
+
+# what the last cycle measured, for main(): time asleep, charge in and out
+last_sleep = {}
+
+
+def cycle(ignore=()):
 	"""One sleep and the way back. Returns why it woke."""
 	dozing = background_apps_active(fresh=True) or push_active()
 	alarm_s = min(MAX_SLEEP_S, DOZE_SLEEP_S) if dozing else MAX_SLEEP_S
+	cap = battery_cap()
+	if cap is not None and cap < alarm_s:
+		log(f'battery low: sleeping at most {cap}s')
+		alarm_s = cap
+	last_sleep.clear()
 	user_env = ['env', 'XDG_RUNTIME_DIR=' + ztos_user.RUNTIME_DIR]
 	user = ztos_user.USER
 	entries = int(read(SLEEP / 'entries', '0') or 0)
@@ -404,6 +527,8 @@ def cycle():
 	old_ufs = read(UFS)
 	reason, stat = 'failed', 0
 	audio_out = False
+	settle = 1
+	slept = None
 	# on a cable (bench, `once`) the USB gadget is let go for the sleep, as
 	# the trials did; the daemon itself never sleeps on a charger
 	udc = next(Path('/sys/kernel/config/usb_gadget').glob('*/UDC'), None)
@@ -420,6 +545,7 @@ def cycle():
 		signal.alarm(PREPARE_S)
 		try:
 			if wifi_bound:
+				settle = 3
 				step('wifi down')
 				run('ip', 'link', 'set', 'wlp1s0', 'down')
 				step('wifi unbind')
@@ -438,6 +564,7 @@ def cycle():
 			step('dry_run 0')
 			write(SLEEP / 'dry_run', 0)
 			if controller:
+				settle = 3
 				step('usb gadget off')
 				for _ in range(10):
 					try:
@@ -450,27 +577,51 @@ def cycle():
 			# preparations: unbinding Wi-Fi and the gadget count as events,
 			# and they set the Bluetooth chip talking (HOST_WAKE pulses):
 			# give it its idle threshold (600 ms) and some to go quiet.
+			# With only the sleep-mode command sent to it, a second will do.
 			step('settle')
-			time.sleep(3)
+			time.sleep(settle)
 			step('mark and sync')
 			MARK.write_text(str(time.time()))
 			os.sync()
 			step('wakeup_count')
-			write('/sys/power/wakeup_count', read('/sys/power/wakeup_count'))
+			count = read('/sys/power/wakeup_count')
+			# what happened during the preparations (a power key press, a
+			# call, a new inhibit) stops the sleep here; anything later
+			# moves the count, and the write below fails
+			why = why_awake(ignore)
+			if why:
+				raise Cancelled(why)
+			write('/sys/power/wakeup_count', count)
 			signal.alarm(0)		# the sleep itself may last MAX_SLEEP_S
 			step('suspend')
-			write('/sys/power/state', 'mem')
+			last_sleep['charge_in'] = charge_uah()
+			t_in = time.clock_gettime(time.CLOCK_BOOTTIME)
+			try:
+				write('/sys/power/state', 'mem')
+			finally:
+				slept = time.clock_gettime(time.CLOCK_BOOTTIME) - t_in
+				last_sleep['slept'] = slept
+				last_sleep['charge_out'] = charge_uah()
+		except Cancelled as e:
+			log(f'sleep cancelled: {e}')
+			reason = 'cancelled'
 		except OSError as e:
 			log('sleep refused:', e.strerror)
+			if e.errno == errno.EBUSY and 'alarmtimer' in failed_device():
+				reason = 'alarm-due'
+			else:
+				log('wakeup sources:', wakeup_sources())
 		except Stalled:
 			log(f'sleep abandoned: stuck at "{read(STEP)}" for {PREPARE_S}s')
+			log('wakeup sources:', wakeup_sources())
 			reason = 'stalled'
 		finally:
 			signal.alarm(0)
 			signal.signal(signal.SIGALRM, old_alarm)
 			step('restoring')
-		if reason != 'stalled':
-			reason, stat = wake_reason(entries)
+		if reason not in ('stalled', 'cancelled', 'alarm-due'):
+			reason, stat = wake_reason(entries, slept)
+		last_sleep['entered'] = number(SLEEP / 'entries') > entries
 	finally:
 		restored = True
 		def restore_write(path, value):
@@ -514,6 +665,59 @@ def status(**fields):
 	STATUS.write_text(''.join(f'{k}={v}\n' for k, v in fields.items()))
 
 
+def boottime():
+	# monotonic time stops while asleep: boot time does not
+	return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def push_progress():
+	"""zrn-pushd is getting somewhere: it has a network to try."""
+	return kv(PUSH).get('state', '') not in ('', 'offline', 'resolving')
+
+
+def mah(uah):
+	return 'n/a' if uah is None else f'{uah / 1000:.1f}'
+
+
+class Totals:
+	"""This boot's sleeping, summed: a line every SUMMARY_S and at stop."""
+	def __init__(self):
+		self.t0, self.c0 = boottime(), charge_uah()
+		self.cycles = self.fw_aborts = 0
+		self.reasons = {}
+		self.asleep_s, self.asleep_uah = 0.0, 0
+
+	def add(self, reason, info):
+		self.cycles += 1
+		self.reasons[reason] = self.reasons.get(reason, 0) + 1
+		self.fw_aborts += reason == 'fw-abort'
+		if info.get('entered') and info.get('slept') is not None:
+			self.asleep_s += info['slept']
+			if info.get('charge_in') is not None and info.get('charge_out') is not None:
+				self.asleep_uah += info['charge_in'] - info['charge_out']
+
+	def line(self):
+		total = max(1e-3, boottime() - self.t0)
+		now = charge_uah()
+		used = self.c0 - now if now is not None and self.c0 is not None else None
+		awake_uah = used - self.asleep_uah if used is not None else None
+		reasons = ','.join(f'{k}:{v}' for k, v in sorted(self.reasons.items())) or 'none'
+		return (f'summary: {total / 3600:.2f} h, cycles={self.cycles} fw-aborts={self.fw_aborts} '
+			f'wakes={reasons} awake={100 * (total - self.asleep_s) / total:.0f}% '
+			f'mAh asleep={mah(self.asleep_uah)} awake={mah(awake_uah)}')
+
+
+def bits(word):
+	return ','.join(str(i) for i in range(32) if word >> i & 1) or 'none'
+
+
+def clear_grp4():
+	try:
+		write(SLEEP / 'clear_grp4', 1)
+	except OSError as e:
+		log('clear_grp4:', e)
+
+
 def main():
 	# systemctl stop, a reboot: SystemExit unwinds a cycle through its
 	# restores (Wi-Fi bound again, dry_run back on) before the unit's
@@ -530,57 +734,110 @@ def main():
 	off_since = None
 	backoff = 0
 	sleeps = 0
+	fails = 0		# failed cycles in a row: the backoff doubles
+	fw_aborts = 0		# sleeps the firmware gave up, in a row
+	wakes, woke_at = 0, 0	# real returns from the SoC (the sensor hub's side reads them)
 	window = None		# a doze window: (woke, wall clock woke, its end at the latest)
-	while True:
-		why = why_awake()
-		if screen_off():
-			off_since = off_since or time.monotonic()
-		else:
-			off_since = None
-		if why is None and window:
-			woke, woke_wall, latest = window
-			online = push_online_since()
-			if time.monotonic() >= latest:
-				window = None
-			elif online >= woke_wall - 1 and time.time() >= online + PUSH_GRACE_S:
-				window = None
-			elif not push_active():
-				window = None
+	last = {}
+	totals = Totals()
+	summary_at = time.monotonic() + SUMMARY_S
+	try:
+		while True:
+			why = why_awake()
+			if screen_off():
+				off_since = off_since or time.monotonic()
 			else:
-				why = 'doze window'
-		if why is None and off_since and time.monotonic() - off_since >= SCREEN_OFF_S and \
-				time.monotonic() >= backoff:
-			if not ready:
-				ready = setup()
-				if not ready:
-					ENABLED.unlink(missing_ok=True)
-					tell_shell('notify Power|Sleep switched off|Its driver did not load.')
-					continue
-			# (monotonic time stops while asleep: boot time does not)
-			t0 = time.clock_gettime(time.CLOCK_BOOTTIME)
-			reason, stat = cycle()
-			sleeps += 1
-			slept = round(time.clock_gettime(time.CLOCK_BOOTTIME) - t0)
-			log(f'woke: {reason} wake_stat={stat:#010x} after {slept}s')
-			if reason in ('failed', 'aborted', 'stalled'):
-				backoff = time.monotonic() + min(300, 30 * 2 ** min(4, sleeps % 5))
-			else:
-				backoff = time.monotonic() + AWAKE_AFTER.get(reason, 8)
-				if last_dozing and reason in ('rtc', 'other'):
-					backoff = time.monotonic() + DOZE_AWAKE_S
-					window = (time.monotonic(), time.time(),
-						  time.monotonic() + DOZE_AWAKE_MAX_S)
-			if reason == 'key':
-				# gpio-keys may hand the shell the press itself, which toggles
-				# the screen: only light it if that did not
-				time.sleep(1)
-				if screen_off():
-					tell_shell('screen on')
 				off_since = None
-			status(state='awake', last=reason, slept=slept, sleeps=sleeps)
-		else:
-			status(state='awake', why=why or 'waiting', sleeps=sleeps)
-		time.sleep(2)
+			if why is None and window:
+				woke, woke_wall, latest = window
+				online = push_online_since()
+				mono = time.monotonic()
+				if mono >= latest:
+					window = None
+				# logged in again, or its connection lived through the
+				# sleep (LTE): what Google held has had PUSH_GRACE_S
+				elif online and time.time() >= max(online, woke_wall) + PUSH_GRACE_S:
+					window = None
+				# no network to log in through: no reason to wait 45 s
+				elif mono - woke >= DOZE_NO_NET_S and not push_progress():
+					window = None
+				elif not push_active():
+					window = None
+				else:
+					why = 'doze window'
+			if why is None and off_since and time.monotonic() - off_since >= SCREEN_OFF_S and \
+					time.monotonic() >= backoff:
+				if not ready:
+					ready = setup()
+					if not ready:
+						ENABLED.unlink(missing_ok=True)
+						tell_shell('notify Power|Sleep switched off|Its driver did not load.')
+						continue
+				t0 = boottime()
+				reason, stat = cycle()
+				sleeps += 1
+				slept = round(boottime() - t0)
+				info = dict(last_sleep)
+				totals.add(reason, info)
+				if info.get('entered'):
+					wakes += 1
+					woke_at = int(time.time())
+				charge = ''
+				if info.get('slept') is not None:
+					charge = (f' (asleep {info["slept"]:.1f}s, charge {mah(info.get("charge_in"))}'
+						  f'->{mah(info.get("charge_out"))} mAh)')
+				log(f'woke: {reason} wake_stat={stat:#010x} after {slept}s{charge}')
+				mono = time.monotonic()
+				if reason == 'fw-abort':
+					fw_aborts += 1
+					grp4 = number(SLEEP / 'grp4_before')
+					log(f'the firmware gave the sleep up ({fw_aborts} in a row): '
+					    f'grp4_before={grp4:#010x} bits {bits(grp4)} '
+					    f'eint_pending={read(SLEEP / "eint_pending")}')
+					if fw_aborts >= FW_ABORT_LIMIT:
+						PAUSED.parent.mkdir(parents=True, exist_ok=True)
+						PAUSED.write_text(f'{int(time.time())} grp4_before={grp4:#010x}\n')
+						log('sleep paused for this boot: the firmware refuses it')
+						tell_shell('notify Power|Sleep paused|The firmware refuses to sleep; '
+							   'a reboot restores it.')
+					else:
+						if fw_aborts == 1:
+							clear_grp4()
+						backoff = mono + FW_ABORT_RETRY_S
+				elif reason == 'cancelled':
+					backoff = mono + CANCEL_RETRY_S
+				elif reason == 'alarm-due':
+					backoff = mono + ALARM_RETRY_S
+				elif reason in ('failed', 'aborted', 'stalled', 'audio unavailable'):
+					fails += 1
+					backoff = mono + min(300, 30 * 2 ** min(4, fails - 1))
+				else:
+					fails = fw_aborts = 0
+					backoff = mono + AWAKE_AFTER.get(reason, 8)
+					if last_dozing and reason in ('rtc', 'other'):
+						backoff = mono + DOZE_AWAKE_S
+						window = (mono, time.time(), mono + DOZE_AWAKE_MAX_S)
+				if reason == 'key':
+					# gpio-keys may hand the shell the press itself, which toggles
+					# the screen: only light it if that did not
+					time.sleep(1)
+					if screen_off():
+						tell_shell('screen on')
+					off_since = None
+				last = dict(last=reason, slept=slept)
+				status(state='awake', **last, sleeps=sleeps, wakes=wakes, woke_at=woke_at)
+			else:
+				status(state='awake', why=why or 'waiting', **last, sleeps=sleeps,
+				       wakes=wakes, woke_at=woke_at)
+			if time.monotonic() >= summary_at:
+				log(totals.line())
+				summary_at = time.monotonic() + SUMMARY_S
+			time.sleep(2)
+	finally:
+		log(totals.line())
+
+
+ONCE_IGNORES = ('charger', 'switched off', 'paused')
 
 
 if __name__ == '__main__':
@@ -588,11 +845,14 @@ if __name__ == '__main__':
 	if cmd == 'enable':
 		STATE.mkdir(parents=True, exist_ok=True)
 		ENABLED.touch()
+		PAUSED.unlink(missing_ok=True)
 	elif cmd == 'disable':
 		ENABLED.unlink(missing_ok=True)
 	elif cmd == 'status':
 		print(read(STATUS) or 'not running')
 		print('enabled' if ENABLED.exists() else 'disabled')
+		if PAUSED.exists():
+			print('paused for this boot:', read(PAUSED))
 	elif cmd == 'once':
 		# zrn-sleepd once [SECONDS]: one sleep now, an RTC alarm after SECONDS
 		STATE.mkdir(parents=True, exist_ok=True)
@@ -604,9 +864,19 @@ if __name__ == '__main__':
 			tell_shell('screen off')
 			time.sleep(3)
 		for attempt in range(3):
-			reason, stat = cycle()
-			log(f'once: woke: {reason} wake_stat={stat:#010x}')
-			if reason != 'aborted':
+			reason, stat = cycle(ONCE_IGNORES)
+			info = dict(last_sleep)
+			charge = ''
+			if info.get('slept') is not None:
+				charge = (f' (asleep {info["slept"]:.1f}s, charge {mah(info.get("charge_in"))}'
+					  f'->{mah(info.get("charge_out"))} mAh)')
+			log(f'once: woke: {reason} wake_stat={stat:#010x}{charge}')
+			if reason == 'fw-abort':
+				grp4 = number(SLEEP / 'grp4_before')
+				log(f'once: the firmware gave the sleep up: grp4_before={grp4:#010x} '
+				    f'bits {bits(grp4)} eint_pending={read(SLEEP / "eint_pending")}')
+				clear_grp4()
+			if reason not in ('aborted', 'fw-abort', 'alarm-due'):
 				break
 			time.sleep(5)
 	else:
