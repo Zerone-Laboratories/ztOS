@@ -21,7 +21,7 @@ loader.exec_module(sleepd)
 
 
 class RecoveryTest(unittest.TestCase):
-    def exercise(self, failure=None, awake_after_settle=None, busy=False, capacity=None):
+    def exercise(self, failure=None, awake_after_settle=None, busy=False, capacity=None, hub_busy=False):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             wifi = base / 'wifi'
@@ -33,6 +33,7 @@ class RecoveryTest(unittest.TestCase):
             mark = base / 'sleeping'
             writes, commands = [], []
             entered = False
+            refused = {'n': 4}
             parameters = base / 'parameters'
             ufs = base / 'ufs'
             battery = base / 'battery'
@@ -45,6 +46,9 @@ class RecoveryTest(unittest.TestCase):
                 path = str(path)
                 writes.append((path, value))
                 if path == '/sys/power/state':
+                    if hub_busy:	# zrn-sleep-init refused: host_req high
+                        refused['n'] += 1
+                        raise OSError(errno.EBUSY, 'Device or resource busy')
                     if busy:
                         raise OSError(errno.EBUSY, 'Device or resource busy')
                     entered = True
@@ -71,6 +75,8 @@ class RecoveryTest(unittest.TestCase):
                     return 'N' if failure == 'audio' and entered else 'Y'
                 if str(path).endswith('last_failed_dev'):
                     return 'alarmtimer.2.auto'
+                if str(path).endswith('/hub_refused'):
+                    return str(refused['n'])
                 return '0'
 
             with patch.multiple(sleepd, SLEEP=parameters, WIFI=wifi, UFS=ufs,
@@ -90,7 +96,7 @@ class RecoveryTest(unittest.TestCase):
             self.writes = writes
 
             self.assertIn((str(wifi / 'bind'), sleepd.WIFI_DEV), writes)
-            if awake_after_settle or busy or capacity is not None:
+            if awake_after_settle or busy or hub_busy or capacity is not None:
                 return reason
             self.assertFalse(any(command[0] in ('modprobe', 'rmmod') for command in commands))
             self.assertFalse(any('pipewire.service' in command for command in commands))
@@ -118,6 +124,11 @@ class RecoveryTest(unittest.TestCase):
 
     def test_alarm_due_is_a_short_retry(self):
         self.assertEqual(self.exercise(busy=True), 'alarm-due')
+
+    def test_hub_refusal_is_hub_busy(self):
+        # EBUSY with hub_refused moved: the hub, not an alarm (last_failed_dev
+        # still names an old alarmtimer failure)
+        self.assertEqual(self.exercise(hub_busy=True), 'hub-busy')
 
     def test_low_battery_shortens_the_sleep(self):
         for capacity, alarm in ((50, '+1800'), (10, '+600'), (4, '+120')):
@@ -154,6 +165,25 @@ class WakeReasonTest(unittest.TestCase):
     def test_not_entered(self):
         self.assertEqual(self.reason(0, entries='3'), 'aborted')
 
+    def test_hub_wake_reason(self):
+        # an EINT wake (bit 0) with gpa1-7, the hub's host_req, pending
+        self.assertEqual(self.reason(30, wake_stat=str(0x80000001), eint_pending='0,128,0,0,0'), 'hub')
+
+    def test_rtc_with_gpa1_pending_is_rtc(self):
+        self.assertEqual(self.reason(60, wake_stat=str(0x80000002), eint_pending='0,128,0,0,0'), 'rtc')
+
+    def test_key_before_hub(self):
+        self.assertEqual(self.reason(30, wake_stat=str(0x80000001), eint_pending='0,128,16,0,0'), 'key')
+
+    def test_fw_abort_uses_grp4_at_smc_when_present(self):
+        # zrn-sleep-init cleared a stale latch after reading grp4_before
+        self.assertEqual(self.reason(60, wake_stat=str(0x80000002), grp4_before='1',
+                                     grp4_at_smc='0'), 'rtc')
+        self.assertEqual(self.reason(0.4, wake_stat=str(0x80000001), grp4_before='1',
+                                     grp4_at_smc='1', eint_pending='0,128,0,0,0'), 'fw-abort')
+        # an older module: grp4_before alone
+        self.assertEqual(self.reason(60, wake_stat=str(0x80000002), grp4_before='1'), 'fw-abort')
+
 
 class Stop(Exception):
     pass
@@ -161,8 +191,9 @@ class Stop(Exception):
 
 class LoopTest(unittest.TestCase):
     """main() on a fake clock: 2 s a loop, cycle() scripted."""
-    def run_main(self, results, until, push=lambda t: {}, dozing=False):
+    def run_main(self, results, until, push=lambda t: {}, dozing=False, slept=None):
         clock = {'t': 0.0}
+        boot = {'extra': 0.0}	# boot time runs on through the sleeps
         calls, statuses, notes, writes = [], [], [], []
         script = list(results)
 
@@ -178,7 +209,9 @@ class LoopTest(unittest.TestCase):
             if not script:
                 raise Stop()
             reason = script.pop(0)
-            sleepd.last_sleep.update(entered=reason not in ('aborted', 'failed', 'cancelled', 'alarm-due'),
+            if slept:
+                boot['extra'] += slept
+            sleepd.last_sleep.update(entered=reason not in ('aborted', 'failed', 'cancelled', 'alarm-due', 'hub-busy'),
                                      slept=0.4 if reason == 'fw-abort' else 300.0)
             return reason, 0x80000000
 
@@ -205,7 +238,7 @@ class LoopTest(unittest.TestCase):
                     patch.object(sleepd, 'status', side_effect=lambda **f: statuses.append((clock['t'], f))), \
                     patch.object(sleepd, 'tell_shell', side_effect=notes.append), \
                     patch.object(sleepd, 'log'), \
-                    patch.object(sleepd, 'boottime', side_effect=lambda: clock['t']), \
+                    patch.object(sleepd, 'boottime', side_effect=lambda: clock['t'] + boot['extra']), \
                     patch.object(sleepd.time, 'monotonic', side_effect=lambda: clock['t']), \
                     patch.object(sleepd.time, 'time', side_effect=lambda: 1e9 + clock['t']), \
                     patch.object(sleepd.time, 'sleep', side_effect=sleep):
@@ -233,17 +266,58 @@ class LoopTest(unittest.TestCase):
         for gap, want in zip(gaps, (5, 3, 30)):
             self.assertTrue(want <= gap <= want + 2, (gaps, want))
 
-    def test_firmware_aborts_clear_grp4_then_pause(self):
+    def test_firmware_aborts_pause_without_clear(self):
         calls, statuses, notes, writes, paused = self.run_main(['fw-abort'] * 3 + ['rtc'], 600)
         self.assertEqual(len(calls), 3)		# paused: no fourth try
         for gap in self.gaps(calls):
             self.assertTrue(5 <= gap <= 7, calls)
-        # GRP4 cleared once, at the first
-        self.assertEqual([value for path, value in writes if path.endswith('/clear_grp4')], [1])
+        # GRP4 never forced clear: only the reset to N at the start
+        self.assertEqual([value for path, value in writes if path.endswith('/clear_grp4')], [0])
         self.assertTrue(paused)
         self.assertTrue(any('Sleep paused' in n for n in notes))
         # a firmware abort is not a wake the sensor hub's side should hear of
         self.assertEqual(statuses[-1][1].get('wakes'), 3)
+
+    def test_fw_abort_never_writes_clear_grp4(self):
+        *_, writes, paused = self.run_main(['fw-abort', 'rtc', 'fw-abort', 'rtc'], 600)
+        self.assertNotIn(1, [value for path, value in writes if path.endswith('/clear_grp4')])
+        self.assertFalse(paused)
+
+    def test_clear_grp4_reset_at_start(self):
+        calls, statuses, notes, writes, paused = self.run_main(['rtc'], 60)
+        self.assertEqual(writes[0][1], 0)
+        self.assertTrue(writes[0][0].endswith('/clear_grp4'))
+
+    def test_setup_resets_clear_grp4(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parameters = Path(directory)
+            (parameters / 'enable_deep').write_text('Y\n')
+            writes = []
+            with patch.object(sleepd, 'SLEEP', parameters), \
+                    patch.object(sleepd, 'read', side_effect=lambda path, default='':
+                                 'Y' if str(path).endswith('enable_deep') else 's2idle [deep]'), \
+                    patch.object(sleepd, 'write', side_effect=lambda path, value: writes.append((str(path), value))):
+                self.assertTrue(sleepd.setup())
+            self.assertEqual(writes, [(str(parameters / 'clear_grp4'), 0)])
+
+    def test_hub_busy_is_a_short_retry(self):
+        calls, *_ = self.run_main(['hub-busy', 'rtc', 'rtc'], 600)
+        gaps = self.gaps(calls)
+        self.assertTrue(5 <= gaps[0] <= 7, gaps)
+
+    def test_hub_backoff_after_three_in_120s(self):
+        calls, *_ = self.run_main(['hub', 'hub-busy', 'hub', 'rtc', 'rtc'], 2000)
+        gaps = self.gaps(calls)
+        self.assertGreaterEqual(len(gaps), 4, gaps)
+        # 5 s after each of the first two, then left awake 120 s, then as usual
+        for gap, want in zip(gaps, (5, 5, 120, 3)):
+            self.assertTrue(want <= gap <= want + 2, (gaps, want))
+
+    def test_hub_wakes_far_apart_do_not_back_off(self):
+        # 300 s asleep between them (boot time): never 3 within 120 s
+        calls, *_ = self.run_main(['hub', 'hub', 'hub', 'rtc'], 2000, slept=300.0)
+        for gap in self.gaps(calls)[:3]:
+            self.assertTrue(5 <= gap <= 7, calls)
 
     def window_end(self, push):
         """When a doze window after an RTC wake at t=0 of the loop ended."""

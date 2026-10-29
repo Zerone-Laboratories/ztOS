@@ -17,8 +17,11 @@ It sleeps once all of these hold:
 
 What wakes it: the power key (EINT 20), the modem's mailbox (an incoming
 call or SMS: zrn-modem's mcu_ipc wake IRQ), Bluetooth's HOST_WAKE (EINT 19),
-the charger and the PMIC (EINT 14, 1), and an RTC alarm, its own every
-MAX_SLEEP_S at the latest, or anything sooner that asked (alarmtimer).
+the charger and the PMIC (EINT 14, 1), the sensor hub's host_req (EINT 15,
+while lhd holds it as a wake IRQ: zrn-sleep-init's eint_follow), and an RTC
+alarm, its own every MAX_SLEEP_S at the latest, or anything sooner that
+asked (alarmtimer). The kernel refuses a sleep while host_req is high (the
+hub is talking): 'hub-busy', tried again in a few seconds.
 
 A cycle is what the bench trials proved (power/suspend/mif-trial.sh,
 power/suspend-test.py), less what only served the tests: the audio driver
@@ -35,7 +38,7 @@ like a hang and switched sleeping off (26 Oct, three times).
   zrn-sleepd once       one cycle now, conditions or not (screen must be off)
   zrn-sleepd enable | disable | status
 """
-import ctypes, errno, json, os, signal, socket, struct, subprocess, sys, time
+import collections, ctypes, errno, json, os, signal, socket, struct, subprocess, sys, time
 from pathlib import Path
 
 sys.path.insert(0, '/usr/lib/ztos/python')
@@ -73,19 +76,28 @@ DOZE_SLEEP_S = 300
 DOZE_AWAKE_S = 10
 DOZE_AWAKE_MAX_S = 45
 PUSH_GRACE_S = 8
-AWAKE_AFTER = {'rtc': 3, 'modem': 15, 'bt': 5, 'key': 0, 'other': 8}
+AWAKE_AFTER = {'rtc': 3, 'modem': 15, 'bt': 5, 'key': 0, 'hub': 5, 'other': 8}
 # EINT_WAKEUP_MASK (PMU 0x60c, bit = 8 x gpaN + pin, 0 = may wake): open
 # 1 PMIC (gpa0-1), 14 MAX77705 charger (gpa1-6), 19 BT HOST_WAKE (gpa2-3),
-# 20 power key (gpa2-4)
+# 20 power key (gpa2-4). Bit 15 (the sensor hub's host_req, gpa1-7) stays
+# masked here: zrn-sleep-init opens it itself while its IRQ is a wake IRQ
+# (eint_follow), as stock's EINT wake mask follows enable_irq_wake.
 EINT_WAKE = 0xffe7bffd
 # A sleep the firmware gave up (ACPM 'upend_wk': PMU_INTR_GEN GRP4 latched,
 # 29 Oct, a whole boot): smc 0, no wake source, back at once. Not a wake:
-# clear GRP4 and try again soon; FW_ABORT_LIMIT in a row and sleeping
-# pauses for the boot (PAUSED, in /run: a reboot clears it), rather than
-# churning Wi-Fi, the DSP and the sensor hub every few seconds.
+# try again soon; FW_ABORT_LIMIT in a row and sleeping pauses for the boot
+# (PAUSED, in /run: a reboot clears it), rather than churning Wi-Fi, the
+# DSP and the sensor hub every few seconds. GRP4 is not forced clear from
+# here (clear_grp4 is for a person at the bench): zrn-sleep-init clears a
+# stale latch itself at each attempt, and only once host_req is low; a
+# sleep forced through a live latch while GNSS ran took the hub down (J0c).
 FW_ABORT_LIMIT = 3
 FW_ABORT_RETRY_S = 5
 FW_ABORT_SLEPT_S = 2
+# the sensor hub keeps waking the phone or refusing its sleeps: this many
+# in HUB_WINDOW_S and it is left awake HUB_BACKOFF_S
+HUB_BUSY_RETRY_S = 5
+HUB_LIMIT, HUB_WINDOW_S, HUB_BACKOFF_S = 3, 120, 120
 PAUSED = Path('/run/zrn-sleepd/paused')
 CANCEL_RETRY_S = 5	# something woke up during the preparations
 ALARM_RETRY_S = 3	# an alarm due within 2 s refused the suspend (EBUSY)
@@ -295,10 +307,21 @@ def module_options(name='zrn_sleep_init', directory=Path('/etc/modprobe.d')):
 	return words
 
 
+def unforce_grp4():
+	"""clear_grp4 back to N: an earlier zrn-sleepd set it on the first
+	firmware abort and it stayed Y for the boot, forcing every later sleep
+	through a live latch."""
+	try:
+		write(SLEEP / 'clear_grp4', 0)
+	except OSError:
+		pass
+
+
 def setup():
 	"""The backend and what it leans on, as mif-trial.sh brings them up."""
 	if SLEEP.exists():
 		if read(SLEEP / 'enable_deep') == 'Y' and 'deep' in read('/sys/power/mem_sleep'):
+			unforce_grp4()
 			return True
 		log('zrn_sleep_init present but deep sleep not enabled, reloading')
 		run('rmmod', 'zrn_sleep_init', check=False)
@@ -334,6 +357,7 @@ def setup():
 		log('backend did not load:', r.stdout.strip() if r else '')
 		return False
 	write('/sys/power/mem_sleep', 's2idle')
+	unforce_grp4()
 	log('backend up')
 	return True
 
@@ -447,8 +471,11 @@ def wake_reason(before, slept=None):
 	if number(SLEEP / 'entries') <= before:
 		return 'aborted', stat
 	# the firmware gave the sleep up: GRP4 latched at the handoff, or back
-	# at once with no wake source at all (bit 31 is only a status flag)
-	if number(SLEEP / 'grp4_before') or (
+	# at once with no wake source at all (bit 31 is only a status flag).
+	# GRP4 as it was at the SMC: zrn-sleep-init clears a stale latch after
+	# grp4_before is read (an older module has only grp4_before)
+	grp4 = SLEEP / 'grp4_at_smc'
+	if number(grp4 if grp4.exists() else SLEEP / 'grp4_before') or (
 			number(SLEEP / 'last_smc') == 0 and not stat & 0x7fffffff and
 			not number(SLEEP / 'wake_stat2') and not number(SLEEP / 'wake_stat3') and
 			not any(eint) and slept is not None and slept < FW_ABORT_SLEPT_S):
@@ -457,6 +484,9 @@ def wake_reason(before, slept=None):
 		return 'key', stat
 	if gpa2 & (1 << 3):
 		return 'bt', stat
+	# an EINT wake with the sensor hub's host_req (gpa1-7) pending
+	if stat & 1 and len(eint) > 1 and eint[1] & 0x80:
+		return 'hub', stat
 	if stat & (1 << 24):
 		return 'modem', stat
 	if stat & (1 << 1):
@@ -523,6 +553,7 @@ def cycle(ignore=()):
 	user_env = ['env', 'XDG_RUNTIME_DIR=' + ztos_user.RUNTIME_DIR]
 	user = ztos_user.USER
 	entries = int(read(SLEEP / 'entries', '0') or 0)
+	hub_refused = number(SLEEP / 'hub_refused')	# 0 with an older module
 	wifi_bound = (WIFI / WIFI_DEV).exists()
 	old_ufs = read(UFS)
 	reason, stat = 'failed', 0
@@ -606,11 +637,15 @@ def cycle(ignore=()):
 			log(f'sleep cancelled: {e}')
 			reason = 'cancelled'
 		except OSError as e:
-			log('sleep refused:', e.strerror)
-			if e.errno == errno.EBUSY and 'alarmtimer' in failed_device():
-				reason = 'alarm-due'
+			if e.errno == errno.EBUSY and number(SLEEP / 'hub_refused') > hub_refused:
+				log('sleep refused: the sensor hub is talking (host_req high)')
+				reason = 'hub-busy'
 			else:
-				log('wakeup sources:', wakeup_sources())
+				log('sleep refused:', e.strerror)
+				if e.errno == errno.EBUSY and 'alarmtimer' in failed_device():
+					reason = 'alarm-due'
+				else:
+					log('wakeup sources:', wakeup_sources())
 		except Stalled:
 			log(f'sleep abandoned: stuck at "{read(STEP)}" for {PREPARE_S}s')
 			log('wakeup sources:', wakeup_sources())
@@ -619,7 +654,7 @@ def cycle(ignore=()):
 			signal.alarm(0)
 			signal.signal(signal.SIGALRM, old_alarm)
 			step('restoring')
-		if reason not in ('stalled', 'cancelled', 'alarm-due'):
+		if reason not in ('stalled', 'cancelled', 'alarm-due', 'hub-busy'):
 			reason, stat = wake_reason(entries, slept)
 		last_sleep['entered'] = number(SLEEP / 'entries') > entries
 	finally:
@@ -712,6 +747,8 @@ def bits(word):
 
 
 def clear_grp4():
+	"""By hand only (nothing here calls it): force GRP4 clear at every
+	handoff until set back to N."""
 	try:
 		write(SLEEP / 'clear_grp4', 1)
 	except OSError as e:
@@ -738,6 +775,8 @@ def main():
 	fw_aborts = 0		# sleeps the firmware gave up, in a row
 	wakes, woke_at = 0, 0	# real returns from the SoC (the sensor hub's side reads them)
 	window = None		# a doze window: (woke, wall clock woke, its end at the latest)
+	hub_times = collections.deque()	# when the hub woke the phone or refused a sleep
+	unforce_grp4()
 	last = {}
 	totals = Totals()
 	summary_at = time.monotonic() + SUMMARY_S
@@ -801,11 +840,11 @@ def main():
 						tell_shell('notify Power|Sleep paused|The firmware refuses to sleep; '
 							   'a reboot restores it.')
 					else:
-						if fw_aborts == 1:
-							clear_grp4()
 						backoff = mono + FW_ABORT_RETRY_S
 				elif reason == 'cancelled':
 					backoff = mono + CANCEL_RETRY_S
+				elif reason == 'hub-busy':
+					backoff = mono + HUB_BUSY_RETRY_S
 				elif reason == 'alarm-due':
 					backoff = mono + ALARM_RETRY_S
 				elif reason in ('failed', 'aborted', 'stalled', 'audio unavailable'):
@@ -817,6 +856,17 @@ def main():
 					if last_dozing and reason in ('rtc', 'other'):
 						backoff = mono + DOZE_AWAKE_S
 						window = (mono, time.time(), mono + DOZE_AWAKE_MAX_S)
+				if reason in ('hub', 'hub-busy'):
+					# boot time: the window counts the sleeps in between
+					now = boottime()
+					hub_times.append(now)
+					while hub_times and now - hub_times[0] > HUB_WINDOW_S:
+						hub_times.popleft()
+					if len(hub_times) >= HUB_LIMIT:
+						log(f'sensor hub keeps the AP awake: {len(hub_times)} in '
+						    f'{HUB_WINDOW_S}s, next try in {HUB_BACKOFF_S}s')
+						backoff = mono + HUB_BACKOFF_S
+						hub_times.clear()
 				if reason == 'key':
 					# gpio-keys may hand the shell the press itself, which toggles
 					# the screen: only light it if that did not
@@ -874,9 +924,9 @@ if __name__ == '__main__':
 			if reason == 'fw-abort':
 				grp4 = number(SLEEP / 'grp4_before')
 				log(f'once: the firmware gave the sleep up: grp4_before={grp4:#010x} '
-				    f'bits {bits(grp4)} eint_pending={read(SLEEP / "eint_pending")}')
-				clear_grp4()
-			if reason not in ('aborted', 'fw-abort', 'alarm-due'):
+				    f'bits {bits(grp4)} grp4_at_smc={read(SLEEP / "grp4_at_smc", "n/a")} '
+				    f'eint_pending={read(SLEEP / "eint_pending")}')
+			if reason not in ('aborted', 'fw-abort', 'alarm-due', 'hub-busy'):
 				break
 			time.sleep(5)
 	else:
