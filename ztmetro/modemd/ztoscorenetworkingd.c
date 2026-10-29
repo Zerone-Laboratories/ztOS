@@ -1281,6 +1281,35 @@ static void data_keep(void)
 		data_activate();
 }
 
+/* The Hutch workaround's 080a (WCDMA/GSM only): at most HUTCH_SENDS each
+ * registration change, then HUTCH_HOLD_MS without; none with the screen off;
+ * none after one the modem did not answer (8001), until the registration
+ * changes or the modem restarts. 29 Oct: 306 sends in 5 h, every 60 s,
+ * unanswered, the phone on LTE all along. */
+#define HUTCH_SENDS	3
+#define HUTCH_HOLD_MS	600000L
+static int hutch_sends;
+static bool hutch_waiting, hutch_dead;
+static long hutch_hold_until;
+
+static void at_setup(void);
+static void poll_state(void);
+
+/* What stock's libsec-ril does when the screen goes off or on (Android's
+ * unsolicited-response filter, MiscManager::DoScreenStateBehavior): a
+ * MISC_SCREEN_STATUS event (0a0f, type 5: 0 off, 1 on), so the CP holds back
+ * its indications (signal, icons, cell changes), each of which wakes the AP
+ * through the mailbox; and cell changes no longer reported (+CREG=1: only
+ * the registration). */
+static void screen_tell_modem(void)
+{
+	unsigned char state = screen_off ? 0 : 1;
+	ipc_send(0x0a, 0x0f, 5, &state, 1);
+	queue_at(screen_off ? "AT+CREG=1" : "AT+CREG=2");
+	queue_at(screen_off ? "AT+CGREG=1" : "AT+CGREG=2");
+	queue_at(screen_off ? "AT+CEREG=1" : "AT+CEREG=2");
+}
+
 static void ipc_message(int main_cmd, int sub, int type, const unsigned char *data, size_t len)
 {
 	if (ipc_log) {
@@ -1299,10 +1328,15 @@ static void ipc_message(int main_cmd, int sub, int type, const unsigned char *da
 		fprintf(stderr, "ztoscorenetworkingd: the modem started\n");
 		net_set = net_retried = false;
 		at_setup();
+		screen_tell_modem();	/* it forgot the screen too */
+		hutch_sends = 0;
+		hutch_waiting = hutch_dead = false;
 		ctx_up = false;
 		now.data = false;
 		now.ip[0] = 0;
 		data_tried_at = 0;
+	} else if (main_cmd == 0x80 && sub == 0x01 && len >= 2 && data[0] == 0x08 && data[1] == 0x0a) {
+		hutch_waiting = false;	/* the network mask was taken */
 	} else if (main_cmd == 0x80 && sub == 0x01 && len >= 5 && data[0] == 0x0d) {
 		int result = data[3] | data[4] << 8;
 		if (result != 0x8000) {
@@ -1368,10 +1402,15 @@ static void command(char *l)
 		fprintf(stderr, "ztoscorenetworkingd: asked: %.40s\n", l);
 	if (!strcmp(l, "screen off") || !strcmp(l, "screen on")) {
 		/* from zrnperfd: with the screen off nobody is looking at the bars */
+		bool was_off = screen_off;
 		screen_off = !strcmp(l, "screen off");
+		if (screen_off != was_off)
+			screen_tell_modem();
 		if (!screen_off) {
 			silent_polls = 0;	/* someone is looking: back to the normal rate */
 			next_poll = ms();	/* discard the old screen-off deadline */
+			if (was_off)
+				poll_state();	/* what was held back while it was off */
 		}
 		return;
 	}
@@ -1704,14 +1743,36 @@ int main(int argc, char **argv)
 		bool hutch = !strncmp(sim_mccmnc, "41303", 5) || !strncmp(sim_mccmnc, "41308", 5);
 		bool lte = now.eps_reg == 1 || now.eps_reg == 5;
 		bool cs = now.cs_reg == 1 || now.cs_reg == 5;
+		static int hutch_reg = -1;
+		int reg = now.cs_reg * 64 + now.eps_reg;
+		if (reg != hutch_reg) {		/* a registration change: tries anew */
+			hutch_reg = reg;
+			hutch_sends = 0;
+			hutch_dead = false;
+		}
 		if (!hutch || cs || airplane_asked || strcmp(now.sim, "ready")) hutch_lte_since = 0;
 		else if (!hutch_lte_since) hutch_lte_since = ms();
 		if (hutch_lte_since && ms() - hutch_lte_since >= 60000) {
-			unsigned char networks = 0x03;
-			ipc_send(0x08, 0x0a, 3, &networks, 1);
 			hutch_lte_since = ms();
-			fprintf(stderr, "ztoscorenetworkingd: Hutch CS absent for 60 s (%s); WCDMA/GSM mask 0x03\n",
-				lte ? "on LTE" : "not registered");
+			if (screen_off || hutch_dead || ms() < hutch_hold_until) {
+				/* not now */
+			} else if (hutch_waiting) {
+				hutch_dead = true;
+				fprintf(stderr, "ztoscorenetworkingd: Hutch: the last WCDMA/GSM mask got no answer; "
+					"not again until the registration changes\n");
+			} else {
+				unsigned char networks = 0x03;
+				ipc_send(0x08, 0x0a, 3, &networks, 1);
+				hutch_waiting = true;
+				fprintf(stderr, "ztoscorenetworkingd: Hutch CS absent for 60 s (%s); WCDMA/GSM mask 0x03\n",
+					lte ? "on LTE" : "not registered");
+				if (++hutch_sends >= HUTCH_SENDS) {
+					hutch_sends = 0;
+					hutch_hold_until = ms() + HUTCH_HOLD_MS;
+					fprintf(stderr, "ztoscorenetworkingd: Hutch: %d masks sent; the next in 10 min\n",
+						HUTCH_SENDS);
+				}
+			}
 		}
 		next_at();
 		long wait = next_poll - ms();
@@ -1720,7 +1781,9 @@ int main(int argc, char **argv)
 			call_poll_at = ms() + 2000;
 			next_at();
 		}
-		if ((fake_call || hutch_lte_since) && wait > 1000) wait = 1000;
+		if (fake_call && wait > 1000) wait = 1000;
+		if (hutch_lte_since && hutch_lte_since + 60000 - ms() < wait)
+			wait = hutch_lte_since + 60000 - ms();
 		if (now.call[0] && wait > 500)
 			wait = 500;
 		if (busy && AT_TIMEOUT_MS - (ms() - sent_at) < wait)
