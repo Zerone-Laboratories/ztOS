@@ -25,6 +25,18 @@
  * opens a transaction with a 9-byte header (command, length, options, data),
  * the hub echoes the options and then takes the payload or sends the answer.
  * What the hub sends unasked arrives as frames of tagged records.
+ *
+ * One transaction is open at a time, as in Samsung's driver: the next header
+ * waits until the hub has echoed the last one and taken its payload (or
+ * until it gives up waiting, as Samsung's does: 400 ms within 5 s of a
+ * resume, else 1 s). A bare command (length 0) is not echoed and does not
+ * hold the link. After each kernel resume that pulsed the hub's AP_SLEEP
+ * line (zrn-bbd counts them in /sys/class/sec/sensorhub/resume_seq), the hub
+ * is sent MSG2SSP_AP_STATUS_RESUME (0xd3), as Samsung's ssp_resume does.
+ * The early-suspend pair 0xd1 / 0xd2 stays out (see sensors_apply).
+ *
+ * For tests: ZTOSCSF_SSP names the hub device, ZTOSCSF_RESUME_SEQ the resume
+ * counter, and ZTOSCSF_ROOT is put in front of every /run and /var path.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -46,9 +58,17 @@
 #define CTL	"/run/ztoscsf-sensord.ctl"
 #define OUT	"/run/ztoscsf-sensors"
 #define STATE	"/var/lib/ztoscsf-sensord/state"
+#define RESUME_SEQ "/sys/devices/virtual/sec/sensorhub/resume_seq"
+
+/* ZTOSCSF_ROOT in front of each path under /run and /var (tests) */
+static char root[128], ctl_path[192], out_path[192], state_path[192];
+
+static void at(char *buf, size_t size, const char *path) {
+	snprintf(buf, size, "%s%s", root, path);
+}
 
 enum { AP2HUB_READ, AP2HUB_WRITE, HUB2AP_WRITE };
-enum { CMD_ADD = 0xa1, CMD_REMOVE = 0xa2, CMD_TIMESTAMP = 0xa7 };
+enum { CMD_ADD = 0xa1, CMD_REMOVE = 0xa2, CMD_TIMESTAMP = 0xa7, CMD_AP_RESUME = 0xd3 };
 enum { REC_DEBUG = 0x03, REC_META = 0x05, REC_TIME_SYNC = 0x06, REC_INIT_DONE = 0x0a,
 	REC_DATA = 0x37 };
 
@@ -73,44 +93,154 @@ static bool screen_on = true, auto_on = true;
 
 /* --- transactions ------------------------------------------------------ */
 
-static struct pending {
+/*
+ * One transaction on the link at a time, as Samsung's driver has it: its
+ * comm_mutex is held from the header until the hub's echo has taken the
+ * payload (ssp_bbd.c, bbd_do_transfer). This daemon used to write every
+ * header at once; two REMOVEs back to back (light, then a watched accel or
+ * prox), the second header before the first one's echo, came with the
+ * firmware's assert at every screen-off (MCU_BCM477X_transport_layer.c line
+ * 165, 30 Oct, 8 of 8). Everything waits in outq, in order.
+ */
+struct txn {
+	uint8_t cmd;
 	uint16_t opts;
-	uint8_t payload[32];
 	int len;
-} pending[16];
-static int n_pending, next_index = 1;
+	uint8_t payload[32];
+};
+#define QUEUE_MAX 16
+static struct txn outq[QUEUE_MAX], inflight_txn;
+static int nq, next_index = 1;
+static struct txn *inflight;	/* the transaction whose echo is awaited */
+static uint64_t inflight_at, inflight_deadline;	/* CLOCK_BOOTTIME, ns */
+static uint64_t resumed_at_ns;	/* when this daemon last saw a kernel resume */
+static bool time_pending;	/* hub_time() waits for an idle link */
 
-static void hub_write(int cmd, const void *payload, int len) {
-	uint8_t head[9] = { 0 };
-	uint16_t opts = AP2HUB_WRITE | next_index << 3;
-	next_index = next_index % 8000 + 1;
-	head[0] = cmd;
-	head[1] = len, head[2] = len >> 8;
-	head[3] = opts, head[4] = opts >> 8;
-	if (len) {	/* a bare command is not echoed */
-		if (n_pending == 16) {	/* the hub never answered these; forget the oldest */
-			memmove(pending, pending + 1, sizeof(pending[0]) * --n_pending);
-		}
-		pending[n_pending].opts = opts;
-		pending[n_pending].len = len;
-		memcpy(pending[n_pending].payload, payload, len);
-		n_pending++;
-	}
-	if (write(dev, head, sizeof(head)) < 0) {
-		perror("ztoscsf-sensord: write");
-	}
+static uint64_t now_ns(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_BOOTTIME, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Samsung's ssp_spi_async: 400 ms within 5 s of a resume, else 1 s */
+static uint64_t echo_timeout_ns(uint64_t now) {
+	return resumed_at_ns && now - resumed_at_ns < 5000000000ULL ? 400000000ULL : 1000000000ULL;
 }
 
 /* Samsung's driver tells the hub the time now and then, in one piece. */
-static void hub_time(void) {
+static void send_time(void) {
 	uint8_t msg[17] = { CMD_TIMESTAMP, 8, 0, AP2HUB_WRITE, 0 };
-	struct timespec ts;
-	clock_gettime(CLOCK_BOOTTIME, &ts);
-	int64_t ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+	int64_t ns = (int64_t)now_ns();
 	memcpy(msg + 9, &ns, 8);
 	if (write(dev, msg, sizeof(msg)) < 0) {
 		perror("ztoscsf-sensord: write");
 	}
+}
+
+/* Send what is queued, up to the first transaction the hub must echo. */
+static void hub_kick(void) {
+	while (!inflight && nq) {
+		struct txn t = outq[0];
+		memmove(outq, outq + 1, sizeof(outq[0]) * --nq);
+		uint8_t head[9] = { t.cmd, t.len & 0xff, t.len >> 8, t.opts & 0xff, t.opts >> 8 };
+		if (write(dev, head, sizeof(head)) < 0) {
+			perror("ztoscsf-sensord: write");
+			continue;	/* never reached the hub: nothing to wait for */
+		}
+		if (t.cmd == CMD_AP_RESUME) {
+			fprintf(stderr, "ztoscsf-sensord: sent 0xd3 (AP resumed)\n");
+		}
+		if (t.len) {	/* a bare command is not echoed (Samsung's use_no_irq) */
+			inflight_txn = t;
+			inflight = &inflight_txn;
+			inflight_at = now_ns();
+			inflight_deadline = inflight_at + echo_timeout_ns(inflight_at);
+		}
+	}
+	if (!inflight && !nq && time_pending) {
+		time_pending = false;
+		send_time();
+	}
+}
+
+static void hub_queue(int cmd, uint16_t opts, const void *payload, int len) {
+	if (len < 0 || len > (int)sizeof(outq[0].payload)) {
+		return;
+	}
+	if (nq == QUEUE_MAX) {	/* never the open one: the hub may be taking it */
+		fprintf(stderr, "ztoscsf-sensord: queue full, dropped 0x%02x\n", outq[0].cmd);
+		memmove(outq, outq + 1, sizeof(outq[0]) * --nq);
+	}
+	struct txn *t = &outq[nq++];
+	t->cmd = cmd;
+	t->opts = opts;
+	t->len = len;
+	if (len) {
+		memcpy(t->payload, payload, len);
+	}
+	hub_kick();
+}
+
+static void hub_write(int cmd, const void *payload, int len) {
+	uint16_t opts = AP2HUB_WRITE | next_index << 3;
+	next_index = next_index % 8000 + 1;
+	hub_queue(cmd, opts, payload, len);
+}
+
+static void hub_time(void) {
+	time_pending = true;
+	hub_kick();
+}
+
+/* The hub never echoed the open transaction: let it go, as Samsung's does. */
+static void hub_expire(void) {
+	if (inflight && now_ns() >= inflight_deadline) {
+		fprintf(stderr, "ztoscsf-sensord: no echo for 0x%02x (opts %04x), dropped\n",
+			inflight->cmd, inflight->opts);
+		inflight = NULL;
+		hub_kick();
+	}
+}
+
+/* ms until the open transaction times out, -1 with none open */
+static int hub_wait_ms(void) {
+	if (!inflight) {
+		return -1;
+	}
+	uint64_t now = now_ns();
+	if (now >= inflight_deadline) {
+		return 0;
+	}
+	return (int)((inflight_deadline - now + 999999) / 1000000);
+}
+
+/* zrn-bbd's resume counter: it moves after each kernel resume that pulsed
+ * the hub's AP_SLEEP line, and the hub is then told the AP is back (0xd3). */
+static int resume_fd = -1;
+static char resume_seen[32];
+
+static bool resume_read(char *buf, size_t size) {
+	if (resume_fd < 0 || lseek(resume_fd, 0, SEEK_SET) < 0) {
+		return false;
+	}
+	ssize_t n = read(resume_fd, buf, size - 1);
+	if (n <= 0) {
+		return false;
+	}
+	buf[n] = 0;
+	buf[strcspn(buf, "\n")] = 0;
+	return true;
+}
+
+static void resume_check(void) {
+	char now[32];
+	if (!resume_read(now, sizeof(now)) || strcmp(now, resume_seen) == 0) {
+		return;
+	}
+	snprintf(resume_seen, sizeof(resume_seen), "%s", now);
+	resumed_at_ns = now_ns();
+	fprintf(stderr, "ztoscsf-sensord: AP resumed (resume_seq %s)\n", now);
+	hub_queue(CMD_AP_RESUME, AP2HUB_WRITE, NULL, 0);	/* as ssp_send_cmd: no index */
 }
 
 static void sensor_set(struct sensor *s, bool on) {
@@ -129,11 +259,12 @@ static void sensor_set(struct sensor *s, bool on) {
 }
 
 /*
- * The hub is not told the AP is asleep or awake (0xd2 / 0xd1): Samsung's
+ * The hub is not told the screen is off or on (0xd2 / 0xd1): Samsung's
  * driver on this phone never sends either (they belong to early suspend, not
  * built), and the hub's firmware asserted in its transport layer
  * (MCU_BCM477X_transport_layer.c line 165) within a second of each, at every
- * start and every screen-off. Taking the sensors off is enough.
+ * start and every screen-off (sent then without waiting for echoes, so the
+ * assert may have been the overlap). Taking the sensors off is enough.
  */
 static void sensors_apply(void) {
 	for (int i = 0; i < N_SENSORS; i++) {
@@ -144,8 +275,8 @@ static void sensors_apply(void) {
 /* --- what is published ------------------------------------------------- */
 
 static void publish(const char *name, const char *text) {
-	char path[128], tmp[136];
-	snprintf(path, sizeof(path), OUT "/%s", name);
+	char path[256], tmp[264];
+	snprintf(path, sizeof(path), "%s/%s", out_path, name);
 	snprintf(tmp, sizeof(tmp), "%s.new", path);
 	FILE *f = fopen(tmp, "w");
 	if (f) {
@@ -162,7 +293,9 @@ static int shown = -1, goal = -1;	/* percent; -1 before the first reading */
 
 static void shell(const char *line) {
 	glob_t g;
-	if (glob("/run/user/*/ztmetro.ctl", 0, NULL, &g) == 0) {
+	char pattern[192];
+	at(pattern, sizeof(pattern), "/run/user/*/ztmetro.ctl");
+	if (glob(pattern, 0, NULL, &g) == 0) {
 		for (size_t i = 0; i < g.gl_pathc; i++) {
 			int fd = open(g.gl_pathv[i], O_WRONLY | O_NONBLOCK);	/* no shell, no write */
 			if (fd >= 0) {
@@ -366,6 +499,10 @@ static void frame(const uint8_t *f, int len) {
 			i += 2;
 			break;
 		case REC_INIT_DONE:	/* the hub started again: it has forgotten everything */
+			/* what was on its way belongs to the old hub: a REMOVE of a
+			 * sensor the new one never added asserts its firmware */
+			inflight = NULL;
+			nq = 0;
 			for (int k = 0; k < N_SENSORS; k++) {
 				sensors[k].on = false;
 			}
@@ -399,16 +536,13 @@ static void stream_parse(void) {
 			at += 4 + len;
 			continue;
 		}
-		/* the hub is ready for the payload of one of our writes */
-		for (int i = 0; i < n_pending; i++) {
-			if (pending[i].opts == opts) {
-				if (write(dev, pending[i].payload, pending[i].len) < 0) {
-					perror("ztoscsf-sensord: write");
-				}
-				memmove(pending + i, pending + i + 1,
-					sizeof(pending[0]) * (--n_pending - i));
-				break;
+		/* the hub is ready for the payload of the open transaction */
+		if (inflight && inflight->opts == opts) {
+			if (write(dev, inflight->payload, inflight->len) < 0) {
+				perror("ztoscsf-sensord: write");
 			}
+			inflight = NULL;
+			hub_kick();
 		}
 		at += 4;
 	}
@@ -446,7 +580,7 @@ static bool hub_read(void) {
 /* --- control ----------------------------------------------------------- */
 
 static void save(void) {
-	FILE *f = fopen(STATE, "w");
+	FILE *f = fopen(state_path, "w");
 	if (f) {
 		fprintf(f, "auto %s\n", auto_on ? "on" : "off");
 		fprintf(f, "opentone %s\n", tone_on ? "on" : "off");
@@ -507,15 +641,22 @@ static void stop(int sig) {
 }
 
 int main(void) {
-	char line[128];
+	char line[128], path[256], link[192];
 	signal(SIGTERM, stop);
 	signal(SIGINT, stop);
 	setvbuf(stderr, NULL, _IOLBF, 0);
-	mkdir("/var/lib/ztoscsf-sensord", 0755);
-	mkdir(OUT, 0755);
-	mkdir(OUT "/iio:device0", 0755);
+	const char *env = getenv("ZTOSCSF_ROOT");
+	snprintf(root, sizeof(root), "%s", env ? env : "");
+	at(ctl_path, sizeof(ctl_path), CTL);
+	at(out_path, sizeof(out_path), OUT);
+	at(state_path, sizeof(state_path), STATE);
+	at(path, sizeof(path), "/var/lib/ztoscsf-sensord");
+	mkdir(path, 0755);
+	mkdir(out_path, 0755);
+	snprintf(path, sizeof(path), "%s/iio:device0", out_path);
+	mkdir(path, 0755);
 	publish("iio:device0/name", "zrn-hub-als\n");
-	FILE *f = fopen(STATE, "r");
+	FILE *f = fopen(state_path, "r");
 	while (f && fgets(line, sizeof(line), f)) {
 		command(line, false);
 	}
@@ -523,7 +664,8 @@ int main(void) {
 		fclose(f);
 	}
 	/* started while the screen is off (a restart): zrnperfd only reports changes */
-	f = fopen("/run/zrnperfd.status", "r");
+	at(path, sizeof(path), "/run/zrnperfd.status");
+	f = fopen(path, "r");
 	while (f && fgets(line, sizeof(line), f)) {
 		if (strncmp(line, "screen=", 7) == 0) {
 			screen_on = strncmp(line + 7, "off", 3) != 0;
@@ -533,26 +675,35 @@ int main(void) {
 		fclose(f);
 	}
 
-	dev = open(DEV, O_RDWR | O_NONBLOCK);
+	const char *device = getenv("ZTOSCSF_SSP") ? getenv("ZTOSCSF_SSP") : DEV;
+	dev = open(device, O_RDWR | O_NONBLOCK | O_NOCTTY);
 	if (dev < 0) {
-		perror("ztoscsf-sensord: " DEV);
+		fprintf(stderr, "ztoscsf-sensord: %s: %s\n", device, strerror(errno));
 		return 1;
 	}
-	unlink(CTL);
-	if (mkfifo(CTL, 0666) < 0) {
-		perror("ztoscsf-sensord: " CTL);
+	/* an old zrn-bbd has no resume counter: then no 0xd3, as before */
+	const char *seq = getenv("ZTOSCSF_RESUME_SEQ") ? getenv("ZTOSCSF_RESUME_SEQ") : RESUME_SEQ;
+	resume_fd = open(seq, O_RDONLY | O_CLOEXEC);
+	if (!resume_read(resume_seen, sizeof(resume_seen))) {
+		resume_seen[0] = 0;
+	}
+	unlink(ctl_path);
+	if (mkfifo(ctl_path, 0666) < 0) {
+		fprintf(stderr, "ztoscsf-sensord: %s: %s\n", ctl_path, strerror(errno));
 		return 1;
 	}
-	chmod(CTL, 0666);
+	chmod(ctl_path, 0666);
 	/* Compatibility symlinks so legacy tools and paths find everything */
-	unlink("/run/zrn-sensord.ctl");
-	symlink(CTL, "/run/zrn-sensord.ctl");
-	unlink("/run/zrn-sensors");
-	symlink(OUT, "/run/zrn-sensors");
+	at(link, sizeof(link), "/run/zrn-sensord.ctl");
+	unlink(link);
+	symlink(ctl_path, link);
+	at(link, sizeof(link), "/run/zrn-sensors");
+	unlink(link);
+	symlink(out_path, link);
 	/* read and write: with no writer left a read-only pipe reads as closed */
-	FILE *ctl = fopen(CTL, "r+");
+	FILE *ctl = fopen(ctl_path, "r+");
 	if (!ctl) {
-		perror("ztoscsf-sensord: " CTL);
+		fprintf(stderr, "ztoscsf-sensord: %s: %s\n", ctl_path, strerror(errno));
 		return 1;
 	}
 	fcntl(fileno(ctl), F_SETFL, O_RDWR | O_NONBLOCK);
@@ -572,11 +723,19 @@ int main(void) {
 	status();
 	fprintf(stderr, "ztoscsf-sensord: started, auto brightness %s\n", auto_on ? "on" : "off");
 
-	struct pollfd fds[2] = { { .fd = dev, .events = POLLIN }, { .fd = fileno(ctl), .events = POLLIN } };
+	/* sysfs wakes poll with POLLPRI when zrn-bbd notifies the counter; a
+	 * negative fd (no counter) is skipped by poll */
+	struct pollfd fds[3] = { { .fd = dev, .events = POLLIN }, { .fd = fileno(ctl), .events = POLLIN },
+		{ .fd = resume_fd, .events = POLLPRI | POLLERR } };
 	while (!stopping) {
-		/* awake on a timer only while the brightness is on its way somewhere */
+		/* awake on a timer only while the brightness is on its way
+		 * somewhere, or while the hub owes an echo */
 		bool ramping = auto_on && screen_on && goal >= 0 && shown != goal;
-		if (poll(fds, 2, ramping ? 40 : -1) < 0) {
+		int timeout = ramping ? 40 : -1, wait = hub_wait_ms();
+		if (wait >= 0 && (timeout < 0 || wait < timeout)) {
+			timeout = wait;
+		}
+		if (poll(fds, 3, timeout) < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
@@ -594,16 +753,23 @@ int main(void) {
 			}
 			clearerr(ctl);
 		}
+		resume_check();	/* also after other wakes: one read, and no notify is lost */
+		hub_expire();
 		if (ramping && shown != goal) {
 			brightness_show(shown + (goal > shown ? 1 : -1));
 		}
 	}
-	if (stopping) {	/* leave the hub quiet */
+	if (stopping) {	/* leave the hub quiet: the REMOVEs one by one, 1 s at most */
 		screen_on = false;
 		sensors_apply();
-		for (int i = 0; i < 20 && n_pending; i++) {
-			poll(fds, 1, 50);
-			hub_read();
+		uint64_t end = now_ns() + 1000000000ULL;
+		while ((nq || inflight) && now_ns() < end) {
+			int ms = hub_wait_ms(), left = (int)((end - now_ns()) / 1000000) + 1;
+			poll(fds, 1, ms < 0 || ms > left ? left : ms);
+			if (!hub_read()) {
+				break;
+			}
+			hub_expire();
 		}
 		return 0;
 	}
