@@ -9496,7 +9496,7 @@ static void retro_setup(struct zt_server *server) {
 	dm_launcher_set_palette(server->dm, server->dm_palette, server->dm_amoled);
 	retro_apps(server);
 	dm_launcher_set_config(server->dm, &server->dm_cfg);
-	if (!server->dm_timer) {
+	if (!server->dm_timer && server->loop) {	/* (none when only rendering to files) */
 		server->dm_timer = wl_event_loop_add_timer(server->loop, retro_timer_fired, server);
 	}
 	const struct dm_screen *s = dm_launcher_screen(server->dm);
