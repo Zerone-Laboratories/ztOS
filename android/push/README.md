@@ -29,6 +29,8 @@ have to be kept awake (the old `keep_awake=` exemption) to get its messages.
 | `ztos-waydroid-recover microg` | the same (root) | microG's device identity; microG's own MCS kept off |
 | `ztos-waydroid-power` | `android/waydroid/power.sh` | no freeze while a push hold is on |
 | `ztos-android` | `os/overlay/usr/local/bin` | ATL apps get their package as GApplication id, and a D-Bus service file |
+| `network.py` | `android/waydroid` | `push_background=` apps keep Android's background rights |
+| `reregister-waydroid-app.sh` | here (root, by hand) | drops an app's cached Firebase token so it registers again |
 | `/etc/sudoers.d/zrn-pushd` | written by `install.sh` | the user may run the two root actions above |
 
 ### One device identity
@@ -146,6 +148,45 @@ that is not running (its window opens, as ATL does upstream).
 
 When one package is registered in both runtimes, its messages go to the ATL
 copy, because the category does not tell the two apart.
+
+### Background rights inside Android
+
+Waydroid's background policy (`network.py`) restricts every app the user
+did not pick. It sets `RUN_ANY_IN_BACKGROUND` to `ignore` and puts the app in
+the restricted standby bucket. Such an app still gets its message, because
+its receiver runs, but Android refuses it a foreground service ("not allowed
+due to bg restriction"). Telegram X fetching its messages was refused this
+way in the first test. Two settings in `~/.config/ztos/android.conf` lift
+the restriction:
+
+- `keep_awake=PKG,...` gives the app background rights inside Android. It
+  also keeps Android thawed (perfd, `ztos-waydroid-power`) and keeps the SoC
+  awake (zrn-sleepd).
+- `push_background=PKG,...` gives only the background rights. Android still
+  freezes, and push thaws it when a message comes. Use this for a chat app
+  once its push is proven.
+
+## WhatsApp: from keep_awake to push
+
+WhatsApp keeps `keep_awake=com.whatsapp` until a real message has been seen
+to arrive by push. To make the switch:
+
+1. WhatsApp must have registered through microG under the current identity.
+   `gcmstatus` must list `com.whatsapp`:
+   `sqlite3 ~/.local/share/waydroid/data/data/com.google.android.gms/databases/gcmstatus 'select package_name from registrations'`
+   (as root). On 29 Oct it did not. Firebase in WhatsApp hands out the token it
+   cached on 25 Oct (`shared_prefs/com.google.android.gms.appid.xml`), and
+   setting `c2dm_app_vers` back does not get past that cache. Firebase
+   refreshes the token by itself 7 days after it was cached, or when
+   WhatsApp updates. With the user's consent for WhatsApp's data,
+   `sudo ./reregister-waydroid-app.sh com.whatsapp .Main` does it now.
+2. In `android.conf`, replace `keep_awake=com.whatsapp` with
+   `push_background=com.whatsapp`. Within 5 s `network.py` keeps WhatsApp's
+   Android background rights, and Android may now freeze.
+3. With the screen off and Android frozen, have someone send a message. The
+   journal (`journalctl --user -u zrn-pushd`) shows `message for com.whatsapp`
+   and then `delivered`, and the notification appears. If it does not, put
+   `keep_awake=com.whatsapp` back.
 
 ## Install
 

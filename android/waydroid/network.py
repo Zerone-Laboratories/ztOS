@@ -62,6 +62,22 @@ def keep_awake_packages():
     return packages
 
 
+def push_background_packages():
+    """push_background= in android.conf: apps that get their messages by push
+    (zrn-pushd thaws Android for each one) and need Android's background
+    rights to act on them (fetch, post a notification, ring), without
+    keeping Android awake the way keep_awake does."""
+    packages = set()
+    try:
+        for line in ztos_user.home('.config/ztos/android.conf').read_text().splitlines():
+            key, separator, value = line.partition('=')
+            if separator and key.strip() == 'push_background':
+                packages.update(item.strip() for item in value.split(',') if item.strip())
+    except OSError:
+        pass
+    return packages
+
+
 # IActivityManager.Stub.TRANSACTION_setProcessLimit in this image's framework.jar
 # (LineageOS 20, Android 13; android/app/IActivityManager$Stub, 0x2c)
 SET_PROCESS_LIMIT = 44
@@ -87,10 +103,10 @@ def policy_stamp():
 
 def background_policy(attach):
     """Background rights for the apps the user chose (Settings > background
-    apps, or keep_awake in android.conf); every other installed app is
+    apps, or keep_awake or push_background in android.conf); every other installed app is
     restricted: no background work, the restricted standby bucket, stopped."""
     stamp = policy_stamp()
-    keep = keep_awake_packages()
+    keep = keep_awake_packages() | push_background_packages()
     listed = run([*attach[:-1], attach[-1] + 'pm', 'list', 'packages', '-3'])
     if listed.returncode:
         raise RuntimeError(listed.stderr.strip())
