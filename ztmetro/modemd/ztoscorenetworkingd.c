@@ -692,6 +692,12 @@ static bool call_incoming, call_seen, fake_call;
  * active (stat 0) while it still rings, so a call coming in is only active
  * once it was answered here. */
 static bool call_answering;
+/* This call was dialled here. The modem's list says nothing useful about one:
+ * a call to 0777717794 came back "+CLCC: 0,1,0,4,0" (direction 1, stat 0, as a
+ * call coming in) while it was still ringing at the far end, and went to the
+ * "incoming" screen with the ringtone on top of the call (2026-10-30). The
+ * modem's own report says when it is answered: call_connected. */
+static bool call_dialled, call_connected;
 static int empty_lists;	/* AT+CLCC answered with no call, in a row */
 static long fake_until;
 /* Hang-up, as the person sees it, is at once: the call is over here and the
@@ -700,6 +706,11 @@ static long fake_until;
  * comes back on screen rather than running on unseen. */
 #define RELEASE_GIVE_UP_MS	10000
 static long release_since, release_again_at, release_next_poll;
+/* What was said of the call let go may still be arriving when the next one
+ * starts: its one "over" is not the new call's. */
+static long stale_end_until;
+/* A ring this long after the hang-up is a call, new or not let go. */
+#define RELEASE_RING_MS		4000
 static bool release_saw_call;
 
 
@@ -730,8 +741,13 @@ static void call_audio(int route)
 		snprintf(cmd, sizeof(cmd), "amixer -q -c0 cset name='Voice Call' %s", names[route]);
 		if (system(cmd))
 			fprintf(stderr, "ztoscorenetworkingd: %s: failed\n", cmd);
-		if (!call_audio_route)
+		if (!call_audio_route) {
+			/* every call starts unmuted, as Android's does: the modem keeps
+			 * its mute from call to call, whoever left it on */
+			unsigned char unmuted = 0;
 			ipc_send(0x09, 0x09, 1, &on, 1);
+			ipc_send(0x09, 0x02, 3, &unmuted, 1);
+		}
 		ipc_send(0x09, 0x03, 3, path, 2);
 		ipc_send(0x09, 0x01, 3, volume, 2);
 	} else {
@@ -752,8 +768,10 @@ static void call_set(const char *state, const char *number)
 		call_since = time(NULL);
 		call_answered_at = 0;
 		call_answering = false;
+		call_connected = false;
 		empty_lists = 0;
 		call_incoming = !strcmp(state, "incoming");
+		call_dialled = !strcmp(state, "dialing");
 	}
 	if (!strcmp(state, "active") && !call_answered_at)
 		call_answered_at = time(NULL);
@@ -806,6 +824,13 @@ static void on_line(char *l)
 			raw_at[0] = 0;
 	}
 	if (!strcmp(l, "NO CARRIER") || !strcmp(l, "BUSY") || !strcmp(l, "NO ANSWER") || !strcmp(l, "NO DIALTONE")) {
+		if (stale_end_until && ms() < stale_end_until && now.call[0] && !release_since) {
+			stale_end_until = 0;
+			fprintf(stderr, "ztoscorenetworkingd: %s: the call before this one\n", l);
+			if (busy && (!strncmp(sent, "ATD", 3) || !strncmp(sent, "ATA", 3)))
+				busy = false;
+			return;
+		}
 		release_done(l);
 		snprintf(call_result, sizeof(call_result), "%s", !strcmp(l, "BUSY") ? "busy" : "drop");
 		call_set("", "");
@@ -920,9 +945,10 @@ static void on_line(char *l)
 		if (sms_index >= 0)
 			queue_at("AT+CMGD=%d", sms_index);
 		sms_index = -1;
-	} else if (release_since && (!strcmp(l, "RING") || !strncmp(l, "+CRING", 6) || !strncmp(l, "+CLIP:", 6))) {
+	} else if (release_since && ms() - release_since < RELEASE_RING_MS &&
+		   (!strcmp(l, "RING") || !strncmp(l, "+CRING", 6) || !strncmp(l, "+CLIP:", 6))) {
 		/* the call being let go, still ringing */
-	} else if (release_since && !strncmp(l, "+CLCC:", 6)) {
+	} else if (release_since && !now.call[0] && !strncmp(l, "+CLCC:", 6)) {
 		call_seen = true;
 	} else if (!strcmp(l, "RING") || !strncmp(l, "+CRING", 6)) {
 		if (strcmp(now.call, "incoming"))
@@ -951,7 +977,10 @@ static void on_line(char *l)
 			call_seen = true;
 			const char *state = stat == 0 ? "active" : stat == 2 ? "dialing" : stat == 3 ? "ringing" :
 				stat == 4 || stat == 5 ? "incoming" : "active";
-			if (!strcmp(state, "active") && (dir == 1 || call_incoming) && !call_answering)
+			if (call_dialled) {
+				if (strcmp(state, "dialing"))
+					state = call_connected ? "active" : "ringing";
+			} else if (!strcmp(state, "active") && (dir == 1 || call_incoming) && !call_answering)
 				state = "incoming";
 			if (strcmp(state, now.call))
 				fprintf(stderr, "ztoscorenetworkingd: modem: +CLCC:%s -> %s\n", l + 6, state);
@@ -1818,6 +1847,18 @@ static void ipc_message(int main_cmd, int sub, int type, int mseq, const unsigne
 		now.data = false;
 		now.ip[0] = 0;
 		data_tried_at = 0;
+	} else if (main_cmd == 0x02 && sub == 0x05 && type == 3 && len >= 4) {
+		/* A call's state, as seen on real calls: byte 3 is 1 setting up, 3
+		 * connected, 4 released. */
+		if (data[3] == 3) {
+			call_connected = true;
+			if (call_dialled && now.call[0] && strcmp(now.call, "active")) {
+				fprintf(stderr, "ztoscorenetworkingd: the far end answered\n");
+				call_set("active", "");
+			}
+		} else if (data[3] == 4) {
+			release_done("ipc released");
+		}
 	} else if (main_cmd == 0x26 && sub == 0x01 && type == 1) {
 		/* OesDrkCpInfo: confirmed as stock does, if asked to */
 		if (replying(reply_cfrm)) {
@@ -2006,6 +2047,11 @@ static void command(char *l)
 	} else if (!strncmp(l, "call ", 5)) {
 		char number[32];
 		if (sscanf(l + 5, "%31[0-9+*#]", number) == 1 && !now.call[0]) {
+			if (release_since) {
+				/* the last one's end is not waited for any more */
+				stale_end_until = ms() + RELEASE_GIVE_UP_MS;
+				release_since = 0;
+			}
 			call_set("dialing", number);
 			queue_at("ATD%s;", number);
 			call_poll_at = ms() + 1500;
@@ -2338,12 +2384,17 @@ int main(int argc, char **argv)
 				}
 			}
 		}
+		if (release_since && now.call[0]) {
+			/* a call came in meanwhile: asking again would end that one */
+			fprintf(stderr, "ztoscorenetworkingd: hangup: a new call; no more asking\n");
+			release_since = 0;
+		}
 		if (release_since) {
 			long t = ms();
 			if (t - release_since >= RELEASE_GIVE_UP_MS) {
 				fprintf(stderr, "ztoscorenetworkingd: hangup: the modem still lists the call\n");
 				release_since = 0;
-				if (release_saw_call)
+				if (release_saw_call && !now.call[0])
 					call_set("active", "");
 			} else if (t >= release_again_at) {
 				release_send();
@@ -2362,7 +2413,7 @@ int main(int argc, char **argv)
 			/* how the path of the call stands: numbers only, for the journal */
 			static long diag_at;
 			if (!fake_call && call_audio_route && ms() >= diag_at) {
-				char diag[220] = "";
+				char diag[320] = "";
 				FILE *f = fopen("/sys/module/snd_zrn_abox/parameters/call_diag", "r");
 				if (f) {
 					if (fgets(diag, sizeof(diag), f))
