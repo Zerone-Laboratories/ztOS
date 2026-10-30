@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""zrn-testmode: switch something off for a test, and be sure it comes back.
+
+Every test change is written to a ledger before it is made, with the command
+that undoes it and an expiry. Whatever the agent or person doing the test
+does next (finishes, crashes, loses the link, reboots the phone), a timer and
+a boot unit run the undo once the entry expires.
+
+  zrn-testmode off NAME --undo 'CMD' [--ttl 2h|30m|boot] [--why TEXT] -- CMD...
+      record NAME, then run CMD (the change). --ttl boot: undo at the next boot.
+  zrn-testmode note NAME --undo 'CMD' [--ttl ...] [--why TEXT]
+      record a change already made by hand.
+  zrn-testmode restore NAME | --all | --expired
+      run the undo; the entry goes once its undo succeeds.
+  zrn-testmode list
+      what is off now, why, and when it comes back.
+
+Safety switch-offs are not test changes: zrn-sleepd switching sleep off after a
+sleep that never came back must stay off until someone looks. Never record one.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DIR = Path(os.environ.get('ZRN_TESTMODE_DIR', '/var/lib/zrn-testmode'))
+ENTRIES = DIR / 'entries'
+LOG = DIR / 'log'
+DEFAULT_TTL = 2 * 3600
+
+
+def log(msg):
+	DIR.mkdir(parents=True, exist_ok=True)
+	with open(LOG, 'a') as f:
+		f.write(time.strftime('%Y-%m-%d %H:%M:%S ') + msg + '\n')
+
+
+def boot_id():
+	return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+
+def parse_ttl(s):
+	if s == 'boot':
+		return None
+	units = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+	if s[-1] in units:
+		return int(float(s[:-1]) * units[s[-1]])
+	return int(s)
+
+
+def entry_path(name):
+	if not name or '/' in name or name.startswith('.'):
+		sys.exit(f'zrn-testmode: bad name {name!r}')
+	return ENTRIES / (name + '.json')
+
+
+def record(name, undo, ttl, why):
+	ENTRIES.mkdir(parents=True, exist_ok=True)
+	p = entry_path(name)
+	if p.exists():
+		sys.exit(f'zrn-testmode: {name} is already off; restore it first')
+	e = {'name': name, 'undo': undo, 'why': why, 'made': int(time.time()),
+	     'boot': boot_id(), 'until': None if ttl is None else int(time.time()) + ttl,
+	     'by': os.environ.get('SUDO_USER') or os.environ.get('USER', '?')}
+	tmp = p.with_suffix('.tmp')
+	tmp.write_text(json.dumps(e))
+	os.replace(tmp, p)
+	log(f'off {name} ({why or "no reason given"}), undo: {undo}')
+
+
+def expired(e):
+	if e['until'] is None:
+		return e['boot'] != boot_id()
+	return time.time() >= e['until']
+
+
+def entries():
+	if not ENTRIES.exists():
+		return []
+	out = []
+	for p in sorted(ENTRIES.glob('*.json')):
+		try:
+			out.append(json.loads(p.read_text()))
+		except (OSError, ValueError):
+			log(f'unreadable entry {p.name}, left in place')
+	return out
+
+
+def restore(e):
+	r = subprocess.run(['sh', '-c', e['undo']], capture_output=True, text=True, timeout=120)
+	if r.returncode == 0:
+		entry_path(e['name']).unlink(missing_ok=True)
+		log(f'restored {e["name"]}')
+		return True
+	log(f'restore {e["name"]} failed ({r.returncode}): {(r.stderr or r.stdout).strip()[:200]}')
+	return False
+
+
+def opts(args):
+	o, rest = {}, []
+	while args:
+		a = args.pop(0)
+		if a == '--':
+			o['cmd'] = args[:]
+			break
+		if a in ('--undo', '--ttl', '--why'):
+			o[a[2:]] = args.pop(0)
+		else:
+			rest.append(a)
+	return o, rest
+
+
+def main(argv):
+	if not argv or argv[0] in ('-h', '--help'):
+		print(__doc__.strip())
+		return 0
+	cmd, args = argv[0], argv[1:]
+	if cmd in ('off', 'note'):
+		o, rest = opts(args)
+		if len(rest) != 1 or 'undo' not in o or (cmd == 'off' and not o.get('cmd')):
+			sys.exit(f'usage: zrn-testmode {cmd} NAME --undo CMD [--ttl T] [--why TEXT]' +
+				 (' -- CMD...' if cmd == 'off' else ''))
+		ttl = parse_ttl(o['ttl']) if 'ttl' in o else DEFAULT_TTL
+		record(rest[0], o['undo'], ttl, o.get('why', ''))
+		if cmd == 'off':
+			r = subprocess.run(o['cmd'])
+			if r.returncode != 0:
+				log(f'change for {rest[0]} failed ({r.returncode}); restoring')
+				restore(next(e for e in entries() if e['name'] == rest[0]))
+				return r.returncode
+		return 0
+	if cmd == 'restore':
+		todo = entries()
+		if args == ['--expired']:
+			todo = [e for e in todo if expired(e)]
+		elif args != ['--all']:
+			todo = [e for e in todo if e['name'] in args]
+			if len(todo) != len(args):
+				sys.exit('zrn-testmode: no such entry')
+		ok = all([restore(e) for e in todo])
+		return 0 if ok else 1
+	if cmd == 'list':
+		es = entries()
+		if not es:
+			print('nothing off')
+		for e in es:
+			when = 'next boot' if e['until'] is None else \
+				time.strftime('%H:%M', time.localtime(e['until']))
+			print(f"{e['name']}: back at {when}{' (due)' if expired(e) else ''}"
+			      f" - {e['why'] or 'no reason'} [by {e['by']}]\n    undo: {e['undo']}")
+		return 0
+	sys.exit(f'zrn-testmode: unknown command {cmd}')
+
+
+if __name__ == '__main__':
+	sys.exit(main(sys.argv[1:]))
