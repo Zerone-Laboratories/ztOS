@@ -1,0 +1,31 @@
+#!/bin/sh
+# zrn-batlog: a battery sample a minute, and one at once when the charger is
+# plugged in or pulled out, for the Power app's drain graph.
+#
+# Each line of /var/lib/zrn-power/battery.log:
+#   epoch percent charge_uAh charger_online current_avg_uA
+# Nothing runs while the SoC sleeps: the first sample after a wake shows what
+# the sleep cost. The log keeps about four days.
+BAT=/sys/class/power_supply/max170xx_battery
+CHG=/sys/class/power_supply/max77705-charger
+DIR=/var/lib/zrn-power
+LOG=$DIR/battery.log
+MAX=262144
+
+mkdir -p "$DIR"
+last=-1
+due=0
+while :; do
+	online=$(cat "$CHG/online" 2>/dev/null || echo 0)
+	now=$(date +%s)
+	if [ "$online" != "$last" ] || [ "$now" -ge "$due" ]; then
+		echo "$now $(cat "$BAT/capacity") $(cat "$BAT/charge_now") $online" \
+			"$(cat "$BAT/current_avg" 2>/dev/null || echo 0)" >>"$LOG"
+		last=$online
+		due=$((now + 60))
+		if [ "$(stat -c %s "$LOG")" -gt "$MAX" ]; then
+			tail -c $((MAX / 2)) "$LOG" | tail -n +2 >"$LOG.new" && mv "$LOG.new" "$LOG"
+		fi
+	fi
+	sleep 10
+done

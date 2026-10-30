@@ -1,0 +1,11 @@
+[Unit]
+Description=Battery samples for the Power app's drain graph
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/zrn-batlog
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
