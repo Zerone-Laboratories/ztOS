@@ -1,3 +1,58 @@
+# Modem wakes: which channel carried them — 2026-10-30
+
+A wake by the CP's mailbox (wake_stat bit 24, `modem`) says nothing of what
+the CP sent. zrn-sleepd now names the channel, from the modem's own wakeup
+sources:
+
+- each of zrn-modem's io devices has a wakeup source of its own, and takes
+  it on every frame it receives (modem_v1 `iodev_lock_wlock`,
+  modem_io_device.c:453, 484): `umts_ipc0` (IPC, SIPC ch 0xeb),
+  `umts_rfs0` (the CP's file requests, ch 0xf5), `umts_router` (AT: RING,
+  +CMTI), `rmnet*`, `multipdp*`;
+- zrn-sleepd reads their `wakeup_count` and `event_count` right after its
+  `/sys/power/wakeup_count` write, and again 1.0 s after
+  `/sys/power/state` returns (the frames that wake the AP are read by the
+  resume path within milliseconds: 7 ms before modem_resume in J1);
+- every source that moved goes on the `woke:` line and into
+  `/run/zrn-sleepd/status` as `modem_rx=`:
+  `woke: modem (umts_ipc0 +2) wake_stat=0x81000000 after 140s`, or
+  `woke: modem (no channel rx)`; another reason with modem traffic in the
+  window reads `rtc (modem rx: umts_router +1)`.
+
+Not from the journal: the kernel's LNK-RX log never shows the AT channel
+(`log_enabled()`, modem/zrn-modem/modem_utils.c:303-323, has no case for
+ch 25, SIPC_CH_ID_BT_DUN), so a RING or +CMTI wake would read as
+unattributed there. No kernel or zrn-modem.ko change was needed.
+Host tests: `ModemRxTest` in test-sleepd-recovery.py (parsing a fake
+/sys/class/wakeup, an rfs-only, a router-only, no and a missing source,
+and cycle() recording the delta).
+
+Bench (30 Oct, on the charger, the CP's IPC kept alive by answering its
+file requests, modem/README.md; power/suspend/hub-bench/once-no-push.py,
+which is `once` with the timed-push inhibit not counted, because a busy
+Beeper chat held every sleep off for over an hour):
+
+| sleep | result |
+|---|---|
+| 11, 12, 13 (300 s) | RTC wakes after 297.1, 296.5, 297.1 s; `rtc (modem rx: umts_ipc0 +1)` on the first, nothing on the others; no `umts_rfs0` wake |
+| 14 | freezing aborted (335 tasks), then an EINT wake after 0.9 s from gpa1-6 (the MAX77705 charger) |
+| 15 | **the phone reset** about 60 s after `PM: suspend entry` (nothing logged; zrn-sleepd then switched sleep off: "the last sleep never came back") |
+| 21, 22 | charger EINT wakes (gpa1-6) after 7.7 and 6.8 s, `other (modem rx: umts_ipc0 +1)` |
+| 23 | a fw-abort (GRP4 bit 0 latched, grp4_at_smc 1) after 17.5 s; **the phone reset** during the retry's preparations (journal ends at the Wi-Fi unbind) |
+| 24 (just after boot) | `modem (umts_ipc0 +5, umts_router +1)` wake_stat 0x81000000 after 10.8 s |
+| 31, control: no answers to the CP | **the phone reset** during the preparations (journal ends at the Wi-Fi unbind) |
+| 32, control, 66 s after boot | `modem (umts_rfs0 +1)` after 3.7 s |
+
+**Open: three resets in the sleep path, with and without the modem
+answers**, so the answers are not the cause (observed, one control reset).
+All three came after the charger started raising EINT wakes (gpa1-6) and
+the battery discharged on the charger (-274 to -404 mA, input limit
+500 mA). Inferred, not shown: a hang the 60 s s3c2410 watchdog ended
+(`tmr_margin=60`); the console is suspended in sleep and ramoops held only
+the start of a boot. Sleeps 11-13, before the charger started, were clean.
+Sleep is switched off (zrn-sleepd's own safety switch-off) until this is
+understood.
+
 # The sensor hub and SoC sleep, round 2 — 2026-10-30
 
 **GNSS holds SoC sleep off (ztos-gnss-gate's timed-gnss); it does not
