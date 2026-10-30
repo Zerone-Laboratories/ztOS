@@ -13,8 +13,7 @@
  *
  * Calls are the modem daemon's (comm.h: "call", "answer", "hangup" on its
  * control pipe; its report says how the call stands, its log what calls there
- * were). The sound of a call is not routed on this phone yet: a call connects
- * and is silent, and the page says so.
+ * were). The sound of a call is the daemon's too.
  *
  *	ztphone				history
  *	ztphone NUMBER			the keypad with that number on it
@@ -30,6 +29,8 @@
 #include <cairo.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "zrnvibe.h"
@@ -149,6 +150,22 @@ static void sound_play(const char *file, bool loop) {
 		loop_pid = pid;
 		snprintf(loop_sound, sizeof(loop_sound), "%s", file);
 	}
+}
+
+/* A key's tone: through ztos-sounds, whose stream is already open and which cuts
+ * them short and one at a time; a pw-play for each key took a process start per
+ * press and left a second of tone under the next. Its protocol: sound, volume. */
+static void key_tone(int key) {
+	if (sample) return;
+	static int fd = -1;
+	int index = 10 + (key == '*' ? 10 : key == '#' ? 11 : key - '0');
+	int volume = ring_volume() * 60 / 100;
+	if (volume < 1) return;
+	if (fd < 0) fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	struct sockaddr_un to = { .sun_family = AF_UNIX };
+	snprintf(to.sun_path, sizeof(to.sun_path), "%s/ztos-sounds.sock", getenv("XDG_RUNTIME_DIR") ?: "/run/user/1000");
+	unsigned char packet[2] = { (unsigned char)index, (unsigned char)volume };
+	if (fd >= 0) sendto(fd, packet, sizeof(packet), MSG_DONTWAIT, (struct sockaddr *)&to, sizeof(to));
 }
 
 static void ringtone(char *out, size_t size) {
@@ -543,14 +560,16 @@ static double draw_call(cairo_t *cr) {
 			const char *labels[] = { "mute", "speaker", call_keys ? "hide keypad" : "keypad" };
 			int actions[] = { ACT_MUTE, ACT_SPEAKER, ACT_CALL_KEYS };
 			double side = (w - 16) / 3;
+			/* square tiles, as the reference; low ones under the keypad */
+			double tile = call_keys ? 64 : side, top = bottom + 22 - tile;
 			for (int i = 0; i < 3; i++) {
 				double x = MARGIN + i * (side + 8);
 				if ((i == 0 && muted) || (i == 1 && speaker) || (i == 2 && call_keys)) zmc_accent(cr);
 				else cairo_set_source_rgb(cr, .25, .25, .25);
-				cairo_rectangle(cr, x, bottom - 44, side, 64); cairo_fill(cr);
+				cairo_rectangle(cr, x, top, side, tile); cairo_fill(cr);
 				cairo_set_source_rgb(cr, 1, 1, 1);
-				zmc_text_centred(cr, labels[i], FONT_REGULAR, 15, x + side / 2, bottom - 23);
-				zmc_add_hit(x, bottom - 44, side, 64, actions[i], 0);
+				zmc_text_centred(cr, labels[i], FONT_REGULAR, 15, x + side / 2, top + tile / 2 - 10);
+				zmc_add_hit(x, top, side, tile, actions[i], 0);
 			}
 		}
 		cairo_set_source_rgb(cr, .25, .25, .25);
@@ -558,8 +577,6 @@ static double draw_call(cairo_t *cr) {
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		zmc_text_centred(cr, "end call", FONT_SEMILIGHT, 22, zmc.width / 2, bottom + 42);
 		zmc_add_hit(MARGIN, bottom + 30, w, 54, ACT_HANGUP, 0);
-		cairo_set_source_rgb(cr, .65, .65, .65);
-		zmc_text(cr, "Call audio is not routed yet. Neither side can hear.", FONT_REGULAR, 12, MARGIN, bottom + 94, w);
 	}
 	return zmc.height;
 }
@@ -663,6 +680,18 @@ static void dial(const char *who) {
 	}
 }
 
+/* The call is over on this page, now: its sound, "call ended", and away. */
+static void call_over(const char *result) {
+	answered_at = 0;
+	sound_stop();
+	sound_play(!strcmp(result, "busy") ? "Busy.wav" : !strcmp(result, "drop") ? "Calldrop.wav" : "Disconnct.wav", false);
+	ending = true;
+	ended_at = zmc_now_ms();
+	call_keys = muted = speaker = false;
+	snprintf(state, sizeof(state), "idle");
+	zmc_redraw();
+}
+
 static void other_app(const char *app, const char *arg) {
 	char command[160], clean[40];
 	size_t o = 0;
@@ -681,10 +710,11 @@ static void activate(int action, int arg) {
 	size_t len = strlen(digits);
 	switch (action) {
 	case ACT_KEY: {
-		char file[32];
-		snprintf(file, sizeof(file), "dtmf%s.wav", arg == '*' ? "ast" : arg == '#' ? "pd" : (char[2]){arg, 0});
-		sound_play(file, false);
-		if (on_call()) break;
+		if (arg != '+') key_tone(arg);
+		if (on_call()) {
+			modem_tell("dtmf %c", arg);
+			break;
+		}
 		if (len + 1 < sizeof(digits) - 1) {
 			digits[len] = (char)arg;
 			digits[len + 1] = 0;
@@ -731,6 +761,7 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_MUTE:
 		muted = !muted;
+		modem_tell(muted ? "mute on" : "mute off");
 		break;
 	case ACT_SPEAKER:
 		speaker = !speaker;
@@ -756,10 +787,10 @@ static void activate(int action, int arg) {
 		break;
 	}
 	case ACT_HANGUP:
-		sound_stop();
 		modem_tell("hangup");
 		zmc_haptic("click");
-		break;		/* the page goes when the modem says the call is over */
+		call_over("ended");	/* at once: the daemon sees the modem through it */
+		break;
 	case ACT_ANSWER:
 		sound_stop();
 		modem_tell("answer");
@@ -928,15 +959,9 @@ static void tick(void) {
 		came_from = zmc.page == P_ENTRY ? P_HISTORY : zmc.page;
 		zmc_go(P_CALL, 1);
 	} else if (!on_call() && was) {
-		answered_at = 0;
-		sound_stop();
 		char result[16];
 		modem_value("call_result", result, sizeof(result));
-		sound_play(!strcmp(result, "busy") ? "Busy.wav" : !strcmp(result, "drop") ? "Calldrop.wav" : "Disconnct.wav", false);
-		ending = true;
-		ended_at = zmc_now_ms();
-		call_keys = muted = speaker = false;
-		zmc_redraw();
+		call_over(result);
 		return;
 	} else if (changed || (zmc.page == P_CALL && !strcmp(state, "active"))) {
 		zmc_redraw();	/* the state, or the clock of the call */

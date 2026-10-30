@@ -1,6 +1,7 @@
 # Phone app redesign (WP 8.1 look, full-screen incoming call, stock sounds)
 
-Status: designed, not implemented (usage limit reached 2026-10-24).
+Status 2026-10-30: call page states, square tiles, swivels and stock sounds done. Still to do:
+the full-screen call over the lock screen (ztmetro.c, below) and `ztphone --call-screen` limits.
 
 ## References (scratchpad copies were temporary)
 - Incoming call, WP 8.1: dark grey screen; small accent caps "INCOMING CALL"; number/name in
@@ -34,7 +35,7 @@ Plan:
 ## Call page states (ztphone P_CALL)
 incoming: as the reference above (answer/ignore/text reply); outgoing: "calling" + ringback;
 active: timer top, name, number; row of square tiles mute | speaker | keypad, then
-full-width "end call". Keep the "sound not routed yet" note until call audio exists.
+full-width "end call".
 
 ## Related open item
 Hutch SIM: calls only register on 2G/3G (no VoLTE). Add to modemd: if CS not registered
