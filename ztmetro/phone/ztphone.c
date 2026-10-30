@@ -84,10 +84,23 @@ static char entry[40];			/* the number the entry page is of */
 static int menu_for = -1;
 static bool sample;
 static bool call_screen_only, call_keys, muted, speaker, ending, reply_hint;
-static uint32_t ended_at, swivel_at;
-static cairo_surface_t *swivel_surface;
-static unsigned swivel_revision;
-static bool swivel_leaving;
+/* The call as this page holds it. state[] above is what is on screen, and only
+ * tick() and the taps change it: the daemon's report is read through call_seen().
+ *
+ *   dialled	this app placed the call: it can never be one to answer
+ *   connected	it has been in progress: it stays so until it ends
+ *   answering	"answer" went down the pipe, the report has not caught up
+ *   daemon_said	the report has shown this call at all (a dial's first ticks)
+ *   daemon_idle	since the call ended here, the report has said so too
+ *   page_wanted	where the call wants the page to be, until it gets there
+ */
+static bool dialled, connected, answering, daemon_said, daemon_idle, redraw_wanted;
+static uint32_t ended_at, dialled_at, answered_tap_at;
+static int page_wanted = -1;
+static long clock_shown = -1;
+#define ENDED_MS	1000	/* "call ended" stays this long */
+#define DIAL_GRACE_MS	3000	/* a dial not yet in the report is not a call that ended */
+#define ANSWER_GRACE_MS	6000	/* after this an answer that did nothing rings again */
 static pid_t loop_pid;
 static char loop_sound[64];
 #define PHONE_SOUNDS "/usr/local/share/sounds/ztos/phone/"
@@ -633,42 +646,51 @@ static double render(cairo_t *cr, int page) {
 	return 0;
 }
 
-/* Keep the named Lumia swivel on the GPU; cache its face once per arrival. */
-static void arrived(int page) {
-	if (page != P_KEYPAD && page != P_CALL) return;
-	if (swivel_surface) cairo_surface_destroy(swivel_surface);
-	swivel_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, zmc.width * zmc.scale, zmc.height * zmc.scale);
-	cairo_surface_set_device_scale(swivel_surface, zmc.scale, zmc.scale);
-	cairo_t *cr = cairo_create(swivel_surface);
-	cairo_set_source_rgb(cr, 0, 0, 0); cairo_paint(cr);
-	int hits = zmc.n_hits;
-	render(cr, page);
-	zmc.n_hits = hits;
-	cairo_destroy(cr);
-	swivel_at = zmc_now_ms();
-	swivel_leaving = false;
-	swivel_revision++;
-	zmc_present();
-}
-
-static void overlay(int page) {
-	if (!swivel_surface || (page != P_CALL && page != P_KEYPAD)) return;
-	const char *transition = swivel_leaving ? "swivel-out" : "swivel-in";
-	double t = (zmc_now_ms() - swivel_at) / zmc_transition_ms(transition);
-	if (t >= 1) {
-		cairo_surface_destroy(swivel_surface);
-		swivel_surface = NULL;
-		return;
-	}
-	zmc_gpu_rect(0, 0, zmc.width, zmc.height, 0, 0, 0);
-	zmc_transition(transition, t, 0, 0, zmc.width, zmc.height, swivel_surface, swivel_revision);
-	zmc.dirty = true;	/* request the next callback without entering the renderer again */
-}
-
 /* ---- what taps do --------------------------------------------------------- */
 
+/* The one way the page moves for a call. The core ignores a turn asked for
+ * while another runs, and a turn over a moving pivot tears it: so this only
+ * notes where to be, and settle() goes there when nothing else is moving. */
+static void want_page(int page) {
+	page_wanted = page;
+}
+
+static void want_redraw(void) {
+	redraw_wanted = true;
+}
+
+static bool page_moving(void) {
+	return zmc.anim_active || zmc.slide_active || zmc.swiping || zmc.spring;
+}
+
+static void settle(void) {
+	if (page_moving()) return;
+	if (page_wanted >= 0) {
+		int page = page_wanted;
+		page_wanted = -1;
+		if (zmc.page != page) {
+			redraw_wanted = false;	/* the turn draws the page afresh */
+			zmc_go(page, page == P_CALL ? 1 : -1);
+			return;
+		}
+	}
+	if (redraw_wanted) {
+		redraw_wanted = false;
+		zmc_redraw();
+	}
+}
+
+static void call_begun(void) {
+	answered_at = 0;
+	clock_shown = -1;
+	connected = answering = false;
+	if (zmc.page != P_CALL) came_from = zmc.page == P_ENTRY ? P_HISTORY : zmc.page;
+	want_page(P_CALL);
+	want_redraw();
+}
+
 static void dial(const char *who) {
-	if (!who[0] || on_call()) {
+	if (!who[0] || on_call() || ending) {
 		return;
 	}
 	if (!modem_tell("call %s", who)) {
@@ -676,12 +698,12 @@ static void dial(const char *who) {
 	}
 	snprintf(number, sizeof(number), "%s", who);
 	snprintf(state, sizeof(state), "dialing");
-	answered_at = 0;
+	dialled = true;
+	daemon_said = false;
+	dialled_at = zmc_now_ms();
 	zmc_haptic("click");
-	if (zmc.page != P_CALL) {
-		came_from = zmc.page == P_ENTRY ? P_HISTORY : zmc.page;
-		zmc_go(P_CALL, 1);
-	}
+	call_begun();
+	settle();
 }
 
 /* The call is over on this page, now: its sound, "call ended", and away. */
@@ -691,9 +713,15 @@ static void call_over(const char *result) {
 	sound_play(!strcmp(result, "busy") ? "Busy.wav" : !strcmp(result, "drop") ? "Calldrop.wav" : "Disconnct.wav", false);
 	ending = true;
 	ended_at = zmc_now_ms();
+	/* the modem keeps its mute: the next call must not start with it on */
+	if (muted) modem_tell("mute off");
 	call_keys = muted = speaker = false;
+	dialled = connected = answering = daemon_said = false;
+	daemon_idle = false;
+	reply_hint = false;
 	snprintf(state, sizeof(state), "idle");
-	zmc_redraw();
+	want_redraw();
+	settle();
 }
 
 static void other_app(const char *app, const char *arg) {
@@ -710,7 +738,7 @@ static void other_app(const char *app, const char *arg) {
 }
 
 static void activate(int action, int arg) {
-	if (ending || (swivel_surface && zmc_now_ms() - swivel_at < 300)) return;
+	if (ending) return;
 	size_t len = strlen(digits);
 	switch (action) {
 	case ACT_KEY: {
@@ -797,6 +825,10 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_ANSWER:
 		sound_stop();
+		answering = true;
+		answered_tap_at = zmc_now_ms();
+		snprintf(state, sizeof(state), "active");	/* on the page at once; the ring must not resume */
+		if (!answered_at) answered_at = time(NULL);
 		modem_tell("answer");
 		zmc_haptic("click");
 		break;
@@ -923,60 +955,102 @@ static bool back(void) {
 	return false;
 }
 
-/* How the call stands, from the modem daemon's report: once a second. */
+/* What the report's state means for the call on this page. Every flip the
+ * report can make that is not news to the person holding the phone stops here:
+ * a call you placed or are already in is never one to answer, so it can neither
+ * ring nor put answer and ignore on the screen. */
+static const char *call_seen(const char *now) {
+	if (!strcmp(now, "incoming")) {
+		if (dialled || connected) return "active";
+		if (answering && zmc_now_ms() - answered_tap_at < ANSWER_GRACE_MS) return "active";
+		answering = false;
+	}
+	return now;
+}
+
+/* How the call stands, from the modem daemon's report: four times a second.
+ * This is the only place the report reaches the page. */
 static void tick(void) {
 	while (waitpid(-1, NULL, WNOHANG) > 0) {}
-	if (ending) {
-		if (!swivel_leaving && zmc_now_ms() - ended_at >= 600) {
-			arrived(P_CALL);
-			swivel_leaving = true;
-		}
-		if (zmc_now_ms() - ended_at >= 1000) {
-			ending = false;
-			number[0] = 0;
-			if (call_screen_only) zmc_quit();
-			else zmc_go(came_from, -1);
-		}
-		return;
-	}
-
 	char now[16], who[40];
-	bool was = on_call();
 	modem_value("call", now, sizeof(now));
 	modem_value("call_number", who, sizeof(who));
 	if (!now[0]) {
 		snprintf(now, sizeof(now), "idle");
 	}
-	bool changed = strcmp(now, state) != 0;
-	/* (just dialled: the daemon may not have said so yet) */
-	if (!strcmp(state, "dialing") && !strcmp(now, "idle") && !changed) {
+	bool daemon_on = strcmp(now, "idle") != 0;
+
+	if (ending) {
+		if (!daemon_on) daemon_idle = true;
+		if (daemon_idle && daemon_on) {
+			/* a new call, in the moment of the last one's "call ended" */
+			ending = false;
+			number[0] = 0;
+		} else if (zmc_now_ms() - ended_at < ENDED_MS) {
+			settle();
+			return;
+		} else if (daemon_idle) {
+			ending = false;
+			number[0] = 0;
+			if (call_screen_only) {
+				zmc_quit();
+				return;
+			}
+			want_page(came_from);
+			want_redraw();
+			settle();
+			return;
+		} else {
+			/* hung up here, and the report still has it: the daemon has not
+			 * let go, so the call is not over: show it again */
+			ending = false;
+		}
+	}
+
+	if (daemon_on) daemon_said = true;
+	/* just dialled: the daemon may not have said so yet */
+	if (dialled && !daemon_said && zmc_now_ms() - dialled_at < DIAL_GRACE_MS) {
+		settle();
 		return;
 	}
-	snprintf(state, sizeof(state), "%s", now);
+	bool was = on_call();
+	const char *seen = call_seen(now);
+	bool changed = strcmp(seen, state) != 0;
+	if (changed) snprintf(state, sizeof(state), "%s", seen);
 	if (who[0]) {
+		if (strcmp(number, who)) changed = true;
 		snprintf(number, sizeof(number), "%s", who);
 	}
-	if (!strcmp(state, "active") && !answered_at) {
-		answered_at = time(NULL);
-	}
-	if (on_call() && !was && zmc.page != P_CALL) {
-		came_from = zmc.page == P_ENTRY ? P_HISTORY : zmc.page;
-		zmc_go(P_CALL, 1);
-	} else if (!on_call() && was) {
+	if (!was && on_call()) {
+		call_begun();
+	} else if (was && !on_call()) {
 		char result[16];
 		modem_value("call_result", result, sizeof(result));
 		call_over(result);
 		return;
-	} else if (changed || (zmc.page == P_CALL && !strcmp(state, "active"))) {
-		zmc_redraw();	/* the state, or the clock of the call */
+	}
+	/* (the report's word, not the page's: an answer that did nothing is not a call) */
+	if (!strcmp(now, "active")) connected = true;
+	if (!strcmp(state, "active") && !answered_at) answered_at = time(NULL);
+	if (!strcmp(state, "incoming")) answered_at = 0;
+	if (changed) want_redraw();
+	if (zmc.page == P_CALL && !strcmp(state, "active") && answered_at) {
+		long seconds = time(NULL) - answered_at;	/* the clock: a page's drawing once a second */
+		if (seconds != clock_shown) {
+			clock_shown = seconds;
+			want_redraw();
+		}
+	}
+	if (on_call() && page_wanted < 0 && zmc.page != P_CALL && !page_moving()) {
+		want_page(P_CALL);	/* whatever turned away from a call in progress */
 	}
 	call_sound();
+	settle();
 }
 
 static const struct zmc_app phone = {
 	.app_id = "ztphone", .title = "Phone", .caps = "PHONE",
 	.render = render, .activate = activate, .back = back, .text = typed, .hold = hold,
-	.arrived = arrived, .overlay = overlay, .overlay_above_header = true,
 };
 
 int main(int argc, char **argv) {
@@ -1030,7 +1104,10 @@ int main(int argc, char **argv) {
 	if (call_now && !on_call() && modem_tell("call %s", call_now)) {
 		snprintf(number, sizeof(number), "%.38s", call_now);
 		snprintf(state, sizeof(state), "dialing");
+		dialled = true;
+		dialled_at = zmc_now_ms();
 	}
+	if (!strcmp(state, "active")) connected = true;
 	if (call_screen_only && !on_call()) return 0;
 	if (on_call()) {
 		first = P_CALL;
