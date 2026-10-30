@@ -33,6 +33,13 @@ void *zmg_dmabuf_import(int w, int h, uint32_t fourcc, uint64_t modifier, int pl
 void zmg_dmabuf_free(void *image);
 /* the whole image over the four corners (points), as zmg_surface */
 void zmg_dmabuf_draw(void *image, const struct zmg_vertex corners[4], float alpha);
+/* A small texture updated whole, again and again, without going through the
+ * retained pictures: one row of a long list. */
+unsigned zmg_row_new(int w, int h);
+void zmg_row_upload(unsigned texture, cairo_surface_t *source);
+void zmg_row_draw(unsigned texture, double u0, double v0, double u1, double v1,
+		const struct zmg_vertex corners[4], float alpha);
+void zmg_row_free(unsigned texture);
 void zmg_report(const char *app_id);
 void zmg_fini(void);
 /* below 1: what zmg_surface and zmg_dmabuf_draw draw shows through that share

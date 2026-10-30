@@ -61,7 +61,6 @@ enum action {
 	ACT_MENU_CLOSE,
 	ACT_SUGGEST,	/* arg: a contact the digits match: its number */
 	ACT_PERSON,	/* arg: a row of the contacts tab */
-	ACT_ALL_PEOPLE,
 	ACT_GOOGLE,
 	ACT_SPEED_TILE,	/* arg: which speed dial entry (n_speed: the plus) */
 	ACT_SPEED_MENU,	/* arg: 0 remove, 1 move up, 2 move down */
@@ -480,9 +479,48 @@ static void draw_suggestions(cairo_t *cr, double y, double bottom) {
 	}
 }
 
-/* Everyone: tap for their page. The core takes so many tap targets a page, so
- * the rest are in People. */
-#define CONTACT_ROWS 140
+/* Everyone: tap for their page. A zmc_list, as in People: all of them, under
+ * their letters, with only the rows near the screen drawn. */
+#define CONTACT_ROW_H 62
+static int contact_rows[MAX_CONTACTS + 27];	/* a person; or -1 - a letter */
+static int n_contact_rows;
+
+static char contact_letter(const struct contact *c) {
+	char first = (char)toupper((unsigned char)c->name[0]);
+	return first >= 'A' && first <= 'Z' ? first : '#';
+}
+
+static void contacts_row_draw(cairo_t *cr, int row) {
+	int v = contact_rows[row];
+	if (v < 0) {
+		char text[2] = { (char)tolower((unsigned char)(-1 - v)), 0 };
+		zmc_accent(cr);
+		cairo_rectangle(cr, MARGIN, 8, 42, 42);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, text, FONT_SEMILIGHT, 26, MARGIN + 6, 16, 0);
+		return;
+	}
+	const struct contact *c = &contacts[v];
+	contact_tile(cr, MARGIN, 7, 48, c->name, c->uid);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text_line(cr, c->name, FONT_SEMILIGHT, 24, MARGIN + 60, 6, zmc.width - 2 * MARGIN - 60);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text_line(cr, c->mobile[0] ? c->mobile : c->other, FONT_REGULAR, 13.5, MARGIN + 60, 37, zmc.width - 2 * MARGIN - 60);
+}
+
+static bool contacts_row_hit(int row, double x, double y, struct zmc_hit *hit) {
+	if (contact_rows[row] < 0) {
+		return false;
+	}
+	*hit = (struct zmc_hit){ .x = 0, .y = 4, .w = zmc.width, .h = 58, .action = ACT_PERSON, .arg = contact_rows[row] };
+	return true;
+}
+
+__attribute__((unused)) static bool contacts_row_head(int row) {
+	return contact_rows[row] < 0;
+}
+
 static double draw_contacts(cairo_t *cr) {
 	zmc.pivot_after = "speed dial";
 	double y = zmc_pivot_next(cr, "contacts", "history", ZMC_ACT_PIVOT, P_HISTORY);
@@ -493,21 +531,21 @@ static double draw_contacts(cairo_t *cr) {
 		y = zmc_entry(cr, y + 34, "sign in with Google", "bring your contacts here", ACT_GOOGLE, 0);
 		return y + 40;
 	}
-	int shown = n_contacts < CONTACT_ROWS ? n_contacts : CONTACT_ROWS;
-	for (int i = 0; i < shown; i++) {
-		struct contact *c = &contacts[i];
-		contact_tile(cr, MARGIN, y + 1, 48, c->name, c->uid);
-		cairo_set_source_rgb(cr, 1, 1, 1);
-		zmc_text_line(cr, c->name, FONT_SEMILIGHT, 24, MARGIN + 60, y, zmc.width - 2 * MARGIN - 60);
-		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		zmc_text_line(cr, c->mobile[0] ? c->mobile : c->other, FONT_REGULAR, 13.5, MARGIN + 60, y + 31, zmc.width - 2 * MARGIN - 60);
-		zmc_add_hit(0, y - 2, zmc.width, 58, ACT_PERSON, i);
-		y += 62;
+	char letter = 0;
+	n_contact_rows = 0;
+	for (int i = 0; i < n_contacts; i++) {
+		char first = contact_letter(&contacts[i]);
+		if (first != letter) {
+			letter = first;
+			contact_rows[n_contact_rows++] = -1 - first;
+		}
+		contact_rows[n_contact_rows++] = i;
 	}
-	if (shown < n_contacts) {
-		y = zmc_entry(cr, y, "all people", "the rest are in People", ACT_ALL_PEOPLE, 0);
-	}
-	return y + 40;
+	struct zmc_list list = { .count = n_contact_rows, .row_h = CONTACT_ROW_H,
+		.revision = contact_list_revision(), .draw_row = contacts_row_draw,
+		.row_hit = contacts_row_hit,
+		.pin_x = 0, .pin_y = 0, .pin_w = zmc.width, .pin_h = CONTACT_ROW_H };
+	return zmc_list(cr, y - 6, &list) + 40;
 }
 
 static double suggest_y;
@@ -949,9 +987,6 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_GOOGLE:
 		run_app("ztcontacts --google");
-		break;
-	case ACT_ALL_PEOPLE:
-		run_app("ztcontacts");
 		break;
 	case ACT_SPEED_TILE:
 		if (arg >= 0 && arg < n_speed) {

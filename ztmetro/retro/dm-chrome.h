@@ -59,6 +59,9 @@ void dm_dot_rect(cairo_t *cr, double x, double y, double w, double h, double pit
  * dm_wrap_active() says so. dm_wrap_pitch: the lattice, in points. */
 extern bool (*dm_wrap_active)(void);
 extern double dm_wrap_pitch;
+/* device pixels the target's top is below the lattice's: a piece of a longer
+ * picture (one row of a list) falls on the same lattice as the rest of it */
+extern double dm_wrap_origin_y;
 extern int dm_wrap_raw;		/* above 0: fills and strokes go through as they are */
 /* any colour in the palette: a colour becomes the accent, a grey the main
  * colour at its brightness */

@@ -138,6 +138,9 @@ static double press_geometry(double w, double h, double *rx, double *ry);
 static int out_tapped = -1;	/* the row of out_rows that was tapped, or -1 */
 static void begin_animation(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start);
 
+static void back_forget(void);
+static cairo_surface_t *pivot_snapshot(int page, double scroll, int scale, struct zmc_rowset *rows,
+		double *its_next_dx);
 /* The shell plays it, if the user has that kind of touch switched on: one
  * line down its control pipe, never waited for. */
 void zmc_haptic(const char *kind) {
@@ -698,12 +701,527 @@ static void frame_done(void *data, struct wl_callback *callback, uint32_t time) 
 static const struct wl_callback_listener frame_listener = { .done = frame_done };
 
 /* One page drawn whole, at `scale` pixels per point. */
+/* ---- a long list (zmc_list) --------------------------------------------------
+ *
+ * The page's cache holds what is above the list, and at the top of the list the
+ * rows that fit on the first screen, so that everything that takes the cache as
+ * a picture of the page at rest still can. Every other row is drawn when it
+ * comes near the screen into one small texture, kept while it stays near, and
+ * only moved after that. Pictures of the page scrolled (a page turn, a pivot)
+ * are drawn fresh with just the rows in sight.
+ */
+#define LIST_SLOTS	24
+#define LIST_HEADS	64
+#define LIST_PAGES	32
+static struct {
+	bool active;
+	struct zmc_list l;
+	double top;
+	int cache_rows;		/* rows drawn into the page's cache: the first ones */
+	int heads[LIST_HEADS], n_heads;
+} vl;
+static double vl_window = -1;	/* drawing a picture of the page scrolled so far; -1: the cache */
+static bool vl_skip;		/* a second pass, for the title only: no rows */
+static double vl_saved[LIST_PAGES];	/* where each list was left, or is to be shown */
+static double vl_mem_top, vl_mem_row;
+static int vl_mem_count;
+static uint64_t vl_heads_rev = 1;
+static int vl_heads_count = -1;
+static int vl_heads_mem[LIST_HEADS], vl_heads_n;
+static bool vl_frozen;
+static struct {
+	int row;		/* -1: free */
+	uint64_t rev;
+	unsigned tex;
+	cairo_surface_t *cpu;	/* without the GPU */
+	unsigned used;
+} vl_slot[LIST_SLOTS];
+static bool vl_slots_set;
+static int vl_slots_w, vl_slots_h, vl_slots_n, vl_used;
+static cairo_surface_t *vl_scratch;
+static int vl_last_r0;		/* which way the list is going */
+static int vl_r0, vl_r1;	/* the rows in use this frame */
+static double vl_pin_at;	/* the pinned head: where on the screen; */
+static int vl_pin_row = -1;	/* and which row */
+
+static void vl_begin(double window) {
+	vl.active = false;
+	vl_window = window;
+}
+
+/* the part of a head that is pinned, drawn straight into a picture */
+static void vl_pin_where(double scroll) {
+	vl_pin_row = -1;
+	if (!vl.active || !vl.l.is_head || vl.n_heads == 0 || scroll <= 0) return;
+	double h = vl.l.row_h;
+	int at = (int)floor((scroll + HEADER_H - vl.top) / h);
+	if (at < 0) return;
+	int head = -1, next = -1;
+	for (int i = 0; i < vl.n_heads; i++) {
+		if (vl.heads[i] <= at) {
+			head = vl.heads[i];
+		} else {
+			next = vl.heads[i];
+			break;
+		}
+	}
+	if (head < 0) return;
+	double y = HEADER_H;
+	if (next >= 0) {
+		double ny = vl.top + next * h - scroll;
+		if (ny - h < y) y = ny - h;
+	}
+	vl_pin_row = head;
+	vl_pin_at = y;
+}
+
+static void vl_pin_cairo(cairo_t *cr, double scroll) {
+	vl_pin_where(scroll);
+	if (vl_pin_row < 0) return;
+	cairo_save(cr);
+	cairo_rectangle(cr, vl.l.pin_x, fmax(vl_pin_at + vl.l.pin_y, HEADER_H), vl.l.pin_w,
+		vl.l.pin_h);
+	cairo_clip(cr);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_paint(cr);
+	cairo_translate(cr, 0, vl_pin_at);
+	vl.l.draw_row(cr, vl_pin_row);
+	cairo_restore(cr);
+}
+
+double zmc_list(cairo_t *cr, double y, const struct zmc_list *list) {
+	vl.active = true;
+	vl.l = *list;
+	vl.top = y;
+	vl_mem_top = y;
+	vl_mem_row = list->row_h;
+	vl_mem_count = list->count;
+	if (vl_heads_rev != list->revision || vl_heads_count != list->count) {
+		vl_heads_rev = list->revision;
+		vl_heads_count = list->count;
+		vl_heads_n = 0;
+		for (int i = 0; i < list->count && list->is_head && vl_heads_n < LIST_HEADS; i++) {
+			if (list->is_head(i)) vl_heads_mem[vl_heads_n++] = i;
+		}
+	}
+	vl.n_heads = vl_heads_n;
+	memcpy(vl.heads, vl_heads_mem, sizeof(vl.heads));
+	int first = 0, last = -1;
+	double h = list->row_h;
+	if (vl_skip) {
+		last = -1;
+	} else if (vl_window >= 0) {
+		first = (int)floor((vl_window + HEADER_H - y) / h);
+		last = (int)floor((vl_window + zmc.height - y) / h);
+		if (first < 0) first = 0;
+		vl.cache_rows = 0;
+	} else if (zmc.scroll == 0) {
+		last = (int)floor((zmc.height - y) / h) - 1;
+		vl.cache_rows = last + 1 > list->count ? list->count : last + 1 > 0 ? last + 1 : 0;
+	} else {
+		vl.cache_rows = 0;	/* only ever seen again by way of a scroll: rows are the textures' */
+	}
+	if (last >= list->count) last = list->count - 1;
+	for (int r = first; r <= last; r++) {
+		cairo_save(cr);
+		cairo_translate(cr, 0, y + r * h);
+		list->draw_row(cr, r);
+		cairo_restore(cr);
+	}
+	if (vl_window > 0 && !vl_skip) {
+		/* in a picture of it: the pin too, under whatever .render draws next */
+		cairo_save(cr);
+		cairo_translate(cr, 0, vl_window);
+		vl_pin_cairo(cr, vl_window);
+		cairo_restore(cr);
+	}
+	return y + list->count * h;
+}
+
+void zmc_list_show(int page, int row) {
+	if (page < 0 || page >= LIST_PAGES) return;
+	double at = vl_mem_top + row * vl_mem_row - HEADER_H;
+	double max = vl_mem_top + vl_mem_count * vl_mem_row + 24 - zmc.height;
+	vl_saved[page] = at < 0 ? 0 : at > max && max > 0 ? max : at;
+	back_forget();
+}
+
+void zmc_list_freeze(bool freeze) {
+	vl_frozen = freeze;
+}
+
+static void vl_slots_forget(void) {
+	for (int i = 0; i < LIST_SLOTS; i++) {
+		if (vl_slot[i].tex) zmg_row_free(vl_slot[i].tex);
+		if (vl_slot[i].cpu) cairo_surface_destroy(vl_slot[i].cpu);
+		memset(&vl_slot[i], 0, sizeof(vl_slot[i]));
+		vl_slot[i].row = -1;
+	}
+	if (vl_scratch) cairo_surface_destroy(vl_scratch);
+	vl_scratch = NULL;
+	vl_slots_set = true;
+}
+
+/* ---- rows drawn ahead, on a thread ----------------------------------------
+ *
+ * Drawing a row takes up to 25 ms on a small core (a photo to decode, a name to
+ * lay out), and a fling brings over a row a frame. So one thread draws the rows
+ * about to arrive, while the frame only uploads what is ready (1.5 ms). Anything
+ * that draws with the app's own drawing holds vl_lock: Pango's and the photo
+ * cache's state are one thread's at a time. vl_q holds what the two share. */
+#define VL_READY 6
+static pthread_mutex_t vl_lock;
+static pthread_mutex_t vl_q = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t vl_wake = PTHREAD_COND_INITIALIZER;
+static pthread_once_t vl_lock_once = PTHREAD_ONCE_INIT;
+static int vl_drawing = -1;	/* the row on the thread right now */
+static struct { int row; uint64_t rev; cairo_surface_t *surface; bool busy; } vl_ready[VL_READY];
+static struct {
+	bool started, set;
+	struct zmc_list l;
+	double top;
+	int r0, r1, dir, scale, w, h;
+	int have[LIST_SLOTS], n_have;
+} vl_want;
+
+static void vl_lock_init(void) {
+	pthread_mutexattr_t a;
+	pthread_mutexattr_init(&a);
+	pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&vl_lock, &a);
+	pthread_mutexattr_destroy(&a);
+}
+
+void zmc_list_lock(bool lock) {
+	pthread_once(&vl_lock_once, vl_lock_init);
+	if (lock) pthread_mutex_lock(&vl_lock);
+	else pthread_mutex_unlock(&vl_lock);
+}
+
+/* the next row to draw ahead, and a free picture for it; caller holds vl_q */
+static int vl_pick(int *row_out) {
+	struct zmc_list *l = &vl_want.l;
+	int free_at = -1;
+	for (int i = 0; i < VL_READY; i++) {
+		if (vl_ready[i].busy) continue;
+		if (vl_ready[i].row < 0 || vl_ready[i].rev != l->revision ||
+				(vl_want.dir > 0 && vl_ready[i].row <= vl_want.r1) ||
+				(vl_want.dir < 0 && vl_ready[i].row >= vl_want.r0) ||
+				vl_ready[i].row < vl_want.r0 - VL_READY || vl_ready[i].row > vl_want.r1 + VL_READY) {
+			vl_ready[i].row = -1;
+			free_at = i;
+		}
+	}
+	if (free_at < 0) return -1;
+	/* the way it is going, all of it first; only at rest the other way too */
+	bool down = vl_want.dir >= 0;
+	for (int pass = 0; pass < (vl_want.dir ? 1 : 2); pass++) {
+		for (int k = 1; k <= VL_READY - (pass ? 4 : 0); k++) {
+			int row = down != (pass == 1) ? vl_want.r1 + k : vl_want.r0 - k;
+			if (row < 0 || row >= l->count) continue;
+			bool known = false;
+			for (int i = 0; i < VL_READY && !known; i++) {
+				known = vl_ready[i].row == row && vl_ready[i].rev == l->revision;
+			}
+			for (int i = 0; i < vl_want.n_have && !known; i++) {
+				known = vl_want.have[i] == row;
+			}
+			if (!known) {
+				*row_out = row;
+				return free_at;
+			}
+		}
+	}
+	return -1;
+}
+
+static void vl_paint_row(cairo_surface_t *target, const struct zmc_list *l, double top, int row, int scale) {
+	cairo_t *cr = cairo_create(target);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_paint(cr);
+	cairo_scale(cr, scale, scale);
+	dm_wrap_origin_y = (top + row * l->row_h) * scale;
+	l->draw_row(cr, row);
+	dm_wrap_origin_y = 0;
+	cairo_destroy(cr);
+	cairo_surface_flush(target);
+}
+
+static void *vl_worker(void *unused) {
+	(void)unused;
+	pthread_mutex_lock(&vl_q);
+	for (;;) {
+		int row = -1, at = vl_want.set ? vl_pick(&row) : -1;
+		if (at < 0) {
+			pthread_cond_wait(&vl_wake, &vl_q);
+			continue;
+		}
+		struct zmc_list l = vl_want.l;
+		double top = vl_want.top;
+		int scale = vl_want.scale, w = vl_want.w, h = vl_want.h;
+		vl_ready[at].busy = true;
+		vl_drawing = row;
+		cairo_surface_t *target = vl_ready[at].surface;
+		if (!target || cairo_image_surface_get_width(target) != w || cairo_image_surface_get_height(target) != h) {
+			if (target) cairo_surface_destroy(target);
+			target = cairo_image_surface_create(CAIRO_FORMAT_RGB24, w, h);
+			vl_ready[at].surface = target;
+		}
+		pthread_mutex_unlock(&vl_q);
+		zmc_list_lock(true);
+		/* (the app's rows may have changed since this was asked for) */
+		if (row < vl.l.count && vl.l.revision == l.revision) {
+			vl_paint_row(target, &l, top, row, scale);
+		} else {
+			row = -1;
+		}
+		zmc_list_lock(false);
+		pthread_mutex_lock(&vl_q);
+		if (row < 0) vl_want.set = false;	/* until the next frame says what is wanted */
+		vl_ready[at].row = row;
+		vl_ready[at].rev = l.revision;
+		vl_ready[at].busy = false;
+		vl_drawing = -1;
+	}
+	return NULL;
+}
+
+/* what the frame now shows, and so what to draw next */
+static void vl_publish(int r0, int r1, int dir, int scale) {
+	pthread_mutex_lock(&vl_q);
+	if (!vl_want.started) {
+		for (int i = 0; i < VL_READY; i++) vl_ready[i].row = -1;
+		pthread_t thread;
+		if (pthread_create(&thread, NULL, vl_worker, NULL) == 0) {
+			pthread_detach(thread);
+			vl_want.started = true;
+		}
+	}
+	vl_want.set = true;
+	vl_want.l = vl.l;
+	vl_want.top = vl.top;
+	vl_want.r0 = r0;
+	vl_want.r1 = r1;
+	vl_want.dir = dir;
+	vl_want.scale = scale;
+	vl_want.w = vl_slots_w;
+	vl_want.h = vl_slots_h;
+	vl_want.n_have = 0;
+	for (int i = 0; i < vl_slots_n; i++) {
+		if (vl_slot[i].row >= 0 && vl_slot[i].rev == vl.l.revision) vl_want.have[vl_want.n_have++] = vl_slot[i].row;
+	}
+	pthread_cond_signal(&vl_wake);
+	pthread_mutex_unlock(&vl_q);
+}
+
+/* the texture (or picture) of a row, drawn now if it has none */
+static int vl_get(int row, int scale) {
+	int r0 = vl_r0, r1 = vl_r1;
+	int w = zmc.width * scale, h = (int)ceil(vl.l.row_h * scale);
+	if (!vl_slots_set || w != vl_slots_w || h != vl_slots_h) {
+		vl_slots_forget();
+		vl_slots_w = w;
+		vl_slots_h = h;
+		/* a screen of rows, and a little more either way */
+		vl_slots_n = (int)ceil(zmc.height / vl.l.row_h) + 7;
+		if (vl_slots_n > LIST_SLOTS) vl_slots_n = LIST_SLOTS;
+	}
+	int found = -1, victim = -1;
+	long worst = -1;
+	for (int i = 0; i < vl_slots_n; i++) {
+		if (vl_slot[i].rev == vl.l.revision && vl_slot[i].row == row) {
+			found = i;
+			break;
+		}
+		long far;
+		if (vl_slot[i].row < 0 || vl_slot[i].rev != vl.l.revision) {
+			far = 1000000;
+		} else if (vl_slot[i].row == vl_pin_row || (vl_slot[i].row >= r0 && vl_slot[i].row <= r1)) {
+			far = -1;	/* in use this frame */
+		} else {
+			far = vl_slot[i].row < r0 ? r0 - vl_slot[i].row : vl_slot[i].row - r1;
+		}
+		if (far > worst) {
+			worst = far;
+			victim = i;
+		}
+	}
+	if (found >= 0) {
+		vl_slot[found].used = ++vl_used;
+		return found;
+	}
+	if (victim < 0) return -1;
+	bool gl = zmg_ready();
+	cairo_surface_t *target;
+	if (gl) {
+		if (!vl_scratch) vl_scratch = cairo_image_surface_create(CAIRO_FORMAT_RGB24, w, h);
+		target = vl_scratch;
+		if (!vl_slot[victim].tex) vl_slot[victim].tex = zmg_row_new(w, h);
+	} else {
+		if (!vl_slot[victim].cpu) vl_slot[victim].cpu = cairo_image_surface_create(CAIRO_FORMAT_RGB24, w, h);
+		target = vl_slot[victim].cpu;
+	}
+	/* ready on the thread's side? */
+	cairo_surface_t *drawn = NULL;
+	int ready_at = -1;
+	pthread_mutex_lock(&vl_q);
+	if (vl_drawing == row) {
+		/* nearly there: cheaper to wait than to draw it twice */
+		pthread_mutex_unlock(&vl_q);
+		zmc_list_lock(true);
+		zmc_list_lock(false);
+		for (int spin = 0; spin < 50; spin++) {
+			pthread_mutex_lock(&vl_q);
+			if (vl_drawing != row) break;
+			pthread_mutex_unlock(&vl_q);
+			struct timespec nap = { 0, 100000 };
+			nanosleep(&nap, NULL);
+			if (spin == 49) pthread_mutex_lock(&vl_q);
+		}
+	}
+	for (int i = 0; i < VL_READY; i++) {
+		if (!vl_ready[i].busy && vl_ready[i].row == row && vl_ready[i].rev == vl.l.revision &&
+				vl_ready[i].surface && cairo_image_surface_get_width(vl_ready[i].surface) == w &&
+				cairo_image_surface_get_height(vl_ready[i].surface) == h) {
+			ready_at = i;
+			vl_ready[i].busy = true;
+			drawn = vl_ready[i].surface;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&vl_q);
+	if (!drawn) {
+		zmc_list_lock(true);
+		vl_paint_row(target, &vl.l, vl.top, row, scale);
+		zmc_list_lock(false);
+		drawn = target;
+	}
+	if (gl) {
+		zmg_row_upload(vl_slot[victim].tex, drawn);
+	} else if (drawn != target) {
+		/* no GPU: the two pictures change places */
+		cairo_surface_t *old = vl_slot[victim].cpu;
+		vl_slot[victim].cpu = drawn;
+		vl_ready[ready_at].surface = old;
+	}
+	if (ready_at >= 0) {
+		pthread_mutex_lock(&vl_q);
+		vl_ready[ready_at].row = -1;
+		vl_ready[ready_at].busy = false;
+		if (vl_want.n_have < LIST_SLOTS) vl_want.have[vl_want.n_have++] = row;	/* it is a slot's now */
+		pthread_cond_signal(&vl_wake);
+		pthread_mutex_unlock(&vl_q);
+	}
+	vl_slot[victim].row = row;
+	vl_slot[victim].rev = vl.l.revision;
+	vl_slot[victim].used = ++vl_used;
+	return victim;
+}
+
+/* a piece of a row (points, in the row) to the screen at sx, sy */
+static void vl_blit(cairo_t *cr, int slot, double px, double py, double pw, double ph,
+		double sx, double sy, int scale) {
+	if (slot < 0) return;
+	if (!cr) {
+		struct zmg_vertex q[4] = { {sx,sy,0}, {sx+pw,sy,0}, {sx,sy+ph,0}, {sx+pw,sy+ph,0} };
+		double W = vl_slots_w, H = vl_slots_h;
+		zmg_row_draw(vl_slot[slot].tex, px * scale / W, py * scale / H,
+			(px + pw) * scale / W, (py + ph) * scale / H, q, 1);
+		return;
+	}
+	cairo_save(cr);
+	cairo_rectangle(cr, sx * scale, sy * scale, pw * scale, ph * scale);
+	cairo_clip(cr);
+	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+	cairo_set_source_surface(cr, vl_slot[slot].cpu, (sx - px) * scale, lround((sy - py) * scale));
+	cairo_paint(cr);
+	cairo_restore(cr);
+}
+
+/* The list as it stands on the screen, and what is above it. cr NULL: the GPU.
+ * The title goes over it afterwards. */
+static void vl_draw(cairo_t *cr, int scale) {
+	double off = zmc.scroll, s = scale, h = vl.l.row_h;
+	double top = HEADER_H + (off < 0 ? -off : 0);
+	double from = HEADER_H + (off > 0 ? off : 0);
+	double end = from + zmc.height - top;
+	double limit = vl.top + vl.cache_rows * h;
+	if (from < limit) {
+		double to = end < limit ? end : limit;
+		if (!cr) {
+			gpu_surface_rect(zmc.cache, 0, from * s, zmc.width * s, to * s,
+				0, top, zmc.width, top + to - from, 1);
+		} else {
+			cairo_save(cr);
+			cairo_rectangle(cr, 0, top * s, zmc.width * s, (to - from) * s);
+			cairo_clip(cr);
+			cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+			cairo_set_source_surface(cr, zmc.cache, 0, -lround(off * s));
+			cairo_paint(cr);
+			cairo_restore(cr);
+		}
+	}
+	int r0 = (int)floor((from - vl.top) / h), r1 = (int)floor((end - 0.001 - vl.top) / h);
+	if (r0 < 0) r0 = 0;
+	if (r1 >= vl.l.count) r1 = vl.l.count - 1;
+	vl_r0 = r0;
+	vl_r1 = r1;
+	vl_pin_where(off);
+	for (int r = r0 > vl.cache_rows ? r0 : vl.cache_rows; r <= r1; r++) {
+		vl_blit(cr, vl_get(r, scale), 0, 0, zmc.width, h, 0, vl.top + r * h - off, scale);
+	}
+	if (vl_pin_row >= 0) {
+		double y = vl_pin_at + vl.l.pin_y;
+		vl_blit(cr, vl_get(vl_pin_row, scale), vl.l.pin_x, vl.l.pin_y, vl.l.pin_w, vl.l.pin_h,
+			vl.l.pin_x, y, scale);
+	}
+	/* (a list at rest looks both ways, once the finger is off it and it has stopped) */
+	vl_publish(r0, r1, r0 > vl_last_r0 ? 1 : r0 < vl_last_r0 ? -1 :
+		(zmc.fling || zmc.touching ? vl_want.dir : 0), scale);
+	vl_last_r0 = r0;
+}
+
+/* the row under a point of the page, the pinned head over all */
+static bool vl_hit(double x, double y, double cy, struct zmc_hit *out) {
+	if (!vl.active || vl_frozen || y < HEADER_H) return false;
+	double h = vl.l.row_h;
+	int row;
+	bool pinned = false;
+	vl_pin_where(zmc.scroll);
+	if (vl_pin_row >= 0 && x >= vl.l.pin_x && x < vl.l.pin_x + vl.l.pin_w &&
+			y >= vl_pin_at + vl.l.pin_y && y < vl_pin_at + vl.l.pin_y + vl.l.pin_h) {
+		row = vl_pin_row;
+		pinned = true;
+	} else {
+		if (cy < vl.top) return false;
+		row = (int)floor((cy - vl.top) / h);
+		if (row >= vl.l.count) return false;
+	}
+	struct zmc_hit hit = {0};
+	double ly = pinned ? vl.l.pin_y + vl.l.pin_h / 2 : cy - vl.top - row * h;
+	if (!vl.l.row_hit || !vl.l.row_hit(row, x, ly, &hit)) {
+		if (!pinned) return false;
+		memset(out, 0, sizeof(*out));	/* the square is over what is under it, and answers nothing */
+		out->action = 0;
+		return true;
+	}
+	hit.y += vl.top + row * h;
+	if (pinned) hit.w = hit.h = 0;	/* no tilt for what is only a window on the row */
+	*out = hit;
+	return true;
+}
+
 static void cache_ensure(int scale);
 
 /* The page in front as it is on the screen, at `scale`, from the full-size
  * drawing scrolling already uses: a few milliseconds, where drawing the page
  * again took a good part of a second. */
 static cairo_surface_t *cache_snapshot(int scale) {
+	if (vl.active && !vl_frozen && (zmc.scroll != 0 || vl.cache_rows == 0)) {
+		struct zmc_rowset rows;
+		double next_dx;
+		return pivot_snapshot(zmc.page, zmc.scroll, scale, &rows, &next_dx);
+	}
 	cache_ensure(zmc.scale);
 	cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24,
 		zmc.width * scale, zmc.height * scale);
@@ -730,6 +1248,8 @@ static cairo_surface_t *cache_snapshot(int scale) {
 }
 
 static cairo_surface_t *page_snapshot(int page, double scroll, int scale) {
+	zmc_list_lock(true);
+	vl_begin(scroll > 0 ? scroll : 0);
 	cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24,
 		zmc.width * scale, zmc.height * scale);
 	cairo_t *cr = cairo_create(surface);
@@ -749,10 +1269,13 @@ static cairo_surface_t *page_snapshot(int page, double scroll, int scale) {
 		cairo_clip(cr);
 		cairo_set_source_rgb(cr, 0, 0, 0);
 		cairo_paint(cr);
+		vl_skip = true;
 	}
 	zmc.n_hits = 0;
 	zmc.app->render(cr, page);
+	vl_skip = false;
 	cairo_destroy(cr);
+	zmc_list_lock(false);
 	return surface;
 }
 
@@ -971,6 +1494,8 @@ static void cache_ensure(int scale) {
 	}
 	int h = zmc.cache ? cairo_image_surface_get_height(zmc.cache) : zmc.height * scale;
 	uint32_t began = now_ms();
+	double held_at = zmc.scroll > 0 ? zmc.scroll : 0;
+	zmc_list_lock(true);
 	for (int pass = 0; pass < 2; pass++) {
 		if (!zmc.cache || cairo_image_surface_get_height(zmc.cache) != h ||
 				cairo_image_surface_get_width(zmc.cache) != zmc.width * scale) {
@@ -983,9 +1508,31 @@ static void cache_ensure(int scale) {
 		cairo_set_source_rgb(cr, 0, 0, 0);
 		cairo_paint(cr);
 		cairo_scale(cr, scale, scale);
+		vl_begin(vl_frozen ? held_at : -1);
+		if (vl_frozen) {
+			/* a picture of the list where it stands, with what lies over it,
+			 * and the title in its own place */
+			cairo_save(cr);
+			cairo_rectangle(cr, 0, HEADER_H, zmc.width, zmc.height - HEADER_H);
+			cairo_clip(cr);
+			cairo_translate(cr, 0, -held_at);
+			zmc.n_hits = 0;
+			zmc.pivot_set = false;
+			zmc.app->render(cr, zmc.page);
+			cairo_restore(cr);
+			cairo_rectangle(cr, 0, 0, zmc.width, HEADER_H);
+			cairo_clip(cr);
+			vl_skip = true;
+		}
 		zmc.n_hits = 0;
 		zmc.pivot_set = false;
 		zmc.content_h = zmc.app->render(cr, zmc.page);
+		vl_skip = false;
+		if (vl.active) {
+			if (!vl_frozen && zmc.scroll > scroll_max() && !zmc.touching && !zmc.fling) {
+				zmc.scroll = scroll_max();	/* fewer people than when it was left */
+			}
+		}
 		if (scroll_to_end) {
 			scroll_to_end = false;
 			zmc.scroll = scroll_max();
@@ -993,12 +1540,13 @@ static void cache_ensure(int scale) {
 			zmc.fling = false;
 		}
 		cairo_destroy(cr);
-		int need = (int)ceil((zmc.content_h > zmc.height ? zmc.content_h : zmc.height) * scale);
+		int need = (int)ceil((zmc.content_h > zmc.height && !vl.active ? zmc.content_h : zmc.height) * scale);
 		if (need <= h) {
 			break;
 		}
 		h = need;	/* longer than what we had: once more, with room */
 	}
+	zmc_list_lock(false);
 	zmc.cache_stale = false;
 	cache_gen++;
 	/* into the session log: a page drawn again that cost a frame or more */
@@ -1009,7 +1557,6 @@ static void cache_ensure(int scale) {
 	}
 }
 
-static void back_forget(void);
 
 /* Something on the page changed. */
 void zmc_scroll_end(void) {
@@ -1093,7 +1640,7 @@ static bool hit_at(double x, double y, struct zmc_hit *out) {
 			return true;
 		}
 	}
-	return false;
+	return vl_hit(x, y, cy, out) && out->w > 0;
 }
 
 /* The thing under the finger leans toward it, as a tile on Start does: it
@@ -1148,8 +1695,20 @@ static void draw_press(cairo_t *cr, int scale) {
 		}
 		zmg_clip(0, HEADER_H, zmc.width, zmc.height - HEADER_H);
 		zmg_rect(x, y, w, h, 0, 0, 0);
-		zmg_surface(zmc.cache, cache_gen, x*scale, hit->y*scale,
-			(x+w)*scale, (hit->y+h)*scale, q, 1);
+		if (vl.active && !vl_frozen && hit->y >= vl.top + vl.cache_rows * vl.l.row_h) {
+			/* a row of a long list: from its own texture */
+			int r = (int)floor((hit->y + 0.01 - vl.top) / vl.l.row_h), slot = vl_get(r, scale);
+			double ry = hit->y - (vl.top + r * vl.l.row_h);
+			if (slot >= 0) {
+				zmg_row_draw(vl_slot[slot].tex, x * scale / (double)vl_slots_w,
+					ry * scale / (double)vl_slots_h, (x + w) * scale / (double)vl_slots_w,
+					(ry + h) * scale / (double)vl_slots_h, q, 1);
+			}
+		} else {
+			double from = hit->y - (vl.active && vl_frozen ? zmc.scroll : 0);
+			zmg_surface(zmc.cache, cache_gen, x*scale, from*scale,
+				(x+w)*scale, (from+h)*scale, q, 1);
+		}
 		zmg_clip(0, 0, zmc.width, zmc.height);
 		return;
 	}
@@ -1204,7 +1763,14 @@ static void draw_press(cairo_t *cr, int scale) {
 			double a = (x10 - x00) / sw, b = (y10 - y00) / sw, c = (x01 - x00) / sh, d = (y01 - y00) / sh;
 			cairo_matrix_init(&m, a, b, c, d, x00 - a * sx0 - c * sy0, y00 - b * sx0 - d * sy0);
 			cairo_set_matrix(cr, &m);
-			cairo_set_source_surface(cr, zmc.cache, 0, 0);
+			if (vl.active && !vl_frozen && h->y >= vl.top + vl.cache_rows * vl.l.row_h) {
+				int r = (int)floor((h->y + 0.01 - vl.top) / vl.l.row_h);
+				int slot = vl_get(r, scale);
+				if (slot < 0) { cairo_restore(cr); continue; }
+				cairo_set_source_surface(cr, vl_slot[slot].cpu, 0, (vl.top + r * vl.l.row_h) * scale);
+			} else {
+				cairo_set_source_surface(cr, zmc.cache, 0, vl.active && vl_frozen ? -src_y : 0);
+			}
 			/* nearest: at four pixels to the point the difference is not
 			 * seen, and it is several times quicker on the row's whole area */
 			cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_FAST);
@@ -1242,6 +1808,11 @@ static cairo_surface_t *pivot_snapshot(int page, double scroll, int scale, struc
 	bool set = zmc.pivot_set;
 	int other = zmc.pivot_page;
 	double next_dx = zmc.pivot_next_dx;
+	zmc_list_lock(true);
+	static __typeof__(vl) vl_kept;
+	double window_kept = vl_window;
+	vl_kept = vl;
+	vl_begin(scroll > 0 ? scroll : 0);
 	cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
 		zmc.width * scale, zmc.height * scale);
 	cairo_t *cr = cairo_create(surface);
@@ -1251,17 +1822,24 @@ static cairo_surface_t *pivot_snapshot(int page, double scroll, int scale, struc
 		double top = HEADER_H + (scroll < 0 ? -scroll : 0);
 		cairo_rectangle(cr, 0, top, zmc.width, zmc.height - top);
 		cairo_clip(cr);
+		dm_wrap_origin_y = scroll * scale;
 		cairo_translate(cr, 0, -scroll);
 		zmc.app->render(cr, page);
+		dm_wrap_origin_y = 0;
 		cairo_restore(cr);
 		cairo_rectangle(cr, 0, 0, zmc.width, HEADER_H);
 		cairo_clip(cr);
+		vl_skip = true;
 	}
 	zmc.n_hits = 0;
 	zmc.app->render(cr, page);
+	vl_skip = false;
 	cairo_destroy(cr);
 	collect_rows(rows, scroll, -1, false);
 	*its_next_dx = zmc.pivot_next_dx;
+	vl = vl_kept;
+	vl_window = window_kept;
+	zmc_list_lock(false);
 	memcpy(zmc.hits, saved, sizeof(saved[0]) * (size_t)n);
 	zmc.n_hits = n;
 	zmc.pivot_set = set;
@@ -1344,7 +1922,8 @@ static bool back_wants_prepare(void) {
 
 static void back_prepare(void) {
 	double next_dx;
-	back_surface = pivot_snapshot(back_page, 0, ANIM_SCALE, &back_rows, &next_dx);
+	back_surface = pivot_snapshot(back_page, back_page < LIST_PAGES ? vl_saved[back_page] : 0, ANIM_SCALE,
+		&back_rows, &next_dx);
 	for (int i = 0; i < back_rows.n; i++) {
 		back_rows.rows[i].order = back_rows.n - 1 - back_rows.rows[i].order;	/* it will turn back */
 	}
@@ -1621,8 +2200,15 @@ static void present_gpu(uint32_t ms) {
 		double s = zmc.scale, off = zmc.scroll;
 		double top = HEADER_H + (off < 0 ? -off : 0);
 		double from = HEADER_H + (off > 0 ? off : 0);
-		gpu_surface_rect(zmc.cache, 0, from*s, zmc.width*s, (from+zmc.height-top)*s,
-			0, top, zmc.width, zmc.height, 1);
+		if (vl.active && vl_frozen) {
+			gpu_surface_rect(zmc.cache, 0, HEADER_H*s, zmc.width*s, zmc.height*s,
+				0, HEADER_H, zmc.width, zmc.height, 1);
+		} else if (vl.active) {
+			vl_draw(NULL, zmc.scale);
+		} else {
+			gpu_surface_rect(zmc.cache, 0, from*s, zmc.width*s, (from+zmc.height-top)*s,
+				0, top, zmc.width, zmc.height, 1);
+		}
 		draw_press(NULL, zmc.scale);
 		if (slider_live >= 0 && zmc.sliding) {
 			draw_slider_live(s);
@@ -1708,9 +2294,12 @@ static void *bg_draw(void *unused) {
 		cairo_scale(cr, scale, scale);
 		zmc.n_hits = 0;
 		zmc.pivot_set = false;
+		zmc_list_lock(true);
+		vl_begin(-1);
 		bg.content_h = zmc.app->render(cr, bg.page);
+		zmc_list_lock(false);
 		cairo_destroy(cr);
-		int need = (int)ceil((bg.content_h > zmc.height ? bg.content_h : zmc.height) * scale);
+		int need = (int)ceil((bg.content_h > zmc.height && !vl.active ? bg.content_h : zmc.height) * scale);
 		if (need <= h) break;
 		h = need;
 	}
@@ -1854,7 +2443,7 @@ static void present(void) {
 		return;
 	}
 	/* a page at rest or scrolling, with nothing pressed: the list's own surface */
-	if (list_surface && !zmc.anim_active && !zmc.quit_after_anim && !zmc.busy &&
+	if (list_surface && !vl.active && !zmc.anim_active && !zmc.quit_after_anim && !zmc.busy &&
 			!zmc.slide_active && !zmc.swiping && !zmc.spring &&
 			zmc.press_to <= 0 && press_amount() <= 0.001 && zmc.height > HEADER_H + 8) {
 		int shown = present_list(scale);
@@ -1895,8 +2484,17 @@ static void present(void) {
 		int top = head + (off < 0 ? -off : 0);
 		cairo_rectangle(cr, 0, top, buffer->width, buffer->height - top);
 		cairo_clip(cr);
-		cairo_set_source_surface(cr, zmc.cache, 0, -off);
-		cairo_paint(cr);	/* past the cache's end it is black (SOURCE, no extend) */
+		if (vl.active && vl_frozen) {
+			cairo_set_source_surface(cr, zmc.cache, 0, 0);
+			cairo_paint(cr);
+		} else if (vl.active) {
+			cairo_set_source_rgb(cr, 0, 0, 0);
+			cairo_paint(cr);
+			vl_draw(cr, scale);
+		} else {
+			cairo_set_source_surface(cr, zmc.cache, 0, -off);
+			cairo_paint(cr);	/* past the cache's end it is black (SOURCE, no extend) */
+		}
 		cairo_restore(cr);
 		if (top > head) {
 			cairo_save(cr);
@@ -1967,6 +2565,19 @@ static void collect_rows(struct rowset *set, double scroll, double tapped, bool 
 			edges[n++] = y;
 		}
 	}
+	if (vl.active && !vl_frozen) {
+		/* a long list's rows are not among the hits */
+		for (int r = (int)floor((scroll + HEADER_H - vl.top) / vl.l.row_h); r < vl.l.count && n < MAX_ROWS - 2; r++) {
+			if (r < 0) r = 0;
+			double y = vl.top + r * vl.l.row_h - scroll;
+			if (y >= zmc.height) break;
+			if (y < HEADER_H) {
+				if (n == 0) edges[n++] = HEADER_H;
+				continue;
+			}
+			if (y > 0 && (n == 0 || y > edges[n - 1] + 8)) edges[n++] = y;
+		}
+	}
 	set->n = 0;
 	double top = 0;
 	int tapped_row = -1;
@@ -2032,7 +2643,10 @@ static void begin_animation_(bool have_from, bool have_to, int target, double ta
 	if (have_from) {
 		/* the page in front is drawn already: shrunk, not drawn again (its
 		 * hits, which the rows come from, are the drawing's own) */
-		if (zmg_ready() && zmc.scroll == 0) {
+		if (have_to && zmc.page >= 0 && zmc.page < LIST_PAGES) {
+			if (vl.active) vl_saved[zmc.page] = zmc.scroll > 0 ? zmc.scroll : 0;
+		}
+		if (zmg_ready() && zmc.scroll == 0 && !(vl.active && vl.cache_rows == 0)) {
 			cache_ensure(zmc.scale);
 			zmc.anim_from_surface = cairo_surface_reference(zmc.cache);
 		} else {
@@ -2042,8 +2656,16 @@ static void begin_animation_(bool have_from, bool have_to, int target, double ta
 		collect_rows(&zmc.out_rows, zmc.scroll, tapped, back);
 	}
 	if (have_to) {
-		zmc.scroll = 0;
-		if (zmg_ready() && have_from && back_surface && back_page == target && zmc.anim_back) {
+		/* a long list comes back to where it was left */
+		double arrive = target >= 0 && target < LIST_PAGES && zmc.anim_back ? vl_saved[target] : 0;
+		zmc.scroll = arrive;
+		if (arrive != 0 && !(back_surface && back_page == target) && zmg_ready() && have_from) {
+			double next_dx;
+			zmc.anim_to_surface = pivot_snapshot(target, arrive, ANIM_SCALE, &zmc.in_rows, &next_dx);
+			for (int i = 0; i < zmc.in_rows.n; i++) {
+				zmc.in_rows.rows[i].order = zmc.in_rows.n - 1 - zmc.in_rows.rows[i].order;
+			}
+		} else if (zmg_ready() && have_from && back_surface && back_page == target && zmc.anim_back) {
 			/* drawn ahead while the page in front was idle */
 			zmc.anim_to_surface = cairo_surface_reference(back_surface);
 			zmc.in_rows = back_rows;
@@ -2052,6 +2674,7 @@ static void begin_animation_(bool have_from, bool have_to, int target, double ta
 		} else if (zmg_ready() && have_from) {
 			zmc.anim_target_pending = true;
 			zmc.in_rows.n = 0;
+			zmc.n_hits = 0;	/* (first: a quick page has its hits drawn before the uploads below end) */
 			bg_start(target);
 		} else if (zmg_ready()) {
 			gpu_prepare_destination(target);
@@ -2077,7 +2700,7 @@ static void begin_animation_(bool have_from, bool have_to, int target, double ta
 			(in > title ? in : title);
 	}
 	zmc.anim_frames = 0;
-	if (!zmc.anim_cache_ready) zmc.n_hits = 0;	/* touch_down blocks input during the turn */
+	if (!zmc.anim_cache_ready && !bg.busy) zmc.n_hits = 0;	/* touch_down blocks input during the turn */
 	uint32_t now = now_ms();
 	/* Fix the clock before present() can submit the first buffer. Rewinding
 	 * it afterward can expose an advanced title, then a black first frame. */
@@ -2117,6 +2740,7 @@ static double scroll_max(void) {
 /* Under the finger the list goes where it is taken, and past either end it
  * follows at a fraction of the pull. */
 static void set_scroll(double scroll) {
+	if (vl_frozen) return;
 	double max = scroll_max();
 	if (scroll < 0) {
 		scroll *= 0.4;
@@ -2136,6 +2760,10 @@ static void fling_step(void) {
 	double dt = now - zmc.fling_last;
 	zmc.fling_last = now;
 	if (dt > 50) dt = 50;
+	if (vl_frozen) {
+		zmc.fling = false;
+		return;
+	}
 	double max = scroll_max();
 	zmc.scroll += zmc.vel * dt;
 	double bound = zmc.scroll < 0 ? 0 : zmc.scroll > max ? max : zmc.scroll;
@@ -2291,8 +2919,12 @@ static void touch_up(void *data, struct wl_touch *touch, uint32_t serial, uint32
 		struct zmc_hit *h = &zmc.hits[i];
 		if (cx >= h->x && cx < h->x + h->w && cy >= h->y && cy < h->y + h->h) {
 			zmc_activate(h);
-			break;
+			return;
 		}
+	}
+	struct zmc_hit row;
+	if (vl_hit(cx, zmc.down_y, cy, &row) && row.action) {
+		zmc_activate(&row);
 	}
 }
 
@@ -3407,7 +4039,12 @@ int zmc_render_png(const struct zmc_app *app, int page, int height, const char *
 	zmc.height = height;
 	zmc.accent = zmc_config_accent();
 	zmc_config_style();
-	cairo_surface_t *surface = page_snapshot(page, 0, zmc.scale);
+	/* (ZMC_RENDER_SCROLL: how a list looks scrolled, for looking at it) */
+	const char *scroll = getenv("ZMC_RENDER_SCROLL");
+	double next_dx;
+	struct zmc_rowset rows;
+	cairo_surface_t *surface = scroll ? pivot_snapshot(page, atof(scroll), zmc.scale, &rows, &next_dx) :
+		page_snapshot(page, 0, zmc.scale);
 	cairo_status_t status = cairo_surface_write_to_png(surface, path);
 	cairo_surface_destroy(surface);
 	return status == CAIRO_STATUS_SUCCESS ? 0 : 1;

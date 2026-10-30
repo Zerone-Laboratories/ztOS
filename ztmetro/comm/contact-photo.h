@@ -108,6 +108,20 @@ static inline const struct contact *contact_of_number(const char *number)
 	return NULL;
 }
 
+/* Changes when a list of the people would come out differently. */
+static inline uint64_t contact_list_revision(void)
+{
+	uint64_t h = 0xcbf29ce484222325ULL;
+	for (int i = 0; i < n_contacts; i++) {
+		const struct contact *c = &contacts[i];
+		h = (h ^ contact_photo_hash(c->name)) * 0x100000001b3ULL;
+		h = (h ^ contact_photo_hash(c->mobile)) * 0x100000001b3ULL;
+		h = (h ^ contact_photo_hash(c->other)) * 0x100000001b3ULL;
+		h = (h ^ contact_photo_hash(c->uid)) * 0x100000001b3ULL;
+	}
+	return (h ^ (uint64_t)contact_photos_stamp()) * 0x100000001b3ULL;
+}
+
 /* One UTF-8 character of s into out; returns its length. */
 static inline size_t contact_one_char(const char *s, char *out)
 {

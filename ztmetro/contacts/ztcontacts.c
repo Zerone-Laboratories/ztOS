@@ -16,8 +16,8 @@
  *
  * The people are kept in ~/.local/share/ztmetro/contacts (comm.h), which
  * Phone and Messaging read to put names to numbers, and zrn-contacts-sync
- * fills from Google (CONTACTS-SYNC.md). The list page holds WINDOW people at a
- * time, because its page is cached whole; hit targets are limited as well.
+ * fills from Google (CONTACTS-SYNC.md). The list is a zmc_list: everyone, in one
+ * scroll, with only the rows near the screen drawn at all.
  *
  *	ztcontacts			the list
  *	ztcontacts --add NUMBER		a new person with that number filled in
@@ -37,7 +37,7 @@
 #include "contact-photo.h"
 
 #define MARGIN ZMC_MARGIN
-#define WINDOW 60	/* people on the page at once: the page is cached whole, at 4x */
+#define ROW_H 58		/* a person, or a letter's square: the list is arithmetic */
 #define MAX_RESULTS 20
 
 enum page { P_ALL, P_CARD, P_EDIT, P_JUMP, P_SEARCH, P_GOOGLE };
@@ -56,7 +56,6 @@ enum action {
 	ACT_MENU_CLOSE,
 	ACT_JUMP,	/* a letter's square: all the letters */
 	ACT_LETTER,	/* arg: index into LETTERS */
-	ACT_WINDOW,	/* arg: first person on the page */
 	ACT_SEARCH,
 	ACT_QUERY,
 	ACT_GOOGLE,
@@ -71,7 +70,6 @@ static int shown = -1;		/* who the card is of */
 static int menu_for = -1;	/* whose menu is open on the list */
 static bool confirm_delete;	/* the card's "delete" has been tapped once */
 static bool confirm_signout;
-static int window_start;	/* the first person on the list page */
 static int card_from = P_ALL;	/* where back from the card goes */
 static char query[64];
 
@@ -134,7 +132,9 @@ static void person_row(cairo_t *cr, double y, const struct contact *c, int who) 
 	contact_tile(cr, MARGIN, y + 3, 48, c->name, c->uid);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text_line(cr, c->name, FONT_SEMILIGHT, 22, MARGIN + 60, y + 13, zmc.width - 2 * MARGIN - 60);
-	zmc_add_hit(0, y, zmc.width, 54, ACT_OPEN, who);
+	if (who >= 0) {
+		zmc_add_hit(0, y, zmc.width, 54, ACT_OPEN, who);
+	}
 }
 
 static void google_status(char *state, size_t state_size, char *detail, size_t detail_size,
@@ -165,6 +165,64 @@ static bool google_file(const char *name) {
 
 /* ---- people --------------------------------------------------------------- */
 
+/* The rows: a person (their index), or the square of a letter (-1 - the letter). */
+static int rows[MAX_CONTACTS + sizeof(LETTERS)];
+static int n_rows;
+static uint64_t rows_revision;
+
+static void rows_build(void) {
+	char letter = 0;
+	n_rows = 0;
+	for (int i = 0; i < n_contacts; i++) {
+		char first = letter_of(&contacts[i]);
+		if (first != letter) {
+			letter = first;
+			rows[n_rows++] = -1 - first;
+		}
+		rows[n_rows++] = i;
+	}
+	rows_revision = contact_list_revision();
+}
+
+static int row_of_person(int who) {
+	for (int r = 0; r < n_rows; r++) {
+		if (rows[r] == who) {
+			return r;
+		}
+	}
+	return 0;
+}
+
+__attribute__((unused)) static bool row_is_head(int row) {
+	return rows[row] < 0;
+}
+
+static void draw_row(cairo_t *cr, int row) {
+	if (rows[row] >= 0) {
+		person_row(cr, 0, &contacts[rows[row]], -1);
+		return;
+	}
+	/* the letter, in a square of the accent colour: tap for all the letters */
+	char text[2] = { (char)tolower((unsigned char)(-1 - rows[row])), 0 };
+	zmc_accent(cr);
+	cairo_rectangle(cr, MARGIN, 6, 42, 42);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text(cr, text, FONT_SEMILIGHT, 26, MARGIN + 6, 14, 0);
+}
+
+static bool row_hit(int row, double x, double y, struct zmc_hit *hit) {
+	if (rows[row] >= 0) {
+		*hit = (struct zmc_hit){ .x = 0, .y = 0, .w = zmc.width, .h = 54, .action = ACT_OPEN, .arg = rows[row] };
+		return true;
+	}
+	if (x < MARGIN || x >= MARGIN + 42 || y < 6 || y >= 48) {
+		return false;
+	}
+	*hit = (struct zmc_hit){ .x = MARGIN, .y = 6, .w = 42, .h = 42, .action = ACT_JUMP };
+	return true;
+}
+
 static double draw_all(cairo_t *cr) {
 	double y = zmc_header(cr, "people");
 	cairo_set_source_rgb(cr, 1, 1, 1);
@@ -179,47 +237,20 @@ static double draw_all(cairo_t *cr) {
 			zmc.width - 2 * MARGIN) + 20;
 		return y;
 	}
-	if (window_start >= n_contacts) {
-		window_start = 0;
-	}
-	if (window_start > 0) {
-		int back_to = window_start > WINDOW ? window_start - WINDOW : 0;
-		y = zmc_entry(cr, y, "earlier", contacts[back_to].name, ACT_WINDOW, back_to) + 6;
-	}
-	char letter = 0;
-	double menu_at = -1;
-	int end = window_start + WINDOW < n_contacts ? window_start + WINDOW : n_contacts;
-	for (int i = window_start; i < end; i++) {
-		struct contact *c = &contacts[i];
-		char first = letter_of(c);
-		if (first != letter) {
-			/* the letter, in a square of the accent colour: tap for all the letters */
-			char text[2] = { (char)tolower((unsigned char)first), 0 };
-			letter = first;
-			y += 6;
-			zmc_accent(cr);
-			cairo_rectangle(cr, MARGIN, y, 42, 42);
-			cairo_fill(cr);
-			cairo_set_source_rgb(cr, 1, 1, 1);
-			zmc_text(cr, text, FONT_SEMILIGHT, 26, MARGIN + 6, y + 8, 0);
-			zmc_add_hit(MARGIN, y, 42, 42, ACT_JUMP, 0);
-			y += 52;
-		}
-		person_row(cr, y, c, i);
-		if (i == menu_for) {
-			menu_at = y + 50;
-		}
-		y += 58;
-	}
-	if (end < n_contacts) {
-		y = zmc_entry(cr, y + 6, "later", contacts[end].name, ACT_WINDOW, end);
-	}
-	y += 24;
-	if (menu_for >= 0 && menu_at >= 0) {
+	rows_build();
+	static const struct zmc_list list = { .row_h = ROW_H, .draw_row = draw_row,
+		.row_hit = row_hit,
+		.pin_x = 0, .pin_y = 0, .pin_w = 360, .pin_h = ROW_H };
+	struct zmc_list here = list;
+	here.pin_w = zmc.width;	/* a clear band: nothing goes behind the letter */
+	here.count = n_rows;
+	here.revision = rows_revision;
+	y = zmc_list(cr, y, &here);
+	if (menu_for >= 0 && menu_for < n_contacts) {
 		static const char *const items[] = { "edit", "delete" };
-		zmc_menu(cr, menu_at, items, 2, ACT_MENU, ACT_MENU_CLOSE);
+		zmc_menu(cr, here.row_h * row_of_person(menu_for) + y - n_rows * ROW_H + 50, items, 2, ACT_MENU, ACT_MENU_CLOSE);
 	}
-	return y;
+	return y + 24;
 }
 
 /* ---- all the letters: the jump list ---------------------------------------- */
@@ -403,14 +434,21 @@ static double render(cairo_t *cr, int page) {
 
 static long store_stamp;	/* the store as last read */
 
+static void menu_set(int who) {
+	menu_for = who;
+	zmc_list_freeze(who >= 0);	/* the menu lies over the list where it stands */
+}
+
 static void delete_person(int who) {
 	if (who < 0 || who >= n_contacts) {
 		return;
 	}
 	struct contact gone = contacts[who];
 	int lock = contact_store_lock();
+	zmc_list_lock(true);
 	contacts_load();
 	contact_delete(contact_store_find(&gone));
+	zmc_list_lock(false);
 	contact_store_unlock(lock);
 	store_stamp = contact_store_stamp();
 }
@@ -433,6 +471,7 @@ static void save_edit(void) {
 	/* the sync may have changed the list since this page opened: read it again,
 	 * under the lock, and change only this one person */
 	int lock = contact_store_lock();
+	zmc_list_lock(true);	/* (until saved: the list's rows read these) */
 	contacts_load();
 	int at = editing >= 0 ? contact_store_find(&edit_orig) : -1;
 	struct contact *c;
@@ -442,6 +481,7 @@ static void save_edit(void) {
 		c = &contacts[n_contacts++];
 		memset(c, 0, sizeof(*c));
 	} else {
+		zmc_list_lock(false);
 		contact_store_unlock(lock);
 		snprintf(edit_note, sizeof(edit_note), "The list is full.");
 		return;
@@ -454,6 +494,7 @@ static void save_edit(void) {
 	snprintf(c->email, sizeof(c->email), "%s", field[F_EMAIL]);
 	snprintf(c->note, sizeof(c->note), "%s", field[F_NOTE]);
 	contacts_save();	/* (sorts: the person may have moved) */
+	zmc_list_lock(false);
 	contact_store_unlock(lock);
 	store_stamp = contact_store_stamp();
 	shown = -1;
@@ -488,15 +529,11 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_LETTER: {
 		int first = first_with_letter(LETTERS[arg]);
-		window_start = first > 0 ? first : 0;
+		/* the letter's own square at the top, just as it arrives */
+		zmc_list_show(P_ALL, first > 0 ? row_of_person(first) - 1 : 0);
 		zmc_go(P_ALL, -1);
 		break;
 	}
-	case ACT_WINDOW:
-		zmc.scroll = 0;
-		zmc_turn(arg >= window_start ? 1 : -1);
-		window_start = arg;
-		break;
 	case ACT_SEARCH:
 		query[0] = 0;
 		zmc_go(P_SEARCH, 1);
@@ -576,7 +613,7 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_MENU: {
 		int who = menu_for;
-		menu_for = -1;
+		menu_set(-1);
 		if (who < 0 || who >= n_contacts) {
 			break;
 		}
@@ -592,14 +629,14 @@ static void activate(int action, int arg) {
 		break;
 	}
 	case ACT_MENU_CLOSE:
-		menu_for = -1;
+		menu_set(-1);
 		break;
 	}
 }
 
 static bool hold(int action, int arg) {
 	if (zmc.page == P_ALL && action == ACT_OPEN && menu_for < 0) {
-		menu_for = arg;
+		menu_set(arg);
 		return true;
 	}
 	return false;
@@ -658,7 +695,7 @@ static void typed(const char *text) {
 
 static bool back(void) {
 	if (menu_for >= 0) {
-		menu_for = -1;
+		menu_set(-1);
 		zmc_redraw();
 		return true;
 	}
@@ -683,12 +720,6 @@ static bool back(void) {
 	if (zmc.page == P_SEARCH) {
 		zmc_keyboard(false);
 		zmc_go(P_ALL, -1);
-		return true;
-	}
-	if (window_start > 0) {
-		window_start = 0;	/* back to the top before closing */
-		zmc.scroll = 0;
-		zmc_turn(-1);
 		return true;
 	}
 	return false;
@@ -716,7 +747,9 @@ static void tick(void) {
 		bool first = photos_stamp == 0;
 		photos_stamp = stamp;
 		if (!first && !zmc.anim_active && zmc.page != P_EDIT && menu_for < 0) {
+			zmc_list_lock(true);
 			contact_photos_forget();
+			zmc_list_lock(false);
 			zmc_redraw();
 		}
 	}
@@ -729,7 +762,9 @@ static void tick(void) {
 	if (shown >= 0 && shown < n_contacts) {
 		was = contacts[shown];
 	}
+	zmc_list_lock(true);
 	contacts_load();
+	zmc_list_lock(false);
 	if (was.name[0]) {
 		shown = contact_store_find(&was);
 		if (shown < 0 && zmc.page == P_CARD) {

@@ -51,8 +51,9 @@ static void dot(cairo_t *cr, bool stroke, bool preserve) {
 	}
 	double scale = sqrt(fabs(m.xx * m.yy - m.xy * m.yx));
 	double pitch = dm_wrap_pitch * (scale > 0 ? scale : 1);
-	int c0 = (int)floor(dx0 / pitch), r0 = (int)floor(dy0 / pitch);
-	int c1 = (int)ceil(dx1 / pitch), r1 = (int)ceil(dy1 / pitch);
+	double oy = dm_wrap_origin_y;
+	int c0 = (int)floor(dx0 / pitch), r0 = (int)floor((dy0 + oy) / pitch);
+	int c1 = (int)ceil(dx1 / pitch), r1 = (int)ceil((dy1 + oy) / pitch);
 	int cols = c1 - c0, rows = r1 - r0;
 	cairo_path_t *path = cairo_copy_path(cr);
 	if (cols <= 0 || rows <= 0 || (long)cols * rows > 400000) {
@@ -66,7 +67,7 @@ static void dot(cairo_t *cr, bool stroke, bool preserve) {
 	cairo_surface_t *mask = cairo_image_surface_create(CAIRO_FORMAT_A8, cols * SS, rows * SS);
 	cairo_t *mc = cairo_create(mask);
 	cairo_scale(mc, SS / pitch, SS / pitch);
-	cairo_translate(mc, -c0 * pitch, -r0 * pitch);
+	cairo_translate(mc, -c0 * pitch, oy - r0 * pitch);
 	cairo_transform(mc, &m);
 	cairo_append_path(mc, path);
 	if (stroke) {
@@ -128,7 +129,7 @@ static void dot(cairo_t *cr, bool stroke, bool preserve) {
 					lit[r * cols + c - 1] && lit[r * cols + c + 1];
 				if (hollow && in != inner) continue;
 				cairo_new_sub_path(cr);
-				cairo_arc(cr, (c0 + c + 0.5) * pitch, (r0 + r + 0.5) * pitch, pitch * 0.36, 0, 2 * M_PI);
+				cairo_arc(cr, (c0 + c + 0.5) * pitch, (r0 + r + 0.5) * pitch - oy, pitch * 0.36, 0, 2 * M_PI);
 			}
 		}
 		if (inner) {

@@ -16,6 +16,7 @@
 
 bool (*dm_wrap_active)(void);
 double dm_wrap_pitch = 2.3;
+double dm_wrap_origin_y;
 int dm_wrap_raw;
 uint32_t dm_wrap_main = 0xffffff, dm_wrap_accent = 0xff3030;
 

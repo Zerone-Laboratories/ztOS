@@ -306,6 +306,43 @@ void zmc_set_rgb(cairo_t *cr, uint32_t color);
 void zmc_picture(cairo_t *cr, cairo_surface_t *picture, double x, double y, double size);
 void zmc_accent(cairo_t *cr);
 
+/* A long list, of up to thousands of rows of one height, with no page of that
+ * size anywhere and no tap target per row: call zmc_list from .render at the
+ * height it starts at, and go on from what it returns. Rows are drawn one at a
+ * time as they come near the screen, each onto a GPU texture of its own that
+ * is then only moved, and a tap finds its row by arithmetic. Only a page's
+ * rows that fit on the first screen are ever in its cached page.
+ *
+ * Its heads are the rows that start a section: the part of a head from pin_x,
+ * pin_y over pin_w, pin_h stays at the top of the list, opaque, so nothing shows
+ * behind it (take the row's whole width), while its section passes
+ * below it, until the next head arrives and pushes it off, as Windows Phone's
+ * letters do. It comes from the head's row texture, so it costs nothing a frame. */
+struct zmc_list {
+	int count;
+	double row_h;
+	uint64_t revision;	/* changes when any row would be drawn differently */
+	/* one row, its top left at the origin, zmc.width across */
+	void (*draw_row)(cairo_t *cr, int row);
+	/* what a touch at x, y in the row gives: action, arg and the box it presses
+	 * (x, y, w, h in the row; w 0: no tilt). false: nothing there */
+	bool (*row_hit)(int row, double x, double y, struct zmc_hit *hit);
+	bool (*is_head)(int row);	/* NULL: no heads */
+	double pin_x, pin_y, pin_w, pin_h;
+};
+/* returns where the list ends */
+double zmc_list(cairo_t *cr, double y, const struct zmc_list *list);
+/* when `page` next arrives (going back, or as the next zmc_go to it), show
+ * `row` at the top of the list: its place is otherwise kept while away */
+void zmc_list_show(int page, int row);
+/* something drawn over a list at where it is now, such as zmc_menu: from here
+ * until zmc_list_freeze(false) the page is one picture of this moment, which
+ * does not scroll, and what .render draws at page heights lands right */
+void zmc_list_freeze(bool freeze);
+/* Rows are also drawn ahead on a thread: hold this while changing what
+ * draw_row reads, outside .render (which already holds it). */
+void zmc_list_lock(bool lock);
+
 /* ---- odds and ends ---- */
 /* A touch to be felt: "tick", "tap", "click" or "heavy", from the lightest.
  * The shell has the motor and the user's settings for it (Settings >

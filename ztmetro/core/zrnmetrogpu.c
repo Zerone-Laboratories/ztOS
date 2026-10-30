@@ -371,6 +371,53 @@ void zmg_surface(cairo_surface_t *source, unsigned revision, double x0, double y
 	}
 }
 
+/* ---- a list's rows: one small texture each ---------------------------------- */
+
+unsigned zmg_row_new(int w, int h) {
+	GLuint t = 0;
+	glGenTextures(1, &t);
+	glBindTexture(GL_TEXTURE_2D, t);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	return t;
+}
+
+void zmg_row_upload(unsigned texture, cairo_surface_t *source) {
+	cairo_surface_flush(source);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cairo_image_surface_get_width(source),
+		cairo_image_surface_get_height(source), GL_RGBA, GL_UNSIGNED_BYTE,
+		cairo_image_surface_get_data(source));
+	gpu.uploads++;
+	gpu.bytes += (size_t)cairo_image_surface_get_stride(source) * cairo_image_surface_get_height(source);
+}
+
+void zmg_row_draw(unsigned texture, double u0, double v0, double u1, double v1,
+		const struct zmg_vertex c[4], float alpha) {
+	float v[20];
+	for (int j = 0; j < 4; j++) {
+		v[j*5] = c[j].x; v[j*5+1] = c[j].y; v[j*5+2] = c[j].z;
+		v[j*5+3] = (j & 1) ? u1 : u0; v[j*5+4] = (j & 2) ? v1 : v0;
+	}
+	glUniform1i(gpu.solid, 0);
+	glUniform1i(gpu.native, 0);
+	glUniform1f(gpu.reveal, zmg_reveal);
+	glUniform1f(gpu.dpitch, zmg_dot_pitch * gpu.scale);
+	glUniform1i(gpu.opaque, 1);
+	glUniform1f(gpu.alpha, alpha);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	vertices(v);
+}
+
+void zmg_row_free(unsigned texture) {
+	GLuint t = texture;
+	if (gpu.ready && t) glDeleteTextures(1, &t);
+}
+
 /* ---- external buffers (DMA-BUF), no copy ---------------------------------- */
 
 struct external {
