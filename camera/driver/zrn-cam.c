@@ -13,6 +13,7 @@
  *	act-read	rear up; read the aperture and focus drivers, no pulse, no move
  *	act-move	rear up; drive the aperture both ways and the focus a little;
  *			ends at F1.5 with the focus landed, then rear off
+ *	stream-*, intcam-*	RAW through CSIS0: see zrn-cam-csis.h
  *
  * Results are in .../result and dmesg. Rails are never left on: the off
  * sequence runs on every path and from a reboot notifier. There is no remove
@@ -820,6 +821,8 @@ static void act_run(bool move)
 	act_bus_off();
 }
 
+#include "zrn-cam-csis.h"
+
 static void pmic_dump(void)
 {
 	static const u8 pb03[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
@@ -845,11 +848,11 @@ static void pmic_dump(void)
 
 static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, loff_t *pos)
 {
-	char cmd[24];
+	char cmd[32];
 	size_t n = min(len, sizeof(cmd) - 1);
 	bool rails = false;
 	const struct camera *c = NULL;
-	bool act = false, act_moves = false;
+	bool act = false, act_moves = false, stream = false, st_frame = false, st_tp = false;
 	int i, ret;
 
 	if (copy_from_user(cmd, ubuf, n))
@@ -868,6 +871,32 @@ static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, lo
 	if (!strcmp(cmd, "pmic")) {
 		pmic_dump();
 		goto done;
+	}
+	if (!strncmp(cmd, "dvfs-", 5)) {
+		u32 dom = 0, khz = 0;
+
+		if (!top_cmu)
+			top_cmu = ioremap(0x1a240000, 0x3000);
+		bus_note("before");
+		/* only the two camera domains of the stock DT */
+		if (sscanf(cmd, "dvfs-%u-%u", &dom, &khz) == 2 && (dom == 5 || dom == 7) &&
+		    khz >= 100000 && khz <= INTCAM_KHZ) {
+			ret = apm_set(dom, khz);
+			note("APM domain %u at %u kHz: %d", dom, khz, ret);
+			usleep_range(1000, 2000);
+			bus_note("after");
+		} else {
+			ret = -EINVAL;
+		}
+		goto done;
+	}
+	if (!strncmp(cmd, "stream-", 7)) {
+		if (!top_cmu)
+			top_cmu = ioremap(0x1a240000, 0x3000);
+		stream = true;
+		st_frame = !strncmp(cmd, "stream-frame", 12);
+		st_tp = strstr(cmd, "-tp");
+		c = &cameras[0];
 	}
 	if (!strcmp(cmd, "act-read") || !strcmp(cmd, "act-move")) {
 		act = true;
@@ -919,7 +948,9 @@ static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, lo
 		}
 	}
 	ret = power_on(c, rails);
-	if (!ret && !rails)
+	if (!ret && stream)
+		ret = stream_run(st_frame, st_tp);
+	else if (!ret && !rails)
 		read_id(c);
 	if (!ret && act)
 		act_run(act_moves);
@@ -948,6 +979,19 @@ static ssize_t result_read(struct file *f, char __user *ubuf, size_t len, loff_t
 	return r;
 }
 
+/* the last frame's area, for a root reader; pictures go to /run and no further */
+static ssize_t frame_read(struct file *f, char __user *ubuf, size_t len, loff_t *pos)
+{
+	ssize_t r = 0;
+
+	mutex_lock(&lock);
+	if (frame)
+		r = simple_read_from_buffer(ubuf, len, pos, frame + FRAME_FRONT, FRAME_AREA);
+	mutex_unlock(&lock);
+	return r;
+}
+
+static const struct file_operations frame_fops = { .owner = THIS_MODULE, .read = frame_read };
 static const struct file_operations run_fops = { .owner = THIS_MODULE, .write = run_write };
 static const struct file_operations result_fops = { .owner = THIS_MODULE, .read = result_read };
 
@@ -956,6 +1000,7 @@ static int reboot_cb(struct notifier_block *nb, unsigned long a, void *d)
 	/* a cycle in progress holds the lock until it is off; wait out to one second */
 	unsigned int i;
 
+	stop_now = true;
 	for (i = 0; i < 100 && !mutex_trylock(&lock); i++)
 		msleep(10);
 	if (i < 100)
@@ -983,6 +1028,10 @@ static int __init zrn_cam_init(void)
 	d = debugfs_create_dir("zrn-cam", NULL);
 	debugfs_create_file("run", 0200, d, NULL, &run_fops);
 	debugfs_create_file("result", 0400, d, NULL, &result_fops);
+	debugfs_create_file("frame", 0400, d, NULL, &frame_fops);
+	ctl_pdev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
+	ctl_pdev->dev.dma_mask = &ctl_pdev->dev.coherent_dma_mask;
+	stream_ws = wakeup_source_register(NULL, "zrn-cam");
 	pr_info("zrn-cam: loaded, idle\n");
 	return 0;
 }
