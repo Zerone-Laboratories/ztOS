@@ -208,9 +208,13 @@ static void call_sound(void) {
 			vibe_stop(&vibe_pid);
 			vibe_playing[0] = 0;
 		}
-	} else if (!strcmp(state, "dialing") || !strcmp(state, "ringing")) {
-		sound_play("ringback.wav", true);
-	} else sound_stop();
+	} else {
+		/* Dialling and ringing sound nothing here: the call's path is open from
+		 * dialling and the network's own ringback comes through it. A local tone
+		 * went out on another DSP stream in the middle of the call's route change
+		 * (RDMA0 then ran at 180542 frames a second) and doubled the real one. */
+		sound_stop();
+	}
 }
 
 
