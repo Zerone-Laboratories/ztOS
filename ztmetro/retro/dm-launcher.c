@@ -947,7 +947,10 @@ static void draw_drawer(struct dm_launcher *L, struct dm_grid *g, int64_t A) {
 	int shown = rows * 7 / 6;
 	for (int k = 0; k < nl && k < shown; k++) {
 		int r = 21 + k * step;
-		dm_glyph3(g, letters[k], 61, r, DM_DIM);
+		/* the letter of the apps at the top of the list stands out, as Metro's
+		 * pinned square does: this list moves a row at a time, on the same dots */
+		bool here = first[k] <= top && (k + 1 >= nl || first[k + 1] > top);
+		dm_glyph3(g, letters[k], 61, r, here ? DM_ACCENT : DM_DIM);
 		add_hit(L, 59, r - 1, 64, r + 5, H_JUMP, first[k]);
 	}
 	dm_text3(g, "< HOME", 5, 143 + dy, DM_DIM, DM_NO_CLIP);

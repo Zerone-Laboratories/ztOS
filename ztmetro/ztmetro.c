@@ -4689,6 +4689,35 @@ static void load_apps(struct zt_server *server) {
 	retro_apps(server);
 }
 
+/* The letter pinned at the top of the app list while its rows pass: which item
+ * it is, and how far down the screen its top is (the next letter pushes it up).
+ * -1: none, at the very top of the list or searching. */
+static int list_pinned(struct zt_server *server, float *screen_y) {
+	if (server->searching || server->list_scroll <= 0) {
+		return -1;
+	}
+	double top = server->list_scroll + LIST_TOP;
+	int head = -1, next = -1;
+	for (int i = 0; i < server->n_items; i++) {
+		if (!server->items[i].header) continue;
+		if (server->items[i].y0 <= top) {
+			head = i;
+		} else {
+			next = i;
+			break;
+		}
+	}
+	if (head < 0) {
+		return -1;
+	}
+	double y = top;
+	if (next >= 0 && server->items[next].y0 - LIST_ROW_H < y) {
+		y = server->items[next].y0 - LIST_ROW_H;
+	}
+	*screen_y = (float)(y + STATUS_H - server->list_scroll);
+	return head;
+}
+
 /* Rows near the screen have their textures, the rest do not: all of the first
  * that are in sight at once, and two a frame of those about to be, so that no
  * frame waits for more than that. Returns whether there is more to do. */
@@ -4701,9 +4730,11 @@ static bool list_prepare(struct zt_server *server) {
 	bool in_sight = server->page > 0.001f, more = false;
 	int built = 0, n_drop = 0;
 	GLuint drop[16];
+	float pin_y;
+	int pinned = list_pinned(server, &pin_y);	/* its texture stays, wherever its row is */
 	for (int i = 0; i < server->n_items; i++) {
 		struct app_item *it = &server->items[i];
-		bool on = in_sight && !it->hidden && it->y + LIST_ICON > top && it->y < bottom;
+		bool on = i == pinned || (in_sight && !it->hidden && it->y + LIST_ICON > top && it->y < bottom);
 		bool near = it->y + LIST_ICON > top - visible && it->y < bottom + visible;
 		if (!it->layer.tex && (on || near)) {
 			if (on || built < 2) {
@@ -4712,7 +4743,7 @@ static bool list_prepare(struct zt_server *server) {
 			} else {
 				more = true;
 			}
-		} else if (it->layer.tex && n_drop < 16 &&
+		} else if (it->layer.tex && n_drop < 16 && i != pinned &&
 				(it->y + LIST_ICON < top - 2.5 * visible || it->y > bottom + 2.5 * visible)) {
 			drop[n_drop++] = it->layer.tex;
 			it->layer.tex = 0;
@@ -8926,6 +8957,10 @@ static int item_at(struct zt_server *server, double x, double y) {
 	if (y < STATUS_H || x < list_margin(server) - 6) {
 		return -1;
 	}
+	float pin_y;
+	if (list_pinned(server, &pin_y) >= 0 && y < pin_y + LIST_ROW_H) {
+		return -1;	/* the clear band: what is under it does not show, nor take a tap */
+	}
 	for (int i = 0; i < server->n_items; i++) {
 		struct app_item *it = &server->items[i];
 		if (!it->header && !it->hidden && cy >= it->y - 4 && cy < it->y + LIST_ICON + 4) {
@@ -13050,6 +13085,30 @@ static void render_frame(struct zt_server *server) {
 					(float)it->layer.pw / it->layer.tw, (float)it->layer.ph / it->layer.th);
 			}
 			glDisable(GL_SCISSOR_TEST);
+			{
+				/* The letter whose rows are passing stays at the top, over a clear
+				 * band across the list: no row shows behind it. Its own texture,
+				 * nothing drawn; the next letter pushes it up and off. */
+				float pin_y, m[16];
+				int pin = list_pinned(server, &pin_y);
+				if (pin >= 0 && server->items[pin].layer.tex) {
+					struct app_item *it = &server->items[pin];
+					float w = (float)it->layer.w;
+					float alpha = turn_place(server, m, lx, pin_y, w, LIST_ICON, LIST_SPAN,
+						item_turn(server, pin), turn_chance(server, pin, 2), false);
+					float band[16], band_h = pin_y + LIST_ROW_H - STATUS_H;
+					if (band_h > 0) {
+						mat_identity(band);
+						mat_translate(band, lx, STATUS_H);
+						mat_scale(band, server->width, band_h);
+						quad(server, GL_TEXTURE_2D, server->black_tex, band, alpha, false, false, 1.0f, 1.0f);
+					}
+					mat_translate(m, -w / 2, -LIST_ICON / 2.0f);
+					mat_scale(m, w, LIST_ICON);
+					quad(server, GL_TEXTURE_2D, it->layer.tex, m, alpha, true, false,
+						(float)it->layer.pw / it->layer.tw, (float)it->layer.ph / it->layer.th);
+				}
+			}
 			/* the search button, fixed at the top of the app list (absolute, not scrollable);
 			 * or, searching, the box with what has been typed, which stays */
 			{

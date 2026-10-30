@@ -517,7 +517,7 @@ static bool contacts_row_hit(int row, double x, double y, struct zmc_hit *hit) {
 	return true;
 }
 
-__attribute__((unused)) static bool contacts_row_head(int row) {
+static bool contacts_row_head(int row) {
 	return contact_rows[row] < 0;
 }
 
@@ -543,7 +543,7 @@ static double draw_contacts(cairo_t *cr) {
 	}
 	struct zmc_list list = { .count = n_contact_rows, .row_h = CONTACT_ROW_H,
 		.revision = contact_list_revision(), .draw_row = contacts_row_draw,
-		.row_hit = contacts_row_hit,
+		.row_hit = contacts_row_hit, .is_head = contacts_row_head,
 		.pin_x = 0, .pin_y = 0, .pin_w = zmc.width, .pin_h = CONTACT_ROW_H };
 	return zmc_list(cr, y - 6, &list) + 40;
 }

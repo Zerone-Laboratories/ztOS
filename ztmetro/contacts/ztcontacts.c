@@ -193,7 +193,7 @@ static int row_of_person(int who) {
 	return 0;
 }
 
-__attribute__((unused)) static bool row_is_head(int row) {
+static bool row_is_head(int row) {
 	return rows[row] < 0;
 }
 
@@ -239,7 +239,7 @@ static double draw_all(cairo_t *cr) {
 	}
 	rows_build();
 	static const struct zmc_list list = { .row_h = ROW_H, .draw_row = draw_row,
-		.row_hit = row_hit,
+		.row_hit = row_hit, .is_head = row_is_head,
 		.pin_x = 0, .pin_y = 0, .pin_w = 360, .pin_h = ROW_H };
 	struct zmc_list here = list;
 	here.pin_w = zmc.width;	/* a clear band: nothing goes behind the letter */
