@@ -1278,6 +1278,19 @@ static int call_set(int route)
 		return 0;
 	if (route) {
 		if (!vss_started && cp_vss) {
+			/* The voice firmware marks this word once it has come up. A SoC
+			 * sleep reboots the DSP, so VSS must start afresh, and a stale
+			 * mark from the last call left RDMA4 idle: wdma2 ran, the
+			 * earpiece was silent (the first call after a sleep that followed
+			 * another call, 30 Oct). Samsung clears it only at probe; its
+			 * DSP does not reboot here. */
+			void __iomem *magic = ioremap(CP_VSS_PA + CP_VSS_MAGIC, 4);
+
+			if (magic) {
+				pr_info("snd-zrn-abox: VSS mark was %08x: cleared\n", readl(magic));
+				writel(0, magic);
+				iounmap(magic);
+			}
 			ret = call_msg(ABOX_START_VSS, 0);
 			vss_started = !ret;
 			msleep(50);
