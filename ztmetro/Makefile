@@ -32,7 +32,7 @@ IAL_LIBS := $(shell pkg-config --exists ztos-ial 2>/dev/null && pkg-config --lib
 
 # ztRetrofit's styles beside Metro: retro/ (DotMatrix: the dot engine and its launcher)
 RETRO = retro/dotmatrix.c retro/dm-launcher.c retro/dm-chrome.c
-RETRO_DEPS = $(RETRO) retro/dotmatrix.h retro/dm-launcher.h retro/dm-chrome.h retro/dm-glyphs.h
+RETRO_DEPS = $(RETRO) core/zrnboard.h retro/dotmatrix.h retro/dm-launcher.h retro/dm-chrome.h retro/dm-glyphs.h
 # every cairo fill and stroke through retro/dm-wrap.c: the style's dots
 DM_WRAP = retro/dm-wrap.c
 DM_WRAP_LDFLAGS = -Wl,--wrap=cairo_fill,--wrap=cairo_fill_preserve,--wrap=cairo_stroke,--wrap=cairo_stroke_preserve,--wrap=cairo_paint

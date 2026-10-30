@@ -141,6 +141,8 @@ static void begin_animation(bool have_from, bool have_to, int target, double tap
 
 /* set while drawing a frame, which cannot start another: asks for the next one */
 static bool board_more;
+/* this action leaves the page as it is: no redraw after it */
+static bool board_keep_page;
 static void board_draw(void);
 static void board_forget(void);
 static bool board_touch_down(int32_t id, double x, double y);
@@ -3415,7 +3417,9 @@ static void zmc_activate(struct zmc_hit *hit) {
 	if (zmc.app->activate) {
 		zmc.app->activate(hit->action, hit->arg);
 	}
-	if (zmc.anim_active && (zmc.anim_cache_ready || zmc.anim_target_pending)) {
+	if (board_keep_page) {
+		board_keep_page = false;	/* (the board has asked for its own frames) */
+	} else if (zmc.anim_active && (zmc.anim_cache_ready || zmc.anim_target_pending)) {
 		present();	/* zmc_go() already prepared the destination */
 	} else {
 		zmc_redraw();
@@ -3851,6 +3855,10 @@ static struct {
 	struct zmc_board b;
 	int state, rows;
 	uint32_t start;
+	double came_ms;	/* closing: how far the rows had got coming in */
+	bool clock_waits;	/* the clock starts at the frame that shows it, after any redraw */
+	double clock_from;	/* and from here */
+	void (*apply)(void);	/* a choice, made once the rows have gone (zmc_board_choose) */
 	cairo_surface_t *atlas, *box, *label, *black;
 	unsigned revision;
 	double label_h;
@@ -3945,16 +3953,49 @@ void zmc_board_open(const struct zmc_board *board) {
 	zmc.vel = 0;
 	bd.state = zmc.configured ? BOARD_IN : BOARD_SHOWN;	/* (a picture of it: at rest) */
 	bd.start = zmc_now_ms();
+	bd.clock_waits = true;
+	bd.clock_from = 0;
+	bd.apply = NULL;
+	board_keep_page = true;	/* it does not change what is under it */
 	present();
+}
+
+/* Since it opened or began to close, in the board's time. */
+static double board_ms(void) {
+	double slow = 1;
+#ifdef ZMC_BOARD_TEST
+	/* a number in /tmp/zmc-board-slow: that many times slower, to record it */
+	static double read;
+	if (!read) {
+		char e[16];
+		zmc_read_file("/tmp/zmc-board-slow", e, sizeof(e));
+		read = atof(e) > 0 ? atof(e) : 1;
+	}
+	slow = read;
+#endif
+	return (double)(uint32_t)(zmc_now_ms() - bd.start) / slow;
 }
 
 void zmc_board_close(void) {
 	if (bd.state == BOARD_HIDDEN || bd.state == BOARD_OUT) {
 		return;
 	}
+	/* a row that had not started in has nothing to take out */
+	bd.came_ms = bd.state == BOARD_IN ? board_ms() - board_lead_ms() : HUGE_VAL;
 	bd.state = BOARD_OUT;
 	bd.start = zmc_now_ms();
+	bd.clock_waits = true;
+	bd.clock_from = 0;
 	present();
+}
+
+void zmc_board_choose(void (*apply)(void)) {
+	if (bd.state == BOARD_HIDDEN || bd.state == BOARD_OUT) {
+		return;
+	}
+	bd.apply = apply;
+	board_keep_page = true;
+	zmc_board_close();
 }
 
 bool zmc_board_up(void) {
@@ -3974,6 +4015,15 @@ static void board_forget(void) {
 	}
 	bd.state = BOARD_HIDDEN;
 	board_free();
+	if (bd.apply) {
+		void (*apply)(void) = bd.apply;
+		bd.apply = NULL;
+		apply();	/* a page change took it: the choice still stands */
+		if (bd.b.closed) {
+			bd.b.closed();
+		}
+		zmc.cache_stale = true;
+	}
 }
 
 static void board_scrim(double alpha) {
@@ -4004,6 +4054,9 @@ static void board_row(int r, double ms, bool in) {
 		/* no turn in this style: the row lights up, or goes out, dot by dot */
 		double reveal = alpha;
 		if (reveal <= 0.001) return;
+		/* dots are open: nothing behind may read through them */
+		double back[4][3] = { { 0, y, 0 }, { w, y, 0 }, { 0, y + h, 0 }, { w, y + h, 0 } };
+		zmc_gpu_quad(bd.black, 1, back, reveal);
 		struct zmg_vertex q[4] = { { 0, (float)y, 0 }, { (float)w, (float)y, 0 },
 			{ 0, (float)(y + h), 0 }, { (float)w, (float)(y + h), 0 } };
 		zmg_reveal = (float)reveal;
@@ -4019,15 +4072,23 @@ static void board_draw(void) {
 	if (bd.state == BOARD_HIDDEN) {
 		return;
 	}
-	/* a number in /tmp/zmc-board-slow: that many times slower, to record it
-	 * (the shell's recorder is coarse); read once a run */
-	static double slow;
-	if (!slow) {
-		char e[16];
-		zmc_read_file("/tmp/zmc-board-slow", e, sizeof(e));
-		slow = atof(e) > 0 ? atof(e) : 1;
+	if (bd.clock_waits) {
+		bd.clock_waits = false;
+		bd.start = zmc_now_ms();	/* moving the list can take a frame or more */
 	}
-	double ms = (double)(uint32_t)(zmc_now_ms() - bd.start) / slow, run = board_run_ms();
+	double ms = board_ms() + bd.clock_from, run = board_run_ms();
+	if (bd.state == BOARD_OUT && bd.apply && ms >= run) {
+		/* behind the black now: the page's redraw, the slow part, is not seen */
+		void (*apply)(void) = bd.apply;
+		bd.apply = NULL;
+		apply();
+		zmc.cache_stale = true;
+		bd.clock_waits = true;
+		bd.clock_from = run;
+		board_scrim(1);
+		board_more = true;
+		return;
+	}
 	if (bd.state == BOARD_OUT) {
 		double end = bd.b.picker ? run + ZB_PAGE_IN_MS : run;
 		if (ms >= end) {
@@ -4040,13 +4101,16 @@ static void board_draw(void) {
 			return;
 		}
 		board_scrim(bd.b.picker ? 1 - fmax(0, ms - run) / ZB_PAGE_IN_MS : ZB_SCRIM * (1 - ms / run));
-		if (bd.label && ms < run) {
+		if (bd.label && ms < ZB_ROW_MS) {
+			/* it goes with the first row, as on the phone (out60) */
 			double c[4][3] = { { 0, bd.b.top - bd.label_h, 0 }, { zmc.width, bd.b.top - bd.label_h, 0 },
 				{ 0, bd.b.top, 0 }, { zmc.width, bd.b.top, 0 } };
-			zmc_gpu_quad(bd.label, 1, c, 1);
+			zmc_gpu_quad(bd.label, 1, c, 1 - ms / ZB_ROW_MS);
 		}
 		for (int r = 0; r < bd.rows; r++) {
-			board_row(r, ms - r * ZB_STAGGER_MS, false);
+			if (bd.came_ms > r * ZB_STAGGER_MS) {
+				board_row(r, ms - r * ZB_STAGGER_MS, false);
+			}
 		}
 		board_more = true;
 		return;
@@ -4147,6 +4211,10 @@ static bool board_touch_up(int32_t id) {
 	if (col >= bd.b.cols || px - col * w >= bd.b.cell_w || py - row * pitch >= bd.b.cell_h ||
 			i >= bd.b.count || (bd.b.live && !bd.b.live(i))) {
 		return true;	/* a dim letter, or between the tiles: nothing */
+	}
+	if (bd.state == BOARD_IN &&
+			board_ms() - board_lead_ms() - row * ZB_STAGGER_MS < ZB_ROW_MS / 2) {
+		return true;	/* not on the screen yet: a double tap must not choose */
 	}
 	struct zmc_hit hit = { .action = bd.b.action, .arg = i };
 	zmc_activate(&hit);

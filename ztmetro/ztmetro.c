@@ -27,8 +27,8 @@
  * Built on wlroots 0.20; the xdg-shell plumbing follows wlroots' tinywl.
  */
 #define _GNU_SOURCE
-#ifdef HAVE_ZTOS_IAL
 #include "core/zrnboard.h"
+#ifdef HAVE_ZTOS_IAL
 #include <ztos-ial.h>
 #endif
 #include "background-apps.h"
@@ -823,6 +823,8 @@ struct zt_server {
 	/* the app list's letters, flipped in over it (core/zrnboard.h) */
 	int board_state;	/* 0 hidden, 1 in, 2 shown, 3 out */
 	uint32_t board_start;
+	double board_came_ms;	/* closing: how far the rows had got coming in */
+	bool board_clock_waits;	/* the clock starts at the frame that shows it */
 	struct zt_layer board_rows[ZB_ROWS];
 	bool board_live[ZB_CELLS];
 	uint32_t turn_seed;	/* for the chance in each return */
@@ -4585,13 +4587,17 @@ static void board_open(struct zt_server *server) {
 	server->list_v = 0;
 	server->board_state = 1;
 	server->board_start = now_ms();
+	server->board_clock_waits = true;
 	damage(server);
 }
 
 static void board_close(struct zt_server *server) {
 	if (server->board_state == 1 || server->board_state == 2) {
+		/* a row that had not started in has nothing to take out */
+		server->board_came_ms = server->board_state == 1 ? (uint32_t)(now_ms() - server->board_start) : HUGE_VAL;
 		server->board_state = 3;
 		server->board_start = now_ms();
+		server->board_clock_waits = true;
 		damage(server);
 	}
 }
@@ -4614,6 +4620,10 @@ static void board_tap(struct zt_server *server, double x, double y) {
 	int i = r * ZB_COLS + c;
 	if (!server->board_live[i]) {
 		return;
+	}
+	if (server->board_state == 1 &&
+			(uint32_t)(now_ms() - server->board_start) < r * ZB_STAGGER_MS + ZB_ROW_MS / 2) {
+		return;	/* not on the screen yet: a double tap must not choose */
 	}
 	hap(server, HAP_TAP, HG_NAV);
 	for (int k = 0; k < server->n_items; k++) {
@@ -12841,6 +12851,10 @@ static void board_frame(struct zt_server *server) {
 	if (!server->board_state) {
 		return;
 	}
+	if (server->board_clock_waits) {
+		server->board_clock_waits = false;
+		server->board_start = now_ms();
+	}
 	double ms = (uint32_t)(now_ms() - server->board_start), run = (ZB_ROWS - 1) * ZB_STAGGER_MS + ZB_ROW_MS;
 	bool out = server->board_state == 3;
 	if (out && ms >= run) {
@@ -12864,6 +12878,9 @@ static void board_frame(struct zt_server *server) {
 	for (int r = 0; r < ZB_ROWS; r++) {
 		struct zt_layer *l = &server->board_rows[r];
 		double t = (ms - r * ZB_STAGGER_MS) / ZB_ROW_MS;
+		if (out && server->board_came_ms <= r * ZB_STAGGER_MS) {
+			continue;
+		}
 		if (t < 0 || (out && t >= 1) || !l->tex) {
 			if (out && t < 0) {
 				t = 0;	/* still in its place until its turn */

@@ -19,7 +19,7 @@
 #define ZB_FONT		27.0
 #define ZB_INSET	9.0	/* the letter, from the tile's left and bottom */
 #define ZB_DIM_RGB	0x262626	/* a letter with nothing under it */
-#define ZB_DIM_TEXT	0.4
+#define ZB_DIM_TEXT	0.85	/* near white on video, which may flatter it */
 #define ZB_SCRIM	0.85	/* the live list stays faintly visible (value not measured) */
 
 #define ZB_IN_DEG	(-45.0)

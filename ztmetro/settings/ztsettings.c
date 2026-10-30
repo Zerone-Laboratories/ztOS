@@ -1659,6 +1659,14 @@ static double draw_accents(cairo_t *cr) {
  * chosen, they flip out from the top and the old page is back with it. */
 
 static double accent_box_y;	/* on the theme page */
+static bool board_unsaved;
+
+static void accent_closed(void) {
+	if (board_unsaved) {
+		board_unsaved = false;
+		config_save();
+	}
+}
 
 static void accent_cell(cairo_t *cr, int i, double w, double h) {
 	zmc_set_rgb(cr, ACCENTS[i].color);
@@ -1704,7 +1712,8 @@ static void accent_board_open(void) {
 		.x0 = MARGIN, .top = 46, .cell_w = side, .cell_h = dots ? side + 30 : side, .gap = gap,
 		.draw_cell = dots ? palette_cell : accent_cell, .action = dots ? ACT_PALETTE : ACT_ACCENT,
 		.label = dots ? "PALETTES" : "ACCENTS", .picker = true, .draw_box = accent_box,
-		.box_x = MARGIN, .box_y = accent_box_y - zmc.scroll, .box_w = zmc.width - 2 * MARGIN, .box_h = 42 };
+		.box_x = MARGIN, .box_y = accent_box_y - zmc.scroll, .box_w = zmc.width - 2 * MARGIN, .box_h = 42,
+		.closed = accent_closed };
 	zmc_board_open(&b);
 }
 
@@ -3008,6 +3017,24 @@ static bool is_picker(int action) {
 	return action >= ACT_QUICK_SLOT && action <= ACT_QUICK_LAST;
 }
 
+static int board_choice;
+
+/* The page first, with the new one; the shell is told when it is back (.closed),
+ * because the shell's own redraw of everything then takes the cores. */
+static void accent_apply(void) {
+	app.accent = board_choice;
+	zmc.accent = ACCENTS[app.accent].color;
+	board_unsaved = true;
+}
+
+static void palette_apply(void) {
+	app.palette = board_choice;
+	board_unsaved = true;
+	config_save();
+	zmc_config_style();
+	board_unsaved = false;
+}
+
 static void activate(int action, int arg) {
 	/* a picker's box opens or closes it; one of its options is the choice */
 	if (is_picker(action) && arg < 0) {
@@ -3120,12 +3147,15 @@ static void activate(int action, int arg) {
 		zmc_go(arg, 1);
 		break;
 	case ACT_PALETTE:
+		if (zmc_board_up()) {
+			board_choice = arg;
+			zmc_board_choose(palette_apply);
+			break;
+		}
 		app.palette = arg;
 		config_save();
 		zmc_config_style();	/* this app's dots in it at once */
-		if (zmc_board_up()) {
-			zmc_board_close();
-		} else if (zmc.page == PAGE_ACCENTS) {
+		if (zmc.page == PAGE_ACCENTS) {
 			zmc_go(PAGE_THEME, -1);
 		} else {
 			zmc_redraw();
@@ -3135,12 +3165,14 @@ static void activate(int action, int arg) {
 		accent_board_open();
 		break;
 	case ACT_ACCENT:
+		if (zmc_board_up()) {
+			board_choice = arg;
+			zmc_board_choose(accent_apply);
+			break;
+		}
 		app.accent = arg;
 		config_save();
-		if (zmc_board_up()) {
-			zmc_board_redraw();	/* the outline on the new one, as they go */
-			zmc_board_close();
-		} else if (zmc.page == PAGE_ACCENTS) {
+		if (zmc.page == PAGE_ACCENTS) {
 			zmc_go(PAGE_THEME, -1);	/* (opened directly, by name) */
 		}
 		break;

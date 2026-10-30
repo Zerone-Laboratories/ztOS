@@ -305,6 +305,10 @@ struct zmc_board {
 };
 void zmc_board_open(const struct zmc_board *board);
 void zmc_board_close(void);		/* from the top, as it came */
+/* Close for a choice: apply() runs once the rows have gone, when the page's
+ * redraw is hidden, so the rows do not wait for it. Only for a picker. It runs
+ * inside a frame: it changes state and must not redraw. */
+void zmc_board_choose(void (*apply)(void));
 bool zmc_board_up(void);
 void zmc_board_redraw(void);		/* the rows again: a cell has changed */
 /* People's and the phone's letters: # a..z and the globe. has(i) says whether a
