@@ -199,6 +199,21 @@ static unsigned int eint_follow = 0x8000;
 module_param(eint_follow, uint, 0600);
 MODULE_PARM_DESC(eint_follow, "EINT bits whose wake follows their IRQ's enable_irq_wake (default: host_req)");
 static int follow_irq[32];	/* 0: that bit is not followed */
+/* EINT bits (8 x gpaN + pin) whose pad is a plain input while the SoC
+ * sleeps, as stock's sec_ts off_state pinctrl (attn-input) does. The
+ * touchscreen's attn (gpa1-0, s6sy761_irq) is wake-masked but stays
+ * asserted after the driver's application sleep; its level re-latches the
+ * pending bit microseconds after the clear, ACPM finds GRP4 set and gives the
+ * sleep up ("other" fw-abort, 30 Oct). Only bits masked in eint_wake and not
+ * followed are switched; restore_platform() puts the EINT function back. */
+static unsigned int eint_quiet = 0x100;
+module_param(eint_quiet, uint, 0600);
+MODULE_PARM_DESC(eint_quiet, "wake-masked EINT bits whose pad is a plain input during sleep (default: touch attn gpa1-0)");
+static unsigned int quieted;		/* the bits switched for this sleep */
+static u32 saved_quiet_con[4];
+static unsigned long quiet_sleeps;
+module_param(quiet_sleeps, ulong, 0444);
+
 static unsigned int eint_effective;	/* the PMU 0x60c word of the last sleep */
 module_param_cb(eint_effective, &hex32_ops, &eint_effective, 0444);
 static unsigned long hub_refused, hub_pend_cleared, grp4_stale_clears;
@@ -368,6 +383,10 @@ static void restore_platform(void)
 		writel_relaxed(saved_wake[i], pmu + wake_offsets[i]);
 		writel_relaxed(saved_idle[i], pmu + 0x3f0 + 4 * i);
 	}
+	for (i = 0; i < 4; i++)
+		if ((quieted >> (i * 8)) & 0xff)
+			writel_relaxed(saved_quiet_con[i], mapped_base(0x14050000) + i * 0x20);
+	quieted = 0;
 	for (i = 0; i < ARRAY_SIZE(eint_offset); i++)
 		writel_relaxed(saved_eint_mask[i], mapped_base(0x14050000) + 0x900 + eint_offset[i]);
 	/* The unbound cluster-0 watchdog must retain its boot-disabled state. */
@@ -491,6 +510,25 @@ static int sleep_finisher(unsigned long state)
 		}
 		low |= BIT(b);
 	}
+	/* A masked level line still latches its pending bit: make its pad a
+	 * plain input (CON nibble 0) before the clear below, so it stays clear
+	 * through ACPM's GRP4 check. CON of gpaN is at 0x14050000 + N x 0x20. */
+	quieted = eint_quiet & eint_wake & ~eint_follow;
+	for (i = 0; i < 4; i++) {
+		void __iomem *con = mapped_base(0x14050000) + i * 0x20;
+		u32 pins = (quieted >> (i * 8)) & 0xff, v;
+
+		if (!pins)
+			continue;
+		saved_quiet_con[i] = v = readl_relaxed(con);
+		for (b = 0; b < 8; b++)
+			if (pins & BIT(b))
+				v &= ~(0xfU << (b * 4));
+		writel_relaxed(v, con);
+	}
+	if (quieted)
+		quiet_sleeps++;
+	wmb();
 	/* Discard only latched events from explicitly masked diagnostic sources
 	 * and the stale latches of followed lines that are low; preserve the
 	 * power-key latch and all enabled wake sources. */
