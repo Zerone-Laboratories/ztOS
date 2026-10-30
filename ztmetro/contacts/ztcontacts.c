@@ -7,8 +7,8 @@
  *   people	everyone, under the letter their name starts with; round
  *		buttons to add, search and see Google. Tap a name for its
  *		card; hold it for a menu (edit, delete). A letter's square
- *		opens the jump list.
- *   jump	all the letters, those without anyone dimmed.
+ *		flips in all the letters over the list, those without anyone
+ *		dimmed (zmc_letter_board); no page of its own.
  *   search	by name, number or e-mail, as it is typed.
  *   profile	one person: call, text, the other number; edit and delete.
  *   edit	the same person as boxes to type into; save or cancel.
@@ -40,7 +40,7 @@
 #define ROW_H 58		/* a person, or a letter's square: the list is arithmetic */
 #define MAX_RESULTS 20
 
-enum page { P_ALL, P_CARD, P_EDIT, P_JUMP, P_SEARCH, P_GOOGLE };
+enum page { P_ALL, P_CARD, P_EDIT, P_SEARCH, P_GOOGLE };
 
 enum action {
 	ACT_OPEN = 1,	/* arg: who */
@@ -253,31 +253,10 @@ static double draw_all(cairo_t *cr) {
 	return y + 24;
 }
 
-/* ---- all the letters: the jump list ---------------------------------------- */
+/* ---- all the letters: the reader board over the list ---------------------- */
 
-static double draw_jump(cairo_t *cr) {
-	double y = zmc_header(cr, "people");
-	const double gap = 8, side = (zmc.width - 2 * MARGIN - 3 * gap) / 4;
-	for (int i = 0; LETTERS[i]; i++) {
-		double x = MARGIN + (i % 4) * (side + gap), top = y + (i / 4) * (side + gap);
-		bool has = first_with_letter(LETTERS[i]) >= 0;
-		if (has) {
-			zmc_accent(cr);
-		} else {
-			zmc_set_rgb(cr, 0x262626);
-		}
-		cairo_rectangle(cr, x, top, side, side);
-		cairo_fill(cr);
-		char text[2] = { (char)tolower((unsigned char)LETTERS[i]), 0 };
-		if (has) {
-			cairo_set_source_rgb(cr, 1, 1, 1);
-			zmc_add_hit(x, top, side, side, ACT_LETTER, i);
-		} else {
-			cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);
-		}
-		zmc_text(cr, text, FONT_SEMILIGHT, side * 0.42, x + 8, top + side - side * 0.62, 0);
-	}
-	return y + 7 * (side + gap) + 24;
+static bool letter_has_person(int i) {
+	return first_with_letter(LETTERS[i]) >= 0;
 }
 
 /* ---- search ------------------------------------------------------------------ */
@@ -423,7 +402,6 @@ static double render(cairo_t *cr, int page) {
 	case P_ALL: return draw_all(cr);
 	case P_CARD: return draw_card(cr);
 	case P_EDIT: return draw_edit(cr);
-	case P_JUMP: return draw_jump(cr);
 	case P_SEARCH: return draw_search(cr);
 	case P_GOOGLE: return draw_google(cr);
 	}
@@ -525,13 +503,13 @@ static void activate(int action, int arg) {
 		open_person(arg, zmc.page == P_SEARCH ? P_SEARCH : P_ALL);
 		break;
 	case ACT_JUMP:
-		zmc_go(P_JUMP, 1);
+		zmc_letter_board(letter_has_person, ACT_LETTER);
 		break;
 	case ACT_LETTER: {
 		int first = first_with_letter(LETTERS[arg]);
-		/* the letter's own square at the top, just as it arrives */
+		/* the list moves at once, under the rows going */
 		zmc_list_show(P_ALL, first > 0 ? row_of_person(first) - 1 : 0);
-		zmc_go(P_ALL, -1);
+		zmc_board_close();
 		break;
 	}
 	case ACT_SEARCH:
@@ -713,7 +691,7 @@ static bool back(void) {
 		}
 		return true;
 	}
-	if (zmc.page == P_JUMP || zmc.page == P_GOOGLE) {
+	if (zmc.page == P_GOOGLE) {
 		zmc_go(P_ALL, -1);
 		return true;
 	}
@@ -772,9 +750,8 @@ static void tick(void) {
 			return;
 		}
 	}
-	if (zmc.page != P_JUMP) {
-		zmc_redraw();
-	}
+	zmc_board_redraw();	/* the letters, if they are up */
+	zmc_redraw();
 }
 
 static const struct zmc_app people = {
@@ -802,12 +779,17 @@ int main(int argc, char **argv) {
 		}
 		const char *name = argv[2];
 		int page = !strcmp(name, "card") ? P_CARD : !strcmp(name, "edit") ? P_EDIT :
-			!strcmp(name, "jump") ? P_JUMP : !strcmp(name, "search") ? P_SEARCH :
+			!strcmp(name, "search") ? P_SEARCH :
 			!strcmp(name, "google") ? P_GOOGLE : P_ALL;
 		shown = 2;
 		snprintf(query, sizeof(query), "an");
 		if (page == P_EDIT) {
 			edit_begin(2, NULL);
+		}
+		if (!strcmp(name, "jump")) {
+			zmc.accent = zmc_config_accent();
+			zmc_config_style();
+			zmc_letter_board(letter_has_person, ACT_LETTER);	/* over the list */
 		}
 		return zmc_render_png(&people, page, 664, argv[3]);
 	}
