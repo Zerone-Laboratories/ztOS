@@ -67,6 +67,12 @@
 #include <pango/pangocairo.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
+#include <wlr/backend/multi.h>
+#include <wlr/backend/wayland.h>
+#include <wlr/config.h>
+#if WLR_HAS_X11_BACKEND
+#include <wlr/backend/x11.h>
+#endif
 #include <wlr/interfaces/wlr_keyboard.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/egl.h>
@@ -837,6 +843,25 @@ static void auth_submit(struct zt_server *);
 static void auth_finish(struct zt_server *);
 static void draw_dialog(struct zt_server *);
 static void run_detached(const char *, const char *, const char *, const char *);
+
+/* In a window on another desktop (scripts/dev/run-nested.sh, any machine),
+ * not on a phone's own screen: the machine's backlight, radios, volume and
+ * power are not the shell's to change, and there is no sensor hub or Waydroid
+ * to wait for at boot. Asked for with ZTMETRO_NESTED=1, and only taken when
+ * wlroots did open a window (see main). */
+static bool g_nested;
+
+static void backend_is_window(struct wlr_backend *backend, void *data) {
+	bool *window = data;
+	if (wlr_backend_is_wl(backend)) {
+		*window = true;
+	}
+#if WLR_HAS_X11_BACKEND
+	if (wlr_backend_is_x11(backend)) {
+		*window = true;
+	}
+#endif
+}
 
 /* ZTMETRO_PERFLOG=1: frame timings into the session log. Off, as every line
  * is a write to the log file, and the slow frames it reports are the ones
@@ -2101,6 +2126,9 @@ static void haptics_init(struct zt_server *server) {
 	}
 	server->haptic_fd = -1;
 	server->haptic_scan_ms = now_ms();
+	if (g_nested) {
+		return;
+	}
 	DIR *dir = opendir("/dev/input");
 	struct dirent *entry;
 	while (dir && (entry = readdir(dir))) {
@@ -2643,6 +2671,10 @@ static void backlight_init(struct zt_server *server) {
 	bl.usable = 0;
 	bl.mode = BL_NONE;
 	bl.server = server;
+	if (g_nested) {
+		wlr_log(WLR_INFO, "backlight: none (nested, the desktop's own is left alone)");
+		return;
+	}
 	bool has_device = false, is_s9 = false;
 #ifdef HAVE_ZTOS_IAL
 	/* ztOSIAL's Display1 names the panel and how to drive it: "table" and
@@ -5468,7 +5500,7 @@ static int boot_check_sensorhub(void *data) {
 	struct zt_server *server = data;
 	bool test_fail = getenv("ZT_TEST_SENSORHUB_FAIL") != NULL;
 
-	bool sensor_ready = server->boot_skip_sensorhub;
+	bool sensor_ready = server->boot_skip_sensorhub || g_nested;
 	/* Samsung's sensor hub (SSP) is on the S9's vendor kernel only, under
 	 * the sec class; a phone without that class has none to wait for (the
 	 * J5 sat on the boot splash 45 s, then warned that it had failed) */
@@ -5489,7 +5521,8 @@ static int boot_check_sensorhub(void *data) {
 
 	uint32_t elapsed = now_ms() - server->boot_wait_started_ms;
 	/* and Android only where Waydroid has been set up (waydroid init) */
-	bool android_ready = access("/run/ztos-waydroid-boot-ready", F_OK) == 0 ||
+	bool android_ready = g_nested ||
+		access("/run/ztos-waydroid-boot-ready", F_OK) == 0 ||
 		access("/var/lib/waydroid/waydroid.cfg", F_OK) != 0;
 	if ((android_ready && (sensor_ready || server->sensorhub_fail_screen)) || elapsed >= 45000) {
 		if (android_ready && sensor_ready) {
@@ -6519,6 +6552,12 @@ static void launch_cmd(struct zt_server *server, const char *cmd) {
 
 /* Start a helper and do not wait for it: nothing here may block a frame. */
 static void run_detached(const char *program, const char *a1, const char *a2, const char *a3) {
+	/* nested, these would act on the desktop (nmcli, wpctl, systemctl reboot,
+	 * pacman…); only the app list's own helper runs */
+	if (g_nested && strcmp(program, "ztapps") != 0) {
+		wlr_log(WLR_INFO, "nested: not running %s %s", program, a1 ? a1 : "");
+		return;
+	}
 	pid_t pid = fork();
 	if (pid == 0) {
 		setsid();
@@ -8869,6 +8908,12 @@ static void tone_rgb(int kelvin, float rgb[3]) {
  * are scheduled; the power key brings it back. */
 static void screen_set(struct zt_server *server, bool on) {
 	if (!server->output || server->screen_on == on) {
+		return;
+	}
+	/* nested, a disabled output is the window gone, with nothing left to
+	 * wake it; and the Waydroid freeze below is not this machine's */
+	if (!on && g_nested) {
+		wlr_log(WLR_INFO, "nested: the screen stays on");
 		return;
 	}
 	if (!on && server->auth_active) auth_finish(server);
@@ -11594,6 +11639,11 @@ static void output_frame(struct wl_listener *listener, void *data) {
 static void output_request_state(struct wl_listener *listener, void *data) {
 	struct zt_output *output = wl_container_of(listener, output, request_state);
 	const struct wlr_output_event_request_state *event = data;
+	/* a window on a desktop asks for its new size when it is resized; the
+	 * layout is worked out once, for the phone-shaped size it opened at */
+	if (wl_list_empty(&output->wlr_output->modes)) {
+		return;
+	}
 	wlr_output_commit_state(output->wlr_output, event->state);
 }
 
@@ -11625,15 +11675,27 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	wlr_output_state_init(&state);
 	wlr_output_state_set_enabled(&state, true);
 	struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
+	int px_w = wlr_output->width, px_h = wlr_output->height;
 	if (mode) {
 		wlr_output_state_set_mode(&state, mode);
+	} else if (wl_list_empty(&wlr_output->modes)) {
+		/* a window on a desktop (Wayland or X11): no panel to take a mode
+		 * from, so a phone's shape, ZTMETRO_SIZE=WxH in pixels */
+		int w = 540, h = 1110;
+		const char *size = getenv("ZTMETRO_SIZE");
+		if (size && (sscanf(size, "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0)) {
+			w = 540, h = 1110;
+		}
+		wlr_output_state_set_custom_mode(&state, w, h, 0);
+		px_w = w, px_h = h;	/* the automatic scale below works from these */
 	}
 	if (server->scale <= 0.0f) {
 		/* automatic: 360 points across the panel, as the S9 (1440 px, 4.0)
 		 * was laid out, so every phone shows the same layout; the J5's
 		 * 720 px give 2.0. Settings' display size steps it either side */
-		int px = mode ? mode->width : wlr_output->width;
-		if (px > mode_height(mode, wlr_output)) px = mode_height(mode, wlr_output);
+		int px = mode ? mode->width : px_w;
+		int py = mode ? mode_height(mode, wlr_output) : px_h;
+		if (px > py) px = py;
 		float s = px > 0 ? px / 360.0f * server->size_step : 4.0f;
 		server->scale = roundf(s * 20.0f) / 20.0f;	/* a step of 0.05 */
 		if (server->scale < 1.0f) server->scale = 1.0f;
@@ -12000,8 +12062,6 @@ int main(int argc, char *argv[]) {
 
 	server.wl_display = wl_display_create();
 	server.loop = wl_display_get_event_loop(server.wl_display);
-	backlight_init(&server);
-	backlight_set(server.shade_brightness);	/* (load_config ran before the loop) */
 	server.backend = wlr_backend_autocreate(server.loop, NULL);
 	if (server.backend) {
 		int drm_fd = wlr_backend_get_drm_fd(server.backend);
@@ -12018,6 +12078,33 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_ERROR, "failed to create the backend");
 		return 1;
 	}
+	/* Nested mode is asked for, and checked against what wlroots opened: a
+	 * window without the ask would act on the desktop's own Wi-Fi, volume and
+	 * power, so it does not start; the ask on a screen of its own (a phone) is
+	 * ignored, so the phone keeps its hardware. */
+	bool window = false;
+	if (wlr_backend_is_multi(server.backend)) {
+		wlr_multi_for_each_backend(server.backend, backend_is_window, &window);
+	} else {
+		backend_is_window(server.backend, &window);
+	}
+	const char *nested = getenv("ZTMETRO_NESTED");
+	bool asked = nested && strcmp(nested, "1") == 0;
+	if (window && !asked) {
+		wlr_log(WLR_ERROR, "nested: in a window on another desktop without ZTMETRO_NESTED=1; "
+			"start it with scripts/dev/run-nested.sh");
+		wlr_backend_destroy(server.backend);
+		return 1;
+	}
+	if (asked && !window) {
+		wlr_log(WLR_ERROR, "nested: ZTMETRO_NESTED=1 on a screen of its own, ignored");
+	}
+	g_nested = window;
+	if (g_nested) {
+		wlr_log(WLR_INFO, "nested: in a window, hardware and system actions off");
+	}
+	backlight_init(&server);
+	backlight_set(server.shade_brightness);	/* (load_config ran before the loop) */
 	server.renderer = wlr_renderer_autocreate(server.backend);
 	if (!server.renderer) {
 		wlr_log(WLR_ERROR, "failed to create the renderer");
