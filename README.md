@@ -66,6 +66,33 @@ From a Galaxy S9 running ztOS (taken from the live display with `scripts/phone-g
 | `archive/` | everything else from bring-up (recordings, screenshots, logs); `archive/MANIFEST.txt` says where each came from |
 | `build/`, `out/` | build inputs and outputs (not in the repository) |
 
+## Development shell (Nix)
+
+On Arch Linux, `nix develop` gives you the toolchain, the ztMETRO libraries,
+QEMU, and the image tools without installing them with `pacman`:
+
+```sh
+nix develop
+./installer/ztos install --target qemu
+```
+
+The shell provides `qemu-system-aarch64`, `qemu-user`, `qemu-img`, and the
+aarch64 UEFI firmware through `ZTOS_EDK2`, so the emulator works without Arch's
+`edk2-aarch64`. It also carries wlroots 0.20, Wayland, GTK, Python, and the
+kernel build tools. The first `nix develop` downloads about 2 GB; on x86-64 it
+also builds the aarch64 UEFI firmware once.
+
+Two things stay host configuration, because a shell cannot set them:
+
+- on x86-64 hosts, aarch64 binaries need binfmt: `qemu-user-static-binfmt` on
+  Arch Linux, or `boot.binfmt.emulatedSystems = [ "aarch64-linux" ];` on NixOS;
+- the build runs in a user namespace, so your account needs a subordinate ID
+  range in `/etc/subuid` and `/etc/subgid`.
+
+The shell is provided for `x86_64-linux` and `aarch64-linux`. It is the
+development environment for the Arch Linux ARM port, not the NixOS image
+builder.
+
 ## ztOS's parts
 
 | Name | What it is |
