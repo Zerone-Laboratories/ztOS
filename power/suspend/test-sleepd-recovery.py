@@ -185,6 +185,69 @@ class WakeReasonTest(unittest.TestCase):
         self.assertEqual(self.reason(60, wake_stat=str(0x80000002), grp4_before='1'), 'fw-abort')
 
 
+class ModemRxTest(unittest.TestCase):
+    """Which modem channel a wake carried, from the wakeup sources' counts."""
+    def tree(self, base, sources):
+        for i, (name, wakeups, events) in enumerate(sources):
+            d = base / f'wakeup{i}'
+            d.mkdir()
+            (d / 'name').write_text(name + '\n')
+            (d / 'wakeup_count').write_text(f'{wakeups}\n')
+            (d / 'event_count').write_text(f'{events}\n')
+
+    def counts(self, sources):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            self.tree(base, sources)
+            with patch.object(sleepd, 'WAKEUP', base):
+                return sleepd.modem_counts()
+
+    BEFORE = [('umts_rfs0', 10, 91), ('umts_ipc0', 0, 82), ('umts_router', 0, 975),
+              ('rmnet0', 0, 0), ('14170000.mcu_ipc', 0, 0), ('alarmtimer.2.auto', 3, 3)]
+
+    def test_parse_only_modem_sources(self):
+        counts = self.counts(self.BEFORE)
+        self.assertEqual(counts, {'umts_rfs0': (10, 91), 'umts_ipc0': (0, 82),
+                                  'umts_router': (0, 975), 'rmnet0': (0, 0)})
+
+    def test_rfs_only(self):
+        before = self.counts(self.BEFORE)
+        after = dict(before, umts_rfs0=(20, 101))
+        self.assertEqual(sleepd.modem_rx(before, after), 'umts_rfs0 +10')
+
+    def test_router_only(self):
+        before = self.counts(self.BEFORE)
+        after = dict(before, umts_router=(0, 977))
+        self.assertEqual(sleepd.modem_rx(before, after), 'umts_router +2')
+
+    def test_no_delta(self):
+        before = self.counts(self.BEFORE)
+        self.assertEqual(sleepd.modem_rx(before, dict(before)), '')
+        self.assertEqual(sleepd.woke_text('modem', {'modem_rx': ''}), 'modem (no channel rx)')
+        self.assertEqual(sleepd.woke_text('rtc', {'modem_rx': ''}), 'rtc')
+
+    def test_missing_source(self):
+        before = self.counts(self.BEFORE)
+        after = dict(before, umts_ipc0=(1, 85))
+        del before['umts_ipc0']		# gone before, back after: not counted
+        self.assertEqual(sleepd.modem_rx(before, after), '')
+        after2 = dict(self.counts(self.BEFORE))
+        del after2['umts_rfs0']
+        self.assertEqual(sleepd.modem_rx(self.counts(self.BEFORE), after2), '')
+
+    def test_woke_text(self):
+        self.assertEqual(sleepd.woke_text('modem', {'modem_rx': 'umts_rfs0 +10'}), 'modem (umts_rfs0 +10)')
+        self.assertEqual(sleepd.woke_text('rtc', {'modem_rx': 'umts_ipc0 +1'}), 'rtc (modem rx: umts_ipc0 +1)')
+        self.assertEqual(sleepd.woke_text('aborted', {}), 'aborted')
+
+    def test_cycle_records_the_delta(self):
+        # snapshots after the wakeup_count write and a second after the return
+        snaps = [{'umts_ipc0': (0, 5), 'umts_router': (0, 9)}, {'umts_ipc0': (1, 7), 'umts_router': (0, 9)}]
+        with patch.object(sleepd, 'modem_counts', side_effect=snaps):
+            RecoveryTest('test_success_clears_crash_marker').exercise()
+        self.assertEqual(sleepd.last_sleep.get('modem_rx'), 'umts_ipc0 +2')
+
+
 class Stop(Exception):
     pass
 

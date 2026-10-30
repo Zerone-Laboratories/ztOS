@@ -61,6 +61,13 @@ WIFI_DEV = '0000:01:00.0'
 PERF = Path('/run/zrnperfd.status')
 PUSH = Path(ztos_user.RUNTIME_DIR) / 'zrn-pushd.status'
 MODEM = Path('/run/ztoscorenetworking/status')
+# The modem's channels: each of its io devices takes its own wakeup source on
+# every frame it receives (modem_v1 iodev_lock_wlock), so their counts say
+# which channel a CP mailbox wake carried (0xeb umts_ipc0, IPC; 0xf5
+# umts_rfs0, file requests; umts_router, AT: RING, +CMTI). The kernel's
+# LNK-RX log never shows the AT channel (log_enabled() has no case for it).
+WAKEUP = Path('/sys/class/wakeup')
+MODEM_SOURCES = ('umts_', 'rmnet', 'multipdp')
 
 SCREEN_OFF_S = 15	# off this long before the first sleep
 MAX_SLEEP_S = 1800	# an RTC alarm at the latest after this
@@ -533,6 +540,42 @@ def wakeup_sources():
 	return ' '.join(out) or 'none'
 
 
+def modem_counts():
+	"""{name: (wakeup_count, event_count)} of the modem's channels."""
+	out = {}
+	for p in WAKEUP.glob('*'):
+		name = read(p / 'name')
+		if not name.startswith(MODEM_SOURCES):
+			continue
+		try:
+			out[name] = (int(read(p / 'wakeup_count', '0') or 0), int(read(p / 'event_count', '0') or 0))
+		except ValueError:
+			continue
+	return out
+
+
+def modem_rx(before, after):
+	"""The channels that received between two modem_counts(): 'umts_rfs0 +10'.
+	A source missing from either side is left out."""
+	moved = []
+	for name in sorted(after):
+		if name not in before:
+			continue
+		wakeups = after[name][0] - before[name][0]
+		events = after[name][1] - before[name][1]
+		if wakeups > 0 or events > 0:
+			moved.append(f'{name} +{max(wakeups, events)}')
+	return ', '.join(moved)
+
+
+def woke_text(reason, info):
+	"""The reason as the log gives it: a modem wake names its channels."""
+	rx = info.get('modem_rx')
+	if reason == 'modem':
+		return f'modem ({rx or "no channel rx"})'
+	return f'{reason} (modem rx: {rx})' if rx else reason
+
+
 def failed_device():
 	return read('/sys/power/suspend_stats/last_failed_dev')
 
@@ -623,6 +666,10 @@ def cycle(ignore=()):
 			if why:
 				raise Cancelled(why)
 			write('/sys/power/wakeup_count', count)
+			# the modem's channels as the window opens: what moves until a
+			# second after the return is what woke the phone (the frames that
+			# wake it are read by the resume path within milliseconds)
+			rx_before = modem_counts()
 			signal.alarm(0)		# the sleep itself may last MAX_SLEEP_S
 			step('suspend')
 			last_sleep['charge_in'] = charge_uah()
@@ -633,6 +680,8 @@ def cycle(ignore=()):
 				slept = time.clock_gettime(time.CLOCK_BOOTTIME) - t_in
 				last_sleep['slept'] = slept
 				last_sleep['charge_out'] = charge_uah()
+			time.sleep(1.0)
+			last_sleep['modem_rx'] = modem_rx(rx_before, modem_counts())
 		except Cancelled as e:
 			log(f'sleep cancelled: {e}')
 			reason = 'cancelled'
@@ -825,7 +874,7 @@ def main():
 				if info.get('slept') is not None:
 					charge = (f' (asleep {info["slept"]:.1f}s, charge {mah(info.get("charge_in"))}'
 						  f'->{mah(info.get("charge_out"))} mAh)')
-				log(f'woke: {reason} wake_stat={stat:#010x} after {slept}s{charge}')
+				log(f'woke: {woke_text(reason, info)} wake_stat={stat:#010x} after {slept}s{charge}')
 				mono = time.monotonic()
 				if reason == 'fw-abort':
 					fw_aborts += 1
@@ -874,7 +923,8 @@ def main():
 					if screen_off():
 						tell_shell('screen on')
 					off_since = None
-				last = dict(last=reason, slept=slept)
+				last = dict(last=reason, slept=slept,
+					    modem_rx=info.get('modem_rx', '').replace(', ', ',').replace(' ', '') or 'none')
 				status(state='awake', **last, sleeps=sleeps, wakes=wakes, woke_at=woke_at)
 			else:
 				status(state='awake', why=why or 'waiting', **last, sleeps=sleeps,
@@ -920,7 +970,7 @@ if __name__ == '__main__':
 			if info.get('slept') is not None:
 				charge = (f' (asleep {info["slept"]:.1f}s, charge {mah(info.get("charge_in"))}'
 					  f'->{mah(info.get("charge_out"))} mAh)')
-			log(f'once: woke: {reason} wake_stat={stat:#010x}{charge}')
+			log(f'once: woke: {woke_text(reason, info)} wake_stat={stat:#010x}{charge}')
 			if reason == 'fw-abort':
 				grp4 = number(SLEEP / 'grp4_before')
 				log(f'once: the firmware gave the sleep up: grp4_before={grp4:#010x} '
