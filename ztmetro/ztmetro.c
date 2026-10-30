@@ -39,6 +39,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/wait.h>
@@ -2516,8 +2517,8 @@ static void config_keep(const char *key, int value) {
  */
 #define BL_SETTLE_MS	300
 #define BL_LAND_MS	20	/* the panel takes a level at its next frame */
-/* BL_TABLE: the S9 with its full brightness table loaded (ztos-panel-bl,
- * kernel/s9p-bl-table.py): every level the panel's own, exact and smooth.
+/* BL_TABLE: the S9 with its L* brightness table loaded (ztos-panel-bl,
+ * kernel/s9p-bl-table.py): 512 even steps of AOR, walked by the ramp below.
  * BL_S9: the S9 without it, four AOR levels and the rest darkened. */
 enum bl_mode { BL_NONE, BL_S9, BL_CTL, BL_TABLE };
 #define BL_TABLE_MARK	"/run/ztos-panel-bl"	/* written once the table is in */
@@ -2540,204 +2541,163 @@ static struct {
 } bl = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, BL_NONE, -1, -1, -1, 100, 100, -1, -1, "", -1 };
 
 /*
- * BL_TABLE's ladder: the screen follows a brightness change at once, in
- * software, and the panel catches up unseen.
+ * BL_TABLE's ramp. Brightness is percent L*: 50 % looks half way between black
+ * and the panel's peak, and the table (kernel/s9p-bl-table.py) maps L* to
+ * level evenly. The panel's floor is L* 18, the longest AOR the table uses;
+ * below it the panel stays at level 0 and the picture is darkened, so the
+ * scale carries on down to 2 with no join.
  *
- * The level wanted is a luminance (nits, from the table's own list,
- * /var/lib/ztos/panel-bl-nits.txt). The picture is darkened by m, which
- * takes m^2.2 of the light, so the screen shows nits(hw) * m^2.2: exactly
- * what is wanted whenever the panel (hw) is at or above it. Dimmer is
- * immediate (m alone). Brighter needs the panel: it goes straight to the
- * level wanted, with a little headroom.
- *
- * The panel then moves towards the exact level, a few percent at a time,
- * m changing with it on the same frame: the frame that carries the new m is
- * committed first, and the panel write made at once after it. The kernel
- * holds the frame trigger while it sends the level's packets, so the queued
- * frame and the new level reach the glass together; when they miss by a
- * frame the difference is one small step, under what an eye sees.
- *
- * Writes are at least BL_LADDER_GAP_MS apart: one sooner than 200 ms after
- * the last gets only the AOR register from the kernel, without the gamma,
- * and lands at the wrong luminance (the old sawing).
+ * Everything that moves the brightness sets a goal. This thread walks to it
+ * every 16 ms, eased, and writes the panel only when the integer level
+ * changes: one AOR packet, under 200 us, which the kernel holds between
+ * frames. The light sensor's goals also have a speed limit, so a room change
+ * is a slow glide; a finger's do not.
  */
-#define BL_LADDER_GAP_MS	230
-#define BL_LADDER_STEP		1.04	/* the most the panel moves in one write, down */
-#define BL_LADDER_HEAD		1.08	/* headroom over the wanted level when going up */
-#define BL_NITS_PATH		"/var/lib/ztos/panel-bl-nits.txt"
+#define BL_RAMP_STEP_NS	16000000L
+#define BL_RAMP_TAU	0.070	/* s: the ease behind a finger */
+#define BL_RAMP_SNAP	0.05	/* L*: close enough to land */
+#define BL_AUTO_SPEED	12.0	/* L* a second, for the light sensor */
+#define BL_L_FLOOR	18.03	/* level 0's L*: duty (3010-2934)/3010 */
+#define BL_L_MIN	2.0
 
 static struct {
-	bool on;
-	int levels;
-	float nits[1024];
-	int hw;			/* the level the panel is at */
-	int pending;		/* to write after the next commit, -1 none */
-	uint32_t pending_ms;	/* when pending was set */
-	double target;		/* nits wanted */
-	uint32_t last_ms;	/* when the panel was last written */
-	int fd;
-	struct wl_event_source *timer;
-	struct zt_server *server;
-} lad = { .pending = -1, .fd = -1 };
-static float lad_test_dark = -1.0f;	/* bltest: held darkening, the ladder off */
+	double goal, cur;	/* L*; goal is 0 until the first set */
+	double speed;		/* L* a second, 0 for no limit */
+	bool moving;		/* the thread has work */
+	bool force;		/* write the level even if it looks the same */
+	bool automatic;		/* the goal is the light sensor's */
+	int written;		/* level last sent, -1 none */
+	_Atomic float dark;	/* 1 - the picture's multiplier */
+} ramp = { .written = -1 };
 
-static int ladder_level_for(double nits) {
-	int lo = 0, hi = lad.levels - 1;
-	if (nits >= lad.nits[hi]) return hi;
-	while (lo < hi) {	/* the first level at or above */
-		int mid = (lo + hi) / 2;
-		if (lad.nits[mid] >= nits - 1e-3) hi = mid; else lo = mid + 1;
+static double lstar_to_y(double l) {
+	return l > 8.0 ? pow((l + 16.0) / 116.0, 3.0) : l / 903.3;
+}
+
+/* below the panel's floor. Pixel values darkened by m give m^2.2 of the light */
+static float ramp_dark_for(double l) {
+	if (l >= BL_L_FLOOR) return 0.0f;
+	return 1.0f - (float)pow(lstar_to_y(l) / lstar_to_y(BL_L_FLOOR), 1.0 / 2.2);
+}
+
+static int ramp_level_for(double l) {
+	if (l <= BL_L_FLOOR) return 0;
+	int level = (int)lround((l - BL_L_FLOOR) / (100.0 - BL_L_FLOOR) * bl.max);
+	return level > bl.max ? bl.max : level;
+}
+
+static void ramp_write(int fd, int level) {
+	char text[16];
+	int n = snprintf(text, sizeof(text), "%d\n", level);
+	if (fd >= 0 && pwrite(fd, text, n, 0) != n) {
+		wlr_log(WLR_ERROR, "backlight: write %d failed", level);
 	}
-	return lo;
+	ramp.written = level;
 }
 
-static uint32_t ladder_now(void) {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+/* the settings page follows this file; written once a move has landed, not
+ * for every step */
+static void ramp_publish(double l) {
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	if (!runtime) return;
+	char p[256], tmp[260], text[16];
+	snprintf(p, sizeof(p), "%s/ztmetro.brightness", runtime);
+	snprintf(tmp, sizeof(tmp), "%s.new", p);
+	int n = snprintf(text, sizeof(text), "%d\n", (int)lround(l));
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0) return;
+	bool ok = write(fd, text, n) == n;
+	close(fd);
+	if (!ok || rename(tmp, p) != 0) unlink(tmp);
 }
 
-/* the level the frame being drawn will be shown at */
-static int ladder_shown(void) {
-	return lad.pending >= 0 ? lad.pending : lad.hw;
-}
-
-/* what the panel should move to next, -1 when it is where it should be */
-static int ladder_next(void) {
-	double at = lad.nits[lad.hw];
-	int exact = ladder_level_for(lad.target);
-	if (lad.target > at * 1.001) {
-		double want = lad.target * BL_LADDER_HEAD;
-		return ladder_level_for(want > lad.nits[lad.levels - 1] ? lad.nits[lad.levels - 1] : want);
-	}
-	if (lad.hw > exact) {
-		double ratio = at / (lad.target > 1e-3 ? lad.target : 1e-3);
-		double step = ratio > 4.0 ? 2.5 : ratio > 2.0 ? 1.6 : BL_LADDER_STEP;
-		int l = ladder_level_for(at / step);
-		if (l >= lad.hw) l = lad.hw - 1;	/* the bottom's steps are bigger than one */
-		return l < exact ? exact : l;
-	}
-	return -1;
-}
-
-static int ladder_tick(void *data);
-
-/* plan the next panel move: on the next frame if the gap allows, else later */
-static void ladder_plan(void) {
-	if (!lad.on || lad_test_dark >= 0.0f) return;
-	uint32_t now = ladder_now();
-	if (lad.pending >= 0) {
-		/* Watchdog: if a pending level has been waiting for a commit for >100 ms,
-		 * the compositor dropped or skipped the frame. Commit the level now so
-		 * the ladder never stalls. */
-		if (now - lad.pending_ms > 100) {
-			char text[16];
-			int n = snprintf(text, sizeof(text), "%d\n", lad.pending);
-			if (pwrite(lad.fd, text, n, 0) != n) {
-				wlr_log(WLR_ERROR, "backlight: watchdog write %d failed", lad.pending);
-			}
-			lad.hw = lad.pending;
-			lad.pending = -1;
-			lad.last_ms = now;
-		} else {
-			return;
+static void *bl_ramp_thread(void *data) {
+	int fd = open(bl.path, O_WRONLY | O_CLOEXEC);
+	struct timespec next;
+	for (;;) {
+		pthread_mutex_lock(&bl.lock);
+		bool idle = !ramp.moving;
+		while (!ramp.moving) {
+			pthread_cond_wait(&bl.wake, &bl.lock);
 		}
+		double goal = ramp.goal, speed = ramp.speed, cur = ramp.cur;
+		bool force = ramp.force;
+		ramp.force = false;
+		if (idle) clock_gettime(CLOCK_MONOTONIC, &next);
+		const double dt = BL_RAMP_STEP_NS / 1e9;
+		double step = (goal - cur) * (1.0 - exp(-dt / BL_RAMP_TAU));
+		if (speed > 0.0 && fabs(step) > speed * dt) {
+			step = step > 0 ? speed * dt : -speed * dt;
+		}
+		cur += step;
+		bool landed = fabs(goal - cur) < BL_RAMP_SNAP;
+		if (landed) cur = goal;
+		ramp.cur = cur;
+		if (landed) ramp.moving = false;
+		pthread_mutex_unlock(&bl.lock);
+
+		int level = ramp_level_for(cur);
+		if (level != ramp.written || force) ramp_write(fd, level);
+		float dark = ramp_dark_for(cur);
+		if (fabsf(dark - atomic_load(&ramp.dark)) > 0.0005f) {
+			atomic_store(&ramp.dark, dark);
+			uint64_t one = 1;
+			if (write(bl.fd, &one, sizeof(one)) < 0) {}	/* a frame to tint */
+		}
+		if (landed) {
+			/* the kernel drops a level it finds the DECON busy for: this
+			 * one is the last, so it goes twice */
+			ramp_write(fd, level);
+			ramp_publish(cur);
+			continue;
+		}
+		next.tv_nsec += BL_RAMP_STEP_NS;
+		if (next.tv_nsec >= 1000000000L) {
+			next.tv_nsec -= 1000000000L;
+			next.tv_sec++;
+		}
+		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
 	}
-	int next = ladder_next();
-	if (next < 0) return;
-	uint32_t since = now - lad.last_ms;
-	if (since >= BL_LADDER_GAP_MS) {
-		lad.pending = next;
-		lad.pending_ms = now;
-		damage(lad.server);	/* the frame with the new m; the write follows it */
-	} else {
-		wl_event_source_timer_update(lad.timer, BL_LADDER_GAP_MS - since);
-	}
+	return NULL;
 }
 
-static int ladder_tick(void *data) {
-	ladder_plan();
+static int bl_ramp_redraw(int fd, uint32_t mask, void *data) {
+	uint64_t n;
+	if (read(fd, &n, sizeof(n)) < 0) {}
+	damage(bl.server);
 	return 0;
 }
 
-/* after a commit: the frame carrying the pending level's m is queued; the
- * panel is told now, while the kernel can still hold that frame back */
-static void ladder_committed(void) {
-	if (!lad.on || lad.pending < 0) return;
-	char text[16];
-	int n = snprintf(text, sizeof(text), "%d\n", lad.pending);
-	if (pwrite(lad.fd, text, n, 0) != n) {
-		wlr_log(WLR_ERROR, "backlight: write %d failed", lad.pending);
-	}
-	lad.hw = lad.pending;
-	lad.pending = -1;
-	lad.last_ms = ladder_now();
-	wl_event_source_timer_update(lad.timer, BL_LADDER_GAP_MS);
+/* the goal, in L*: a hand (speed 0) or the light sensor (BL_AUTO_SPEED) */
+static void ramp_goal(double l, double speed, bool automatic) {
+	if (l < BL_L_MIN) l = BL_L_MIN;
+	if (l > 100.0) l = 100.0;
+	pthread_mutex_lock(&bl.lock);
+	ramp.goal = l;
+	ramp.speed = speed;
+	ramp.automatic = automatic;
+	ramp.moving = true;
+	pthread_cond_signal(&bl.wake);
+	pthread_mutex_unlock(&bl.lock);
 }
 
-/* `bltest LEVEL DARK` on the control pipe: the panel at LEVEL and the picture
- * darkened by DARK, held, for measuring the two against each other with a
- * camera; `bltest off` hands back to the ladder (lad_test_dark) */
-
-static void ladder_test(const char *args) {
-	int level;
-	float d;
-	if (!lad.on) return;
-	if (sscanf(args, "%d %f", &level, &d) == 2) {
-		char text[16];
-		int n = snprintf(text, sizeof(text), "%d\n", level);
-		if (pwrite(lad.fd, text, n, 0) != n) {}
-		lad.hw = level;
-		lad.pending = -1;
-		lad.last_ms = ladder_now();
-		lad_test_dark = d;
-	} else {
-		lad_test_dark = -1.0f;
-		ladder_plan();
-	}
-	damage(lad.server);
-}
-
-/* how much of the picture to take away: 1 - m */
-static float ladder_darkening(void) {
-	if (lad_test_dark >= 0.0f) return lad_test_dark;
-	double shown = lad.nits[ladder_shown()];
-	if (lad.target >= shown) return 0.0f;
-	return 1.0f - (float)pow(lad.target / shown, 1.0 / 2.2);
-}
-
-static bool ladder_init(struct zt_server *server, int max, int now) {
-	FILE *f = fopen(BL_NITS_PATH, "r");
-	if (!f) return false;
-	int n = 0;
-	while (n < (int)(sizeof(lad.nits) / sizeof(lad.nits[0])) && fscanf(f, "%f", &lad.nits[n]) == 1) n++;
-	fclose(f);
-	if (n != max + 1) {
-		wlr_log(WLR_ERROR, "backlight: %s has %d levels, the panel %d: no ladder", BL_NITS_PATH, n, max + 1);
-		return false;
-	}
-	lad.fd = open(bl.path, O_WRONLY | O_CLOEXEC);
-	if (lad.fd < 0) return false;
-	lad.levels = n;
-	lad.hw = now < 0 ? 0 : now > max ? max : now;
-	lad.target = lad.nits[lad.hw];
-	lad.server = server;
-	lad.timer = wl_event_loop_add_timer(server->loop, ladder_tick, NULL);
-	lad.on = true;
-	wlr_log(WLR_INFO, "backlight: ladder over %d levels, %.1f..%.1f nits", n, lad.nits[0], lad.nits[n - 1]);
-	return true;
-}
-
-/* 1..100 %: the same level the slider always meant, as a luminance */
-static void ladder_set(int percent) {
-	double l = (double)percent * (lad.levels - 1) / 100.0;
-	int a = (int)floor(l), b = a + 1 < lad.levels ? a + 1 : a;
-	lad.target = lad.nits[a] + (lad.nits[b] - lad.nits[a]) * (l - a);
-	damage(lad.server);	/* dimmer: at once, by m */
-	ladder_plan();
+/* straight there: the panel is dark or has just lost its level, so nothing
+ * can be seen moving and the level must go out even if it looks unchanged */
+static void ramp_snap(double l) {
+	if (l < BL_L_MIN) l = BL_L_MIN;
+	if (l > 100.0) l = 100.0;
+	pthread_mutex_lock(&bl.lock);
+	ramp.goal = ramp.cur = l;
+	ramp.force = true;
+	ramp.moving = true;
+	pthread_cond_signal(&bl.wake);
+	pthread_mutex_unlock(&bl.lock);
 }
 
 static void *bl_thread(void *data) {
+	if (bl.mode == BL_TABLE) {
+		return bl_ramp_thread(data);
+	}
 	for (;;) {
 		pthread_mutex_lock(&bl.lock);
 		while (bl.want_raw < 0 && bl.want < 0) {
@@ -2760,12 +2720,6 @@ static void *bl_thread(void *data) {
 			pthread_mutex_unlock(&bl.lock);
 			uint64_t one = 1;
 			if (write(bl.fd, &one, sizeof(one)) < 0) {}
-			if (bl.mode == BL_TABLE) {
-				/* each level is twenty panel packets sent between frames:
-				 * a dragged slider gets the latest level every 40 ms, not a
-				 * write for every pixel it moved */
-				usleep(40000);
-			}
 		} else if (percent >= 0) {	/* brightnessctl */
 			char arg[16];
 			snprintf(arg, sizeof(arg), "%d%%", percent);
@@ -2897,13 +2851,14 @@ static void backlight_init(struct zt_server *server) {
 			wlr_log(WLR_ERROR, "%s is not writable by the shell (udev rule "
 				"90-zrn-backlight.rules?): dimming in software instead", bl.path);
 		} else if (bl.max > 0 && bl.fd >= 0) {
+			if (access(BL_TABLE_MARK, F_OK) == 0) {
+				bl.mode = BL_TABLE;	/* before the thread, which reads it */
+			}
 			backlight_start_thread();
 		}
-		if (bl.usable && access(BL_TABLE_MARK, F_OK) == 0) {
-			bl.mode = BL_TABLE;
-			bl.hw = bl.target = (int)lround(atof(now) * 100 / bl.max);
-			wlr_log(WLR_INFO, "backlight: the panel's own %d levels", bl.max + 1);
-			lad.on = false;
+		if (bl.usable && bl.mode == BL_TABLE) {
+			wl_event_loop_add_fd(server->loop, bl.fd, WL_EVENT_READABLE, bl_ramp_redraw, NULL);
+			wlr_log(WLR_INFO, "backlight: the panel's own %d levels, by L*", bl.max + 1);
 		} else if (bl.usable) {
 			bl.mode = BL_S9;
 			bl.hw = bl.target = (int)lround(atof(now) * 100 / bl.max);
@@ -2926,7 +2881,7 @@ static void backlight_init(struct zt_server *server) {
 	}
 }
 
-/* 1..100 %. */
+/* 1..100 %: a hand, or anything else that is not the light sensor. */
 static void backlight_set(int percent) {
 	if (!backlight_usable()) {
 		return;
@@ -2934,6 +2889,10 @@ static void backlight_set(int percent) {
 	if (percent < 1) percent = 1;
 	if (percent > 100) percent = 100;
 	bl.target = percent;
+	if (bl.mode == BL_TABLE) {
+		ramp_goal(percent, 0.0, false);
+		return;
+	}
 	/* Publish the effective brightness: on the S9 the panel sits at a band
 	 * level, so a reader of /sys sees 20/40/70/100, not what is wanted. The
 	 * settings slider follows this file instead, so it does not snap to a band. */
@@ -2954,20 +2913,6 @@ static void backlight_set(int percent) {
 			}
 		}
 	}
-	if (bl.mode == BL_TABLE && lad.on) {
-		ladder_set(percent);
-		return;
-	}
-	if (bl.mode == BL_TABLE) {
-		/* the exact level; the thread keeps only the latest, and nothing
-		 * on the screen has to be drawn again */
-		int raw = (int)lround((double)percent * bl.max / 100.0);
-		pthread_mutex_lock(&bl.lock);
-		bl.want_raw = raw;
-		pthread_cond_signal(&bl.wake);
-		pthread_mutex_unlock(&bl.lock);
-		return;
-	}
 	if (bl.mode == BL_S9) {
 		if (bl_band(percent) > bl.hw) {
 			bl_request(percent);	/* a higher band: only the panel can brighten */
@@ -2986,7 +2931,8 @@ static void backlight_set(int percent) {
 }
 
 /* How much of the picture to take away for the brightness wanted: all of it
- * without a backlight; on the S9 what the panel's level is above the target
+ * without a backlight; BL_TABLE only below the panel's floor (the ramp); on the
+ * S9's bands what the panel's level is above the target
  * (pixel values darkened by m give m^2.2 of the light); nothing with
  * brightnessctl, which the panel itself has set to the exact level. */
 static float backlight_darkening(int percent) {
@@ -2999,8 +2945,8 @@ static float backlight_darkening(int percent) {
 		}
 		return 1.0f - powf((float)bl.target / bl.hw, 1.0f / 2.2f);
 	}
-	if (bl.mode == BL_TABLE && lad.on) {
-		return ladder_darkening();
+	if (bl.mode == BL_TABLE) {
+		return atomic_load(&ramp.dark);
 	}
 	return 0.0f;
 }
@@ -3165,7 +3111,12 @@ static void load_config(struct zt_server *server) {
 		server->demo_saved_timeout = server->screen_timeout;
 		server->screen_timeout = 0;
 	}
-	backlight_set(server->shade_brightness);
+	if (bl.mode == BL_TABLE && ramp.automatic) {
+		/* the light sensor has it: a saved manual level must not jump in */
+		server->shade_brightness = (int)lround(ramp.goal);
+	} else {
+		backlight_set(server->shade_brightness);
+	}
 }
 
 static void add_tile(struct zt_server *server, enum tile_size size, const char *color,
@@ -10100,13 +10051,6 @@ static void screen_set(struct zt_server *server, bool on) {
 		return;
 	}
 	if (!on && server->auth_active) auth_finish(server);
-	if (!on && lad.on && lad.pending >= 0) {
-		char text[16];
-		int n = snprintf(text, sizeof(text), "%d\n", lad.pending);
-		if (pwrite(lad.fd, text, n, 0) != n) {}
-		lad.hw = lad.pending;
-		lad.pending = -1;
-	}
 	bool demoloop = demoloop_active();
 	/* Freeze completes before the display-off transition can let zrn-sleepd
 	 * enter SoC sleep. The configured keep_awake list is honored by the helper. */
@@ -10149,9 +10093,14 @@ static void screen_set(struct zt_server *server, bool on) {
 		FILE *state = fopen(runtime_file(path, sizeof(path), "ztos-demoloop.screen"), "w");
 		if (state) { fputs(on ? "on\n" : "off\n", state); fclose(state); }
 	}
-	if (on)
-		backlight_set(server->shade_brightness);	/* the panel comes back at its
-							 * boot level otherwise: a flash */
+	if (on) {
+		/* the panel comes back at its boot level otherwise: a flash */
+		if (bl.mode == BL_TABLE && ramp.goal > 0.0) {
+			ramp_snap(ramp.goal);
+		} else {
+			backlight_set(server->shade_brightness);
+		}
+	}
 	wlr_log(WLR_INFO, "screen %s", on ? "on" : "off");
 	if (!on) {
 		/* locked as it goes dark (lock() itself runs as it comes back on,
@@ -11786,8 +11735,6 @@ static void ctl_command(struct zt_server *server, char *line) {
 				draw_shade(server);
 			}
 		}
-	} else if (strncmp(line, "bltest ", 7) == 0) {
-		ladder_test(line + 7);
 	} else if (strncmp(line, "focus ", 6) == 0) {
 		/* A runtime launcher may reuse a mapped window hidden behind Start. */
 		struct zt_toplevel *t;
@@ -12019,6 +11966,28 @@ static void ctl_command(struct zt_server *server, char *line) {
 		mkdir("/tmp/ztrec", 0755);
 		server->record_until = now_ms() + (uint32_t)id;
 		wlr_log(WLR_INFO, "recording frames for %d ms into /tmp/ztrec", id);
+	} else if (sscanf(line, "brightness-fine %d", &id) == 1) {
+		/* the settings slider under a finger: tenths of a percent */
+		server->shade_brightness = id < 20 ? 2 : id > 1000 ? 100 : (id + 5) / 10;
+		if (bl.mode == BL_TABLE) {
+			ramp_goal(id / 10.0, 0.0, false);
+		} else {
+			backlight_set(server->shade_brightness);
+		}
+		if (bl.mode != BL_TABLE || server->shade_open || server->shade_h > 0) {
+			damage(server);
+		}
+	} else if (sscanf(line, "brightness-auto %d", &id) == 1) {
+		/* the light sensor's goal, tenths of a percent: a slow glide here */
+		server->shade_brightness = id < 20 ? 2 : id > 1000 ? 100 : (id + 5) / 10;
+		if (bl.mode == BL_TABLE) {
+			ramp_goal(id / 10.0, BL_AUTO_SPEED, true);
+		} else {
+			backlight_set(server->shade_brightness);
+		}
+		if (bl.mode != BL_TABLE || server->shade_open || server->shade_h > 0) {
+			damage(server);
+		}
 	} else if (sscanf(line, "brightness %d", &id) == 1) {
 		/* from an ambient light program or settings: 1..100 */
 		server->shade_brightness = id < 1 ? 1 : id > 100 ? 100 : id;
@@ -13425,7 +13394,6 @@ static void render_frame(struct zt_server *server) {
 			wlr_log(WLR_INFO, "plane: the page %s", plane ? "on a display plane" : "drawn by the GPU");
 		}
 		server->output->last_submitted = buffer;
-		ladder_committed();	/* the panel's level, behind the frame that matches it */
 	}
 	wlr_output_state_finish(&state);
 	server->dirty = false;
@@ -14041,7 +14009,12 @@ int main(int argc, char *argv[]) {
 		wlr_log(WLR_INFO, "nested: in a window, hardware and system actions off");
 	}
 	backlight_init(&server);
-	backlight_set(server.shade_brightness);	/* (load_config ran before the loop) */
+	/* (load_config ran before the loop) */
+	if (bl.mode == BL_TABLE) {
+		ramp_snap(server.shade_brightness);
+	} else {
+		backlight_set(server.shade_brightness);
+	}
 	server.renderer = wlr_renderer_autocreate(server.backend);
 	if (!server.renderer) {
 		wlr_log(WLR_ERROR, "failed to create the renderer");

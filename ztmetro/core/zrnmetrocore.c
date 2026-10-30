@@ -2649,6 +2649,8 @@ static void draw_slider_live(double s) {
 static void slider_set(double x, bool done) {
 	int value = (int)lround((x - zmc.slider.x) / zmc.slider.w * 100);
 	value = value < 0 ? 0 : value > 100 ? 100 : value;
+	int fine = (int)lround((x - zmc.slider.x) / zmc.slider.w * 1000);
+	zmc.slider_permille = fine < 0 ? 0 : fine > 1000 ? 1000 : fine;
 	static int notch = -1;
 	if (value / 10 != notch) {
 		if (notch >= 0) {

@@ -44,6 +44,10 @@ share a gamma row and differ only in AOR; --dump shows the vendor's
 interpolated nits for each, which only ever go up. Level 0 is 2 nits,
 not off; level 511 is 400 nits.
 
+The AOR actually sent is not the vendor's row but lstar_aor(): even steps of
+L*, because only the AOR packet goes (WITH_GAMMA and friends are off) and the
+vendor's rows are not monotonic without their gamma.
+
 Fixed, as the task wants it: 25 degrees (the vendor's NORMAL_TEMPERATURE),
 ACL off (the vendor's own default is ACL on, adaptive_control 15%; with
 it off the vendor still writes the 15% OPR and 16-frame average, as here),
@@ -497,11 +501,42 @@ def level_packets(level, gamma, aor, elvss_temp0):
     return pk, brightness, step, idx
 
 
+# Level i is an even step of perceived brightness (CIE L*), by AOR alone. The
+# vendor's AOR table is not monotonic: its rows assume gamma changes with it,
+# and this table sends no gamma (see WITH_GAMMA), so on its own it rises 30
+# times and plateaus. The light is about G * (1 - AOR / AOR_PERIOD), a fit to
+# the vendor's table, not a measurement. Level 0 is the vendor's longest AOR,
+# so the panel never goes where it has not been; below that the shell darkens
+# the picture.
+AOR_PERIOD = 3010
+AOR_LONGEST = 2934              # the vendor's level 0
+AOR_SHORTEST = 12               # the vendor's level 511
+
+
+def lstar_to_y(l):
+    return ((l + 16) / 116) ** 3 if l > 8 else l / 903.3
+
+
+def y_to_lstar(y):
+    return 116 * y ** (1 / 3) - 16 if y > 216 / 24389 else y * 903.3
+
+
+def lstar_aor():
+    """AOR for each level, as ints: L* from the floor to 100, evenly"""
+    floor = y_to_lstar((AOR_PERIOD - AOR_LONGEST) / AOR_PERIOD)
+    out = []
+    for i in range(NR_LEVELS):
+        y = lstar_to_y(floor + (100 - floor) * i / (NR_LEVELS - 1))
+        out.append(max(AOR_SHORTEST, min(AOR_LONGEST,
+                                         round(AOR_PERIOD * (1 - y)))))
+    return out
+
+
 def build(regs, variant):
     """[(packets, brightness, step, row)] for every level"""
     lut = LUT[variant]
     gamma = gamma_rows(regs[0xC8][:34], lut)
-    aor = AOR_TABLE[variant]
+    aor = [v.to_bytes(2, "big") for v in lstar_aor()]
     return [level_packets(i, gamma, aor, regs[0xB5][ELVSS_TEMP_OFS])
             for i in range(NR_LEVELS)]
 
@@ -696,6 +731,15 @@ def selftest():
         check(bad == 0, "gamma curve %.2f: %d of 256 entries off the "
               "formula" % (g / 100, bad))
 
+    # the L* table: AOR only goes down, and no step is a visible one
+    aors = lstar_aor()
+    check(len(aors) == NR_LEVELS, "L* table: %d levels" % len(aors))
+    check(all(b <= a for a, b in zip(aors, aors[1:])), "L* table: AOR never rises")
+    check(aors[0] == AOR_LONGEST and aors[-1] == AOR_SHORTEST, "L* table: the ends are the vendor's")
+    duty = [1 - v / AOR_PERIOD for v in aors]
+    worst = max(b / a - 1 for a, b in zip(duty, duty[1:]))
+    check(worst <= 0.03, "L* table: largest step %.2f %% (limit 3 %%)" % (worst * 100))
+
     nominal = {0xC8: bytes(34), 0xB5: bytes(22) + bytes([ELVSS_TEMP[1]]) +
                bytes(1)}
     lengths = {0xF0: 3, 0xCA: len(GAMMA), 0xB1: None, 0xB5: None,
@@ -716,7 +760,7 @@ def selftest():
                     check(False, "%s level %d: %s is %d bytes" %
                           (variant, i, hexs(p[:1]), len(p)))
             aor_pk = [p for p in pk if p[0] == 0xB1]
-            if step != i or not aor_pk or aor_pk[0] != [0xB1] + list(AOR_TABLE[variant][i]):
+            if step != i or not aor_pk or aor_pk[0] != [0xB1] + list(lstar_aor()[i].to_bytes(2, "big")):
                 aor_ok = False
             n = nits_x100(brightness)
             if n < last_nits or LUM_TBL[idx] < last_lum:
@@ -808,8 +852,9 @@ def main():
         dump(levels, sys.stdout)
     if a.nits:
         with open(a.nits, "w") as f:
-            for pk, brightness, step, idx in levels:
-                f.write("%.2f\n" % (nits_x100(brightness) / 100))
+            # modelled relative light (duty, 0..1), not Samsung's nits
+            for v in lstar_aor():
+                f.write("%.4f\n" % (1 - v / AOR_PERIOD))
     if a.output:
         with open(a.output, "wb") as f:
             f.write(blob)

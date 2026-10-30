@@ -3502,6 +3502,27 @@ static void activate(int action, int arg) {
 /* Where a point on the screen is on the page: the title does not scroll. */
 
 /* A slider is being dragged, or has just been let go. */
+/* The shell's control pipe stays open for a drag's sixty lines a second, and
+ * is opened again if the shell has gone. */
+static void brightness_tell(int permille) {
+	static int fd = -1;
+	char line[40];
+	int n = snprintf(line, sizeof(line), "brightness-fine %d\n", permille);
+	signal(SIGPIPE, SIG_IGN);
+	for (int attempt = 0; attempt < 2; attempt++) {
+		if (fd < 0) {
+			const char *runtime = getenv("XDG_RUNTIME_DIR");
+			char path[256];
+			snprintf(path, sizeof(path), "%s/ztmetro.ctl", runtime ? runtime : "/tmp");
+			fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+			if (fd < 0) return;
+		}
+		if (write(fd, line, n) == n || errno != EPIPE) return;
+		close(fd);
+		fd = -1;
+	}
+}
+
 static void slide(int action, int value, bool done) {
 	static uint32_t saved;
 	char cmd[160];
@@ -3519,21 +3540,17 @@ static void slide(int action, int value, bool done) {
 	}
 	switch (action) {
 	case ACT_BRIGHTNESS_STEP:
-		app.brightness = value < 1 ? 1 : value;
+		app.brightness = value < 2 ? 2 : value;
 		if (app.autobrightness) {
 			/* a hand on the slider takes over from the light sensor */
 			app.autobrightness = false;
 			pipe_tell("/run/ztoscsf-sensord.ctl", "auto off\n");
 		}
-		/* send live brightness to the shell without reloading config/textures */
-		if (done || zmc_now_ms() - saved > 40) {
+		/* live to the shell, which eases between these: a step every frame,
+		 * finer than a percent. The lifted position always goes */
+		if (done || zmc_now_ms() - saved >= 16) {
 			saved = zmc_now_ms();
-			char ctl_cmd[32];
-			snprintf(ctl_cmd, sizeof(ctl_cmd), "brightness %d\n", app.brightness);
-			const char *runtime = getenv("XDG_RUNTIME_DIR");
-			char ctl_path[256];
-			snprintf(ctl_path, sizeof(ctl_path), "%s/ztmetro.ctl", runtime ? runtime : "/tmp");
-			pipe_tell(ctl_path, ctl_cmd);
+			brightness_tell(zmc.slider_permille < 20 ? 20 : zmc.slider_permille);
 		}
 		if (done) {
 			config_save();

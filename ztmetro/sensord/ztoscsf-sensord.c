@@ -289,9 +289,11 @@ static void publish(const char *name, const char *text) {
 /* --- brightness -------------------------------------------------------- */
 
 static double lux_smooth = -1;
-static int shown = -1, goal = -1;	/* percent; -1 before the first reading */
+static int goal = -1;	/* tenths of a percent L*; -1 before the first reading */
 
-static void shell(const char *line) {
+/* whether any shell took it */
+static bool shell(const char *line) {
+	bool sent = false;
 	glob_t g;
 	char pattern[192];
 	at(pattern, sizeof(pattern), "/run/user/*/ztmetro.ctl");
@@ -301,44 +303,58 @@ static void shell(const char *line) {
 			if (fd >= 0) {
 				if (write(fd, line, strlen(line)) < 0) {
 					/* the shell is busy; the next reading tries again */
+				} else {
+					sent = true;
 				}
 				close(fd);
 			}
 		}
 	}
 	globfree(&g);
+	return sent;
 }
 
-static void brightness_show(int percent) {
-	char line[32];
-	shown = percent;
-	snprintf(line, sizeof(line), "brightness %d\n", percent);
-	shell(line);
-}
-
-/* AMOLED brightness from ambient light, continuous across the bands. Lowered
- * 2026-10-18 (the old curve, 8-22 % dim, 22-45 % indoors, felt too bright):
- * Dark (below 1 lux):            3 %
- * Dim rooms (1-100 lux):         4 % - 14 %
- * Office / indoor (100-1000):   14 % - 30 %
- * Daylight (1000-10000):        30 % - 70 %
- * Direct sun (10000-100000):    70 % - 100 %
- */
-static int lux_to_percent(double lux) {
-	double pct, l = log10(lux < 1.0 ? 1.0 : lux);
-	if (lux < 1.0) {
-		pct = 3.0;
-	} else if (l < 2.0) {
-		pct = 4.0 + l / 2.0 * 10.0;
-	} else if (l < 3.0) {
-		pct = 14.0 + (l - 2.0) * 16.0;
-	} else if (l < 4.0) {
-		pct = 30.0 + (l - 3.0) * 40.0;
-	} else {
-		pct = 70.0 + (l - 4.0) * 30.0;
+/* The goal only: the shell walks to it at its own limited speed. A goal the
+ * shell did not get (it is not up yet, at boot) is asked for again by the next
+ * reading. */
+static void brightness_show(int permille) {
+	char line[40];
+	goal = permille;
+	snprintf(line, sizeof(line), "brightness-auto %d\n", permille);
+	if (!shell(line)) {
+		goal = -1;
 	}
-	int res = (int)lround(pct);
-	return res < 3 ? 3 : res > 100 ? 100 : res;
+}
+
+/* AMOLED brightness from ambient light: nits for the room, from Samsung's
+ * auto table (framework-res) at its bins' centres, then as percent L* of the
+ * panel's peak, which is what the shell's brightness means. PANEL_PEAK_NITS is
+ * a model value: the panel has not been measured. It is one constant. */
+#define PANEL_PEAK_NITS	400.0
+#define AUTO_FLOOR_L	18.03	/* the panel's own floor: auto never darkens pixels */
+
+static int lux_to_permille(double lux) {
+	static const struct { double lux, nits; } curve[] = {
+		{ 1, 10 }, { 7, 25 }, { 55, 110 }, { 700, 170 }, { 1400, 250 }, { 2500, 400 },
+	};
+	int n = sizeof(curve) / sizeof(curve[0]);
+	double nits = curve[0].nits;
+	if (lux >= curve[n - 1].lux) {
+		nits = curve[n - 1].nits;
+	} else if (lux > curve[0].lux) {
+		for (int i = 1; i < n; i++) {
+			if (lux <= curve[i].lux) {
+				double t = (log10(lux) - log10(curve[i - 1].lux)) /
+					(log10(curve[i].lux) - log10(curve[i - 1].lux));
+				nits = curve[i - 1].nits + (curve[i].nits - curve[i - 1].nits) * t;
+				break;
+			}
+		}
+	}
+	double l = 116.0 * cbrt(nits / PANEL_PEAK_NITS) - 16.0;
+	if (l < AUTO_FLOOR_L) l = AUTO_FLOOR_L;
+	if (l > 100.0) l = 100.0;
+	return (int)lround(l * 10.0);
 }
 
 /* OpenTone: the screen's white follows the room's light, as True Tone does.
@@ -373,34 +389,43 @@ static void tone(int32_t cct) {
 	}
 }
 
-/* One reading a second. The light is followed in log terms (as the eye
- * sees it), quickly up and slowly down: walking into sunlight should bring
- * the screen up within a few seconds, but a hand or a shadow passing over
- * the sensor should not make it dip. The brightness then moves only when
- * the room has changed enough to matter (3 points), and there it glides
- * (see the ramp in main). */
-#define LIGHT_UP	0.35	/* share of a brighter reading taken each second */
-#define LIGHT_DOWN	0.06	/* share of a darker one: about 15 s to settle */
-#define LIGHT_STEP	3	/* percent the goal must move by */
+/* One reading a second, followed in log terms (as the eye sees it). The goal
+ * moves only when the room has been different enough for long enough: a hand or
+ * a shadow passing over the sensor does nothing, and darker waits longer than
+ * brighter. The glide itself is the shell's. */
+#define LIGHT_SMOOTH	0.35	/* share of each reading taken */
+#define LIGHT_STEP	30	/* tenths of L* the goal must move by */
+#define LIGHT_UP_NS	4000000000ULL
+#define LIGHT_DOWN_NS	8000000000ULL
+
+static int light_way;		/* the way the room is pulling: -1, 0, 1 */
+static uint64_t light_since;
+
+static void light_decide(void) {
+	if (!auto_on || !screen_on || lux_smooth < 0) {
+		return;
+	}
+	int target = lux_to_permille(pow(10.0, lux_smooth) - 1.0);
+	if (goal < 0) {	/* the first since the screen came on, or the shell came up */
+		light_way = 0;
+		brightness_show(target);
+		return;
+	}
+	int way = abs(target - goal) < LIGHT_STEP ? 0 : target > goal ? 1 : -1;
+	if (way != light_way) {
+		light_way = way;
+		light_since = now_ns();
+	}
+	if (way != 0 && now_ns() - light_since >= (way > 0 ? LIGHT_UP_NS : LIGHT_DOWN_NS)) {
+		light_way = 0;
+		brightness_show(target);
+	}
+}
 
 static void light(uint32_t lux) {
 	double l = log10((double)lux + 1.0);
-	if (lux_smooth < 0) {
-		lux_smooth = l;
-	} else {
-		double k = l > lux_smooth ? LIGHT_UP : LIGHT_DOWN;
-		lux_smooth += (l - lux_smooth) * k;
-	}
-	if (!auto_on) {
-		return;
-	}
-	int target = lux_to_percent(pow(10.0, lux_smooth) - 1.0);
-	if (goal < 0) {	/* the first reading since the screen came on: no ramp */
-		goal = target;
-		brightness_show(goal);
-	} else if (abs(target - goal) >= LIGHT_STEP) {
-		goal = target;
-	}
+	lux_smooth = lux_smooth < 0 ? l : lux_smooth + (l - lux_smooth) * LIGHT_SMOOTH;
+	light_decide();
 }
 
 /* --- frames from the hub ----------------------------------------------- */
@@ -603,11 +628,11 @@ static void command(char *line, bool persist) {
 	}
 	if (strcmp(what, "screen") == 0) {
 		screen_on = strcmp(value, "off") != 0;
-		goal = shown = -1;	/* coming back on, go straight to the room's level */
+		goal = -1;	/* coming back on: the room's level, from the next reading */
 		lux_smooth = -1;
 	} else if (strcmp(what, "auto") == 0) {
 		auto_on = strcmp(value, "on") == 0;
-		goal = shown = -1;
+		goal = -1;
 		if (persist) {
 			save();
 		}
@@ -728,10 +753,9 @@ int main(void) {
 	struct pollfd fds[3] = { { .fd = dev, .events = POLLIN }, { .fd = fileno(ctl), .events = POLLIN },
 		{ .fd = resume_fd, .events = POLLPRI | POLLERR } };
 	while (!stopping) {
-		/* awake on a timer only while the brightness is on its way
-		 * somewhere, or while the hub owes an echo */
-		bool ramping = auto_on && screen_on && goal >= 0 && shown != goal;
-		int timeout = ramping ? 40 : -1, wait = hub_wait_ms();
+		/* awake on a timer only while a change in the room is being timed,
+		 * or while the hub owes an echo */
+		int timeout = auto_on && screen_on && light_way != 0 ? 500 : -1, wait = hub_wait_ms();
 		if (wait >= 0 && (timeout < 0 || wait < timeout)) {
 			timeout = wait;
 		}
@@ -755,8 +779,8 @@ int main(void) {
 		}
 		resume_check();	/* also after other wakes: one read, and no notify is lost */
 		hub_expire();
-		if (ramping && shown != goal) {
-			brightness_show(shown + (goal > shown ? 1 : -1));
+		if (light_way != 0) {
+			light_decide();
 		}
 	}
 	if (stopping) {	/* leave the hub quiet: the REMOVEs one by one, 1 s at most */

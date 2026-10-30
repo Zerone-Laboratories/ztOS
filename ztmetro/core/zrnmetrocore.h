@@ -169,6 +169,7 @@ struct zmc_state {
 	double last_y;
 	bool sliding;
 	struct zmc_hit slider;
+	int slider_permille;	/* where the finger is, in tenths of a percent */
 
 	/* a pivot: its tabs slide sideways, under the finger or on their own */
 	bool pivot_set;		/* the page in front is one tab of a pivot */
