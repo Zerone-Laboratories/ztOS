@@ -27,6 +27,7 @@ struct dm_status {
 	bool playing, bt_audio;		/* media playing; through Bluetooth */
 	bool audio;			/* headphones in */
 	int signal;			/* 0..4 bars */
+	int searching;			/* no service: the one bar lit (1..4) of the sweep; 0 not searching */
 	char ssid[64], track[128], artist[128], alarm[16];
 	int cpu, ram, gpu;		/* load, percent */
 	int n_notif;

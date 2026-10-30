@@ -91,11 +91,16 @@ void dm_cairo_paint(cairo_t *cr, const struct dm_grid *g, int palette, float gho
 /* 5-row Bluetooth rune for the status row (the launcher's is 7 rows) */
 static const char *const BT5[] = { "..XX.", "X.X.X", ".XX..", "X.X.X", "..XX." };
 
+/* bar k (0..3) lit: below the signal, or the one bar of the no-service sweep */
+static bool signal_lit(const struct dm_status *st, int k) {
+	return st->searching ? k == st->searching - 1 : k < st->signal;
+}
+
 void dm_chrome_status(struct dm_grid *g, const struct dm_status *st, int64_t wall, bool h24) {
 	const struct dm_screen *s = g->s;
 	int top = (s->rows - 5) / 2, right = s->cols - 2;
 	/* left: signal bars, Wi-Fi, Bluetooth */
-	for (int k = 0; k < 4; k++) dm_vline(g, 1 + k * 2, top + 4 - (k + 1), top + 4, k < st->signal ? DM_MAIN : DM_DIM, 1);
+	for (int k = 0; k < 4; k++) dm_vline(g, 1 + k * 2, top + 4 - (k + 1), top + 4, signal_lit(st, k) ? DM_MAIN : DM_DIM, 1);
 	dm_bmp(g, &dm_icons_wifi, 10, top, st->wifi ? DM_MAIN : DM_DIM);
 	dm_rows(g, BT5, 5, 19, top, st->bt ? DM_MAIN : DM_DIM);
 	/* right: battery, then the time */
@@ -260,7 +265,7 @@ void dm_chrome_lock(struct dm_grid *g, const struct dm_status *st, int64_t wall,
 	if (!st->charging) snprintf(pct, sizeof(pct), "%d%%", st->batt);
 	int sw = 7 + 3 + 7 + 3 + 5 + 3 + bw + (pct[0] ? 2 + dm_width3(pct) : 0);
 	int c = 34 - sw / 2;
-	for (int k = 0; k < 4; k++) dm_vline(g, c + k * 2, sr + 4 - (k + 1), sr + 4, k < st->signal ? DM_MAIN : DM_DIM, 1);
+	for (int k = 0; k < 4; k++) dm_vline(g, c + k * 2, sr + 4 - (k + 1), sr + 4, signal_lit(st, k) ? DM_MAIN : DM_DIM, 1);
 	c += 10;
 	dm_bmp(g, &dm_icons_wifi, c, sr, st->wifi ? DM_MAIN : DM_DIM);
 	c += 10;

@@ -590,6 +590,10 @@ struct zt_server {
 	bool cell_known;		/* there is a report at all */
 	char cell_sim[16], cell_operator[48], cell_tech[8], cell_reg[16];
 	int cell_bars;			/* 0..5 */
+	/* No service (searching): one bar lit at a time, sweeping up the five */
+	int signal_sweep;
+	bool signal_sweep_armed;
+	struct wl_event_source *signal_sweep_timer;
 	bool cell_airplane;
 	bool cell_data;			/* a data connection is up on the mobile network */
 	bool cell_data_on;		/* and whether one is wanted */
@@ -5043,6 +5047,23 @@ static bool cell_registered(struct zt_server *server) {
 	return strcmp(server->cell_reg, "home") == 0 || strcmp(server->cell_reg, "roaming") == 0;
 }
 
+/* The modem reports and is not on a network: searching, or no service. */
+static bool cell_searching(struct zt_server *server) {
+	return server->cell_known && !server->cell_airplane && !cell_registered(server);
+}
+
+#define SIGNAL_SWEEP_MS 280	/* one bar to the next */
+
+/* Keeps the sweep going while a status row that shows it is drawn: each step
+ * draws the row again, and that arms the next. Stops by itself on service or
+ * with the screen off. */
+static void signal_sweep_kick(struct zt_server *server) {
+	if (!server->signal_sweep_armed && server->screen_on && cell_searching(server)) {
+		server->signal_sweep_armed = true;
+		wl_event_source_timer_update(server->signal_sweep_timer, SIGNAL_SWEEP_MS);
+	}
+}
+
 /* What ztoscorenetworkingd last wrote about the modem (and the Wi-Fi link): a small
  * file of key=value lines, read when it says so on the control pipe and with
  * the clock. Nothing here waits on a program. */
@@ -5105,12 +5126,14 @@ static void modem_read(struct zt_server *server) {
 	}
 }
 
-/* Five bars, `lit` of them white and the rest faint. */
-static void draw_signal(cairo_t *cr, double x, double base, double w, double h, int lit) {
+/* Five bars, `lit` of them white and the rest faint; with `sweep` 0..4 (no
+ * service) only that one bar is lit instead. */
+static void draw_signal(cairo_t *cr, double x, double base, double w, double h, int lit, int sweep) {
 	double pitch = w / 4.8, bar = pitch * 0.8;	/* five bars, four gaps */
 	for (int i = 0; i < 5; i++) {
 		double bh = h * (0.2 + 0.2 * i);
-		cairo_set_source_rgba(cr, 1, 1, 1, i < lit ? 1.0 : 0.3);
+		bool on = sweep >= 0 ? i == sweep : i < lit;
+		cairo_set_source_rgba(cr, 1, 1, 1, on ? 1.0 : 0.3);
 		cairo_rectangle(cr, x + i * pitch, base - bh, bar, bh);
 		cairo_fill(cr);
 	}
@@ -5269,7 +5292,10 @@ static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool
 		x += cell * 1.75 + 8;
 	} else {
 		bool there = server->cell_known && cell_registered(server);
-		draw_signal(cr, x, base, cell * 1.75, cell * 1.15, there ? server->cell_bars : 0);
+		bool searching = cell_searching(server);
+		draw_signal(cr, x, base, cell * 1.75, cell * 1.15, there ? server->cell_bars : 0,
+			searching ? server->signal_sweep % 5 : -1);
+		if (searching) signal_sweep_kick(server);
 		if (server->st_arrow_at == 1 && server->st_arrow > 0.001f) {
 			status_pop(cr, x + arrow / 2, base - cell * 1.15 + arrow / 2, server->st_arrow);
 			draw_data_arrow(cr, x, base - cell * 1.15, arrow);
@@ -5552,6 +5578,7 @@ static void draw_status(struct zt_server *server) {
 	cairo_paint(cr);
 	if (retro_on(server)) {
 		retro_paint_status(server, cr);	/* the DotMatrix style's row */
+		signal_sweep_kick(server);
 	} else {
 		status_row(server, cr, false, true);
 	}
@@ -5568,6 +5595,18 @@ static void draw_status(struct zt_server *server) {
 		status_row(server, cr, true, false);
 		zt_buffer_show(server, &server->peek_layer, buffer, cr, server->width, PEEK_H);
 	}
+}
+
+static int signal_sweep_fired(void *data) {
+	struct zt_server *server = data;
+	server->signal_sweep_armed = false;
+	if (server->screen_on && cell_searching(server)) {
+		server->signal_sweep = (server->signal_sweep + 1) % 20;	/* a multiple of 5 and of 4 */
+		draw_status(server);
+	} else {
+		server->signal_sweep = 0;
+	}
+	return 0;
 }
 
 /* The status bar held: it comes down just far enough for the SIM's name, the
@@ -6070,7 +6109,7 @@ static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double
 		draw_wifi(cr, 8, 8 + 17, 17, 3);
 	} else if (q == Q_DATA) {
 		/* the bars with the data's arrow over them */
-		draw_signal(cr, 8, 8 + 17, 22, 14, 5);
+		draw_signal(cr, 8, 8 + 17, 22, 14, 5, -1);
 		draw_data_arrow(cr, 8, 8, 7);
 	} else if (q == Q_VIBRATE) {
 		/* a phone standing, and the lines of its shaking either side */
@@ -10429,6 +10468,7 @@ static void retro_feed(struct zt_server *server) {
 	st.wifi = server->wifi_bars >= 0;
 	st.data = server->cell_data;
 	st.signal = server->cell_known && !server->cell_airplane ? (server->cell_bars * 4 + 2) / 5 : 0;
+	st.searching = cell_searching(server) ? server->signal_sweep % 4 + 1 : 0;
 	st.bt = server->bt_on;
 	st.bt_audio = server->bt_streaming;
 	st.playing = server->media && server->media_playing;
@@ -12743,8 +12783,23 @@ static void render_frame(struct zt_server *server) {
 		render_retry_later(server);
 		return;
 	}
-	if (buffer == server->output->last_submitted)
-		wlr_log(WLR_ERROR, "output acquired its most recently submitted scanout buffer");
+	if (buffer == server->output->last_submitted) {
+		/* The buffer the panel is showing: cleared to black and drawn
+		 * again while it is scanned out, the screen went black but for
+		 * the first tiles drawn (seen as a live tile turned). Hold it so
+		 * the swapchain gives another, and draw into that one. */
+		struct wlr_buffer *other = wlr_swapchain_acquire(output->swapchain);
+		wlr_buffer_unlock(buffer);
+		if (!other || other == server->output->last_submitted) {
+			wlr_log(WLR_ERROR, "output: only the scanout buffer is free; the frame waits");
+			if (other) wlr_buffer_unlock(other);
+			wlr_output_state_finish(&state);
+			render_retry_later(server);
+			return;
+		}
+		wlr_log(WLR_INFO, "output: the scanout buffer came back; drawing into another");
+		buffer = other;
+	}
 	GLuint fbo = wlr_gles2_renderer_get_buffer_fbo(server->renderer, buffer);
 	if (!fbo || !gl_begin(server)) {
 		wlr_log(WLR_ERROR, "render: no framebuffer for the output buffer (fbo %u)", fbo);
@@ -14022,6 +14077,7 @@ int main(int argc, char *argv[]) {
 	server.charging = on_charger();
 	server.toast_timer = wl_event_loop_add_timer(server.loop, toast_hide, &server);
 	server.home_flip_timer = wl_event_loop_add_timer(server.loop, home_flip_fired, &server);
+	server.signal_sweep_timer = wl_event_loop_add_timer(server.loop, signal_sweep_fired, &server);
 	server.home_flip_tile = -1;
 	modem_read(&server);
 	server.idle_notifier = wlr_idle_notifier_v1_create(server.wl_display);
