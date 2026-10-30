@@ -2740,14 +2740,21 @@ double zmc_textbox(cairo_t *cr, double y, const char *caption, const char *value
 	zmc_text(cr, caption, FONT_REGULAR, 13, MARGIN, y, 0);
 	y += 22;
 	/* the box: white with black text while it is being typed into */
-	if (focused) {
+	if (dotmatrix()) {
+		/* lit dots on a dim box: black type on lit dots cannot be read */
+		cairo_set_source_rgb(cr, focused ? 0.3 : 0.16, focused ? 0.3 : 0.16, focused ? 0.3 : 0.16);
+	} else if (focused) {
 		cairo_set_source_rgb(cr, 1, 1, 1);
 	} else {
 		cairo_set_source_rgb(cr, 0.78, 0.78, 0.78);
 	}
 	cairo_rectangle(cr, MARGIN, y, w, h);
 	cairo_fill(cr);
-	cairo_set_source_rgb(cr, 0, 0, 0);
+	if (dotmatrix()) {
+		cairo_set_source_rgb(cr, 1, 1, 1);
+	} else {
+		cairo_set_source_rgb(cr, 0, 0, 0);
+	}
 	char shown[160];
 	snprintf(shown, sizeof(shown), "%s%s", value, focused ? "|" : "");
 	zmc_text(cr, shown, FONT_REGULAR, 17, MARGIN + 8, y + 8, 0);
@@ -2882,6 +2889,13 @@ static void round_glyph(cairo_t *cr, const char *g) {
 		cairo_line_to(cr, -7, 4);
 		cairo_line_to(cr, -9, 4);
 		cairo_close_path(cr);
+		cairo_stroke(cr);
+	} else if (!strcmp(g, "search")) {
+		cairo_new_path(cr);
+		cairo_arc(cr, -2.5, -2.5, 7, 0, 2 * M_PI);
+		cairo_stroke(cr);
+		cairo_move_to(cr, 2.6, 2.6);
+		cairo_line_to(cr, 10, 10);
 		cairo_stroke(cr);
 	} else if (!strcmp(g, "add")) {
 		cairo_move_to(cr, -8, 0);
