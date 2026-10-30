@@ -39,12 +39,15 @@
 #include <linux/i2c.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
+#include <linux/kthread.h>
+#include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_data/i2c-gpio.h>
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/string.h>
+#include <linux/thermal.h>
 #include <linux/uaccess.h>
 
 int s9p_acpm_pmic_read(u8 reg, u8 *val);
@@ -822,6 +825,7 @@ static void act_run(bool move)
 }
 
 #include "zrn-cam-csis.h"
+#include "zrn-cam-live.h"
 
 static void pmic_dump(void)
 {
@@ -861,6 +865,10 @@ static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, lo
 	strim(cmd);
 
 	mutex_lock(&lock);
+	if (live_task) {
+		mutex_unlock(&lock);
+		return -EBUSY;
+	}
 	result_len = 0;
 	result[0] = 0;
 	ret = pmic_buses();
@@ -1002,6 +1010,7 @@ static int reboot_cb(struct notifier_block *nb, unsigned long a, void *d)
 	unsigned int i;
 
 	stop_now = true;
+	live_stop();
 	for (i = 0; i < 100 && !mutex_trylock(&lock); i++)
 		msleep(10);
 	if (i < 100)
@@ -1033,6 +1042,8 @@ static int __init zrn_cam_init(void)
 	ctl_pdev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
 	ctl_pdev->dev.dma_mask = &ctl_pdev->dev.coherent_dma_mask;
 	stream_ws = wakeup_source_register(NULL, "zrn-cam");
+	if (misc_register(&live_misc))
+		pr_warn("zrn-cam: no /dev/zrn-cam\n");
 	pr_info("zrn-cam: loaded, idle\n");
 	return 0;
 }
