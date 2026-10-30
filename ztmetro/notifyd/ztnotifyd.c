@@ -31,7 +31,9 @@
  *     SIGHUP reads the file again (Settings sends it).
  *
  * Everything goes to the shell as lines down its control pipe
- * ($XDG_RUNTIME_DIR/ztmetro.ctl): "notify APP|TITLE|TEXT", "media
+ * ($XDG_RUNTIME_DIR/ztmetro.ctl): "notifyh ICON|APP|TITLE|TEXT" (ICON says
+ * whose picture to draw: the sender's desktop entry, else its icon name, and
+ * "notifyqh" is the same without alerting), "media
  * STATE|TITLE|ARTIST|PLAYER". Its own state is in $XDG_RUNTIME_DIR/ztnotifyd.status.
  */
 #define _GNU_SOURCE
@@ -107,10 +109,12 @@ static int method_notify(sd_bus_message *m, void *userdata, sd_bus_error *error)
 	int r = sd_bus_message_read(m, "susss", &app, &replaces, &icon, &summary, &body);
 	if (r < 0)
 		return r;
-	/* Only what says not to alert is used of the hints: an app that asked for
-	 * no sound, a progress bar, or a quick update of the same notification (a
-	 * download's percent; Android only alerts once for those) */
+	/* Of the hints: whose notification it is (Waydroid says "waydroid.<package>"
+	 * and leaves the icon empty), and what says not to alert: an app that asked
+	 * for no sound, a progress bar, or a quick update of the same notification
+	 * (a download's percent; Android only alerts once for those) */
 	bool quiet = false;
+	const char *entry = NULL;
 	if (sd_bus_message_skip(m, "as") >= 0 && sd_bus_message_enter_container(m, 'a', "{sv}") > 0) {
 		while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
 			const char *key = NULL, *type = NULL;
@@ -124,6 +128,8 @@ static int method_notify(sd_bus_message *m, void *userdata, sd_bus_error *error)
 			} else if (key && type && !strcmp(key, "category") && !strcmp(type, "s")) {
 				sd_bus_message_read(m, "v", "s", &value);
 				quiet = quiet || (value && !strcmp(value, "progress"));
+			} else if (key && type && !strcmp(key, "desktop-entry") && !strcmp(type, "s")) {
+				sd_bus_message_read(m, "v", "s", &entry);
 			} else {
 				sd_bus_message_skip(m, "v");
 			}
@@ -140,14 +146,15 @@ static int method_notify(sd_bus_message *m, void *userdata, sd_bus_error *error)
 		last_id = replaces;
 		last_at = now;
 	}
-	char a[40], s[100], b[400];
+	char a[40], s[100], b[400], who[120];
 	clean(a, sizeof(a), app && app[0] ? app : "Notification");
+	clean(who, sizeof(who), entry && entry[0] ? entry : icon);
 	clean(s, sizeof(s), summary);
 	clean(b, sizeof(b), body);
 	if (a[0] >= 'a' && a[0] <= 'z')
 		a[0] -= 32;	/* "firefox" reads better as "Firefox" */
 	fprintf(stderr, "ztnotifyd: %s: %s\n", a, s);
-	shell_tell("%s %s|%s|%s", quiet ? "notifyq" : "notify", a, s[0] ? s : b, s[0] ? b : "");
+	shell_tell("%s %s|%s|%s|%s", quiet ? "notifyqh" : "notifyh", who, a, s[0] ? s : b, s[0] ? b : "");
 	return sd_bus_reply_method_return(m, "u", replaces ? replaces : next_id++);
 }
 

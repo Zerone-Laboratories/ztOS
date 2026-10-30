@@ -635,6 +635,7 @@ struct zt_server {
 	/* notifications: a banner as each arrives, and the list in the action centre */
 	struct {
 		char app[32], title[48], text[200];
+		char who[96];		/* whose it is, as the sender said (note_key) */
 		time_t at;
 		bool expanded;		/* tapped in the action centre: all of its text */
 	} notes[MAX_NOTES];
@@ -5663,6 +5664,80 @@ static const char *note_glyph(const char *app) {
 	return NULL;
 }
 
+/* A glyph that says nothing about the app: the initial or a kind is better. */
+static bool note_key_usable(struct zt_server *server, const char *key) {
+	return key[0] && strcmp(key, "-") != 0 && strcmp(key, "applications-other") != 0 &&
+		glyph_get(server, key);
+}
+
+/* The glyph ztapps made for a notification's app, or NULL. `who` is what the
+ * sender said: "waydroid.<package>" from Android, a desktop entry's id, an
+ * icon's name or file, or nothing; then the app's name is all there is. Looked
+ * for at each drawing, as the app list can come after the notification. */
+static const char *note_key(struct zt_server *server, const char *app, const char *who) {
+	char id[96];
+	const char *base = strrchr(who, '/');
+	snprintf(id, sizeof(id), "%s", base ? base + 1 : who);
+	size_t len = strlen(id);
+	if (len > 8 && strcmp(id + len - 8, ".desktop") == 0) {
+		id[len - 8] = 0;
+	}
+	const char *package = strncmp(id, "waydroid.", 9) == 0 ? id + 9 : id;
+	if (package[0]) {
+		char launch[120];
+		snprintf(launch, sizeof(launch), " launch %s ", package);
+		for (int i = 0; i < server->n_items; i++) {
+			const struct app_item *it = &server->items[i];
+			if (it->header || !note_key_usable(server, it->key)) {
+				continue;
+			}
+			const char *file = strrchr(it->desktop_path, '/');
+			file = file ? file + 1 : it->desktop_path;
+			size_t n = strlen(package);
+			if (strstr(it->command, launch) ||
+					(strncasecmp(file, package, n) == 0 && strcmp(file + n, ".desktop") == 0)) {
+				return it->key;
+			}
+		}
+		/* not in the app list (Waydroid's own launchers are kept out of it);
+		 * ztapps still makes their glyphs, by the icon file's name */
+		static char key[128];
+		static const char *const FORMS[] = { "%s.png", "ztos-android-%s.png", "ztos-android-%s", "%s" };
+		for (size_t i = 0; i < sizeof(FORMS) / sizeof(FORMS[0]); i++) {
+			snprintf(key, sizeof(key), FORMS[i], package);
+			if (note_key_usable(server, key)) {
+				return key;
+			}
+		}
+	}
+	/* by name: its own first, then the one the phone runs in Waydroid */
+	static const char SUFFIX[] = " (Waydroid)";
+	for (int pass = 0; pass < 2 && app[0]; pass++) {
+		for (int i = 0; i < server->n_items; i++) {
+			const struct app_item *it = &server->items[i];
+			if (it->header || !note_key_usable(server, it->key)) {
+				continue;
+			}
+			size_t n = strlen(app);
+			if (pass == 0 ? strcasecmp(it->name, app) == 0 :
+					strncasecmp(it->name, app, n) == 0 && strcmp(it->name + n, SUFFIX) == 0) {
+				return it->key;
+			}
+		}
+	}
+	return NULL;
+}
+
+/* What the sender said of the newest notification of the app called `app`. */
+static const char *note_who(struct zt_server *server, const char *app) {
+	for (int i = 0; i < server->n_notes; i++) {
+		if (strcmp(server->notes[i].app[0] ? server->notes[i].app : "System", app) == 0) {
+			return server->notes[i].who;
+		}
+	}
+	return "";
+}
+
 /* The DotMatrix style's lock screen: dots on black, the clock in the middle
  * with the status icons over it and the waiting apps under the date. */
 static void retro_paint_lock(struct zt_server *server, cairo_t *cr) {
@@ -5737,9 +5812,14 @@ static void draw_lock_notes(struct zt_server *server) {
 	char line[64];
 	double x = 22, cy = server->height - 120 - LOCK_LIFT + 30 + 34;
 	for (int i = 0; i < n; i++) {
+		const char *key = note_key(server, names[i], note_who(server, names[i]));
 		const char *glyph = note_glyph(names[i]);
 		cairo_set_source_rgb(cr, 1, 1, 1);
-		if (glyph) {
+		if (key) {
+			char icon[80];
+			snprintf(icon, sizeof(icon), "@%s", key);
+			draw_glyph(server, cr, icon, NULL, x + 13, cy, 26);
+		} else if (glyph) {
 			draw_icon(cr, glyph, x + 13, cy, 26);
 		} else {
 			char initial[2] = { (char)toupper((unsigned char)names[i][0]), 0 };
@@ -6125,14 +6205,25 @@ static void note_draw(struct zt_server *server, cairo_t *cr, int slot) {
 	int i = server->note_slot[slot];
 	double y = 0;
 	if (server->note_head[slot]) {
-		/* the app: a square in the accent colour with its initial, and its name */
+		/* the app: a square in the accent colour with its glyph (its initial
+		 * under DotMatrix, where a mask would not come out as dots, and when it
+		 * has none), and its name */
 		const char *app = server->notes[i].app;
 		char initial[2] = { (char)toupper((unsigned char)app[0]), 0 };
+		const char *key = dots() ? NULL : note_key(server, app, server->notes[i].who);
 		set_rgb(cr, server->accent);
 		cairo_rectangle(cr, 14, 0, 28, 28);
 		cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
-		draw_text(cr, initial, FONT_SEMIBOLD, 17, 14, 0, 28, 28, true);
+		if (key) {
+			char icon[80];
+			snprintf(icon, sizeof(icon), "@%s", key);
+			draw_glyph(server, cr, icon, NULL, 28, 14, 22);
+		} else if (!dots() && note_glyph(app)) {
+			draw_icon(cr, note_glyph(app), 28, 14, 20);
+		} else {
+			draw_text(cr, initial, FONT_SEMIBOLD, 17, 14, 0, 28, 28, true);
+		}
 		draw_text(cr, app, FONT_SEMILIGHT, 22, 52, -2, server->width - 66, 0, false);
 		y = NOTE_HEAD_H;
 	}
@@ -9729,7 +9820,7 @@ static int toast_hide(void *data) {
 
 /* An update that should not alert (a download's progress): the app's note with
  * this title changes in place, or a new one is kept; no sound, banner or buzz. */
-static void note_quiet(struct zt_server *server, const char *app, const char *title, const char *text) {
+static void note_quiet(struct zt_server *server, const char *who, const char *app, const char *title, const char *text) {
 	int i = 0;
 	while (i < server->n_notes && (strcmp(server->notes[i].app, app) || strcmp(server->notes[i].title, title)))
 		i++;
@@ -9744,6 +9835,7 @@ static void note_quiet(struct zt_server *server, const char *app, const char *ti
 			server->n_notes++;
 		}
 	}
+	snprintf(server->notes[i].who, sizeof(server->notes[i].who), "%s", who);
 	snprintf(server->notes[i].text, sizeof(server->notes[i].text), "%s", text);
 	server->notes_dirty = true;
 	if (server->width == 0) {
@@ -9756,13 +9848,14 @@ static void note_quiet(struct zt_server *server, const char *app, const char *ti
 	damage(server);
 }
 
-static void note_add(struct zt_server *server, const char *app, const char *title, const char *text) {
+static void note_add_from(struct zt_server *server, const char *who, const char *app, const char *title, const char *text) {
 	memmove(&server->notes[1], &server->notes[0], sizeof(server->notes[0]) * (MAX_NOTES - 1));
 	server->notes_dirty = true;
 	memset(&server->notes[0], 0, sizeof(server->notes[0]));
 	snprintf(server->notes[0].app, sizeof(server->notes[0].app), "%s", app);
 	snprintf(server->notes[0].title, sizeof(server->notes[0].title), "%s", title);
 	snprintf(server->notes[0].text, sizeof(server->notes[0].text), "%s", text);
+	snprintf(server->notes[0].who, sizeof(server->notes[0].who), "%s", who);
 	server->notes[0].at = time(NULL);
 	if (server->n_notes < MAX_NOTES) {
 		server->n_notes++;
@@ -9781,6 +9874,10 @@ static void note_add(struct zt_server *server, const char *app, const char *titl
 	lock_notes_changed(server);
 	hap(server, HAP_HEAVY, HG_SYSTEM);
 	damage(server);
+}
+
+static void note_add(struct zt_server *server, const char *app, const char *title, const char *text) {
+	note_add_from(server, "", app, title, text);
 }
 
 /* Lumia Metro top modal dialog: slides down from the top with title, message,
@@ -11977,7 +12074,23 @@ static void ctl_command(struct zt_server *server, char *line) {
 		char *bar = strchr(line + 8, '|'), *second = bar ? strchr(bar + 1, '|') : NULL;
 		if (second) {
 			*bar = *second = 0;
-			note_quiet(server, line + 8, bar + 1, second + 1);
+			note_quiet(server, "", line + 8, bar + 1, second + 1);
+		}
+	} else if (strncmp(line, "notifyh ", 8) == 0 || strncmp(line, "notifyqh ", 9) == 0) {
+		/* notifyh WHO|APP|TITLE|TEXT, from ztnotifyd: WHO says whose it is */
+		bool quiet = line[6] == 'q';
+		char *who = line + (quiet ? 9 : 8);
+		char *app = strchr(who, '|'), *title = app ? strchr(app + 1, '|') : NULL;
+		char *text = title ? strchr(title + 1, '|') : NULL;
+		if (text) {
+			*app++ = 0;
+			*title++ = 0;
+			*text++ = 0;
+			if (quiet) {
+				note_quiet(server, who, app, title, text);
+			} else {
+				note_add_from(server, who, app, title, text);
+			}
 		}
 	} else if (strncmp(line, "notify ", 7) == 0) {
 		/* notify APP|TITLE|TEXT, or notify TITLE|TEXT from the system */
