@@ -2,6 +2,7 @@
 # the phone's stock firmware and EFS backups (IMEI, calibration)
 stock/
 .claude/
+.idea
 
 # Builds, inputs and outputs (made again by the scripts and the installer)
 build/

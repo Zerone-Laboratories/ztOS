@@ -1,5 +1,5 @@
 # Builds on the phone itself (aarch64 Arch Linux ARM, wlroots 0.20).
-PKGS = wlroots-0.20 wayland-server xkbcommon cairo pangocairo librsvg-2.0 gdk-pixbuf-2.0 pixman-1 libdrm egl glesv2
+PKGS = wlroots-0.20 wayland-server xkbcommon cairo pangocairo librsvg-2.0 gdk-pixbuf-2.0 pixman-1 libdrm egl glesv2 libinput
 APP_PKGS = xkbcommon wayland-client wayland-egl egl glesv2 cairo pangocairo gdk-pixbuf-2.0
 WP := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
 XDG := $(WP)/stable/xdg-shell/xdg-shell.xml

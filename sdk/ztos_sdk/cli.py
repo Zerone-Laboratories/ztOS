@@ -321,6 +321,12 @@ def native_library(target: str, device=None) -> Path:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(base64.b64decode(encoded, validate=True))
     else:
+        cc = os.environ.get("CC") or shutil.which(f"{arch}-linux-gnu-gcc") or shutil.which(f"{arch}-linux-gnu-cc")
+        if cc:
+            result = subprocess.run(["make", "-B", "-C", str(native), f"ARCH={arch}", f"CC={cc}"], capture_output=True)
+            if result.returncode == 0 and out.is_file():
+                stamp.write_text(digest + "\n")
+                return out
         raise Fail(f"no current C renderer for {arch}; use deploy to build it on the phone, "
                    f"or cross-compile with make -C {native} ARCH={arch} CC=YOUR_CC")
     stamp.write_text(digest + "\n")
