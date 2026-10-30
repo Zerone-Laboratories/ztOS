@@ -107,7 +107,39 @@ static int method_notify(sd_bus_message *m, void *userdata, sd_bus_error *error)
 	int r = sd_bus_message_read(m, "susss", &app, &replaces, &icon, &summary, &body);
 	if (r < 0)
 		return r;
-	/* the actions, hints and timeout are not used */
+	/* Only what says not to alert is used of the hints: an app that asked for
+	 * no sound, a progress bar, or a quick update of the same notification (a
+	 * download's percent; Android only alerts once for those) */
+	bool quiet = false;
+	if (sd_bus_message_skip(m, "as") >= 0 && sd_bus_message_enter_container(m, 'a', "{sv}") > 0) {
+		while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
+			const char *key = NULL, *type = NULL;
+			int on = 0;
+			const char *value = NULL;
+			sd_bus_message_read(m, "s", &key);
+			sd_bus_message_peek_type(m, NULL, &type);
+			if (key && type && !strcmp(key, "suppress-sound") && !strcmp(type, "b")) {
+				sd_bus_message_read(m, "v", "b", &on);
+				quiet = quiet || on;
+			} else if (key && type && !strcmp(key, "category") && !strcmp(type, "s")) {
+				sd_bus_message_read(m, "v", "s", &value);
+				quiet = quiet || (value && !strcmp(value, "progress"));
+			} else {
+				sd_bus_message_skip(m, "v");
+			}
+			sd_bus_message_exit_container(m);
+		}
+		sd_bus_message_exit_container(m);
+	}
+	static uint32_t last_id;
+	static time_t last_at;
+	time_t now = time(NULL);
+	if (replaces && replaces == last_id && now - last_at < 10)
+		quiet = true;
+	if (replaces) {
+		last_id = replaces;
+		last_at = now;
+	}
 	char a[40], s[100], b[400];
 	clean(a, sizeof(a), app && app[0] ? app : "Notification");
 	clean(s, sizeof(s), summary);
@@ -115,7 +147,7 @@ static int method_notify(sd_bus_message *m, void *userdata, sd_bus_error *error)
 	if (a[0] >= 'a' && a[0] <= 'z')
 		a[0] -= 32;	/* "firefox" reads better as "Firefox" */
 	fprintf(stderr, "ztnotifyd: %s: %s\n", a, s);
-	shell_tell("notify %s|%s|%s", a, s[0] ? s : b, s[0] ? b : "");
+	shell_tell("%s %s|%s|%s", quiet ? "notifyq" : "notify", a, s[0] ? s : b, s[0] ? b : "");
 	return sd_bus_reply_method_return(m, "u", replaces ? replaces : next_id++);
 }
 

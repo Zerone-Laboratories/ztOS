@@ -7404,6 +7404,12 @@ static void launch(struct zt_server *server, const char *command) {
 		wl_event_source_timer_update(server->launch_timer, server->slow_motion ? 3500 : 900);
 		return;
 	}
+	/* Waydroid's full UI only gets a window while Android's display is on, and
+	 * no window is in front yet to ask for that (ztos-android does it for apps) */
+	if (!strcmp(command, "waydroid")) {
+		waydroid_power_request("active");
+		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
+	}
 	prepare_loading(server);
 	uint32_t launch_at = now_ms();
 	uint32_t enter_at = launch_at +
@@ -9735,6 +9741,35 @@ static int toast_hide(void *data) {
 	return 0;
 }
 
+/* An update that should not alert (a download's progress): the app's note with
+ * this title changes in place, or a new one is kept; no sound, banner or buzz. */
+static void note_quiet(struct zt_server *server, const char *app, const char *title, const char *text) {
+	int i = 0;
+	while (i < server->n_notes && (strcmp(server->notes[i].app, app) || strcmp(server->notes[i].title, title)))
+		i++;
+	if (i == server->n_notes) {
+		memmove(&server->notes[1], &server->notes[0], sizeof(server->notes[0]) * (MAX_NOTES - 1));
+		memset(&server->notes[0], 0, sizeof(server->notes[0]));
+		i = 0;
+		snprintf(server->notes[0].app, sizeof(server->notes[0].app), "%s", app);
+		snprintf(server->notes[0].title, sizeof(server->notes[0].title), "%s", title);
+		server->notes[0].at = time(NULL);
+		if (server->n_notes < MAX_NOTES) {
+			server->n_notes++;
+		}
+	}
+	snprintf(server->notes[i].text, sizeof(server->notes[i].text), "%s", text);
+	server->notes_dirty = true;
+	if (server->width == 0) {
+		return;
+	}
+	if (server->shade_open || server->shade_h > 0.1f) {
+		draw_shade(server);
+	}
+	lock_notes_changed(server);
+	damage(server);
+}
+
 static void note_add(struct zt_server *server, const char *app, const char *title, const char *text) {
 	memmove(&server->notes[1], &server->notes[0], sizeof(server->notes[0]) * (MAX_NOTES - 1));
 	server->notes_dirty = true;
@@ -11955,6 +11990,13 @@ static void ctl_command(struct zt_server *server, char *line) {
 			draw_shade(server);
 		}
 		damage(server);
+	} else if (strncmp(line, "notifyq ", 8) == 0) {
+		/* notifyq APP|TITLE|TEXT: as notify, without alerting */
+		char *bar = strchr(line + 8, '|'), *second = bar ? strchr(bar + 1, '|') : NULL;
+		if (second) {
+			*bar = *second = 0;
+			note_quiet(server, line + 8, bar + 1, second + 1);
+		}
 	} else if (strncmp(line, "notify ", 7) == 0) {
 		/* notify APP|TITLE|TEXT, or notify TITLE|TEXT from the system */
 		char *bar = strchr(line + 7, '|'), *second = bar ? strchr(bar + 1, '|') : NULL;
