@@ -22,12 +22,13 @@
 #define MODEM_STATUS	"/run/ztoscorenetworking/status"
 #define SMS_LOG		"/var/lib/ztoscorenetworking/sms/log"
 #define CALL_LOG	"/var/lib/ztoscorenetworking/calls"
-#define MAX_CONTACTS	400
+#define MAX_CONTACTS	2000	/* zrn_contacts_sync.py has the same number */
 #define MAX_CALLS	150
 #define MAX_MSGS	500
 
 struct contact {
 	char name[64], mobile[32], other[32], email[64], note[96];
+	char uid[64];	/* where it came from: "g:people/c123" for Google, "" typed in here */
 };
 
 struct call_item {
@@ -81,7 +82,7 @@ static inline int contact_order(const void *a, const void *b)
 
 static inline void contacts_load(void)
 {
-	char path[500], line[400];
+	char path[500], line[512];
 	data_path(path, sizeof(path), "contacts");
 	n_contacts = 0;
 	FILE *f = fopen(path, "r");
@@ -93,6 +94,7 @@ static inline void contacts_load(void)
 		snprintf(c->other, sizeof(c->other), "%s", next_field(&cursor));
 		snprintf(c->email, sizeof(c->email), "%s", next_field(&cursor));
 		snprintf(c->note, sizeof(c->note), "%s", next_field(&cursor));
+		snprintf(c->uid, sizeof(c->uid), "%s", next_field(&cursor));
 		if (c->name[0])
 			n_contacts++;
 	}
@@ -106,13 +108,18 @@ static inline bool contacts_save(void)
 	char path[500], tmp[510];
 	data_path(path, sizeof(path), "contacts");
 	snprintf(tmp, sizeof(tmp), "%s.new", path);
-	FILE *f = fopen(tmp, "w");
-	if (!f)
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+	if (!f) {
+		if (fd >= 0)
+			close(fd);
 		return false;
+	}
+	fchmod(fd, 0600);	/* people's numbers: an older file may have been 0644 */
 	qsort(contacts, (size_t)n_contacts, sizeof(contacts[0]), contact_order);
 	for (int i = 0; i < n_contacts; i++) {
 		struct contact *c = &contacts[i];
-		fprintf(f, "%s\t%s\t%s\t%s\t%s\n", c->name, c->mobile, c->other, c->email, c->note);
+		fprintf(f, "%s\t%s\t%s\t%s\t%s\t%s\n", c->name, c->mobile, c->other, c->email, c->note, c->uid);
 	}
 	bool ok = fclose(f) == 0;
 	return ok && rename(tmp, path) == 0;
