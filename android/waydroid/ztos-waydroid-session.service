@@ -5,6 +5,12 @@ Description=ztOS Waydroid user session
 Type=simple
 Environment=XDG_RUNTIME_DIR=%t
 Environment=WAYLAND_DISPLAY=wayland-0
+# Waydroid connects to org.freedesktop.Notifications once, at session start,
+# and never again: started before ztnotifyd (the shell starts it, about 12 s
+# into the boot) it logs "Skipping notification manager service" and Android
+# notifications stay off for the whole session (5 boots of 5, 30 Oct). Wait
+# for the name; after 60 s start anyway, without notifications.
+ExecStartPre=-/usr/bin/gdbus wait --session --timeout 60 org.freedesktop.Notifications
 ExecStart=/usr/bin/waydroid session start
 KillMode=control-group
 TimeoutStopSec=20
