@@ -1,0 +1,8 @@
+[Unit]
+Description=Google contacts into the ztOS contact store
+ConditionPathExists=%h/.config/ztos/google-contacts/token.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zrn-contacts-sync once
+Nice=10

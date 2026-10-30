@@ -1,0 +1,12 @@
+[Unit]
+Description=Google contacts sync, every half hour while the phone is awake
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+# never wakes a sleeping phone; a missed run happens at the next wake
+Persistent=true
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

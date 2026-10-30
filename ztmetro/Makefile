@@ -118,7 +118,7 @@ phone/ztphone: phone/ztphone.c comm/comm.h $(CORE_DEPS)
 messages/ztmessages: messages/ztmessages.c comm/comm.h $(CORE_DEPS)
 	$(APP_BUILD) -Icomm -o $@ messages/ztmessages.c $(CORE) $(APP_LIBS)
 
-contacts/ztcontacts: contacts/ztcontacts.c comm/comm.h $(CORE_DEPS)
+contacts/ztcontacts: contacts/ztcontacts.c comm/comm.h comm/contact-store.h $(CORE_DEPS)
 	$(APP_BUILD) -Icomm -o $@ contacts/ztcontacts.c $(CORE) $(APP_LIBS)
 
 # the App Store: the repos in pacman.conf and the AUR (see store/README.md)
@@ -241,6 +241,9 @@ install: check-arch
 	install -Dm755 phone/ztphone /usr/local/bin/ztphone
 	install -Dm755 messages/ztmessages /usr/local/bin/ztmessages
 	install -Dm755 contacts/ztcontacts /usr/local/bin/ztcontacts
+	install -Dm755 contacts/zrn_contacts_sync.py /usr/local/bin/zrn-contacts-sync
+	install -Dm644 -t /usr/lib/systemd/user contacts/zrn-contacts-sync.service contacts/zrn-contacts-sync.timer
+	install -Dm644 contacts/google-client.json.template /usr/local/share/ztos/google-client.json.template
 	install -Dm644 -t /usr/local/share/applications comm/ztphone.desktop comm/ztmessages.desktop comm/ztcontacts.desktop
 	install -Dm644 -t /usr/local/share/icons/hicolor/scalable/apps comm/ztphone.svg comm/ztmessages.svg comm/ztcontacts.svg
 	install -Dm644 csf/components /etc/ztoscoresensorframework/components
