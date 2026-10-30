@@ -5,6 +5,7 @@
  *	dvfs-DOM-KHZ		ask the APM for a camera domain level, read the ISPPRE bus clock
  *	stream-count[-tp]	rear up, stream 5 s, count frames by polling, no DMA
  *	stream-frame[-tp]	the same, then one frame to memory, read from debugfs "frame"
+ *	fstream-*		the same on the front camera
  *
  * "-tp" is the sensor's test pattern, register 0x0601 = 2 (colour bars): nothing
  * from the room. Registers are from the vendor kernel: fimc-is-hw-csi-v5_1.[ch],
@@ -17,14 +18,35 @@
  */
 #include <linux/dma-mapping.h>
 #include <linux/pm_wakeup.h>
-#include "zrn-cam-2l3.h"
+#include "zrn-cam-tables.h"
 
 #define SENSOR_W	2016
 #define SENSOR_H	1512
 #define PDAF_H		378
+#define FRONT_W		1632
+#define FRONT_H		1224
+#define FMT_EMBEDDED	0x12
 #define FMT_RAW10	0x2b
 #define FMT_NONE	0x3f
 #define SETTLE_1352	66	/* fimc-is-hw-settle-10nm-lpp.h, 1360 */
+#define SETTLE_719	36	/* the same, 720 */
+
+/* one sensor's way in: stock DT fimc_is_sensor0/1, fimc-is-hw-csi-v5_1.h */
+struct csi_path {
+	phys_addr_t csis, phy, vc;
+	u32 rst_bit, iso;		/* iso: PMU offset */
+	u32 sc_06, sc_02, sd[2 + 2];
+	u32 lanes, w, h, pd_h, settle, interleave;
+};
+static const struct csi_path path_rear = {
+	0x16230000, 0x16160000, 0x162b0000, 0, 0x70c, 0x2418, 0x2484,
+	{ 0x2800, 0x2c00, 0x3000, 0x3400 }, 4, SENSOR_W, SENSOR_H, PDAF_H, SETTLE_1352, 2,
+};
+static const struct csi_path path_front = {
+	0x16240000, 0x16180000, 0x162c0000, 2, 0x730, 0x1018, 0x1084,
+	{ 0x1400, 0x1800, 0x1c00, 0x2000 }, 2, FRONT_W, FRONT_H, 0, SETTLE_719, 3,
+};
+static const struct csi_path *pth;
 
 #define CSIS_VERSION	0x000
 #define CSIS_CMN	0x004
@@ -51,13 +73,16 @@
 #define CMN_OTF		0x41c
 
 #define FRAME_FRONT	SZ_1M
-#define FRAME_AREA	(SENSOR_W * 2 * SENSOR_H)	/* observed: the DMA writes 16 bits a pixel */
+#define FRAME_AREA	(SENSOR_W * 2 * SENSOR_H)	/* observed: the DMA writes 16 bits a pixel; front fits */
 #define FRAME_REAR	(2 * SZ_1M)
 #define FRAME_SIZE	(FRAME_FRONT + FRAME_AREA + FRAME_REAR)
 #define CANARY_FRONT	0xa5
 #define CANARY_REAR	0x5a
 
-static void __iomem *csis, *csis_vc, *csis_phy, *csis_dma, *sys_phy, *top_cmu;
+static void __iomem *csis, *csis_vc, *csis_phy, *csis_dma, *sys_phy, *top_cmu, *pmu;
+static u32 coarse, again;
+module_param(coarse, uint, 0644);	/* 0: the table's own */
+module_param(again, uint, 0644);
 static void *frame;
 static dma_addr_t frame_dma;
 static size_t frame_len;
@@ -247,53 +272,70 @@ static void rmw(void __iomem *r, u32 mask, u32 val)
 	writel((readl(r) & ~mask) | val, r);
 }
 
-static int csis_map(void)
+static int csis_map(const struct csi_path *p)
 {
-	if (csis)
-		return 0;
-	csis = ioremap(0x16230000, 0x1000);
-	csis_phy = ioremap(0x16160000, 0x10000);
-	csis_vc = ioremap(0x162b0000, 0x1000);
-	csis_dma = ioremap(0x162f0000, 0x100);
-	sys_phy = ioremap(0x16210500, 4);
-	return csis && csis_phy && csis_vc && csis_dma && sys_phy ? 0 : -ENOMEM;
+	if (csis) {
+		iounmap(csis);
+		iounmap(csis_phy);
+		iounmap(csis_vc);
+	}
+	pth = p;
+	csis = ioremap(p->csis, 0x1000);
+	csis_phy = ioremap(p->phy, 0x10000);
+	csis_vc = ioremap(p->vc, 0x1000);
+	if (!csis_dma)
+		csis_dma = ioremap(0x162f0000, 0x100);
+	if (!sys_phy)
+		sys_phy = ioremap(0x16210500, 4);
+	if (!pmu)
+		pmu = ioremap(0x14060000, 0x1000);
+	return csis && csis_phy && csis_vc && csis_dma && sys_phy && pmu ? 0 : -ENOMEM;
 }
 
 static void csis_on(void)
 {
-	static const u32 sd[] = { 0x2800, 0x2c00, 0x3000, 0x3400 };
+	const struct csi_path *p = pth;
 	unsigned int i;
 
-	/* phy_power_on: release the PHY's reset; PMU isolation 0x70c already reads bypass */
-	rmw(sys_phy, BIT(0), 0);
-	rmw(sys_phy, BIT(0), BIT(0));
+	/* phy_power_on: PMU isolation bypass, then release the PHY's reset */
+	rmw(pmu + p->iso, BIT(0), BIT(0));
+	rmw(sys_phy, BIT(p->rst_bit), 0);
+	rmw(sys_phy, BIT(p->rst_bit), BIT(p->rst_bit));
 
 	rmw(csis + CSIS_CMN, BIT(1), BIT(1));
 	for (i = 0; i < 10 && (readl(csis + CSIS_CMN) & BIT(1)); i++)
 		udelay(10);
 
-	/* csi_hw_s_phy_default_value, CSI_ID_A */
-	writel(0x10, csis_phy + 0x404);
-	writel(0x05, csis_phy + 0x40c);
-	writel(0x68, csis_phy + 0x414);
-	writel(0x6c, csis_phy + 0x418);
-	writel(0x02, csis_phy + 0x2418);
+	/* csi_hw_s_phy_default_value */
+	if (p == &path_rear) {
+		writel(0x10, csis_phy + 0x404);
+		writel(0x05, csis_phy + 0x40c);
+		writel(0x68, csis_phy + 0x414);
+		writel(0x6c, csis_phy + 0x418);
+	}
+	writel(0x02, csis_phy + p->sc_06);
 	/* csi_hw_s_phy_config below 1.5 Gbps: no skew calibration, HS mode 1 */
-	rmw(csis_phy + 0x2484, 0xff, 1);
-	for (i = 0; i < 4; i++) {
-		rmw(csis_phy + sd[i] + 0xac, BIT(2), BIT(2));
-		rmw(csis_phy + sd[i] + 0xb0, 0xff, SETTLE_1352);
+	rmw(csis_phy + p->sc_02, 0xff, 1);
+	for (i = 0; i < p->lanes; i++) {
+		rmw(csis_phy + p->sd[i] + 0xac, BIT(2), BIT(2));
+		rmw(csis_phy + p->sd[i] + 0xb0, 0xff, p->settle);
 	}
 
-	/* four lanes, VC_ONLY, as FIMC_IS_SENSOR_CFG mode 5 */
-	rmw(csis + CSIS_CMN, 3 << 8, 3 << 8);
-	rmw(csis + CSIS_PHY_CMN, 0xf << 1, 0xf << 1);
-	rmw(csis + CSIS_CMN, 3 << 10, 2 << 10);
+	/* as FIMC_IS_SENSOR_CFG: lanes, interleave, then each channel */
+	rmw(csis + CSIS_CMN, 3 << 8, (p->lanes - 1) << 8);
+	rmw(csis + CSIS_PHY_CMN, 0xf << 1, ((1 << p->lanes) - 1) << 1);
+	rmw(csis + CSIS_CMN, 3 << 10, p->interleave << 10);
 	writel(0 | (FMT_RAW10 << 2) | (1 << 12), csis + CSIS_CFG(0));
-	writel(SENSOR_H << 16 | SENSOR_W, csis + CSIS_RES(0));
-	writel(1 | (FMT_RAW10 << 2) | (2 << 12), csis + CSIS_CFG(1));
-	writel(PDAF_H << 16 | SENSOR_W, csis + CSIS_RES(1));
-	writel(2 | (FMT_NONE << 2) | (1 << 12), csis + CSIS_CFG(2));
+	writel(p->h << 16 | p->w, csis + CSIS_RES(0));
+	if (p->pd_h) {
+		writel(1 | (FMT_RAW10 << 2) | (2 << 12), csis + CSIS_CFG(1));
+		writel(p->pd_h << 16 | p->w, csis + CSIS_RES(1));
+		writel(2 | (FMT_NONE << 2) | (1 << 12), csis + CSIS_CFG(2));
+	} else {
+		writel(1 | (FMT_NONE << 2) | (1 << 12), csis + CSIS_CFG(1));
+		writel(0, csis + CSIS_RES(1));
+		writel(0 | (FMT_EMBEDDED << 2) | (1 << 12), csis + CSIS_CFG(2));
+	}
 	writel(0, csis + CSIS_RES(2));
 	writel(3 | (FMT_NONE << 2) | (1 << 12), csis + CSIS_CFG(3));
 	writel(0, csis + CSIS_RES(3));
@@ -333,7 +375,9 @@ static void csis_off(void)
 	writel(0, csis + CSIS_MSK0);
 	writel(0, csis + CSIS_MSK1);
 	writel(0, csis_vc + CMN_MASK);
-	rmw(sys_phy, BIT(0), 0);
+	rmw(sys_phy, BIT(pth->rst_bit), 0);
+	if (pth == &path_front)	/* the rear PHY's isolation was off bypass at no time; leave it */
+		rmw(pmu + pth->iso, BIT(0), 0);
 }
 
 static void dma_prepare(void)
@@ -346,7 +390,7 @@ static void dma_prepare(void)
 	dma_wmb();
 	/* csi_s_config_dma mode: 2D, legacy storage, RAW10, not "pack12": 16 bits a pixel */
 	writel(0, csis_vc + VC_FMT);
-	writel(SENSOR_W, csis_vc + VC_RESOL);
+	writel(pth->w, csis_vc + VC_RESOL);
 	for (i = 0; i < 8; i++)
 		writel(lower_32_bits(frame_dma) + FRAME_FRONT, csis_vc + VC_ADDR(i));
 	writel(0, csis_vc + CMN_OTF);
@@ -435,12 +479,12 @@ static void cis_status(const char *when)
 	note("%s: sensor mode_select %u frame_count %u frame_length 0x%02x%02x", when, mode, fc, b[0], b[1]);
 }
 
-static int stream_run(bool want_frame, bool pattern)
+static int stream_run(bool front, bool want_frame, bool pattern)
 {
 	u32 ver;
 	int ret;
 
-	ret = csis_map();
+	ret = csis_map(front ? &path_front : &path_rear);
 	if (ret)
 		return ret;
 	ver = readl(csis + CSIS_VERSION);
@@ -454,15 +498,27 @@ static int stream_run(bool want_frame, bool pattern)
 			return -ENOMEM;
 		note("frame buffer at 0x%llx", (u64)frame_dma);
 	}
-	bus_note("before");
-	read_id(&cameras[0]);
-	ret = cis_table(tb_reset_tnp, ARRAY_SIZE(tb_reset_tnp));
-	if (!ret)
-		ret = cis_table(tb_global, ARRAY_SIZE(tb_global));
-	if (!ret)
-		ret = cis_table(tb_mode_2016x1512_30, ARRAY_SIZE(tb_mode_2016x1512_30));
+	ret = apm_set(7, INTCAM_KHZ);
+	note("APM dvfs_cam: %d", ret);
+	if (ret)
+		return ret;
+	bus_note("bus");
+	read_id(front ? &cameras[1] : &cameras[0]);
+	if (front) {
+		ret = cis_table(tb_front_1632x1224_30, ARRAY_SIZE(tb_front_1632x1224_30));
+	} else {
+		ret = cis_table(tb_reset_tnp, ARRAY_SIZE(tb_reset_tnp));
+		if (!ret)
+			ret = cis_table(tb_global, ARRAY_SIZE(tb_global));
+		if (!ret)
+			ret = cis_table(tb_mode_2016x1512_30, ARRAY_SIZE(tb_mode_2016x1512_30));
+	}
 	if (!ret && pattern)
 		ret = cis_write8(0x0601, 2);
+	if (!ret && coarse)
+		ret = cis_write16(0x0202, coarse);
+	if (!ret && again)
+		ret = cis_write16(0x0204, again);
 	if (ret) {
 		note("sensor set-up failed: %d, nothing streamed", ret);
 		return ret;
@@ -474,9 +530,13 @@ static int stream_run(bool want_frame, bool pattern)
 	csis_on();
 	note("phy status before stream 0x%x, CMN 0x%08x", readl(csis + CSIS_PHY_STAT), readl(csis + CSIS_CMN));
 
-	/* sensor_2l3_cis_stream_on */
 	cis_write8(0x0104, 1);
-	ret = cis_write16(0x0100, 0x0103);
+	if (front) {	/* sensor_3h1_cis_stream_on */
+		cis_write16(0x6028, 0x4000);
+		ret = cis_write8(0x0100, 1);
+	} else {	/* sensor_2l3_cis_stream_on */
+		ret = cis_write16(0x0100, 0x0103);
+	}
 	cis_write8(0x0104, 0);
 	if (ret)
 		note("stream on: %d", ret);
@@ -484,7 +544,7 @@ static int stream_run(bool want_frame, bool pattern)
 	cis_status("after");
 
 	dma_stop();
-	cis_write8(0x0100, 0);	/* sensor_2l3_cis_stream_off */
+	cis_write8(0x0100, 0);
 	msleep(50);
 	csis_off();
 	__pm_relax(stream_ws);

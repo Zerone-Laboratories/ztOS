@@ -852,7 +852,7 @@ static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, lo
 	size_t n = min(len, sizeof(cmd) - 1);
 	bool rails = false;
 	const struct camera *c = NULL;
-	bool act = false, act_moves = false, stream = false, st_frame = false, st_tp = false;
+	bool act = false, act_moves = false, stream = false, st_frame = false, st_tp = false, st_front = false;
 	int i, ret;
 
 	if (copy_from_user(cmd, ubuf, n))
@@ -890,13 +890,14 @@ static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, lo
 		}
 		goto done;
 	}
-	if (!strncmp(cmd, "stream-", 7)) {
+	if (!strncmp(cmd, "stream-", 7) || !strncmp(cmd, "fstream-", 8)) {
 		if (!top_cmu)
 			top_cmu = ioremap(0x1a240000, 0x3000);
 		stream = true;
-		st_frame = !strncmp(cmd, "stream-frame", 12);
+		st_front = cmd[0] == 'f';
+		st_frame = strstr(cmd, "-frame");
 		st_tp = strstr(cmd, "-tp");
-		c = &cameras[0];
+		c = st_front ? &cameras[1] : &cameras[0];
 	}
 	if (!strcmp(cmd, "act-read") || !strcmp(cmd, "act-move")) {
 		act = true;
@@ -949,7 +950,7 @@ static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, lo
 	}
 	ret = power_on(c, rails);
 	if (!ret && stream)
-		ret = stream_run(st_frame, st_tp);
+		ret = stream_run(st_front, st_frame, st_tp);
 	else if (!ret && !rails)
 		read_id(c);
 	if (!ret && act)
