@@ -34,11 +34,18 @@ clean stop (a reboot, systemctl stop) removes the mark (ExecStopPost) and
 undoes a half-prepared sleep: a reboot during the preparations used to look
 like a hang and switched sleeping off (26 Oct, three times).
 
+An inhibit written after the last check before the suspend still stops it:
+the inhibit directory is watched as a wakeup event (InhibitWatch). A holder
+writes its inhibit before it starts the thing it protects.
+
   zrn-sleepd            run (systemd)
-  zrn-sleepd once       one cycle now, conditions or not (screen must be off)
+  zrn-sleepd once [SECONDS] [--ignore-inhibit NAME]...
+                        one cycle now, conditions or not (screen must be off)
   zrn-sleepd enable | disable | status
+  zrn-sleepd log [N | all]
+                        the last N lines of the log (50), NUL bytes dropped
 """
-import collections, ctypes, errno, json, os, signal, socket, struct, subprocess, sys, time
+import collections, ctypes, errno, json, os, re, select, signal, socket, struct, subprocess, sys, threading, time
 from pathlib import Path
 
 sys.path.insert(0, '/usr/lib/ztos/python')
@@ -83,7 +90,12 @@ DOZE_SLEEP_S = 300
 DOZE_AWAKE_S = 10
 DOZE_AWAKE_MAX_S = 45
 PUSH_GRACE_S = 8
-AWAKE_AFTER = {'rtc': 3, 'modem': 15, 'bt': 5, 'key': 0, 'hub': 5, 'other': 8}
+# 'alarm': the RTC woke it before its own alarm, so someone else's alarmtimer
+# (Android's *_WAKEUP alarms, zrn-pushd): the app's wake locks do not reach
+# the host (no CONFIG_PM_WAKELOCKS; the container's /sys/power is read-only),
+# so this is how long it gets to do its job
+AWAKE_AFTER = {'rtc': 3, 'modem': 15, 'bt': 5, 'key': 0, 'hub': 5, 'alarm': 20, 'other': 8}
+EARLY_RTC_S = 3		# an RTC wake this much before its own alarm is 'alarm'
 # EINT_WAKEUP_MASK (PMU 0x60c, bit = 8 x gpaN + pin, 0 = may wake): open
 # 1 PMIC (gpa0-1), 14 MAX77705 charger (gpa1-6), 19 BT HOST_WAKE (gpa2-3),
 # 20 power key (gpa2-4). Bit 15 (the sensor hub's host_req, gpa1-7) stays
@@ -91,16 +103,28 @@ AWAKE_AFTER = {'rtc': 3, 'modem': 15, 'bt': 5, 'key': 0, 'hub': 5, 'other': 8}
 # (eint_follow), as stock's EINT wake mask follows enable_irq_wake.
 EINT_WAKE = 0xffe7bffd
 # A sleep the firmware gave up (ACPM 'upend_wk': PMU_INTR_GEN GRP4 latched,
-# 29 Oct, a whole boot): smc 0, no wake source, back at once. Not a wake:
-# try again soon; FW_ABORT_LIMIT in a row and sleeping pauses for the boot
-# (PAUSED, in /run: a reboot clears it), rather than churning Wi-Fi, the
-# DSP and the sensor hub every few seconds. GRP4 is not forced clear from
-# here (clear_grp4 is for a person at the bench): zrn-sleep-init clears a
-# stale latch itself at each attempt, and only once host_req is low; a
-# sleep forced through a live latch while GNSS ran took the hub down (J0c).
+# 29 Oct, a whole boot): smc 0, no wake source, back at once. Not a wake.
+# Its cause decides what follows (fw_abort_cause):
+#   'hub': the sensor hub was busy (host_req latched, GNSS or a hub reset
+#     held, the hub not ready): harmless, the hub's own business. Tried again
+#     in FW_ABORT_HUB_S, FW_ABORT_HUB_LONG_S once it has happened
+#     FW_ABORT_HUB_MANY times in a row; it never pauses sleeping.
+#   'other': FW_ABORT_LIMIT in a row and sleeping pauses for PAUSE_S
+#     (PAUSED, until= in boot time), rather than churning Wi-Fi, the DSP and
+#     the sensor hub every few seconds; then it tries again by itself.
+# GRP4 is never forced clear from here: clear_grp4 is written 0 at every
+# cycle and nothing writes 1. A sleep forced through a live latch while GNSS
+# ran took the hub down (J0c); the firmware's own abort did no harm (J0b).
 FW_ABORT_LIMIT = 3
 FW_ABORT_RETRY_S = 5
 FW_ABORT_SLEPT_S = 2
+FW_ABORT_HUB_S, FW_ABORT_HUB_LONG_S, FW_ABORT_HUB_MANY = 20, 300, 6
+PAUSE_S = 1800
+HUB_HOST_REQ = 1 << 7	# gpa1-7 in eint_before/eint_pending word 1
+SENSORHUB_READY = Path('/sys/class/sec/sensorhub/ready')
+# the Waydroid container's cgroup: frozen while the screen is off
+# (suspend_action=freeze)
+CONTAINER_CGROUP = Path('/sys/fs/cgroup/lxc.payload.waydroid')
 # the sensor hub keeps waking the phone or refusing its sleeps: this many
 # in HUB_WINDOW_S and it is left awake HUB_BACKOFF_S
 HUB_BUSY_RETRY_S = 5
@@ -115,6 +139,14 @@ BATTERY = Path('/sys/class/power_supply/max170xx_battery')
 LOW_BATTERY = ((4, 120), (10, 600))	# (at or below %, longest sleep s)
 SUMMARY_S = 3600	# a line of totals this often, and at stop
 INHIBIT_OLD_S = 3600	# an inhibit held this long gets a line in the log
+LOG_ROTATE_BYTES = 1 << 20	# the log moves to log.1 past this
+# /sys/power/wakeup_count blocks while a wakeup source is active: past this
+# the cycle gives up (Stalled), and says which source held it
+WAKEUP_COUNT_S = 15
+# inotify and epoll, for the inhibit watch
+IN_ATTRIB, IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE = 0x4, 0x8, 0x80, 0x100
+IN_Q_OVERFLOW, IN_IGNORED = 0x4000, 0x8000
+EPOLLWAKEUP = 1 << 29
 
 
 class BackgroundApps:
@@ -214,13 +246,86 @@ def background_apps_active(fresh=False):
 
 
 def log(*words):
+	"""A line to the journal and to LOG. One write(2) and fdatasync a line:
+	a hard reset once left the file longer than its data (64 NUL bytes,
+	30 Oct), and grep then hid every line."""
 	line = time.strftime('%Y-%m-%d %H:%M:%S ') + ' '.join(str(w) for w in words)
 	print(line, flush=True)
 	try:
-		with LOG.open('a') as f:
-			f.write(line + '\n')
+		try:
+			if LOG.stat().st_size > LOG_ROTATE_BYTES:
+				os.replace(LOG, LOG.with_name(LOG.name + '.1'))
+		except FileNotFoundError:
+			pass
+		fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+		try:
+			os.write(fd, (line + '\n').encode())
+			os.fdatasync(fd)
+		finally:
+			os.close(fd)
 	except OSError:
 		pass
+
+
+def repair_log():
+	"""NUL bytes in LOG (an unclean stop): keep the file as it was in
+	log.nul (once), and put a marker line where each run was."""
+	try:
+		data = LOG.read_bytes()
+	except OSError:
+		return
+	if b'\0' not in data:
+		return
+	try:
+		keep = os.open(LOG.with_name(LOG.name + '.nul'), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+	except FileExistsError:
+		keep = None
+	except OSError:
+		return
+	if keep is not None:
+		try:
+			os.write(keep, data)
+			os.fsync(keep)
+		finally:
+			os.close(keep)
+	out, i = bytearray(), 0
+	for run in re.finditer(rb'\0+', data):
+		out += data[i:run.start()]
+		if out and not out.endswith(b'\n'):
+			out += b'\n'
+		out += f'-- {run.end() - run.start()} bytes lost: an unclean stop --\n'.encode()
+		i = run.end()
+		if data[i:i + 1] == b'\n':
+			i += 1
+	out += data[i:]
+	tmp = LOG.with_name('.log.tmp')
+	try:
+		fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+		try:
+			os.write(fd, bytes(out))
+			os.fsync(fd)
+		finally:
+			os.close(fd)
+		os.replace(tmp, LOG)
+		directory = os.open(LOG.parent, os.O_RDONLY | os.O_DIRECTORY)
+		try:
+			os.fsync(directory)
+		finally:
+			os.close(directory)
+	except OSError:
+		pass
+
+
+def show_log(lines=50):
+	"""The last `lines` of log.1 and LOG (None: all), NUL bytes dropped."""
+	text = []
+	for path in (LOG.with_name(LOG.name + '.1'), LOG):
+		try:
+			text += path.read_bytes().replace(b'\0', b'').decode(errors='replace').splitlines()
+		except OSError:
+			pass
+	for line in text if lines is None else text[-lines:] if lines > 0 else []:
+		print(line)
 
 
 STEP = Path('/run/zrn-sleepd/step')
@@ -239,7 +344,10 @@ def step(name):
 
 
 class Stalled(Exception):
-	pass
+	"""A preparation step hung; the argument says how long it was given."""
+	def __init__(self, seconds=PREPARE_S):
+		super().__init__(seconds)
+		self.seconds = seconds
 
 
 def _stalled(signum, frame):
@@ -413,9 +521,165 @@ def inhibits():
 	return held
 
 
-def why_awake(ignore=()):
+class InhibitWatch:
+	"""An inhibit made late, after the re-check, as a wakeup event.
+
+	A file is not a wakeup event, and this kernel has no CONFIG_PM_WAKELOCKS,
+	so an inhibit written in the second between why_awake() and the freezer
+	did not stop the suspend. Here inotify on INHIBIT sits in an epoll with
+	EPOLLWAKEUP: the writer's own rename/utime/close wakes the epoll, whose
+	callback activates a wakeup source in that same syscall. From then until
+	drain() the wakeup_count write fails (EINVAL) or the suspend aborts
+	(EBUSY): pm_save_wakeup_count and pm_wakeup_pending see it in flight.
+	The kernel strips EPOLLWAKEUP without CAP_BLOCK_SUSPEND; armed() reads
+	what it kept from /proc/self/fdinfo. Deletions are not watched: the
+	daemon's own removal of an expired inhibit is not an event.
+
+	The contract for a holder: write the inhibit before starting the thing
+	it protects."""
+	MASK = IN_CREATE | IN_MOVED_TO | IN_ATTRIB | IN_CLOSE_WRITE
+
+	def __init__(self, path=None):
+		self.path = Path(path if path is not None else INHIBIT)
+		self.ep = None
+		self.ignored = False
+		libc = ctypes.CDLL(None, use_errno=True)
+		libc.inotify_init1.argtypes = [ctypes.c_int]
+		libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+		self.fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+		if self.fd < 0:
+			raise OSError(ctypes.get_errno(), 'inhibit watch: inotify_init1')
+		try:
+			if libc.inotify_add_watch(self.fd, os.fsencode(self.path), self.MASK) < 0:
+				err = ctypes.get_errno()
+				raise OSError(err, f'inhibit watch on {self.path}: {os.strerror(err)}')
+			self.ino = os.stat(self.path).st_ino
+			self.ep = select.epoll()
+			self.ep.register(self.fd, select.EPOLLIN | select.EPOLLET | EPOLLWAKEUP)
+		except BaseException:
+			self.close()
+			raise
+
+	def close(self):
+		if self.ep is not None:
+			self.ep.close()
+			self.ep = None
+		if self.fd >= 0:
+			os.close(self.fd)
+			self.fd = -1
+
+	def armed(self, fdinfo=None):
+		"""EPOLLWAKEUP kept on the item: 'tfd: FD events: HEX ...'."""
+		text = fdinfo if fdinfo is not None else read(f'/proc/self/fdinfo/{self.ep.fileno()}')
+		for line in text.splitlines():
+			f = line.split()
+			if len(f) >= 4 and f[0] == 'tfd:' and f[2] == 'events:' and f[1] == str(self.fd):
+				try:
+					return bool(int(f[3], 16) & EPOLLWAKEUP)
+				except ValueError:
+					return False
+		return False
+
+	def drain(self):
+		"""Read every event and let the wakeup source go. True if any came
+		other than the watch's own end (IN_IGNORED)."""
+		seen = False
+		while self.fd >= 0:
+			try:
+				buf = os.read(self.fd, 65536)
+			except BlockingIOError:
+				break
+			except OSError:
+				break
+			if not buf:
+				break
+			off = 0
+			while off + 16 <= len(buf):
+				_wd, mask, _cookie, length = struct.unpack_from('iIII', buf, off)
+				if mask & IN_IGNORED:
+					self.ignored = True
+				else:
+					seen = True
+				off += 16 + length
+		if self.ep is not None:
+			try:
+				self.ep.poll(0)	# ep_send_events relaxes the item's source
+			except OSError:
+				pass
+		return seen
+
+	def stale(self):
+		"""The directory went (rmdir, a new /run): watch the new one."""
+		if self.ignored:
+			return True
+		try:
+			return os.stat(self.path).st_ino != self.ino
+		except OSError:
+			return True
+
+
+_watch = None
+_watch_failed = False
+
+
+def ensure_watch():
+	"""The inhibit watch, built or rebuilt as needed; None if it cannot be
+	(then the re-check before the wakeup_count write is all there is)."""
+	global _watch, _watch_failed
+	if _watch is not None and not _watch.stale():
+		return _watch
+	if _watch is not None:
+		_watch.close()
+		_watch = None
+	try:
+		INHIBIT.mkdir(parents=True, exist_ok=True)
+		watch = InhibitWatch(INHIBIT)
+		armed = watch.armed()
+		# it sees what a writer does: a file made and removed
+		probe = INHIBIT / '.watch-selftest'
+		probe.touch()
+		probe.unlink(missing_ok=True)
+		works = watch.drain()
+		if not armed:
+			log('inhibit watch not armed (EPOLLWAKEUP stripped): late inhibits are not caught')
+		elif not works:
+			log('inhibit watch self-test failed: late inhibits may not be caught')
+		else:
+			log('inhibit watch armed')
+		_watch, _watch_failed = watch, False
+	except OSError as e:
+		if not _watch_failed:
+			log('inhibit watch:', e)
+		_watch_failed = True
+		_watch = None
+	return _watch
+
+
+def paused():
+	"""PAUSED holds while boot time is before its until=; then it goes."""
+	try:
+		text = PAUSED.read_text()
+	except OSError:
+		return False
+	until = None
+	for word in text.split():
+		key, _, value = word.partition('=')
+		if key == 'until':
+			try:
+				until = float(value)
+			except ValueError:
+				pass
+	if until is not None and boottime() < until:
+		return True
+	PAUSED.unlink(missing_ok=True)
+	log('sleep pause over: trying again')
+	return False
+
+
+def why_awake(ignore=(), ignore_inhibits=()):
 	"""None when it may sleep; else what keeps it up. `ignore`: reasons
-	that do not count (`once` ignores the charger and the switch)."""
+	that do not count (`once` ignores the charger and the switch);
+	`ignore_inhibits`: inhibit names that do not count (a bench)."""
 	def audio():
 		try:
 			return int(kv(PERF).get('tickle_audio', '0') or 0) > 0
@@ -423,17 +687,43 @@ def why_awake(ignore=()):
 			return False
 	for name, holds in (
 			('switched off', lambda: not ENABLED.exists()),
-			('paused', PAUSED.exists),
+			('paused', paused),
 			('screen on', lambda: not screen_off()),
 			('charger', plugged),
 			('call', lambda: kv(MODEM).get('call', 'idle') not in ('', 'idle')),
 			('audio', audio)):
 		if name not in ignore and holds():
 			return name
-	held = inhibits()
+	held = [name for name in inhibits() if name not in ignore_inhibits]
 	if held:
 		return 'inhibit ' + ','.join(held)
 	return None
+
+
+def read_wakeup_count(seconds=WAKEUP_COUNT_S):
+	"""/sys/power/wakeup_count, read without hanging on our own watch.
+
+	The read blocks while any wakeup source is active. An inhibit written
+	just before it activates the watch's own source, which only drain()
+	lets go: so the read runs in a thread, and this thread drains while it
+	waits. Past `seconds` some other source holds it: Stalled."""
+	box = {}
+
+	def reader():
+		box['count'] = read('/sys/power/wakeup_count')
+	if _watch is not None:
+		_watch.drain()
+	thread = threading.Thread(target=reader, name='wakeup_count', daemon=True)
+	thread.start()
+	end = time.monotonic() + seconds
+	while True:
+		thread.join(1)
+		if not thread.is_alive():
+			return box.get('count', '')
+		if _watch is not None:
+			_watch.drain()
+		if time.monotonic() >= end:
+			raise Stalled(seconds)
 
 
 # ---- one sleep ----------------------------------------------------------------
@@ -470,7 +760,57 @@ def number(path):
 		return 0
 
 
-def wake_reason(before, slept=None):
+def rtc_early(t_alarm, alarm_s, t_woke):
+	"""Back (boot time) before our own RTC alarm, written at t_alarm for
+	+alarm_s, was due: another alarmtimer set the RTC sooner. Measured from
+	the wakealarm write, not from the suspend: the preparations after it
+	(settle, sync, the gadget) take seconds."""
+	if t_alarm is None or t_woke is None:
+		return False
+	return t_woke < t_alarm + alarm_s - EARLY_RTC_S
+
+
+def words(name):
+	"""A comma list module parameter (eint_before, eint_pending)."""
+	try:
+		return [int(x or 0) for x in read(SLEEP / name, '').split(',')]
+	except ValueError:
+		return []
+
+
+def fw_abort_cause():
+	"""Why the firmware gave a sleep up: 'hub' when the sensor hub was busy
+	(host_req latched, raw, before zrn-sleep-init discarded masked bits;
+	GNSS or a hub reset holding; the hub not ready), else 'other'. A masked
+	line alone (gpa1-0, the noise eint_before also keeps) is 'other'."""
+	for name in ('eint_before', 'eint_pending'):
+		w = words(name)
+		if len(w) > 1 and w[1] & HUB_HOST_REQ:
+			return 'hub'
+	for name in ('timed-gnss', 'timed-hub'):
+		if (INHIBIT / name).exists():
+			return 'hub'
+	if read(SENSORHUB_READY, '1') != '1':
+		return 'hub'
+	return 'other'
+
+
+def fw_abort_detail():
+	grp4 = number(SLEEP / 'grp4_before')
+	return (f'grp4_before={grp4:#010x} grp4_at_smc={read(SLEEP / "grp4_at_smc", "n/a")} '
+		f'eint_before={read(SLEEP / "eint_before")} eint_pending={read(SLEEP / "eint_pending")}')
+
+
+def container_frozen():
+	"""Android's container frozen (True), running (False), or unknown."""
+	for line in read(CONTAINER_CGROUP / 'cgroup.events').splitlines():
+		key, _, value = line.partition(' ')
+		if key == 'frozen':
+			return value.strip() == '1'
+	return None
+
+
+def wake_reason(before, slept=None, early_rtc=False):
 	stat = number(SLEEP / 'wake_stat')
 	# EINT pending, one word a bank: gpa0, gpa1, gpa2, gpa3, gpa4
 	eint = [int(x or 0) for x in read(SLEEP / 'eint_pending', '0').split(',')]
@@ -497,7 +837,8 @@ def wake_reason(before, slept=None):
 	if stat & (1 << 24):
 		return 'modem', stat
 	if stat & (1 << 1):
-		return 'rtc', stat
+		# our own alarm, or someone else's sooner one (Android's)
+		return ('alarm' if early_rtc else 'rtc'), stat
 	return 'other', stat
 
 
@@ -584,8 +925,9 @@ def failed_device():
 last_sleep = {}
 
 
-def cycle(ignore=()):
-	"""One sleep and the way back. Returns why it woke."""
+def cycle(ignore=(), ignore_inhibits=()):
+	"""One sleep and the way back. Returns why it woke. `ignore_inhibits`:
+	inhibit names the re-check does not count (a bench)."""
 	dozing = background_apps_active(fresh=True) or push_active()
 	alarm_s = min(MAX_SLEEP_S, DOZE_SLEEP_S) if dozing else MAX_SLEEP_S
 	cap = battery_cap()
@@ -603,6 +945,7 @@ def cycle(ignore=()):
 	audio_out = False
 	settle = 1
 	slept = None
+	t_alarm = t_woke = None	# boot time: the RTC alarm written, the return
 	# on a cable (bench, `once`) the USB gadget is let go for the sleep, as
 	# the trials did; the daemon itself never sleeps on a charger
 	udc = next(Path('/sys/kernel/config/usb_gadget').glob('*/UDC'), None)
@@ -635,6 +978,14 @@ def cycle(ignore=()):
 			step('rtc alarm')
 			write('/sys/class/rtc/rtc0/wakealarm', 0)
 			write('/sys/class/rtc/rtc0/wakealarm', f'+{alarm_s}')
+			t_alarm = time.clock_gettime(time.CLOCK_BOOTTIME)
+			# never forced: nothing here writes 1 (a clear while the hub
+			# talked took it down, J0c); 0 undoes a hand-set Y
+			step('clear_grp4 0')
+			try:
+				write(SLEEP / 'clear_grp4', 0)
+			except OSError as e:
+				log('clear_grp4 0:', e)
 			step('dry_run 0')
 			write(SLEEP / 'dry_run', 0)
 			if controller:
@@ -658,14 +1009,22 @@ def cycle(ignore=()):
 			MARK.write_text(str(time.time()))
 			os.sync()
 			step('wakeup_count')
-			count = read('/sys/power/wakeup_count')
+			ensure_watch()
+			count = read_wakeup_count()
 			# what happened during the preparations (a power key press, a
 			# call, a new inhibit) stops the sleep here; anything later
-			# moves the count, and the write below fails
-			why = why_awake(ignore)
+			# moves the count, and the write below fails. An inhibit
+			# written after this check is a wakeup event too (InhibitWatch):
+			# the write fails (EINVAL) or the suspend does (EBUSY)
+			why = why_awake(ignore, ignore_inhibits)
 			if why:
 				raise Cancelled(why)
-			write('/sys/power/wakeup_count', count)
+			try:
+				write('/sys/power/wakeup_count', count)
+			except OSError as e:
+				if e.errno == errno.EINVAL:
+					raise Cancelled('a wakeup event during the check: ' + wakeup_sources())
+				raise
 			# the modem's channels as the window opens: what moves until a
 			# second after the return is what woke the phone (the frames that
 			# wake it are read by the resume path within milliseconds)
@@ -677,7 +1036,8 @@ def cycle(ignore=()):
 			try:
 				write('/sys/power/state', 'mem')
 			finally:
-				slept = time.clock_gettime(time.CLOCK_BOOTTIME) - t_in
+				t_woke = time.clock_gettime(time.CLOCK_BOOTTIME)
+				slept = t_woke - t_in
 				last_sleep['slept'] = slept
 				last_sleep['charge_out'] = charge_uah()
 			time.sleep(1.0)
@@ -689,14 +1049,18 @@ def cycle(ignore=()):
 			if e.errno == errno.EBUSY and number(SLEEP / 'hub_refused') > hub_refused:
 				log('sleep refused: the sensor hub is talking (host_req high)')
 				reason = 'hub-busy'
+			elif e.errno == errno.EBUSY and _watch is not None and _watch.drain():
+				log('sleep cancelled after the re-check: an inhibit changed '
+				    f'({",".join(inhibits()) or "none held now"})')
+				reason = 'cancelled'
 			else:
 				log('sleep refused:', e.strerror)
 				if e.errno == errno.EBUSY and 'alarmtimer' in failed_device():
 					reason = 'alarm-due'
 				else:
 					log('wakeup sources:', wakeup_sources())
-		except Stalled:
-			log(f'sleep abandoned: stuck at "{read(STEP)}" for {PREPARE_S}s')
+		except Stalled as e:
+			log(f'sleep abandoned: stuck at "{read(STEP)}" for {e.seconds}s')
 			log('wakeup sources:', wakeup_sources())
 			reason = 'stalled'
 		finally:
@@ -704,7 +1068,8 @@ def cycle(ignore=()):
 			signal.signal(signal.SIGALRM, old_alarm)
 			step('restoring')
 		if reason not in ('stalled', 'cancelled', 'alarm-due', 'hub-busy'):
-			reason, stat = wake_reason(entries, slept)
+			early = rtc_early(t_alarm, alarm_s, t_woke)
+			reason, stat = wake_reason(entries, slept, early)
 		last_sleep['entered'] = number(SLEEP / 'entries') > entries
 	finally:
 		restored = True
@@ -768,6 +1133,7 @@ class Totals:
 	def __init__(self):
 		self.t0, self.c0 = boottime(), charge_uah()
 		self.cycles = self.fw_aborts = 0
+		self.causes = {}	# fw-aborts by cause: hub, other
 		self.reasons = {}
 		self.asleep_s, self.asleep_uah = 0.0, 0
 
@@ -780,13 +1146,18 @@ class Totals:
 			if info.get('charge_in') is not None and info.get('charge_out') is not None:
 				self.asleep_uah += info['charge_in'] - info['charge_out']
 
+	def add_cause(self, cause):
+		self.causes[cause] = self.causes.get(cause, 0) + 1
+
 	def line(self):
 		total = max(1e-3, boottime() - self.t0)
 		now = charge_uah()
 		used = self.c0 - now if now is not None and self.c0 is not None else None
 		awake_uah = used - self.asleep_uah if used is not None else None
 		reasons = ','.join(f'{k}:{v}' for k, v in sorted(self.reasons.items())) or 'none'
-		return (f'summary: {total / 3600:.2f} h, cycles={self.cycles} fw-aborts={self.fw_aborts} '
+		causes = ''.join(f' {k}:{v}' for k, v in sorted(self.causes.items()))
+		causes = f' ({causes.strip()})' if causes else ''
+		return (f'summary: {total / 3600:.2f} h, cycles={self.cycles} fw-aborts={self.fw_aborts}{causes} '
 			f'wakes={reasons} awake={100 * (total - self.asleep_s) / total:.0f}% '
 			f'mAh asleep={mah(self.asleep_uah)} awake={mah(awake_uah)}')
 
@@ -795,13 +1166,11 @@ def bits(word):
 	return ','.join(str(i) for i in range(32) if word >> i & 1) or 'none'
 
 
-def clear_grp4():
-	"""By hand only (nothing here calls it): force GRP4 clear at every
-	handoff until set back to N."""
-	try:
-		write(SLEEP / 'clear_grp4', 1)
-	except OSError as e:
-		log('clear_grp4:', e)
+def log_alarm_wake(prefix=''):
+	"""An 'alarm' wake: was Android's container frozen when it fired?"""
+	frozen = container_frozen()
+	state = {True: 'frozen', False: 'running', None: 'state unknown'}[frozen]
+	log(f'{prefix}alarm wake, container {state}')
 
 
 def main():
@@ -810,7 +1179,9 @@ def main():
 	# ExecStopPost removes the mark
 	signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
 	STATE.mkdir(parents=True, exist_ok=True)
+	repair_log()
 	INHIBIT.mkdir(parents=True, exist_ok=True)
+	ensure_watch()
 	if MARK.exists():
 		MARK.unlink()
 		ENABLED.unlink(missing_ok=True)
@@ -821,7 +1192,9 @@ def main():
 	backoff = 0
 	sleeps = 0
 	fails = 0		# failed cycles in a row: the backoff doubles
-	fw_aborts = 0		# sleeps the firmware gave up, in a row
+	fw_aborts = 0		# sleeps the firmware gave up, cause 'other', in a row
+	hub_aborts = 0		# and cause 'hub', in a row
+	pause_told = False	# the shell hears of a pause once a boot
 	wakes, woke_at = 0, 0	# real returns from the SoC (the sensor hub's side reads them)
 	window = None		# a doze window: (woke, wall clock woke, its end at the latest)
 	hub_times = collections.deque()	# when the hub woke the phone or refused a sleep
@@ -831,6 +1204,11 @@ def main():
 	summary_at = time.monotonic() + SUMMARY_S
 	try:
 		while True:
+			# an inhibit change while awake is no reason to stay awake:
+			# let the watch's wakeup source go every pass
+			watch = ensure_watch()
+			if watch is not None:
+				watch.drain()
 			why = why_awake()
 			if screen_off():
 				off_since = off_since or time.monotonic()
@@ -875,19 +1253,34 @@ def main():
 					charge = (f' (asleep {info["slept"]:.1f}s, charge {mah(info.get("charge_in"))}'
 						  f'->{mah(info.get("charge_out"))} mAh)')
 				log(f'woke: {woke_text(reason, info)} wake_stat={stat:#010x} after {slept}s{charge}')
+				if reason == 'alarm':
+					log_alarm_wake()
 				mono = time.monotonic()
 				if reason == 'fw-abort':
-					fw_aborts += 1
-					grp4 = number(SLEEP / 'grp4_before')
-					log(f'the firmware gave the sleep up ({fw_aborts} in a row): '
-					    f'grp4_before={grp4:#010x} bits {bits(grp4)} '
-					    f'eint_pending={read(SLEEP / "eint_pending")}')
-					if fw_aborts >= FW_ABORT_LIMIT:
+					cause = fw_abort_cause()
+					totals.add_cause(cause)
+					if cause == 'hub':
+						hub_aborts += 1
+						n = hub_aborts
+					else:
+						fw_aborts += 1
+						n = fw_aborts
+					log(f'the firmware gave the sleep up (cause {cause}, {n} in a row): '
+					    f'{fw_abort_detail()}')
+					if cause == 'hub':
+						# the hub's business, and harmless: never a pause
+						backoff = mono + (FW_ABORT_HUB_LONG_S if hub_aborts >= FW_ABORT_HUB_MANY
+								  else FW_ABORT_HUB_S)
+					elif fw_aborts >= FW_ABORT_LIMIT:
+						until = boottime() + PAUSE_S
 						PAUSED.parent.mkdir(parents=True, exist_ok=True)
-						PAUSED.write_text(f'{int(time.time())} grp4_before={grp4:#010x}\n')
-						log('sleep paused for this boot: the firmware refuses it')
-						tell_shell('notify Power|Sleep paused|The firmware refuses to sleep; '
-							   'a reboot restores it.')
+						PAUSED.write_text(f'until={until:.0f} {fw_abort_detail()}\n')
+						log(f'sleep paused for {PAUSE_S // 60} min: the firmware refuses it')
+						if not pause_told:
+							tell_shell('notify Power|Sleep paused|The firmware refuses to sleep; '
+								   f'it tries again in {PAUSE_S // 60} min.')
+							pause_told = True
+						fw_aborts = 0
 					else:
 						backoff = mono + FW_ABORT_RETRY_S
 				elif reason == 'cancelled':
@@ -900,10 +1293,10 @@ def main():
 					fails += 1
 					backoff = mono + min(300, 30 * 2 ** min(4, fails - 1))
 				else:
-					fails = fw_aborts = 0
+					fails = fw_aborts = hub_aborts = 0
 					backoff = mono + AWAKE_AFTER.get(reason, 8)
-					if last_dozing and reason in ('rtc', 'other'):
-						backoff = mono + DOZE_AWAKE_S
+					if last_dozing and reason in ('rtc', 'other', 'alarm'):
+						backoff = mono + max(DOZE_AWAKE_S, AWAKE_AFTER.get(reason, 8))
 						window = (mono, time.time(), mono + DOZE_AWAKE_MAX_S)
 				if reason in ('hub', 'hub-busy'):
 					# boot time: the window counts the sleeps in between
@@ -940,6 +1333,52 @@ def main():
 ONCE_IGNORES = ('charger', 'switched off', 'paused')
 
 
+def once(argv):
+	"""zrn-sleepd once [SECONDS] [--ignore-inhibit NAME]...: one sleep now,
+	an RTC alarm after SECONDS. A firmware abort is classified and logged
+	only; it is tried up to 3 times."""
+	global MAX_SLEEP_S
+	ignore_inhibits = []
+	rest = []
+	args = iter(argv)
+	for word in args:
+		if word == '--ignore-inhibit':
+			name = next(args, None)
+			if not name:
+				sys.exit('--ignore-inhibit needs a NAME')
+			ignore_inhibits.append(name)
+		else:
+			rest.append(word)
+	STATE.mkdir(parents=True, exist_ok=True)
+	repair_log()
+	if rest:
+		MAX_SLEEP_S = int(rest[0])
+	if not setup():
+		sys.exit(1)
+	ensure_watch()
+	if ignore_inhibits:
+		log('once: not counting inhibits', ','.join(ignore_inhibits))
+	if not screen_off():
+		tell_shell('screen off')
+		time.sleep(3)
+	for attempt in range(3):
+		reason, stat = cycle(ONCE_IGNORES, tuple(ignore_inhibits))
+		info = dict(last_sleep)
+		charge = ''
+		if info.get('slept') is not None:
+			charge = (f' (asleep {info["slept"]:.1f}s, charge {mah(info.get("charge_in"))}'
+				  f'->{mah(info.get("charge_out"))} mAh)')
+		log(f'once: woke: {woke_text(reason, info)} wake_stat={stat:#010x}{charge}')
+		if reason == 'alarm':
+			log_alarm_wake('once: ')
+		if reason == 'fw-abort':
+			log(f'once: the firmware gave the sleep up (cause {fw_abort_cause()}): '
+			    f'{fw_abort_detail()}')
+		if reason not in ('aborted', 'fw-abort', 'alarm-due', 'hub-busy'):
+			break
+		time.sleep(5)
+
+
 if __name__ == '__main__':
 	cmd = sys.argv[1] if len(sys.argv) > 1 else 'run'
 	if cmd == 'enable':
@@ -952,32 +1391,17 @@ if __name__ == '__main__':
 		print(read(STATUS) or 'not running')
 		print('enabled' if ENABLED.exists() else 'disabled')
 		if PAUSED.exists():
-			print('paused for this boot:', read(PAUSED))
+			until = dict(w.partition('=')[::2] for w in read(PAUSED).split()).get('until', '')
+			try:
+				left = float(until) - boottime()
+				print(f'paused for another {max(0, left) / 60:.0f} min:', read(PAUSED))
+			except ValueError:
+				print('paused:', read(PAUSED))
+	elif cmd == 'log':
+		# zrn-sleepd log [N | all]: the last N lines (50), NUL bytes dropped
+		arg = sys.argv[2] if len(sys.argv) > 2 else '50'
+		show_log(None if arg == 'all' else int(arg))
 	elif cmd == 'once':
-		# zrn-sleepd once [SECONDS]: one sleep now, an RTC alarm after SECONDS
-		STATE.mkdir(parents=True, exist_ok=True)
-		if len(sys.argv) > 2:
-			MAX_SLEEP_S = int(sys.argv[2])
-		if not setup():
-			sys.exit(1)
-		if not screen_off():
-			tell_shell('screen off')
-			time.sleep(3)
-		for attempt in range(3):
-			reason, stat = cycle(ONCE_IGNORES)
-			info = dict(last_sleep)
-			charge = ''
-			if info.get('slept') is not None:
-				charge = (f' (asleep {info["slept"]:.1f}s, charge {mah(info.get("charge_in"))}'
-					  f'->{mah(info.get("charge_out"))} mAh)')
-			log(f'once: woke: {woke_text(reason, info)} wake_stat={stat:#010x}{charge}')
-			if reason == 'fw-abort':
-				grp4 = number(SLEEP / 'grp4_before')
-				log(f'once: the firmware gave the sleep up: grp4_before={grp4:#010x} '
-				    f'bits {bits(grp4)} grp4_at_smc={read(SLEEP / "grp4_at_smc", "n/a")} '
-				    f'eint_pending={read(SLEEP / "eint_pending")}')
-			if reason not in ('aborted', 'fw-abort', 'alarm-due', 'hub-busy'):
-				break
-			time.sleep(5)
+		once(sys.argv[2:])
 	else:
 		main()
