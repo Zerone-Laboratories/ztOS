@@ -1,6 +1,14 @@
 # Call audio on the Galaxy S9: what it takes
 
-Status 2026-10-25: researched, not started. Calls connect and are silent.
+Status 2026-10-30: the whole path is in place, not yet heard on a live call.
+
+The driver's "Voice Call" control now also feeds the microphones to the firmware (Samsung's
+route-cp-tx: NSRC1 <- UAIF0, SIFM1 -> WDMA, with the codec on, whether or not anything records),
+sets the echo reference (RSRC0 <- SIFS0, RECP PIFS0), takes DSM off for the call and maps the real
+VSS parameters (0xf9000000, 2 MiB; empty memory before). The modem daemon sends audio path, clock
+and volume, from dialling on. Bench without a call: `audio/test-call-path.sh`. During a call the
+daemon logs `call path:` lines from the driver's `call_diag`: rx_peak and tx_peak should move.
+The text below is the original research.
 
 ## How the stock phone does it
 
