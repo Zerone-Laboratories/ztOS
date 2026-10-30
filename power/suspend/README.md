@@ -1,3 +1,115 @@
+# Sleep holes closed in round 2 — 2026-10-30
+
+Four holes the round-1 skeptic found, closed in zrn-sleepd plus a 4-byte
+patch to Android's init. No kernel or module change.
+
+| hole | what was wrong | now |
+|---|---|---|
+| late inhibit | why_awake() ran before the wakeup_count write; an inhibit written after it did not stop the suspend (a file is not a wakeup event; no CONFIG_PM_WAKELOCKS) | the inhibit watch (below): a late inhibit cancels the sleep |
+| GRP4 | the first firmware abort set clear_grp4=1 for the boot; a clear while the hub talks killed the hub (J0c) | clear_grp4 is written 0 at setup and at every cycle; nothing writes 1. A firmware abort is classified `hub` or `other` |
+| the log | a hard reset left 64 NUL bytes in /var/lib/zrn-sleep/log; grep then hid the lines | one write and fdatasync a line, NUL runs repaired, `zrn-sleepd log` |
+| Android alarms | Android's init drops CAP_WAKE_ALARM: no *_ALARM timer in system_server | init patched in system.img; an early RTC wake is `alarm` |
+
+## The inhibit watch
+
+zrn-sleepd watches /run/zrn-sleepd/inhibit with inotify (create, moved-to,
+attrib, close-write; not delete, so its own removal of an expired inhibit
+is no event) inside an epoll with EPOLLWAKEUP. In build/linux-7.1: the
+writer's own rename or utime queues the inotify event and wakes the epoll
+in that syscall; ep_poll_callback activates the item's wakeup source; it
+stays active until zrn-sleepd reads the events and polls the epoll
+(ep_send_events relaxes it). While it is active, pm_save_wakeup_count fails
+(the write gives EINVAL) and pm_wakeup_pending aborts the freezer or the
+device suspend (EBUSY). Both are now `cancelled` (5 s), not failures.
+
+- The kernel strips EPOLLWAKEUP without CAP_BLOCK_SUSPEND
+  (ep_take_care_of_epollwakeup). zrn-sleepd reads the bit back from
+  /proc/self/fdinfo and creates and removes a test file: the journal says
+  `inhibit watch armed`, or why not.
+- /sys/power/wakeup_count blocks while any source is active, our own too,
+  so it is read in a thread while the main thread drains; it gives up
+  (`stalled`) after 15 s and lists the sources that held it.
+- The main loop drains every pass (2 s): a change while awake does not
+  hold sleep off.
+- The contract for a holder: write the inhibit before starting the risky
+  thing. An inhibit that comes after the freezer has stopped its writer
+  arrives after the wake, and that writer's job waits for it (B4 below).
+
+R1, the late race on the phone (charger, `once 60 --ignore-inhibit
+timed-push`, a helper that waits for the `wakeup_count` step, sleeps a
+seeded random delay, renames `timed-r2` into place and writes `r2: renamed`
+to /dev/kmsg): **0 of 29 runs had a rename before the handoff**.
+
+| delays | runs | EBUSY cancel | rename after the wake (helper frozen) | EINVAL / why_awake cancel |
+|---|---|---|---|---|
+| 0-800 ms | 1-20 | 2 (85, 190 ms) | 18 | 0 |
+| 0-120 ms | 21-30 | 7 (14-90 ms) | 3 (78-115 ms) | 0 |
+
+`PM: suspend entry` came 24-250 ms after the step. The helper got its
+rename in before the freezer at delays of 14-90 ms (and once at 190 ms);
+at 78 ms and from 111 ms on it was mostly frozen first, although `Freezing
+user space processes` was logged 0.5-0.6 s after the entry. The EINVAL path is covered by host tests
+only. Wi-Fi was associated 4.9-6.4 s and zrn-pushd logged in 7.0-8.7 s after
+each of the 30 returns.
+
+## Firmware aborts: two causes, a pause that ends
+
+A `fw-abort` (smc 0 and no source, or GRP4 at the SMC) is classified:
+
+- `hub`: host_req (gpa1-7) in eint_before or eint_pending, `timed-gnss` or
+  `timed-hub` held (even when a bench ignores it), or the hub not ready.
+  Harmless (J0b): tried again in 20 s, 300 s from the sixth in a row, never
+  a pause.
+- `other`: three in a row pause sleeping 30 min (`/run/zrn-sleepd/paused`,
+  `until=` in boot time); then it tries again by itself. The shell hears of
+  the first pause of a boot. A masked line alone (gpa1-0, which eint_before
+  keeps) is `other`.
+
+The log line is `the firmware gave the sleep up (cause C, N in a row):
+grp4_before=… grp4_at_smc=… eint_before=… eint_pending=…`; the hourly
+summary counts fw-aborts by cause. Not seen on the phone this round: with
+host_req a wake source (eint_follow), a GNSS-streaming bench sleep was a
+`hub` wake after 0.7 s, not a firmware abort (G1: clear_grp4 N, 0
+MCU_REQ_RESP, lhd and ztoscsf PIDs unchanged; then GPS off, a 57 s RTC sleep).
+Both causes are host-tested.
+
+## The log
+
+`log()` opens with O_APPEND, writes the line once and fdatasyncs it; past
+1 MiB the log moves to log.1. At start (daemon and `once`) NUL runs are
+replaced by `-- N bytes lost: an unclean stop --`, after a copy of the file
+as it was goes to log.nul (once). `zrn-sleepd log [N | all]` prints the last
+N lines (50) of log.1 and log without NULs: use it, or `grep -a`, for J5:
+
+	zrn-sleepd log all | grep summary
+
+## Android alarms wake the SoC
+
+Android's init (SecondStageMain, right after "init second stage started!")
+calls prctl(PR_CAPBSET_DROP, 35) on every path, so system_server had
+CapEff 0x1002887420 and only clockids 0, 1, 7. lxc keeps the capability;
+init drops it. android/waydroid/patch-init-wake-alarm.py NOPs that call
+(REA evidence in the script); android/waydroid/README.md has the swap.
+
+zrn-sleepd notes the boot time of its wakealarm write; an RTC wake more than
+3 s before its own alarm is `alarm` (someone else's alarmtimer): awake 20 s
+(Android's wake locks do not reach the host), a doze window when dozing,
+and `alarm wake, container frozen|running`. Measured from the write, not
+from the suspend: the preparations after it take seconds, and a test on
+time asleep would call our own RTC wakes `alarm`.
+
+On the phone after the swap: container init CapBnd 0x1c4bac75ff,
+system_server CapEff 0x1802887420, clockids 8 and 9 present. A2: an
+`android` ELAPSED_WAKEUP batch due 10:05:57.06 woke the SoC from a
+`once 1800` after 108.5 s asleep (PM: suspend exit 10:05:58.80, about
+1.5 s late); `woke: alarm`, container running, screen off; dumpsys
+`Last trigger` 2.9 s after its due time. No eventpoll or [timerfd] source
+was left active.
+
+**Cost: not measured yet.** How often Android's *_WAKEUP alarms wake the
+phone is for J5. In the first ten minutes after a boot the modem woke every
+2-95 s (umts_ipc0) and ended nine sleeps before the alarm did.
+
 # Modem wakes: which channel carried them — 2026-10-30
 
 A wake by the CP's mailbox (wake_stat bit 24, `modem`) says nothing of what
@@ -193,12 +305,12 @@ hub holding host_req: a chip in ROM after the first sleep fits.
 A sleep with smc 0, no wake source (wake_stat & 0x7fffffff, wake_stat2/3 and
 every EINT word 0) and under 2 s of boot time asleep, or any sleep with
 grp4_before set (grp4_at_smc with the round-2 module), is `fw-abort`: not a
-wake, no doze window. It retries after 5 s (it no longer sets clear_grp4:
-that stayed Y for the boot and forced later sleeps through live latches;
-zrn-sleep-init clears a stale latch itself now); three in a row pause sleeping for the boot
-(/run/zrn-sleepd/paused; `zrn-sleepd enable` or a reboot clears it) with the
-shell told "Sleep paused". The log line names grp4_before's set bits and the
-EINT words.
+wake, no doze window. GRP4 is never forced clear from zrn-sleepd
+(clear_grp4 is written 0 at every cycle). Since 30 Oct the abort is
+classified `hub` or `other`; `hub` backs off and never pauses, three
+`other` in a row pause sleeping for 30 min, not for the boot (`zrn-sleepd
+enable` or a reboot also clears it): "Sleep holes closed in round 2" at the
+top.
 
 Also in zrn-sleepd now: the conditions are read again after the settle,
 between reading and writing wakeup_count (`cancelled`, 5 s, J3 below); the

@@ -160,24 +160,42 @@ standby bucket and a boot-time force-stop. Packages listed in `keep_awake` are
 excluded; foreground launches remain available. The cached-process and AppOps
 settings persist in Android user data, so rollback must restore them explicitly.
 
-## Alarm clocks cannot wake the phone (30 Oct)
+## Android alarms wake the phone (30 Oct)
 
-**An Android alarm rings only at the phone's next wake**: up to 5 min late
-with a doze app or zrn-pushd (DOZE_SLEEP_S), up to 30 min late without
-(MAX_SLEEP_S), or at screen-on if Waydroid is frozen. system_server's
-timerfds are CLOCK_REALTIME/MONOTONIC/BOOTTIME only (clockids 0, 1, 7), never
-CLOCK_*_ALARM (8, 9).
+**Android init dropped CAP_WAKE_ALARM; lxc did not.** Right after "init
+second stage started!", SecondStageMain calls prctl(PR_CAPBSET_DROP, 35) on
+both its paths, so everything init starts lacked the capability:
+system_server had CapEff 0x1002887420 and its timerfds were clockids 0, 1
+and 7 only, never CLOCK_*_ALARM (8, 9). An Android alarm then rang only at
+the phone's next wake (up to 5 or 30 min late). The container's own
+bounding set (lxc.cap.keep) keeps bit 35: container init's CapEff was
+0x1c4bac75ff while its bounding set was 0x144bac75ff, after the drop.
 
-Loading the RTC before the container (zrn-rtc.service, 30 Oct) does not
-change that: with rtc0 registered at 4 s and the container at 5 s, the
-clockids were still 0 x3, 1, 7 x2. The blocker is the capability:
-system_server's CapEff is 0x1002887420, without CAP_WAKE_ALARM (bit 35),
-because the container's bounding set (Android init, 0x144bac75ff) lacks
-exactly that one of lxc.cap.keep's list; init's effective set still has it.
-What drops it (LXC 7.0.0 or the image's init) is not found yet. A wake path
-for alarms needs either that capability back (then check the clockids
-again), or a native alarm service with a CLOCK_REALTIME_ALARM timerfd that
-thaws Waydroid and holds a timed inhibit.
+`patch-init-wake-alarm.py PATH` replaces that one call with a NOP (4 bytes
+at file offset 0xf4b88), in place, on the known init only (sha256
+9f2795ad...0921 to d01768fd...1e08); anything else exits 3 untouched. The
+REA evidence is in its docstring. strip-image.sh runs it on new images.
+Test: `tests/test-patch-init-wake-alarm.py INIT` on a copy.
+
+The live S9 image was swapped without stopping the container (30 Oct), as
+one root script: copy system.img to system.img.before-r2 and to a work
+copy, mount the work copy rw, patch its init, unmount, `e2fsck -fy` (rc <= 1),
+check init's hash read-only, then `mv -T` over system.img. The running loop
+device keeps the old inode until the reboot, so a hard reset at any step
+leaves a good system.img. Peak space: three copies, about 7.5 GB.
+
+After the reboot: container init CapBnd 0x1c4bac75ff, system_server CapEff
+0x1802887420, clockids 8 and 9 in system_server; an Android wakeup alarm woke
+the SoC from a 30 min `once` about 1.5 s after its due time
+(power/suspend/README.md, "Android alarms wake the SoC"). Waydroid's
+LocationManagerService crash at boot (system_server restarts once) and the
+Launcher3 inflate crash are in this boot's dropbox as in the four boots
+before it: not from the patch.
+
+Rollback: `mv /usr/share/waydroid-extra/images/system.img.before-r2
+/usr/share/waydroid-extra/images/system.img`, then reboot. Keep the backup
+until an unplugged night (J5) has measured how often Android's *_WAKEUP
+alarms wake the phone.
 
 ## Measurements
 

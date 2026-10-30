@@ -460,6 +460,17 @@ latch, so no firmware abort, in this run. The only hub crashes in the run
 were the two `watch` asserts above (phases A and E end with a sensors
 check), not the sleeps.
 
+**The late-inhibit race is closed in zrn-sleepd (round 2).** A
+`timed-gnss` written after zrn-sleepd's last check and before the freezer
+used to let the sleep go on (about 0.7 s). zrn-sleepd now watches the
+inhibit directory as a wakeup event (inotify in an epoll with EPOLLWAKEUP):
+the gate's own os.replace activates a wakeup source, and the suspend is
+refused (EBUSY) or the wakeup_count write fails, either way `cancelled`.
+On the phone, 0 of 29 race runs slept with a rename made before the
+handoff; 9 were cancelled this way (power/suspend/README.md, "Sleep holes
+closed in round 2"). What it cannot catch: a gate the freezer has already
+stopped. Its reader then waits for the next wake (B4), as before.
+
 ### Constellations and SBAS (a 7-minute session, 30 October)
 
 GSV sentences by talker, with the satellites seen:
