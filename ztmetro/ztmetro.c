@@ -28,6 +28,7 @@
  */
 #define _GNU_SOURCE
 #ifdef HAVE_ZTOS_IAL
+#include "core/zrnboard.h"
 #include <ztos-ial.h>
 #endif
 #include "background-apps.h"
@@ -149,6 +150,7 @@ static int nav_h = NAV_BAR_H;
 #define PEEK_HOLD_MS	320	/* how long a finger rests on it first */
 #define PEEK_STAY_MS	3000	/* and how long it stays after the finger lifts */
 #define MAX_TILES	64
+#define BOARD_MARGIN	16
 #define MAX_ITEMS	640	/* the app list: every application, and the letters between */
 #define MAX_GLYPHS	640
 #define MAX_STARTED	48
@@ -447,6 +449,7 @@ enum touch_role {
 	ROLE_CURSOR,	/* holding the keyboard cursor dot */
 	ROLE_SHADE,	/* dragging or interacting with the status bar shade / Action Center */
 	ROLE_MENU,	/* while the app list's menu is open */
+	ROLE_BOARD,	/* while the app list's letters are up */
 	ROLE_HYPER,	/* on Hyperscan, the search over everything */
 	ROLE_RETRO,	/* on a ztRetrofit style's home (the DotMatrix launcher) */
 };
@@ -817,6 +820,11 @@ struct zt_server {
 	double list_h, list_scroll;
 	float list_v;
 	int tapped_item;	/* the row that leaves last, or -1 */
+	/* the app list's letters, flipped in over it (core/zrnboard.h) */
+	int board_state;	/* 0 hidden, 1 in, 2 shown, 3 out */
+	uint32_t board_start;
+	struct zt_layer board_rows[ZB_ROWS];
+	bool board_live[ZB_CELLS];
 	uint32_t turn_seed;	/* for the chance in each return */
 	struct glyph *glyphs;
 	int n_glyphs;
@@ -4509,6 +4517,114 @@ static void draw_item(struct zt_server *server, int i) {
 		draw_text(cr, it->name, FONT_SEMILIGHT, 22, LIST_ICON + 13, 7, w - LIST_ICON - 13, 0, false);
 	}
 	zt_buffer_show(server, &it->layer, buffer, cr, w, LIST_ICON);
+}
+
+static double scroll_max(struct zt_server *server, bool list);
+
+/* ---- the app list's letters: the reader board over the list ------------------
+ * The same numbers and motion as ZrnMetroCore's (core/zrnboard.h), on the
+ * shell's own quads: one texture a row, drawn once when it opens. Metro only:
+ * DotMatrix's launcher has its own letter index, in dots. */
+
+static double board_side(struct zt_server *server) {
+	return (server->width - 2 * BOARD_MARGIN - (ZB_COLS - 1) * ZB_GAP) / ZB_COLS;
+}
+
+static void board_open(struct zt_server *server) {
+	if (server->board_state || !server->n_items) {
+		return;
+	}
+	memset(server->board_live, 0, sizeof(server->board_live));
+	for (int i = 0; i < server->n_items; i++) {
+		struct app_item *it = &server->items[i];
+		if (it->header) {
+			for (int c = 0; c < 27; c++) {
+				if (zb_letter(c) == it->name[0]) server->board_live[c] = true;
+			}
+		}
+	}
+	double side = board_side(server);
+	for (int r = 0; r < ZB_ROWS; r++) {
+		cairo_t *cr;
+		struct zt_buffer *buffer = zt_buffer_create(server, server->width, side, &cr);
+		for (int c = 0; c < ZB_COLS; c++) {
+			int i = r * ZB_COLS + c;
+			double x = BOARD_MARGIN + c * (side + ZB_GAP);
+			bool has = server->board_live[i];
+			if (has) {
+				set_rgb(cr, server->accent);
+			} else {
+				set_rgb(cr, ZB_DIM_RGB);
+			}
+			cairo_rectangle(cr, x, 0, side, side);
+			cairo_fill(cr);
+			double k = has ? 1 : ZB_DIM_TEXT;
+			cairo_set_source_rgb(cr, k, k, k);
+			if (i < 27) {
+				char text[2] = { zb_letter(i), 0 };
+				draw_text(cr, text, FONT_SEMILIGHT, ZB_FONT, x + ZB_INSET, side - ZB_INSET - ZB_FONT * 1.2,
+					0, 0, false);
+			} else {
+				double gr = 11, cx = x + ZB_INSET + gr, cy = side - ZB_INSET - gr;
+				cairo_set_line_width(cr, 1.5);
+				cairo_arc(cr, cx, cy, gr, 0, 2 * M_PI);
+				cairo_stroke(cr);
+				cairo_save(cr);
+				cairo_translate(cr, cx, cy);
+				cairo_scale(cr, 0.45, 1);
+				cairo_arc(cr, 0, 0, gr, 0, 2 * M_PI);
+				cairo_restore(cr);
+				cairo_stroke(cr);
+				cairo_move_to(cr, cx - gr, cy);
+				cairo_line_to(cr, cx + gr, cy);
+				cairo_stroke(cr);
+			}
+		}
+		zt_buffer_show(server, &server->board_rows[r], buffer, cr, server->width, side);
+	}
+	server->list_v = 0;
+	server->board_state = 1;
+	server->board_start = now_ms();
+	damage(server);
+}
+
+static void board_close(struct zt_server *server) {
+	if (server->board_state == 1 || server->board_state == 2) {
+		server->board_state = 3;
+		server->board_start = now_ms();
+		damage(server);
+	}
+}
+
+/* A lift on the letters: a lit one moves the list there at once, and the rows
+ * go with the list showing under them. Anything else does nothing. */
+static void board_tap(struct zt_server *server, double x, double y) {
+	if (server->board_state != 1 && server->board_state != 2) {
+		return;
+	}
+	double side = board_side(server), pitch = side + ZB_GAP;
+	double px = x - BOARD_MARGIN, py = y - STATUS_H - ZB_TOP;
+	if (px < 0 || py < 0) {
+		return;
+	}
+	int c = (int)(px / pitch), r = (int)(py / pitch);
+	if (c >= ZB_COLS || r >= ZB_ROWS || px - c * pitch >= side || py - r * pitch >= side) {
+		return;
+	}
+	int i = r * ZB_COLS + c;
+	if (!server->board_live[i]) {
+		return;
+	}
+	hap(server, HAP_TAP, HG_NAV);
+	for (int k = 0; k < server->n_items; k++) {
+		struct app_item *it = &server->items[k];
+		if (it->header && it->name[0] == zb_letter(i)) {
+			double at = it->y0 - LIST_TOP, max = scroll_max(server, true);
+			server->list_scroll = at < 0 ? 0 : at > max ? max : at;
+			break;
+		}
+	}
+	board_close(server);
 }
 
 /* The rows' places: all of them under their letters, or, while something is
@@ -9061,6 +9177,25 @@ static int item_at(struct zt_server *server, double x, double y) {
 	return -1;
 }
 
+/* A letter's square, in the list or pinned at the top of it. */
+static bool header_at(struct zt_server *server, double x, double y) {
+	if (y < STATUS_H || x < list_margin(server) - 6 || x >= list_margin(server) + LIST_ICON + 6) {
+		return false;
+	}
+	float pin_y;
+	if (list_pinned(server, &pin_y) >= 0 && y < pin_y + LIST_ROW_H) {
+		return y >= pin_y;
+	}
+	double cy = y - STATUS_H + server->list_scroll;
+	for (int i = 0; i < server->n_items; i++) {
+		struct app_item *it = &server->items[i];
+		if (it->header && !it->hidden && cy >= it->y - 4 && cy < it->y + LIST_ICON + 4) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /* A row leans toward the finger as a tile does, about its own middle. */
 static void item_press(struct zt_server *server, int index, double x, double y) {
 	struct app_item *it = &server->items[index];
@@ -9457,6 +9592,7 @@ static void pin_item(struct zt_server *server, int index) {
 /* The Start button on Start itself: out of whatever was going on, then back
  * to the tiles, then to the top of them. */
 static void home_reset(struct zt_server *server) {
+	server->board_state = 0;
 	if (server->menu_open) {
 		menu_hide(server);
 	} else if (server->editing) {
@@ -9543,6 +9679,8 @@ static void nav_activate(struct zt_server *server, int index) {
 			damage(server);
 		} else if (server->menu_open) {
 			menu_hide(server);
+		} else if (server->board_state) {
+			board_close(server);	/* no scroll */
 		} else if (server->searching) {
 			search_end(server);
 		} else if (server->editing) {
@@ -11075,6 +11213,10 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 			p->role = ROLE_MENU;	/* its one entry, or anywhere else to put it away */
 			return;
 		}
+		if (server->board_state) {
+			p->role = ROLE_BOARD;	/* the letters take every finger */
+			return;
+		}
 		if (!server->start_back && server->start_t > 0.01f) {
 			return;	/* Start is on its way out */
 		}
@@ -11091,7 +11233,9 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		if (coasting) {
 			return;
 		}
-		if (p->on_list && !server->searching &&
+		if (p->on_list && !server->searching && header_at(server, x, y)) {
+			p->badge = 5;	/* a letter's square */
+		} else if (p->on_list && !server->searching &&
 				hypot(x - SEARCH_X, y - (SEARCH_BOX_Y + ROUND / 2.0)) < ROUND) {
 			p->badge = 4;	/* the search button */
 		} else if (!p->on_list && !server->editing && server->n_items > 0 &&
@@ -11646,6 +11790,9 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 			} else if (p->badge == 4) {
 				hap(server, HAP_TAP, HG_NAV);
 				search_begin(server);
+			} else if (p->badge == 5) {
+				hap(server, HAP_TAP, HG_NAV);
+				board_open(server);
 			} else if (p->badge == 1) {
 				tile_unpin(server, server->edit);
 			} else if (p->badge == 2) {
@@ -11660,6 +11807,11 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 		}
 		break;
 	}
+	case ROLE_BOARD:
+		if (!cancelled && !p->moved) {
+			board_tap(server, p->x, p->y);
+		}
+		break;
 	case ROLE_MENU:
 		if (p->long_pressed) {
 			break;	/* the finger that opened it, lifting */
@@ -12678,6 +12830,64 @@ static float smooth01(float x) {
 	return x * x * (3.0f - 2.0f * x);
 }
 
+/* The curves ZrnMetroCore's readerboard uses: Log 60 coming, Exp 60 going. */
+static double board_ease(double t, bool in) {
+	double k = 2.0;
+	return in ? 1 - (exp(k * (1 - t)) - 1) / (exp(k) - 1) : (exp(k * t) - 1) / (exp(k) - 1);
+}
+
+/* A frame of the letters, over the list. Each row turns about its own top. */
+static void board_frame(struct zt_server *server) {
+	if (!server->board_state) {
+		return;
+	}
+	double ms = (uint32_t)(now_ms() - server->board_start), run = (ZB_ROWS - 1) * ZB_STAGGER_MS + ZB_ROW_MS;
+	bool out = server->board_state == 3;
+	if (out && ms >= run) {
+		server->board_state = 0;
+		damage(server);
+		return;
+	}
+	if (server->board_state == 1 && ms >= run) {
+		server->board_state = 2;
+	}
+	if (server->board_state == 2) {
+		ms = run + ZB_ROW_MS;
+	}
+	float m[16];
+	double scrim = out ? ZB_SCRIM * (1 - ms / run) : ZB_SCRIM * fmin(1, ms / ZB_SCRIM_IN_MS);
+	mat_identity(m);
+	mat_translate(m, 0, STATUS_H);
+	mat_scale(m, server->width, server->height - STATUS_H - NAV_H);
+	quad(server, GL_TEXTURE_2D, server->black_tex, m, (float)scrim, false, false, 1.0f, 1.0f);
+	double side = (server->width - 2 * BOARD_MARGIN - (ZB_COLS - 1) * ZB_GAP) / ZB_COLS;
+	for (int r = 0; r < ZB_ROWS; r++) {
+		struct zt_layer *l = &server->board_rows[r];
+		double t = (ms - r * ZB_STAGGER_MS) / ZB_ROW_MS;
+		if (t < 0 || (out && t >= 1) || !l->tex) {
+			if (out && t < 0) {
+				t = 0;	/* still in its place until its turn */
+			} else {
+				continue;
+			}
+		}
+		t = fmin(1, t);
+		double e = board_ease(t, !out);
+		/* mat_rotate_x: positive carries the bottom away */
+		double deg = out ? -ZB_OUT_DEG * e : -ZB_IN_DEG * (1 - e);
+		double alpha = out ? 1 - e : e;
+		mat_identity(m);
+		mat_translate(m, 0, (float)(STATUS_H + ZB_TOP + r * (side + ZB_GAP)));
+		mat_rotate_x(m, (float)deg);
+		mat_scale(m, (float)l->w, (float)l->h);
+		quad(server, GL_TEXTURE_2D, l->tex, m, (float)alpha, true, false,
+			(float)l->pw / l->tw, (float)l->ph / l->th);
+	}
+	if (server->board_state != 2) {
+		damage(server);
+	}
+}
+
 static float turn_place(struct zt_server *server, float m[16], float x, float y, float w,
 		float h, float span, float turn, float jit_travel, bool hinge_right) {
 	/* Each turns on its own edge, with depth: leaving, it comes a little
@@ -13241,6 +13451,7 @@ static void render_frame(struct zt_server *server) {
 						(float)l->pw / l->tw, (float)l->ph / l->th);
 				}
 			}
+			board_frame(server);
 			if (server->menu_t > 0.01f && server->menu_layer.tex &&
 					server->menu_item >= 0 && server->menu_item < server->n_items) {
 				/* a held row's menu: the list goes dim and the panel opens
