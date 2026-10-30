@@ -710,7 +710,7 @@ static void dial(const char *who) {
 static void call_over(const char *result) {
 	answered_at = 0;
 	sound_stop();
-	sound_play(!strcmp(result, "busy") ? "Busy.wav" : !strcmp(result, "drop") ? "Calldrop.wav" : "Disconnct.wav", false);
+	sound_play(!strcmp(result, "busy") ? "Disconnct.wav" : !strcmp(result, "drop") ? "Calldrop.wav" : "Busy.wav", false);
 	ending = true;
 	ended_at = zmc_now_ms();
 	/* the modem keeps its mute: the next call must not start with it on */
