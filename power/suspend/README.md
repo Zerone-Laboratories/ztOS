@@ -1,3 +1,45 @@
+# End-to-end bench after round 2 — 2026-10-30
+
+**Every check passed on the charger.** The hub, the sensors, GNSS, Wi-Fi, push,
+the modem's IPC, the inhibit race, the GRP4 policy and an Android alarm all
+held through 33 SoC entries and 34 AP_SLEEP pulses in one boot
+(10:29-11:25, uptime 35-91 min; entries 15->48).
+There were 0 hub error lines (MCU_REQ_RESP, Assert, ESW, OnCommunicationError,
+hub reset, power retry, `no echo`), and lhd and sensord kept their PIDs. Sleep
+is enabled again (`zrn-sleepd enable`), so it reads `why=charger`. Nothing
+here ran off the charger: J5 (unplugged night) and J6 (call/SMS) still wait
+for the user. Scripts: power/suspend/hub-bench/e2e/.
+
+| part | result (observed) |
+|---|---|
+| test-sleep-e2e.sh A-F | 0 crash lines in every phase, `Assert=` now counted. A: 35 s sleep ended by an Android alarm; fix 12.0 s after the reader; sensors fresh (`AP resumed (resume_seq 16)`, `sent 0xd3`). B, D: cancelled on timed-gnss (D at `settle`). C: modem wake (`umts_ipc0 +1, umts_rfs0 +10`) after 9.5 s. E: Android alarm after 47.8 s, fix 8.4 s. F: inhibit gone 1.2 s after the gate's kill -9. Wi-Fi 4.6-6.0 s, push 6-8 s after each return |
+| GNSS streaming, timed-gnss not counted | `once 60` and 15 `once 300` in 146 s: 16 `hub` wakes after 0.7-1.4 s (wake_stat 0x80000001), one hub-cause fw-abort; GNSS gapless (227 GGA, longest gap 1.6 s); 17 AP_SLEEP pulses and 17 0xd3; 0 refusals. Accel fresh 0.5 s and prox 0.1 s after screen on |
+| modem, GPS off, 3 x `once 300` | 296.5 s and 296.4 s RTC sleeps (one `modem rx: umts_ipc0 +1`), then an Android alarm; 0 modem wakes in 664 s asleep. The CP answered 0501 probes after the sleeps (11:21:36) and sent 0f36 at 11:26, 91 min into the boot |
+| late-inhibit race, 10 runs, 0-120 ms | **0 FAIL**: 4 cancelled before any handoff (3 EBUSY after the re-check, 1 why_awake), 6 renames after the handoff (helper frozen) |
+| GRP4 | clear_grp4 stayed N. Two fw-aborts, each retried by `once`: `hub` (grp4_at_smc 1, gpa1 0x81, GNSS streaming) and `other` (grp4 cleared 1->0 at the handoff, then latched again before the SMC by gpa1-0 alone). grp4_stale_clears went 1 -> 3, hub_pend_cleared 0 -> 1 |
+| Android alarm | two alarm wakes against `dumpsys alarm`'s next wakeup alarm: PM suspend exit 1.2 s after an `android` alarm's due time, and 0.0 s after a networkstack ELAPSED_WAKEUP; `alarm wake, container running` |
+
+What it showed besides:
+
+- **gpa1-0 latches GRP4 between the stale clear and the SMC.** In Samsung's
+  starlte DT, gpa1-0 is `attn-irq`, the sec_ts touchscreen's interrupt
+  (observed in exynos9810-starlte_eur_open_26.dts). That it is the touch
+  controller on this phone is inferred. Each such sleep is an `other`
+  fw-abort, and three in a row pause sleep for 30 min. J5 will show how often
+  that happens.
+- **zrn-pushd's heartbeat never wakes a sleeping SoC.** Every sleep unbinds
+  Wi-Fi, and the connection drop runs mcs_close(), which stops the heartbeat
+  timer (android/push/zrn-pushd.c). One heartbeat was due at 11:21:05 during
+  a sleep; the SoC woke on the RTC 26.6 s later. Push therefore comes back
+  only at a wake: a doze window, an alarm, the modem or the RTC. So an early
+  RTC wake that zrn-sleepd calls `alarm` comes from Android, not from pushd
+  (inferred).
+- **Android's wakeup alarms:** the queue at 11:25 held 4 for the next hour
+  (android, networkstack x3). That is a snapshot, not a rate.
+- entries 48 against ap_suspends and resume_seq 49: one cycle pulsed
+  AP_SLEEP and then cancelled before the SoC entry. sensord sent its 0xd3
+  for it as well.
+
 # Sleep holes closed in round 2 — 2026-10-30
 
 Four holes the round-1 skeptic found, closed in zrn-sleepd plus a 4-byte

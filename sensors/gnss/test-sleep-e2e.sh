@@ -12,9 +12,11 @@
 # G a reader over the 10-minute screen-off cap, then the screen on.
 # On the charger only: zrn-sleepd's own loop never sleeps there.
 # No positions are written: the reader reports times and counts only.
-# sensors_check watches accel and prox, and taking them off at screen-off
-# asserts the hub's firmware (see test-hub-screen-off.sh): it recovers
-# by itself in about 18 s, but phases after A and E see that crash.
+# sensors_check watches accel and prox; taking them off at screen-off
+# asserted the hub's firmware until sensord sent one transaction at a time
+# (round 2, 6bce2ea): an Assert= line in a phase is now a failure.
+# ONCE_ARGS go to every `zrn-sleepd once` (a bench on a busy chat:
+# ONCE_ARGS="--ignore-inhibit timed-push").
 H=${OUT:-/home/zerone/team-test}; R=$H/e2e.out; G=$(dirname "$(readlink -f "$0")")
 CTL=/run/user/1000/ztmetro.ctl; SCTL=/run/ztoscsf-sensord.ctl
 INH=/run/zrn-sleepd/inhibit
@@ -26,7 +28,7 @@ shell() { timeout 3 sh -c "echo \"$1\" > $CTL" 2>/dev/null; }
 sctl() { timeout 3 sh -c "echo \"$1\" > $SCTL" 2>/dev/null; }
 pids() { echo "lhd=$(pgrep -x lhd | tr '\n' ,) hub=$(systemctl show -p MainPID --value ztoscsf-sensorhub) sensord=$(systemctl show -p MainPID --value ztoscsf-sensord) gate=$(systemctl show -p MainPID --value ztos-gnss-gate) ready=$(cat /sys/class/sec/sensorhub/ready)"; }
 inh() { echo "[$(ls $INH 2>/dev/null | tr '\n' ' ')]"; }
-crash() { journalctl --since "@$1" --no-pager -o short-monotonic 2>/dev/null | grep -E 'OnCommunicationError|ESW:CRASHED|lost readiness|MCU_REQ_RESP|hub reset|recovered after power' ; }
+crash() { journalctl --since "@$1" --no-pager -o short-monotonic 2>/dev/null | grep -E 'OnCommunicationError|ESW:CRASHED|lost readiness|MCU_REQ_RESP|hub reset|recovered after power|Assert=' ; }
 gnss_off() { for i in $(seq 60); do systemctl is-active -q ztos-gnss || return 0; sleep 1; done; return 1; }
 wifi_wait() {	# seconds until wlp1s0 is associated and NM connected, from now
 	local t0=$(bt)
@@ -51,7 +53,7 @@ sleep_once() {	# sleep_once SECONDS TAG: one bench sleep, wake facts after it
 	local s=$1 tag=$2 before
 	before=$(wc -l < /var/lib/zrn-sleep/log)
 	log "[$tag] before once $s: $(pids) gnss=$(systemctl is-active ztos-gnss) inhibit=$(inh) push: $(push)"
-	/usr/local/sbin/zrn-sleepd once $s
+	/usr/local/sbin/zrn-sleepd once $s $ONCE_ARGS
 	WAKE_WALL=$(date +%s); WAKE_BT=$(bt)
 	log "[$tag] once returned: $(tail -n +$((before + 1)) /var/lib/zrn-sleep/log | cut -c21- | tr '\n' '|')"
 	log "[$tag] after: $(pids) entries=$(cat /sys/module/zrn_sleep_init/parameters/entries 2>/dev/null) grp4_before=$(cat /sys/module/zrn_sleep_init/parameters/grp4_before 2>/dev/null) chub_before=$(cat /sys/module/zrn_sleep_init/parameters/chub_status_before 2>/dev/null)"
