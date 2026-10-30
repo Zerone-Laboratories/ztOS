@@ -38,3 +38,18 @@ ignores writes from here, so the secure world may own it (not proven).
    writes the frames to memory through its own DMA (the "CSIS WDMA").
 5. A V4L2 device, or a simple dump to a file first, and Bayer to RGB in
    software.
+
+## Aperture and focus (2026-10-31)
+
+`act-read` and `act-move` in `camera/driver/zrn-cam.c` bring the rear camera up, drive the actuators on bit-banged
+gpc0-2/3, and power down. Writes are limited to the registers stock's normal path uses; register 0x03 stores to
+the chip's memory and is refused.
+
+- Aperture AK7372 at 0x4c: stock's pulse, 0xa6=0x7b plus end position, about 11 ms, 0xa6=0, back to 511.
+- Focus AK737x at 0x0c: IDs f3=0x0e and 03=0x0e, 120 to 200 and back, then stock's landing to 0.
+- Register 0x84-85 of both chips changes with a move. After a pulse with the command back at 511, the aperture
+  read 0x63-0x6b after F2.4 and 0x85-0x88 after F1.5, and held that through power cycles. Focus read close to
+  the commanded position. That it is a hall value is inferred; vendor source does not name it.
+- Not proven: the actual f-number. No frame has been captured and nobody has heard it move.
+- The aperture is left at F1.5, stock's `APERTURE_CLOSE_VALUE`. OIS is not initialised: star defines
+  `USE_OIS_SHIFT_FOR_APERTURE` only for LDU or factory builds, and both are off in `stock.config`.
