@@ -371,12 +371,36 @@ Two faults, found together with the sleep work (power/suspend/README.md):
   first lhd exchange after the wake failed (OnCommunicationError,
   ESW:CRASHED), with or without gpsd running. zrn-sleep-init.ko now holds
   that pin (and gpg0-1) through the sleep; with GPS off the hub survives.
-- With gpsd streaming, a sleep still breaks the hub: `[SSPBBD]
-  MCU_REQ_RESP timeout` about 5 s after the wake, then `zrn-bbd: hub reset
-  (it had stopped answering)`. It recovers by itself, but the session is
-  lost. Stock never meets this: gpsd holds a "geo" wake lock while it runs,
-  which is a no-op here (no CONFIG_PM_WAKELOCKS, and none is wanted: a
-  kernel wake lock would be an invisible veto).
+- With gpsd streaming, a sleep through the hub's requests breaks the hub:
+  `[SSPBBD] MCU_REQ_RESP timeout` about 5 s after the wake, then `zrn-bbd:
+  hub reset (it had stopped answering)`. It recovers by itself, but the
+  session is lost. **GNSS holds SoC sleep off (timed-gnss); it does not
+  survive a sleep.** Stock never sleeps through a pending host_req, because
+  host_req is a wake IRQ there (its EINT wake mask follows enable_irq_wake).
+  Since round 2 ours is too (zrn-sleep-init `eint_follow`, power/suspend/
+  README.md): with the inhibit bypassed on the bench, a sleep with gpsd
+  streaming now comes back on the hub's own request within about 1 s, and
+  GNSS goes on without a gap. timed-gnss stays: a sleep of a second is no
+  saving.
+
+  gpsd's own wake lock (REA, Ghidra decompiles of /vendor/bin/hw/gpsd, md5
+  042ecb3a, symbols from its .gnu_debugdata):
+  - `IGpsdInterface::WakeLock(bool, name)` (0x2bb524, ev_19060cc2) logs
+    `WakeLock(Acquire|Release,NAME)` and calls IBrcmGpsHalWakeLock's acquire
+    or release.
+  - `GlGpsdInterface::OnStart` (0x2bff90, ev_860c3ad0) takes the "GPSD" wake
+    lock when PlatfConfig's wake-lock mode (offset 0x5d8) is 1 or 2.
+  - `AcquireWakelock` (0x2bfa28, ev_10c30a21) takes it if not held;
+    `ReleaseWakelock` (0x2bdf30, ev_05b94fc1) only marks a release pending;
+    `ProcessWakelockBeforeSelect` (0x2bdf60, ev_b1c6518c) releases it before
+    gpsd's select() when a release is pending.
+  - `ChipData_GRABSNQ_460790` (0x2bf870, ev_be9b6fab): on the first chip
+    data after the HAL alarm fired, it cancels the alarm and, in mode 2,
+    takes the wake lock again.
+  - Unknown: which mode gps.xml's `WakeLock="geo"` selects (the config
+    parser was not decompiled), and what IBrcmGpsHalWakeLock does on this
+    system. CONFIG_PM_WAKELOCKS is not built here, and none is wanted: a
+    kernel wake lock would be an invisible veto.
 
 ### What holds now
 

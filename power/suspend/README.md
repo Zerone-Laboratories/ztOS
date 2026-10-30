@@ -1,3 +1,77 @@
+# The sensor hub and SoC sleep, round 2 — 2026-10-30
+
+**GNSS holds SoC sleep off (ztos-gnss-gate's timed-gnss); it does not
+survive a sleep.** Stock never sleeps through a pending host_req, because
+host_req is a wake IRQ there: the hub wakes the AP. Ours had host_req
+masked in EINT_WAKE, so a sleep with GNSS running slept through the hub's
+requests and the hub stopped answering 5 s after the wake (J0c, J0d). This
+round makes host_req a wake source and refuses a sleep while the hub talks.
+
+What stock does (REA on stock's Image, stock-syms.txt; the vendor source
+agrees):
+
+- `exynos_wkup_irq_set_wake` (0x3e8e20) clears the pin's bit, `1 << (hwirq +
+  eint_offset * 2)`, in a global mask on enable_irq_wake(on) and sets it on
+  off (0x3e8e74-0x3e8e8c); exynos-powermode.c writes that mask to PMU 0x60c.
+  So stock's EINT wake mask follows enable_irq_wake, and bcm_gps_spi
+  wake-enables host_req (gpa1-7, "ttyBCM", level-high; IRQ 107 or 109, it
+  varies by boot) while lhd
+  holds /dev/ttyBCM.
+- `ssp_suspend` (0xa83560): AP_SLEEP (gpa0-5) set 0, read back, printk, set
+  1 (0xa83594-0xa835c8); uLastResumeState = 0xd4. It sends no command (the
+  0xd4 send is commented out in ssp_dev.c too).
+- `ssp_resume` (0xa83928): AP_SLEEP 1, then `ssp_send_cmd(0xd3, 0)`
+  (0xa839a4-0xa839ac): MSG2SSP_AP_STATUS_RESUME, a bare 9-byte command.
+- `bbd_do_transfer` holds comm_mutex from the header until the echo's
+  payload is out: one transaction on the link at a time. A length-0
+  command is not waited for. The echo wait is 400 ms within 5 s of a
+  resume, else 1000 ms (ssp_spi_async).
+
+What ours does now:
+
+| piece | what |
+|---|---|
+| zrn-sleep-init `eint_follow` (0600, default 0x8000) | EINT bits whose wake follows their IRQ's wake setting; resolved at load (dmesg `eint bit 15 (gpa1-7) follows IRQ 109's wake setting` on 30 Oct). Each sleep, a followed bit whose IRQ is wake-enabled is opened in PMU 0x60c and in the GPIO EINT mask; `eint_effective` shows the word used (0xffe73ffd with lhd up). |
+| the refusal | in the finisher, a wake-enabled followed line that reads high (gpa1 DAT bit 7) refuses the sleep with EBUSY: `zrn-system-sleep: refused: host_req high (eint bit 15)`, `hub_refused` counts them. On the line level, not on the pending latch: the IRQ is level-triggered and bcm_spi_suspend disables it with disable_irq_nosync, so a latch with the line low is normal after any served request. That stale latch is write-1-cleared (`hub_pend_cleared`). |
+| GRP4 | cleared at each attempt once the line check has passed (`grp4_stale_clear`, default Y, counted in `grp4_stale_clears`); not sticky. `grp4_at_smc` is GRP4 read again right before the SMC; zrn-sleepd's fw-abort test uses it. `clear_grp4` stays, for a person at the bench. |
+| handoff line | adds `eint_eff=`, `hub_line=` (-1: nothing followed) and `grp4_at_smc=`. |
+| zrn-bbd `ap_sleep_pulse` (0644, default N; Y from /etc/modprobe.d/zrn-bbd.conf), `ap_sleep_pulse_us` (100) | at PM_SUSPEND_PREPARE, AP_SLEEP low for the given time and back high, as ssp_suspend; only while the hub is ready and host_req is a wake IRQ (a hub told the AP sleeps asks to be woken: pulsing with host_req masked is J0c on purpose). `zrn-bbd: AP_SLEEP pulse, read 0`, or `no AP_SLEEP pulse (why)`. |
+| zrn-bbd `resume_seq`, `ap_suspends` (/sys/class/sec/sensorhub) | at PM_POST_SUSPEND after a pulse, resume_seq goes up and is sysfs-notified. |
+| ztoscsf-sensord | one transaction in flight; on a resume_seq change it queues the bare 0xd3 (`D3 00 00 01 00 00 00 00 00`), behind the open transaction; 400 ms echo timeouts for 5 s after. The only writer on the link, so the kernel sends no hub command. |
+| zrn-sleepd | `hub` wake (wake_stat bit 0 with gpa1-7 pending, after key and bt), 5 s awake; `hub-busy` (EBUSY with hub_refused moved), retried in 5 s, not a failure; 3 of either within 120 s of boot time: awake 120 s (`sensor hub keeps the AP awake`). No automatic clear_grp4 any more; clear_grp4 is set back to N at start. |
+| bbd_suspend | msleep(20), not mdelay(20). |
+
+Bench results (30 Oct, on the charger, `zrn-sleepd once` through
+power/suspend/hub-bench/; the GNSS runs bypass timed-gnss, which only a
+bench does):
+
+| run | what | result |
+|---|---|---|
+| P1 | old sensord: one REMOVE (unwatch accel), screen on | no assert |
+| P2 | new sensord: 8 screen-offs each with accel, prox, both watched | 0 asserts in 24 (before: 8 of 8), 0 `no echo`, lhd PID unchanged |
+| P3 | new zrn-sleepd, old module, GPS off, 60 s | RTC wake, clear_grp4 N, no hub errors |
+| B1 a-d | new modules, GPS off, 3 x 60 s and 300 s | 4 RTC/modem wakes, 0 hub wakes, 0 refusals, 0 MCU_REQ_RESP/Assert/ESW, grp4_at_smc 0, PIDs unchanged; first fix 13.4-17.2 s after a reader came (P3, old module: 20.3 s); bbd_suspend 21, 24, 36 and 520 ms |
+| B2a | control, eint_follow=0, GNSS streaming | J0c again: a full 57 s sleep with gpa1-7 pending, then MCU_REQ_RESP twice and two hub resets (recovered by itself) |
+| B2b 2, 3 | eint_follow=0x8000, GNSS streaming | `hub` wakes after 0.8 and 1.2 s (wake_stat 0x80000001, gpa1-7); 0 hub errors; GNSS gapless (longest 1.4 s) |
+| B3 a-c | pulse on, GPS off, 60 s | RTC wakes, `AP_SLEEP pulse, read 0`, one 0xd3 each, 0 asserts, fix 13.5-14.3 s |
+| B3 d-f | pulse on, GNSS streaming | `hub` wakes after 0.7-0.9 s, one 0xd3 each, GNSS gapless; ap_suspends = resume_seq = 0xd3 sent = 6; no `bIsAPSleeping` |
+| screen on after B3 | watch accel, prox | first new reading 0.88 s and 0.13 s after screen on |
+| B5 | sensors/gnss/test-sleep-e2e.sh A-G (round 1's J1-J3 among them) | 0 crash lines in every phase, the sensor checks after A and E included (they asserted in round 1); Wi-Fi associated 4.6-5.5 s and push logged in 6-8 s after each return; B and D cancelled on timed-gnss; F: inhibit gone 1.1 s after the gate's kill -9; G (run again alone, since run straight after F its reader met the gate restarting): cap 601.3 s after the reader, engine back 1.8 s after screen on |
+| B4 x3 | a reader connects at the `suspend` step | the freeze beat the gate: full 57 s sleeps with the reader waiting, GPS on after the wake (fix 12-16 s); no hub reset |
+
+Not seen yet: a `hub-busy` refusal (hub_refused stayed 0: host_req was
+low at every check), a stale latch cleared (hub_pend_cleared 0) and a GRP4
+stale clear (grp4_stale_clears 0). The 520 ms bbd_suspend is still there
+with msleep; its cause is unknown. B2b1 and B2b4 were bench misfires (the
+gate rewrote timed-gnss in the bypass's window; then its 600 s screen-off
+cap), not results.
+
+The AP_SLEEP pulse is on by default from `/etc/modprobe.d/zrn-bbd.conf`
+(`options zrn_bbd ap_sleep_pulse=1`); delete that file to turn it off.
+Open: a reader that arrives after zrn-sleepd's re-check waits for the next
+wake before GPS starts (B4). Each B4 sleep was 57 s; with the doze and RTC
+limits a wait could be up to 300 or 1800 s.
+
 # Pins while the SoC sleeps; sleeps the firmware gives up — 2026-10-30
 
 **The sensor hub died after every SoC sleep because its power pin let go.**
@@ -46,9 +120,10 @@ then bench sleeps, `zrn-sleepd once`, a 45 s NMEA read after the wake):
 Before the fix every sleep that reached the SoC killed the hub, GNSS on or
 off. With it, an idle hub (lhd up, no gpsd) lives through sleeps. **A hub
 streaming GNSS still does not**: the SPI handshake (MCU_REQ gph0-5 / MCU_RESP
-gph0-4) times out after the wake and zrn-bbd resets the hub. Stock never
-sleeps while its engine runs (gps.xml WakeLock="geo"), and neither may ours:
-ztos-gnss-gate holds `timed-gnss` while it has readers.
+gph0-4) times out after the wake and zrn-bbd resets the hub. GNSS holds
+SoC sleep off (ztos-gnss-gate's `timed-gnss` while it has readers); it does
+not survive a sleep. Stock never sleeps through a pending host_req, because
+host_req is a wake IRQ there (round 2, above).
 
 **What GRP4 bit 0 is (J0b).** A sleep with gpsd running found PMU_INTR_GEN
 GRP4 = 00000001 at the handoff, came straight back (wake_stat 0x80000001,
@@ -62,8 +137,10 @@ hub holding host_req: a chip in ROM after the first sleep fits.
 
 A sleep with smc 0, no wake source (wake_stat & 0x7fffffff, wake_stat2/3 and
 every EINT word 0) and under 2 s of boot time asleep, or any sleep with
-grp4_before set, is `fw-abort`: not a wake, no doze window. The first sets
-clear_grp4 and retries after 5 s; three in a row pause sleeping for the boot
+grp4_before set (grp4_at_smc with the round-2 module), is `fw-abort`: not a
+wake, no doze window. It retries after 5 s (it no longer sets clear_grp4:
+that stayed Y for the boot and forced later sleeps through live latches;
+zrn-sleep-init clears a stale latch itself now); three in a row pause sleeping for the boot
 (/run/zrn-sleepd/paused; `zrn-sleepd enable` or a reboot clears it) with the
 shell told "Sleep paused". The log line names grp4_before's set bits and the
 EINT words.
