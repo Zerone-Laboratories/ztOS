@@ -862,6 +862,8 @@ static void cell_load(void) {
 	app.mobile_data = cell.data_on;
 }
 
+static int brightness_now(void);
+
 static double draw_main(cairo_t *cr) {
 	double y = zmc_pivot_next(cr, "system", "applications", ACT_OPEN_PAGE, PAGE_APPS);
 	char detail[128], wifi[96];
@@ -871,8 +873,11 @@ static double draw_main(cairo_t *cr) {
 	y = zmc_entry(cr, y, "theme", detail, ACT_OPEN_PAGE, PAGE_THEME);
 	y = zmc_entry(cr, y, "navigation bar", "choose the centre icon", ACT_OPEN_PAGE, PAGE_NAVIGATION);
 
+	/* the screen's real level: the config's is only where it last started,
+	 * and auto brightness moves on from it */
+	int bright_now = brightness_now();
 	snprintf(detail, sizeof(detail), "%d%% brightness, %s timeout",
-		app.brightness, app.timeout_idx == 4 ? "Never" : "1 min");
+		bright_now > 0 ? bright_now : app.brightness, app.timeout_idx == 4 ? "Never" : "1 min");
 	y = zmc_entry(cr, y, "display", detail, ACT_OPEN_PAGE, PAGE_DISPLAY);
 
 	wifi_summary(wifi, sizeof(wifi));
