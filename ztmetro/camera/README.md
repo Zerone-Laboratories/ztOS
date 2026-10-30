@@ -30,6 +30,14 @@ shutter now uses the same glyph. The SVG remains an icon-theme fallback.
 
 ## Sources
 
+* If `/dev/zrn-cam` exists (`camera/driver`, loaded by hand, never at boot): the real
+  cameras, RAW with no ISP. The app keeps every fourth pixel's 2x2 cell and the GPU
+  makes colour. The facing button goes rear, front, IR; IR has no picture yet, so it
+  says so and shows the labelled test scene. The aperture button toggles F1.5 and
+  F2.4 on the rear, inside the driver's move limit. Photos are that preview's
+  504x378 cells, not full resolution. Its orientation and exposure loop have not
+  been seen with light. Under DotMatrix the viewfinder is dots, but the camera-roll
+  thumbnail is still a plain picture and the shutter glyph draws wrong.
 * Default: `/dev/video0` if accessible, otherwise a labelled animated test scene.
 * `--device /dev/videoN`: single-plane V4L2 capture, MMAP streaming, negotiated
   YUYV at a requested 640x480. Failed setup falls back to the labelled scene.

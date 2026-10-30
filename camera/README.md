@@ -2,7 +2,7 @@
 
 Goal: frames from the rear sensor over MIPI CSI, without Samsung's ISP
 (fimc-is). Full image quality (the ISP, its closed `fimc_is_lib.bin` and
-setfiles) is out of scope. Nothing here is built yet: every step below writes
+setfiles) is out of scope. The plan below came first; RAW capture is the section above. Every step below writes
 to power-domain, clock or CSIS registers, and on this SoC a write to a block
 that is powered off or gated is a silent bus hang that only the keys undo.
 Do it with someone at the phone.
@@ -12,6 +12,29 @@ order from a module, reads its ID and powers it down, with `zrn-cam-probe`
 leaving a mark so a hang is not retried. Rear 0x20C3 rev 0xA5 (S5K2L3), front
 0x3081 rev 0xA3, three cycles each. Iris: no answer, `gpio_iris_en` (gpg0-7)
 ignores writes from here, so the secure world may own it (not proven).
+
+## RAW capture (2026-10-31)
+
+`camera/driver` now takes frames from the rear and front through CSIS with no ISP,
+by module, and `/dev/zrn-cam` feeds `ztmetro/camera`. Nothing loads it at boot:
+
+```sh
+sudo install -Dm644 camera/driver/90-zrn-cam.rules /etc/udev/rules.d/90-zrn-cam.rules   # once
+sudo zrn-cam-probe pmic    # loads the module; the rails stay off
+```
+
+- ISPPRE's bus boots at mux 2, divider /16, and the receiver overflows on the first
+  frame. The APM's `dvfs_cam` (domain 7, 690000) moves it to mux 0, /1, and the
+  receiver then counts about 30 frames a second with no error bits. `dvfs_intcam`
+  does not move it. No CMU register is written. The level stays until reboot.
+- The DMA writes 16 bits a pixel, 10 bits low, stride 2 x width. Rear 2016x1512 GB/RG,
+  front 1632x1224 GR/BG, read from the sensors' colour bars. SysMMU control reads
+  0x4; the frames landing where asked, canaries untouched, imply it is bypassed.
+- The first frames were taken in a dark room: black level 64, noise growing with gain.
+  **No picture of a scene has been checked yet**, nor the 1.4 stops between F1.5 and F2.4.
+- Iris: still no answer from the sensor, so no frames.
+- A stall of all CPUs (test, 2026-10-31) reset the phone back into ztOS, not TWRP,
+  within 48 s, with no one touching it.
 
 ## The hardware (stock tree, `stock/twrp-live.dts`)
 
