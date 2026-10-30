@@ -1,0 +1,9 @@
+[Unit]
+Description=ztOS: read Android's contacts now and then
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

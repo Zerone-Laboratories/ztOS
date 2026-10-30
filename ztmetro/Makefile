@@ -242,6 +242,8 @@ install: check-arch
 	install -Dm755 messages/ztmessages /usr/local/bin/ztmessages
 	install -Dm755 contacts/ztcontacts /usr/local/bin/ztcontacts
 	install -Dm755 contacts/zrn_contacts_sync.py /usr/local/bin/zrn-contacts-sync
+	install -Dm755 contacts/zrn-contacts-android /usr/local/bin/zrn-contacts-android
+	install -Dm644 -t /etc/systemd/system contacts/zrn-contacts-android.service contacts/zrn-contacts-android.timer
 	install -Dm644 -t /usr/lib/systemd/user contacts/zrn-contacts-sync.service contacts/zrn-contacts-sync.timer
 	install -Dm644 contacts/google-client.json.template /usr/local/share/ztos/google-client.json.template
 	install -Dm644 -t /usr/local/share/applications comm/ztphone.desktop comm/ztmessages.desktop comm/ztcontacts.desktop

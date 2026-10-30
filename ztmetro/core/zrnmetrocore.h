@@ -220,6 +220,7 @@ void zmc_every(int ms, void (*tick)(void));
 /* ---- drawing a page ---- */
 double zmc_header(cairo_t *cr, const char *title);	/* returns where the content starts */
 double zmc_pivot(cairo_t *cr, const char *title, const char *next);
+void zmc_pivot_changed(void);	/* from arrived(), with more than two tabs */
 /* the same, with the next tab's title a thing to tap: it gives (action, arg) */
 double zmc_pivot_next(cairo_t *cr, const char *title, const char *next, int action, int arg);
 double zmc_entry(cairo_t *cr, double y, const char *title, const char *detail, int action, int arg);

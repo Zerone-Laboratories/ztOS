@@ -1229,6 +1229,16 @@ static cairo_surface_t *pivot_snapshot(int page, double scroll, int scale, struc
 	return surface;
 }
 
+/* An app with more than two tabs: the tab just left is not the next one. Called
+ * from arrived(); the next tab's picture is drawn again when idle. */
+void zmc_pivot_changed(void) {
+	if (zmc.piv_other) {
+		cairo_surface_destroy(zmc.piv_other);
+		zmc.piv_other = NULL;
+	}
+	zmc.piv_ready = false;
+}
+
 static void pivot_forget(void) {
 	if (zmc.piv_cur) {
 		cairo_surface_destroy(zmc.piv_cur);

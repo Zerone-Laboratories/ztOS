@@ -1,0 +1,7 @@
+[Unit]
+Description=ztOS: Android's contacts into the contact store
+After=waydroid-container.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zrn-contacts-android
