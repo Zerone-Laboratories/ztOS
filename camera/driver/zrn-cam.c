@@ -10,6 +10,9 @@
  *	rear front iris	full cycle: on, chip ID, off
  *	rear-rails front-rails iris-rails
  *			the rails only, no reset, clock or sensor I2C
+ *	act-read	rear up; read the aperture and focus drivers, no pulse, no move
+ *	act-move	rear up; drive the aperture both ways and the focus a little;
+ *			ends at F1.5 with the focus landed, then rear off
  *
  * Results are in .../result and dmesg. Rails are never left on: the off
  * sequence runs on every path and from a reboot notifier. There is no remove
@@ -34,6 +37,7 @@
 #include <linux/gpio/machine.h>
 #include <linux/i2c.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_data/i2c-gpio.h>
@@ -60,6 +64,9 @@ enum { PB03, PB02, PMIC_N };
 #define BUS_PB03	99
 #define BUS_PB02	100
 #define BUS_SENSOR	101
+#define BUS_ACT		102
+#define ADDR_APERTURE	0x4c
+#define ADDR_FOCUS	0x0c
 #define ADDR_PB03	0x56
 #define ADDR_PB02	0x59
 
@@ -181,7 +188,7 @@ static const struct camera cameras[] = {
 };
 
 static DEFINE_MUTEX(lock);
-static char result[4096];
+static char result[16384];
 static size_t result_len;
 static void __iomem *peri;
 static struct i2c_client *pmic[PMIC_N];
@@ -532,6 +539,287 @@ static void read_id(const struct camera *c)
 	note("%s: chip ID 0x%02x%02x revision 0x%02x", c->name, id[0], id[1], rev);
 }
 
+/*
+ * Aperture (AK7372 at 0x4c) and focus (AK737x at 0x0c), on stock's hsi2c_1 pads
+ * gpc0-2 SCL and gpc0-3 SDA. From fimc-is-aperture-ak7372.c, fimc-is-actuator-ak737x.c
+ * and fimc_is_sensor_peri_actuator_softlanding(). OIS at 0x24 is left alone:
+ * star's USE_OIS_SHIFT_FOR_APERTURE needs LDU or factory, which stock.config has off.
+ *
+ * Only the registers stock's normal path writes can be written here. Register
+ * 0x03 stores to the chip's own memory and must never be written.
+ */
+#define ACT_SCL		2
+#define ACT_SDA		3
+#define ACT_PUD		3	/* the same pull as the sensor's pads, from on_i2c */
+#define AP_HOLD_US	10000
+#define AP_HOLD_LIMIT_US 20000
+#define AP_F1_5		0
+#define AP_F2_4		1023
+#define AP_IDLE		511
+#define AF_FIRST	120
+#define AF_TEST		200
+#define MOVES_PER_LOAD	10
+
+static int moves_left = MOVES_PER_LOAD;
+static struct i2c_client *ap_cl, *af_cl;
+static struct platform_device *act_pdev;
+static u32 act_saved_pud;
+static struct gpiod_lookup_table act_gpios = {
+	.dev_id = "i2c-gpio.102",
+	.table = {
+		GPIO_LOOKUP_IDX("gpc0", ACT_SDA, NULL, 0, GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN),
+		GPIO_LOOKUP_IDX("gpc0", ACT_SCL, NULL, 1, GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN),
+		{ }
+	},
+};
+
+static int act_write(struct i2c_client *cl, u8 reg, u8 val)
+{
+	bool ok = reg <= 0x02 || (cl == ap_cl && (reg == 0xa6 || reg == 0xae));
+
+	if (!ok) {
+		note("refused write 0x%02x to register 0x%02x", cl->addr, reg);
+		return -EPERM;
+	}
+	return i2c_smbus_write_byte_data(cl, reg, val);
+}
+
+static void act_bus_off(void)
+{
+	u32 mask = (0xf << (ACT_SCL * 4)) | (0xf << (ACT_SDA * 4));
+
+	if (ap_cl)
+		i2c_unregister_device(ap_cl);
+	if (af_cl)
+		i2c_unregister_device(af_cl);
+	ap_cl = af_cl = NULL;
+	if (act_pdev) {
+		u32 v;
+
+		platform_device_unregister(act_pdev);
+		act_pdev = NULL;
+		gpiod_remove_lookup_table(&act_gpios);
+		v = readl(peri + BANK_GPC0 + REG_PUD);
+		writel((v & ~mask) | (act_saved_pud & mask), peri + BANK_GPC0 + REG_PUD);
+	}
+}
+
+static int act_bus_on(void)
+{
+	struct platform_device *pd;
+	struct i2c_adapter *ad;
+	struct i2c_client *a, *f;
+
+	gpiod_add_lookup_table(&act_gpios);
+	act_saved_pud = readl(peri + BANK_GPC0 + REG_PUD);
+	field(BANK_GPC0 + REG_PUD, ACT_SCL, ACT_PUD);
+	field(BANK_GPC0 + REG_PUD, ACT_SDA, ACT_PUD);
+	pd = platform_device_register_data(NULL, "i2c-gpio", BUS_ACT, &i2c_100k, sizeof(i2c_100k));
+	if (IS_ERR(pd)) {
+		u32 mask = (0xf << (ACT_SCL * 4)) | (0xf << (ACT_SDA * 4));
+		u32 v = readl(peri + BANK_GPC0 + REG_PUD);
+
+		writel((v & ~mask) | (act_saved_pud & mask), peri + BANK_GPC0 + REG_PUD);
+		gpiod_remove_lookup_table(&act_gpios);
+		return PTR_ERR(pd);
+	}
+	act_pdev = pd;
+	ad = i2c_get_adapter(BUS_ACT);
+	if (!ad)
+		return -ENODEV;
+	a = i2c_new_dummy_device(ad, ADDR_APERTURE);
+	f = i2c_new_dummy_device(ad, ADDR_FOCUS);
+	i2c_put_adapter(ad);
+	if (!IS_ERR(a))
+		ap_cl = a;
+	if (!IS_ERR(f))
+		af_cl = f;
+	if (IS_ERR(a))
+		return PTR_ERR(a);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+	return 0;
+}
+
+/* Read-only snapshot. Registers 0x80-0x8f are read to look for a hall or status
+ * value that follows the move; their meaning is not known from vendor source. */
+static void act_snapshot(struct i2c_client *cl, const char *label)
+{
+	static const u8 regs[] = { 0x00, 0x01, 0x02, 0x03, 0x4b, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85,
+		0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0xa6, 0xae, 0xf3 };
+	char line[240];
+	size_t n = 0;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		int v = i2c_smbus_read_byte_data(cl, regs[i]);
+
+		if (v < 0)
+			n += scnprintf(line + n, sizeof(line) - n, " %02x=E", regs[i]);
+		else
+			n += scnprintf(line + n, sizeof(line) - n, " %02x=%02x", regs[i], v);
+	}
+	note("0x%02x %s:%s", cl->addr, label, line);
+}
+
+static int ap_position(int pos)
+{
+	int ret = act_write(ap_cl, 0x00, (pos >> 2) & 0xff);
+
+	return ret ? ret : act_write(ap_cl, 0x01, (pos << 6) & 0xc0);
+}
+
+/* sensor_ak7372_aperture_init */
+static int ap_init(void)
+{
+	int ret = act_write(ap_cl, 0xae, 0x3b);
+
+	if (!ret)
+		ret = ap_position(AP_IDLE);
+	if (!ret)
+		ret = act_write(ap_cl, 0x02, 0x00);
+	return ret;
+}
+
+/*
+ * sensor_ak7372_aperture_set_value without its same-value shortcut: 0xa6=0x7b,
+ * the end position, 10 ms, 0xa6=0, back to 511, 15 ms. The pulse is timed, and
+ * a pulse that ran long stops any further move. Power-off also ends a pulse.
+ */
+static int ap_move(int pos, const char *name)
+{
+	ktime_t t0, t1;
+	int a6, h, l, ret, close_ret;
+	s64 hold;
+
+	if (moves_left <= 0) {
+		note("aperture: no moves left in this load");
+		return -EPERM;
+	}
+	moves_left--;
+	t0 = ktime_get();
+	ret = act_write(ap_cl, 0xa6, 0x7b);
+	if (!ret)
+		ret = ap_position(pos);
+	a6 = i2c_smbus_read_byte_data(ap_cl, 0xa6);
+	h = i2c_smbus_read_byte_data(ap_cl, 0x00);
+	l = i2c_smbus_read_byte_data(ap_cl, 0x01);
+	hold = ktime_us_delta(ktime_get(), t0);
+	if (hold < AP_HOLD_US)
+		usleep_range(AP_HOLD_US - hold, AP_HOLD_US - hold + 300);
+	close_ret = act_write(ap_cl, 0xa6, 0x00);
+	if (close_ret)
+		close_ret = act_write(ap_cl, 0xa6, 0x00);
+	t1 = ktime_get();
+	hold = ktime_to_us(ktime_sub(t1, t0));
+	if (!close_ret)
+		close_ret = ap_position(AP_IDLE);
+	usleep_range(15000, 16000);
+	note("aperture %s: pulse %lld us, during it a6=0x%02x pos=0x%02x 0x%02x, step %d, close %d",
+	     name, hold, a6 & 0xff, h & 0xff, l & 0xff, ret, close_ret);
+	act_snapshot(ap_cl, name);
+	if (ret)
+		return ret;
+	if (close_ret)
+		return close_ret;
+	if (hold > AP_HOLD_LIMIT_US) {
+		note("aperture: pulse over the limit, stopping");
+		return -ETIMEDOUT;
+	}
+	if ((a6 & 0xff) != 0x7b)
+		note("aperture: 0xa6 did not read back as written, or is not readable");
+	return 0;
+}
+
+static int af_position(int pos)
+{
+	int ret = act_write(af_cl, 0x00, (pos & 0x1ff) >> 1);
+
+	return ret ? ret : act_write(af_cl, 0x01, (pos & 1) << 7);
+}
+
+/* Stock's ID check against the DT's vendor_product_id pairs */
+static bool af_known(void)
+{
+	int f3 = i2c_smbus_read_byte_data(af_cl, 0xf3);
+	int r3 = i2c_smbus_read_byte_data(af_cl, 0x03);
+
+	note("focus: id f3=%d 03=%d", f3, r3);
+	return f3 == 0x0e || r3 == 0x09 || r3 == 0x0e;
+}
+
+/* Init at vendor_first_pos, a small move and back, then stock's landing: to 0, 200 ms */
+static int af_move(void)
+{
+	int pos, ret;
+
+	ret = af_position(AF_FIRST);
+	if (ret)
+		return ret;
+	usleep_range(2000, 2100);
+	ret = act_write(af_cl, 0x02, 0x00);
+	if (ret)
+		return ret;
+	msleep(30);
+	act_snapshot(af_cl, "focus 120");
+	for (pos = AF_FIRST + 20; pos <= AF_TEST && !ret; pos += 20) {
+		ret = af_position(pos);
+		msleep(10);
+	}
+	msleep(30);
+	act_snapshot(af_cl, "focus 200");
+	for (pos = AF_TEST - 20; pos >= AF_FIRST && !ret; pos -= 20) {
+		ret = af_position(pos);
+		msleep(10);
+	}
+	msleep(30);
+	act_snapshot(af_cl, "focus 120 again");
+	/* land on every path, whatever failed above */
+	af_position(0);
+	msleep(200);
+	act_snapshot(af_cl, "focus landed");
+	return ret;
+}
+
+static void act_run(bool move)
+{
+	int ret = act_bus_on();
+
+	if (ret) {
+		note("actuator bus: %d", ret);
+		act_bus_off();
+		return;
+	}
+	act_snapshot(ap_cl, "aperture before init");
+	ret = i2c_smbus_read_byte_data(ap_cl, 0x02);
+	if (ret < 0) {
+		note("aperture: no answer at 0x4c: %d", ret);
+	} else {
+		ret = ap_init();
+		note("aperture init: %d", ret);
+		act_snapshot(ap_cl, "aperture after init");
+		if (!ret && move) {
+			static const int seq[] = { AP_F2_4, AP_F1_5, AP_F2_4, AP_F1_5 };
+			int i;
+
+			for (i = 0; i < ARRAY_SIZE(seq) && !ret; i++)
+				ret = ap_move(seq[i], seq[i] == AP_F1_5 ? "F1.5" : "F2.4");
+			/* a stop on the way still ends at stock's closing value, if allowed */
+			if (ret && moves_left > 0)
+				ap_move(AP_F1_5, "F1.5 after stop");
+			note("aperture moves left in this load: %d", moves_left);
+		}
+	}
+	act_snapshot(af_cl, "focus before");
+	if (!af_known()) {
+		note("focus: no known product ID, not moved");
+	} else if (move) {
+		ret = af_move();
+		note("focus moves: %d", ret);
+	}
+	act_bus_off();
+}
+
 static void pmic_dump(void)
 {
 	static const u8 pb03[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
@@ -561,6 +849,7 @@ static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, lo
 	size_t n = min(len, sizeof(cmd) - 1);
 	bool rails = false;
 	const struct camera *c = NULL;
+	bool act = false, act_moves = false;
 	int i, ret;
 
 	if (copy_from_user(cmd, ubuf, n))
@@ -580,7 +869,12 @@ static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, lo
 		pmic_dump();
 		goto done;
 	}
-	for (i = 0; i < ARRAY_SIZE(cameras); i++) {
+	if (!strcmp(cmd, "act-read") || !strcmp(cmd, "act-move")) {
+		act = true;
+		act_moves = !strcmp(cmd, "act-move");
+		c = &cameras[0];
+	}
+	for (i = 0; !c && i < ARRAY_SIZE(cameras); i++) {
 		size_t l = strlen(cameras[i].name);
 
 		if (!strncmp(cmd, cameras[i].name, l)) {
@@ -627,7 +921,9 @@ static ssize_t run_write(struct file *f, const char __user *ubuf, size_t len, lo
 	ret = power_on(c, rails);
 	if (!ret && !rails)
 		read_id(c);
-	else if (!ret)
+	if (!ret && act)
+		act_run(act_moves);
+	if (!ret && rails)
 		note("%s: rails up", c->name);
 	power_off(c);
 	note("%s: off", c->name);
