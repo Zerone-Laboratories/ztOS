@@ -2029,8 +2029,24 @@ static int codec_power_up(void)
 	u16 id, rev, raw = 0;
 	int i, ret;
 
-	if (cap.codec_up)
-		return 0;
+	if (cap.codec_up) {
+		/* The codec's core rail goes down over a SoC sleep, and it comes back
+		 * at its reset defaults while this flag stays set. codec_start()
+		 * writes nearly everything again, FLL1 still locks and SPI still
+		 * reads the ID, but AIF1's pins stay GPIOs (GP6 0xa001): nothing on
+		 * the data line, digital silence from every recording and every call
+		 * after the first sleep (seen 2026-10-30). The pins tell. */
+		u16 fn;
+
+		mutex_lock(&codec_lock);
+		fn = codec_read(CODEC_GPIO5_CTRL_1) & 0x03ff;
+		mutex_unlock(&codec_lock);
+		if (!fn)
+			return 0;
+		pr_info("snd-zrn-abox: the codec was reset (GP5 fn %03x): setting it up again\n", fn);
+		cap.codec_up = false;
+		cap.path_on = false;
+	}
 	ret = codec_get_gpios();
 	if (ret)
 		return ret;
@@ -2274,6 +2290,27 @@ static int call_mic(bool on)
 	return ret;
 }
 
+/* The loudest sample in a DMA's buffer, when that is in the voice firmware's
+ * memory (mapped for a moment: this is read every few seconds). -1 elsewhere. */
+static int vss_buf_peak(u32 start, u32 end)
+{
+	void __iomem *map;
+	int i, n, peak = 0;
+
+	if (start < IOVA_VSS || start >= IOVA_VSS + CP_VSS_SIZE || end <= start)
+		return -1;
+	n = min_t(u32, end - start, SZ_8K) & ~1;
+	if (!n || start + n > IOVA_VSS + CP_VSS_SIZE)
+		return -1;
+	map = ioremap(CP_VSS_PA + ((start - IOVA_VSS) & ~1U), n);
+	if (!map)
+		return -1;
+	for (i = 0; i < n; i += 2)
+		peak = max(peak, abs((int)(s16)readw(map + i)));
+	iounmap(map);
+	return peak;
+}
+
 /* How the path of a call stands, for the bench and for the first seconds of a
  * real call in the journal: the loudest sample lately in each direction (no
  * sound itself), the two DMAs' status, the routes. */
@@ -2281,6 +2318,8 @@ static int call_diag_get(char *buf, const struct kernel_param *kp)
 {
 	s16 *rx = voice_rx, *tx = voice_tx;
 	int i, rx_peak = 0, tx_peak = 0;
+	u16 gp5 = 0, gp6 = 0, inputs = 0;
+	int tx_vss = -1, rx_vss = -1;
 
 	if (!booted || suspending)
 		return sysfs_emit(buf, "off\n");
@@ -2288,12 +2327,31 @@ static int call_diag_get(char *buf, const struct kernel_param *kp)
 		rx_peak = max(rx_peak, abs((int)rx[i]));
 		tx_peak = max(tx_peak, abs((int)tx[i]));
 	}
-	return sysfs_emit(buf, "route=%d mic=%d vss=%d rx_peak=%d tx_peak=%d rdma4=%08x wdma2=%08x route1=%08x spum0=%08x uaif0=%08x uaif1=%08x\n",
+	if (cap.codec_up && codec_rst) {
+		mutex_lock(&codec_lock);
+		gp5 = codec_read(CODEC_GPIO5_CTRL_1);
+		gp6 = codec_read(CODEC_GPIO5_CTRL_1 + 2);
+		inputs = codec_read(CODEC_INPUT_ENABLES);
+		mutex_unlock(&codec_lock);
+	}
+	/* tx_buf: where WDMA2 really writes, 0x922... being voice_tx above; the
+	 * peaks stayed 0 through a call whose voice was heard, so the voice
+	 * firmware has its own buffers. tx_vss, rx_vss: the peaks in those */
+	if (call_route) {
+		u32 w = ABOX_WDMA0 + 0x100 * VOICE_WDMA, r = ABOX_RDMA0 + 0x100 * VOICE_RDMA;
+
+		tx_vss = vss_buf_peak(readl(sfr + w + 0x08), readl(sfr + w + 0x0c));
+		rx_vss = vss_buf_peak(readl(sfr + r + 0x08), readl(sfr + r + 0x0c));
+	}
+	return sysfs_emit(buf, "route=%d mic=%d vss=%d rx_peak=%d tx_peak=%d rdma4=%08x wdma2=%08x route1=%08x spum0=%08x uaif0=%08x uaif1=%08x tx_buf=%08x tx_off=%08x tx_vss=%d rx_vss=%d gp5=%04x gp6=%04x inputs=%04x\n",
 		call_route, call_mic_on, vss_started, rx_peak, tx_peak,
 		readl(sfr + ABOX_RDMA0 + 0x100 * VOICE_RDMA + RDMA_STATUS),
 		readl(sfr + ABOX_WDMA0 + 0x100 * VOICE_WDMA + WDMA_STATUS),
 		readl(sfr + ABOX_ROUTE_CTRL1), readl(sfr + ABOX_SPUM_CTRL0),
-		readl(sfr + ABOX_UAIF0_CTRL0), readl(sfr + ABOX_UAIF1_CTRL0));
+		readl(sfr + ABOX_UAIF0_CTRL0), readl(sfr + ABOX_UAIF1_CTRL0),
+		readl(sfr + ABOX_WDMA0 + 0x100 * VOICE_WDMA + 0x08),
+		readl(sfr + ABOX_WDMA0 + 0x100 * VOICE_WDMA + 0x10),
+		tx_vss, rx_vss, gp5, gp6, inputs);
 }
 static const struct kernel_param_ops call_diag_ops = { .get = call_diag_get };
 module_param_cb(call_diag, &call_diag_ops, NULL, 0444);

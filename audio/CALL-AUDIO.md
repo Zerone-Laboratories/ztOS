@@ -8,6 +8,12 @@ sets the echo reference (RSRC0 <- SIFS0, RECP PIFS0), takes DSM off for the call
 VSS parameters (0xf9000000, 2 MiB; empty memory before). The modem daemon sends audio path, clock
 and volume, from dialling on. Bench without a call: `audio/test-call-path.sh`. During a call the
 daemon logs `call path:` lines from the driver's `call_diag`: rx_peak and tx_peak should move.
+2026-10-30, first real calls: the earpiece worked, the microphone did not. Every recording on the
+phone was digital silence after the first SoC sleep: the codec comes back at reset defaults, its AIF1
+pins GPIOs again, while the driver still called it set up. codec_power_up() now checks the pins.
+rx_peak and tx_peak read our own buffers, which the voice firmware does not use (0 through a call
+that was heard); tx_vss and rx_vss read the buffers WDMA2 and RDMA4 really point at, -1 when those
+are outside the firmware's memory, and gp5/gp6 low bits nonzero mean the codec's pins are wrong.
 The text below is the original research.
 
 ## How the stock phone does it
