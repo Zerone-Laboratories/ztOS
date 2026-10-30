@@ -37,6 +37,7 @@
 #include "zrnvibe.h"
 
 #include "zrnmetrocore.h"
+#include "zrnboard.h"
 #include "comm.h"
 #include "contact-photo.h"
 
@@ -68,6 +69,8 @@ enum action {
 	ACT_PIVOT_PLUS,	/* the plus on speed dial: pick a number from the history */
 	ACT_MUTE, ACT_SPEAKER, ACT_CALL_KEYS, ACT_REPLY,
 	ACT_CANCEL,	/* the keypad's cancel: back to the history */
+	ACT_LETTERS,	/* a letter's square on the contacts tab */
+	ACT_LETTER,	/* arg: a cell of the letters (zb_letter) */
 };
 
 #define MAX_SPEED	30	/* what the phone allows in speed dial */
@@ -511,10 +514,28 @@ static void contacts_row_draw(cairo_t *cr, int row) {
 
 static bool contacts_row_hit(int row, double x, double y, struct zmc_hit *hit) {
 	if (contact_rows[row] < 0) {
-		return false;
+		if (x < MARGIN || x >= MARGIN + 42 || y < 8 || y >= 50) {
+			return false;
+		}
+		*hit = (struct zmc_hit){ .x = MARGIN, .y = 8, .w = 42, .h = 42, .action = ACT_LETTERS };
+		return true;
 	}
 	*hit = (struct zmc_hit){ .x = 0, .y = 4, .w = zmc.width, .h = 58, .action = ACT_PERSON, .arg = contact_rows[row] };
 	return true;
+}
+
+/* the letter's row in the list, or -1. '#' is itself; the rest are upper case */
+static int contact_letter_row(int cell) {
+	char c = zb_letter(cell);
+	int want = -1 - (c == '#' ? '#' : toupper((unsigned char)c));
+	for (int i = 0; i < n_contact_rows; i++) {
+		if (contact_rows[i] == want) return i;
+	}
+	return -1;
+}
+
+static bool contact_letter_has(int cell) {
+	return contact_letter_row(cell) >= 0;
 }
 
 static bool contacts_row_head(int row) {
@@ -978,6 +999,15 @@ static void activate(int action, int arg) {
 			zmc_redraw();
 		}
 		break;
+	case ACT_LETTERS:
+		zmc_letter_board(contact_letter_has, ACT_LETTER);
+		break;
+	case ACT_LETTER: {
+		/* the list moves at once, under the rows going */
+		zmc_list_show(P_CONTACTS, contact_letter_row(arg));
+		zmc_board_close();
+		break;
+	}
 	case ACT_PERSON:
 		if (arg >= 0 && arg < n_contacts) {
 			snprintf(entry, sizeof(entry), "%s", contacts[arg].mobile[0] ? contacts[arg].mobile : contacts[arg].other);
