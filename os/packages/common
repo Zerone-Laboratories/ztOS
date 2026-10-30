@@ -62,7 +62,8 @@ mpv
 cava
 nodejs
 npm
-firefox
+# no desktop browser: Chromium only as the engine WhatsApp drives headless
+# (os/apps/whatsapp), its launcher hidden (os/overlay/usr/local/share/applications)
 chromium
 gnome-terminal
 

@@ -4,6 +4,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "zrnmetrogpu.h"
 #include "zrnmetrorender.h"
+#include <stdbool.h>
+bool zmc_perflog(void);	/* zrnmetrocore.c */
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
@@ -197,7 +199,7 @@ bool zmg_end(void) {
 
 void zmg_report(const char *app_id) {
 	if (!gpu.ready || !gpu.frames) return;
-	fprintf(stderr, "%s: GLES %u frames, CPU submit %.2f ms/frame (worst %.2f), swap %.2f ms/frame, %u texture uploads (%.1f MB)\n",
+	if (zmc_perflog()) fprintf(stderr, "%s: GLES %u frames, CPU submit %.2f ms/frame (worst %.2f), swap %.2f ms/frame, %u texture uploads (%.1f MB)\n",
 		app_id, gpu.frames, gpu.submit / gpu.frames, gpu.worst, gpu.swap / gpu.frames,
 		gpu.uploads, gpu.bytes / 1048576.0);
 	gpu.frames = gpu.uploads = 0;
@@ -279,6 +281,8 @@ static struct picture *picture(cairo_surface_t *source, unsigned revision) {
 			if (glGetError() != GL_NO_ERROR) { gpu.failed = true; forget(p); return NULL; }
 		}
 	}
+	struct timespec up0, up1;
+	clock_gettime(CLOCK_MONOTONIC, &up0);
 	cairo_surface_flush(source);
 	const unsigned char *data = cairo_image_surface_get_data(source);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -292,6 +296,11 @@ static struct picture *picture(cairo_surface_t *source, unsigned revision) {
 	}
 	p->revision = revision;
 	p->used = ++gpu.clock;
+	clock_gettime(CLOCK_MONOTONIC, &up1);
+	double up_ms = (up1.tv_sec - up0.tv_sec) * 1e3 + (up1.tv_nsec - up0.tv_nsec) / 1e6;
+	if (up_ms >= 8) {
+		if (zmc_perflog()) fprintf(stderr, "ZrnMetroCore: %dx%d page uploaded in %.0f ms (revision %u)\n", w, h, up_ms, revision);
+	}
 	gpu.uploads++;
 	gpu.bytes += (size_t)w * h * 4;
 	return p;

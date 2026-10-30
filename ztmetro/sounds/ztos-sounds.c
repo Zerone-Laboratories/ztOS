@@ -186,6 +186,10 @@ static void input_info(pa_context *c,const pa_sink_input_info *info,int eol,void
  const char *role=pa_proplist_gets(info->proplist,PA_PROP_MEDIA_ROLE);
  const char *app=pa_proplist_gets(info->proplist,PA_PROP_APPLICATION_ID);
  if(app && !strcmp(app,"os.ztos.sounds"))return;
+ // ztOS's own routing (ztos-speaker.out, a loopback with no role) uncorks
+ // whenever anything plays, the volume pip too: it is not media playing.
+ const char *node=pa_proplist_gets(info->proplist,"node.name");
+ if(node && !strncmp(node,"ztos-",5))return;
  if(!info->corked && (!role || (strcmp(role,"event") && strcmp(role,"phone"))))playing++;
 }
 static void scan(void) {

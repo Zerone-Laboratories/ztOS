@@ -1,7 +1,5 @@
 # ztMETRO Start: size | colour | label | icon | command
 medium | accent | Settings | gear | ztsettings
-medium | accent | Firefox | @firefox | /usr/bin/firefox
-medium | accent | Chromium | @chromium | /usr/bin/chromium
 medium | accent | Terminal | terminal | gnome-terminal
 wide | steel | ZrnDevTest | code | zrndevtest
 medium | accent | Welcome | @os.ztos.welcome | /usr/local/lib/ztos/apps/os.ztos.welcome

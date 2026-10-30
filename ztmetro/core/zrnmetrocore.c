@@ -4,6 +4,7 @@
  * (Wayland EGL/GLES, cached Cairo/Pango pages, touch; no toolkit).
  */
 #define _GNU_SOURCE
+#include <pthread.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
@@ -131,6 +132,8 @@ static void draw_slider_live(double s);
 static void zmc_activate(struct zmc_hit *hit);
 static void pivot_forget(void);
 static void collect_rows(struct zmc_rowset *set, double scroll, double tapped, bool reverse);
+static double press_geometry(double w, double h, double *rx, double *ry);
+static int out_tapped = -1;	/* the row of out_rows that was tapped, or -1 */
 static void begin_animation(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start);
 
 /* The shell plays it, if the user has that kind of touch switched on: one
@@ -323,6 +326,15 @@ void zmc_text_line(cairo_t *cr, const char *s, const char *font, double size, do
 	g_object_unref(layout);
 }
 
+bool zmc_perflog(void) {
+	static int on = -1;
+	if (on < 0) {
+		const char *v = getenv("ZTMETRO_PERFLOG");
+		on = v && *v && *v != '0';
+	}
+	return on;
+}
+
 void zmc_add_hit(double x, double y, double w, double h, int action, int arg) {
 	if (zmc.n_hits < MAX_HITS) {
 		zmc.hits[zmc.n_hits++] = (struct zmc_hit){ x, y, w, h, action, arg, false };
@@ -488,9 +500,22 @@ static struct zmc_buffer *buffer_get(int width, int height) {
 	return buffer;
 }
 
+/* the app's step for each frame (zmc_on_frame), or none */
+static void (*frame_hook)(void);
+
+void zmc_on_frame(void (*step)(void)) {
+	frame_hook = step;
+	if (step) present();
+}
+
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time) {
 	wl_callback_destroy(callback);
 	zmc.frame = NULL;
+	if (getenv("ZTB_TIMELINE")) {
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		fprintf(stderr, "T done %.1f\n", ts.tv_sec * 1e3 + ts.tv_nsec / 1e6);
+	}
 	if (zmc.entrance && zmc.anim_active && (int32_t)(zmc.anim_start - now_ms()) > 0) {
 		return;	/* the first black frame is enough until Start has left */
 	}
@@ -498,13 +523,16 @@ static void frame_done(void *data, struct wl_callback *callback, uint32_t time) 
 	if (coasting) {
 		fling_step();
 	}
+	if (frame_hook) {
+		frame_hook();	/* may end itself (zmc_on_frame(NULL)) */
+	}
 	double p = press_amount();
 	bool tilting = p != zmc.press_to;
 	if (zmc.picker_until && (int32_t)(zmc.picker_until - now_ms()) > 0 && !zmc.anim_active) {
 		zmc.cache_stale = true;	/* a list picker is opening or closing: draw the page again */
 		zmc.dirty = true;
 	}
-	if (zmc.dirty || zmc.anim_active || zmc.anim_from_surface || coasting || zmc.busy || tilting ||
+	if (zmc.dirty || frame_hook || zmc.anim_active || zmc.anim_from_surface || coasting || zmc.busy || tilting ||
 			zmc.slide_active || zmc.spring) {
 		present();
 	}
@@ -652,6 +680,29 @@ static uint32_t rows_duration(const struct rowset *set, uint32_t row_ms) {
 	return set->n ? last * ROW_STAGGER_MS + row_ms : 0;
 }
 
+/* The tapped row while it waits its turn to leave (it goes last): drawn as
+ * it is pressed, so its release goes on, on its Log(10) curve, as a Start
+ * tile's does while the others turn; it was drawn flat, the press cut off */
+static void pressed_strip(cairo_t *cr, cairo_surface_t *source, double y0, double y1, double k) {
+	double w = zmc.width, cx = w / 2, cy = (y0 + y1) / 2;
+	double ax = cx - cx * k, bx = cx + (w - cx) * k, ay = cy - (cy - y0) * k, by = cy + (y1 - cy) * k;
+	if (!cr) {
+		struct zmg_vertex q[4] = { {ax, ay, 0}, {bx, ay, 0}, {ax, by, 0}, {bx, by, 0} };
+		zmg_surface(source, source == zmc.cache ? cache_gen : 0,
+			0, y0 * ANIM_SCALE, w * ANIM_SCALE, y1 * ANIM_SCALE, q, 1);
+		return;
+	}
+	cairo_save(cr);
+	cairo_rectangle(cr, ax * ANIM_SCALE, ay * ANIM_SCALE, (bx - ax) * ANIM_SCALE, (by - ay) * ANIM_SCALE);
+	cairo_clip(cr);
+	cairo_translate(cr, cx * ANIM_SCALE, cy * ANIM_SCALE);
+	cairo_scale(cr, k, k);
+	cairo_translate(cr, -cx * ANIM_SCALE, -cy * ANIM_SCALE);
+	cairo_set_source_surface(cr, source, 0, 0);
+	cairo_paint(cr);
+	cairo_restore(cr);
+}
+
 /* One frame of a page change, at `ms` since it began: the old page's rows
  * going, a moment of black, the new page's rows coming. */
 static void draw_turnstile(cairo_t *cr, uint32_t ms) {
@@ -660,6 +711,13 @@ static void draw_turnstile(cairo_t *cr, uint32_t ms) {
 	if (zmc.anim_from_surface && ms < out_ms) {
 		for (int i = 0; i < zmc.out_rows.n; i++) {
 			double t = clamp01(((double)ms - zmc.out_rows.rows[i].order * ROW_STAGGER_MS) / ROW_OUT_MS);
+			double p = i == out_tapped && t <= 0 ? press_amount() : 0;
+			if (p > 0.001) {
+				double rx, ry, sink = press_geometry(zmc.pressed.w, zmc.pressed.h, &rx, &ry);
+				pressed_strip(cr, zmc.anim_from_surface, zmc.out_rows.rows[i].y0,
+					zmc.out_rows.rows[i].y1, 1.0 - sink * p);
+				continue;
+			}
 			double e = t * t;	/* gathering speed as it goes */
 			/* solid while it turns, gone only at the end (as on the Lumia) */
 			double alpha = e < 0.7 ? 1 : (1 - e) / 0.3;
@@ -738,6 +796,7 @@ static void cache_ensure(int scale) {
 		return;
 	}
 	int h = zmc.cache ? cairo_image_surface_get_height(zmc.cache) : zmc.height * scale;
+	uint32_t began = now_ms();
 	for (int pass = 0; pass < 2; pass++) {
 		if (!zmc.cache || cairo_image_surface_get_height(zmc.cache) != h ||
 				cairo_image_surface_get_width(zmc.cache) != zmc.width * scale) {
@@ -768,6 +827,12 @@ static void cache_ensure(int scale) {
 	}
 	zmc.cache_stale = false;
 	cache_gen++;
+	/* into the session log: a page drawn again that cost a frame or more */
+	uint32_t took = now_ms() - began;
+	if (took >= 16) {
+		if (zmc_perflog()) fprintf(stderr, "%s: page %d drawn in %u ms (%dx%d px)\n", zmc.app->app_id, zmc.page, took,
+			cairo_image_surface_get_width(zmc.cache), cairo_image_surface_get_height(zmc.cache));
+	}
 }
 
 static void back_forget(void);
@@ -803,20 +868,44 @@ void zmc_redraw(void) {
 #define PRESS_IN_MS	ZMC_TILT_IN_MS
 #define PRESS_OUT_MS	ZMC_TILT_OUT_MS
 
+/* As the shell's tiles (Windows Phone's tilt): in, linearly; out on WP's
+ * Log(10) curve, fast and then slower and slower, and only once the dip has
+ * gone all the way, so that a quick tap still shows a whole press. */
+static double press_in_from;
+static uint32_t press_in_start;
+
 static double press_amount(void) {
-	uint32_t ms = PRESS_IN_MS;
-	if (zmc.press_to < zmc.press_from) {
-		ms = PRESS_OUT_MS;
+	uint32_t now = now_ms();
+	if (zmc.press_to < zmc.press_from && (int32_t)(now - zmc.press_start) < 0) {
+		/* lifted, but the dip is still on its way down */
+		double t = clamp01((double)(now - press_in_start) / PRESS_IN_MS);
+		return press_in_from + (1.0 - press_in_from) * t;
 	}
-	double t = clamp01((double)(now_ms() - zmc.press_start) / ms);
-	t = 1 - (1 - t) * (1 - t);	/* quick, then easing */
+	if (zmc.press_to >= zmc.press_from) {
+		double t = clamp01((double)(now - zmc.press_start) / PRESS_IN_MS);
+		return zmc.press_from + (zmc.press_to - zmc.press_from) * t;
+	}
+	double t = clamp01((double)(now - zmc.press_start) / PRESS_OUT_MS);
+	t = (1.0 - pow(0.1, t)) / 0.9;	/* Log(10) = (b^t - 1)/(b - 1), b = 1/10 */
 	return zmc.press_from + (zmc.press_to - zmc.press_from) * t;
 }
 
 static void press_set(double to) {
-	zmc.press_from = press_amount();
+	uint32_t now = now_ms();
+	if (to > 0) {
+		press_in_from = press_amount();
+		press_in_start = now;
+		zmc.press_from = press_in_from;
+		zmc.press_start = now;
+	} else if (zmc.press_to > 0 && (int32_t)(now - (zmc.press_start + PRESS_IN_MS)) < 0) {
+		/* back up from the bottom, once there */
+		zmc.press_from = 1.0;
+		zmc.press_start = zmc.press_start + PRESS_IN_MS;
+	} else {
+		zmc.press_from = press_amount();
+		zmc.press_start = now;
+	}
 	zmc.press_to = to;
-	zmc.press_start = now_ms();
 	present();
 }
 
@@ -840,6 +929,30 @@ static bool hit_at(double x, double y, struct zmc_hit *out) {
  * fall when seen from in front of the thing's middle at the shell's depth. */
 #define PRESS_NX	12
 #define PRESS_NY	4
+/* Windows Phone's magnetic tilt, as the shell's Start tiles have it: the lean
+ * grows with how far off the middle the finger is, (|nx| + |ny|) of a quarter
+ * of a radian, toward the finger; lean and sink both fade out PRESS_RANGE
+ * points from the middle; a press at the middle sinks to 88% of its size.
+ * w and h in points; rx, ry in radians; returns how much smaller it gets. */
+#define PRESS_RANGE	188.0	/* WP's 250 px threshold, at 480 px across */
+#define PRESS_SINK	0.12	/* shrinks to 88%, as the shell's tiles (a scale, not depth: the
+				 * GPU's projection made a depth sink of the same size all but invisible) */
+static double press_geometry(double w, double h, double *rx, double *ry) {
+	double nx = zmc.press_fx - 0.5, ny = zmc.press_fy - 0.5;
+	double dist = hypot(nx * w, ny * h), len = hypot(nx, ny);
+	double fall = dist < PRESS_RANGE ? 1.0 - dist / PRESS_RANGE : 0.0;
+	/* a row as wide as the screen is pressed far from its middle in points
+	 * but not for its size: fading only by points left it a 5% sink and a
+	 * 2-degree lean (recorded beside a tile); fade by its own size too, and
+	 * take whichever leaves more */
+	double fall_own = 1.0 - len / M_SQRT1_2;
+	if (fall_own > fall) fall = fall_own;
+	double ang = 0.25 * (fabs(nx) + fabs(ny)) * fall;
+	*ry = len > 1e-6 ? ang * nx / len : 0;
+	*rx = len > 1e-6 ? ang * ny / len : 0;
+	return PRESS_SINK * fall;
+}
+
 static void draw_press(cairo_t *cr, int scale) {
 	double p = press_amount();
 	if (p <= 0.001) {
@@ -849,16 +962,15 @@ static void draw_press(cairo_t *cr, int scale) {
 		struct zmc_hit *hit = &zmc.pressed;
 		double w = hit->w, h = hit->h, x = hit->x, y = hit->y - zmc.scroll;
 		if (w <= 0 || h <= 0) return;
-		double eye = (zmc.height / 2.0) / tan(DEPTH_FOV_DEG * M_PI / 360.0);
-		double max = ZMC_TILT_DEG * M_PI / 180.0;
-		double ry = (zmc.press_fx - 0.5) * 2 * fmin(max, asin(fmin(1.0, ZMC_TILT_LIFT / (w/2)))) * p;
-		double rx = (zmc.press_fy - 0.5) * 2 * fmin(max, asin(fmin(1.0, ZMC_TILT_LIFT / (h/2)))) * p;
+		double rx, ry, sink = press_geometry(w, h, &rx, &ry);
+		rx *= p; ry *= p;
+		double k = 1.0 - sink * p;
 		struct zmg_vertex q[4];
 		for (int i = 0; i < 4; i++) {
-			double X = ((i & 1) ? 0.5 : -0.5) * w;
-			double Y = ((i & 2) ? 0.5 : -0.5) * h;
+			double X = ((i & 1) ? 0.5 : -0.5) * w * k;
+			double Y = ((i & 2) ? 0.5 : -0.5) * h * k;
 			q[i] = (struct zmg_vertex){ x+w/2+X*cos(ry), y+h/2+Y*cos(rx),
-				-ZMC_PRESS_SINK*eye*p-X*sin(ry)-Y*sin(rx) };
+				-X*sin(ry)-Y*sin(rx) };
 		}
 		zmg_clip(0, HEADER_H, zmc.width, zmc.height - HEADER_H);
 		zmg_rect(x, y, w, h, 0, 0, 0);
@@ -872,19 +984,17 @@ static void draw_press(cairo_t *cr, int scale) {
 	double x = h->x * scale, y = (h->y - off) * scale, w = h->w * scale, hh = h->h * scale;
 	double top = HEADER_H * scale;
 	double eye = (zmc.height * scale / 2.0) / tan(DEPTH_FOV_DEG * M_PI / 360.0);
-	/* The lean: up to ZMC_TILT_DEG, but no more than lifts the far end
-	 * ZMC_TILT_LIFT points (a row as wide as the screen leans a few degrees,
-	 * a small button the full amount). Positive about the vertical carries
-	 * the right-hand side away, about the horizontal the bottom. */
-	double max = ZMC_TILT_DEG * M_PI / 180.0, lift = ZMC_TILT_LIFT * scale;
-	double ay = fmin(max, asin(fmin(1.0, lift / (w / 2)))), ax = fmin(max, asin(fmin(1.0, lift / (hh / 2))));
-	double ry = (zmc.press_fx - 0.5) * 2 * ay * p, rx = (zmc.press_fy - 0.5) * 2 * ax * p;
-	double z0 = -ZMC_PRESS_SINK * eye * p;
+	/* The lean and sink: press_geometry (WP's magnetic tilt). Positive
+	 * about the vertical carries the right-hand side away, about the
+	 * horizontal the bottom. */
+	double rx, ry, sink = press_geometry(h->w, h->h, &rx, &ry);
+	rx *= p; ry *= p;
+	double k = 1.0 - sink * p, z0 = 0;
 	double cx = x + w / 2, cy = y + hh / 2;
 	double gx[PRESS_NX + 1][PRESS_NY + 1], gy[PRESS_NX + 1][PRESS_NY + 1];
 	for (int i = 0; i <= PRESS_NX; i++) {
 		for (int j = 0; j <= PRESS_NY; j++) {
-			double X = ((double)i / PRESS_NX - 0.5) * w, Y = ((double)j / PRESS_NY - 0.5) * hh;
+			double X = ((double)i / PRESS_NX - 0.5) * w * k, Y = ((double)j / PRESS_NY - 0.5) * hh * k;
 			double Z = z0 - X * sin(ry) - Y * sin(rx);
 			double s = eye / (eye - Z);
 			gx[i][j] = cx + X * cos(ry) * s;
@@ -1305,6 +1415,8 @@ static void present_gpu(uint32_t ms) {
 		zmc_trace(frames == 1 ? "first frame" : "frame");
 	}
 	zmc.dirty = false;
+	struct timespec t0, t1, t2;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 	zmg_begin(zmc.width, zmc.height, zmc.scale);
 	if (zmc.anim_active) {
 		zmc.anim_frames++;
@@ -1349,12 +1461,93 @@ static void present_gpu(uint32_t ms) {
 	}
 	zmc.frame = wl_surface_frame(zmc.surface);
 	wl_callback_add_listener(zmc.frame, &frame_listener, NULL);
-	if (!zmg_end()) {
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	bool ended = zmg_end();
+	clock_gettime(CLOCK_MONOTONIC, &t2);
+	if (zmc_perflog()) {
+		/* where a frame's time goes: building it, and the swap */
+		fprintf(stderr, "%s: frame %.1f ms, swap %.1f ms\n", zmc.app->app_id,
+			(t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
+			(t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6);
+	}
+	if (!ended) {
 		wl_callback_destroy(zmc.frame);
 		zmc.frame = NULL;
 		zmc.dirty = true;
 		gpu_retry_at = now_ms() + 100;
 	}
+}
+
+/* The page a page change is going to, drawn on a thread while the old one's
+ * rows turn away, so that the turn does not stop for it at the end (Settings'
+ * pages took 120-260 ms, the stutter going into Wi-Fi). While it runs, the
+ * main thread only composes the turn: no app timers or sources are run and
+ * the page's hits are the thread's (touches are blocked during a turn). */
+static struct {
+	pthread_t thread;
+	bool busy;
+	int page, previous, scale;
+	cairo_surface_t *surface;
+	double content_h;
+	uint32_t took;
+} bg;
+
+static void *bg_draw(void *unused) {
+	(void)unused;
+	uint32_t began = now_ms();
+	int scale = bg.scale, h = zmc.height * scale;
+	cairo_surface_t *surface = NULL;
+	for (int pass = 0; pass < 2; pass++) {
+		if (surface) cairo_surface_destroy(surface);
+		surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24, zmc.width * scale, h);
+		cairo_t *cr = cairo_create(surface);
+		cairo_set_source_rgb(cr, 0, 0, 0);
+		cairo_paint(cr);
+		cairo_scale(cr, scale, scale);
+		zmc.n_hits = 0;
+		zmc.pivot_set = false;
+		bg.content_h = zmc.app->render(cr, bg.page);
+		cairo_destroy(cr);
+		int need = (int)ceil((bg.content_h > zmc.height ? bg.content_h : zmc.height) * scale);
+		if (need <= h) break;
+		h = need;
+	}
+	bg.surface = surface;
+	bg.took = now_ms() - began;
+	return NULL;
+}
+
+static void bg_start(int target) {
+	if (bg.busy || list_surface) return;
+	bg.page = target;
+	bg.previous = zmc.page;
+	bg.scale = zmc.scale;
+	bg.surface = NULL;
+	zmc.page = target;	/* as gpu_prepare_destination had it while drawing */
+	if (pthread_create(&bg.thread, NULL, bg_draw, NULL) == 0) {
+		bg.busy = true;
+	} else {
+		zmc.page = bg.previous;
+	}
+}
+
+/* the page drawn behind the turn, made the cache; false if there was none */
+static bool bg_finish(void) {
+	if (!bg.busy) return false;
+	uint32_t waited = now_ms();
+	pthread_join(bg.thread, NULL);
+	bg.busy = false;
+	waited = now_ms() - waited;
+	if (zmc_perflog()) fprintf(stderr, "%s: page %d drawn behind the turn in %u ms (%u ms waited for)\n",
+		zmc.app->app_id, bg.page, bg.took, waited);
+	if (zmc.anim_from_surface != zmc.cache && zmc.cache) {
+		cairo_surface_destroy(zmc.cache);
+	}
+	zmc.cache = bg.surface;
+	zmc.content_h = bg.content_h;
+	zmc.cache_stale = false;
+	cache_gen++;
+	return true;
 }
 
 static void gpu_prepare_destination(int target) {
@@ -1366,15 +1559,21 @@ static void gpu_prepare_destination(int target) {
 		return;
 	}
 	int previous = zmc.page;
-	/* An unscrolled outgoing page can keep its texture without a snapshot
-	 * copy. Give the destination a separate image before drawing into it. */
-	if (zmc.anim_from_surface == zmc.cache) {
-		cairo_surface_destroy(zmc.cache);
-		zmc.cache = NULL;
+	if (bg.busy && bg.page == target) {
+		previous = bg.previous;
+		bg_finish();
+		zmc.page = target;
+	} else {
+		/* An unscrolled outgoing page can keep its texture without a snapshot
+		 * copy. Give the destination a separate image before drawing into it. */
+		if (zmc.anim_from_surface == zmc.cache) {
+			cairo_surface_destroy(zmc.cache);
+			zmc.cache = NULL;
+		}
+		zmc.page = target;
+		zmc.cache_stale = true;
+		cache_ensure(zmc.scale);
 	}
-	zmc.page = target;
-	zmc.cache_stale = true;
-	cache_ensure(zmc.scale);
 	zmc.anim_to_surface = cairo_surface_reference(zmc.cache);
 	collect_rows(&zmc.in_rows, 0, -1, zmc.anim_back);
 	zmc.page = previous;
@@ -1398,7 +1597,7 @@ static void present(void) {
 	bool moving = zmc.anim_active || zmc.fling || zmc.slide_active || zmc.swiping ||
 		(zmc.touching && zmc.moved) || zmc.press_to != press_amount();
 	if (moving && last_frame && began - last_frame > 25 && began - last_frame < 1000) {
-		fprintf(stderr, "%s: slow frame, %u ms since the last (%s%s%s%s%s), cache %s\n", zmc.app->app_id,
+		if (zmc_perflog()) fprintf(stderr, "%s: slow frame, %u ms since the last (%s%s%s%s%s), cache %s\n", zmc.app->app_id,
 			began - last_frame, zmc.anim_active ? "page turn " : "", zmc.fling ? "coasting " : "",
 			zmc.slide_active || zmc.swiping ? "tabs " : "", zmc.touching ? "finger " : "",
 			zmc.press_to != press_amount() ? "press" : "", zmc.cache_stale ? "stale" : "ready");
@@ -1429,7 +1628,7 @@ static void present(void) {
 		if (!zmc.anim_cache_ready) zmc.cache_stale = true;
 		zmc.anim_cache_ready = false;
 		/* into the session log: how the page change went */
-		fprintf(stderr, "%s: page change, %d frames in %u ms (%.1f ms each)\n",
+		if (zmc_perflog()) fprintf(stderr, "%s: page change, %d frames in %u ms (%.1f ms each)\n",
 			zmc.app->app_id, zmc.anim_frames, ms, zmc.anim_frames > 1 ? (double)ms / zmc.anim_frames : 0.0);
 		if (zmc.anim_from_surface) {
 			cairo_surface_destroy(zmc.anim_from_surface);
@@ -1546,6 +1745,9 @@ static void present(void) {
  * tap in content coordinates, or negative; that row is made to go last. */
 static void collect_rows(struct rowset *set, double scroll, double tapped, bool reverse) {
 	double edges[MAX_ROWS];
+	if (set == &zmc.out_rows) {
+		out_tapped = -1;
+	}
 	int n = 0;
 	for (int i = 0; i < zmc.n_hits && n < MAX_ROWS - 2; i++) {
 		struct zmc_hit *h = &zmc.hits[i];
@@ -1587,6 +1789,9 @@ static void collect_rows(struct rowset *set, double scroll, double tapped, bool 
 		}
 		set->rows[tapped_row].order = set->n - 1;
 	}
+	if (set == &zmc.out_rows) {
+		out_tapped = tapped_row;	/* still pressed when the page sets off */
+	}
 	if (reverse) {
 		/* going back, the page turns from the bottom up */
 		for (int i = 0; i < set->n; i++) {
@@ -1597,7 +1802,18 @@ static void collect_rows(struct rowset *set, double scroll, double tapped, bool 
 
 /* Start a page change. Either page may be missing: none to leave when the app
  * starts, none to arrive when it closes. */
+static void begin_animation_(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start);
 static void begin_animation(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start) {
+	uint32_t t0 = now_ms();
+	begin_animation_(have_from, have_to, target, tapped, requested_start);
+	uint32_t took = now_ms() - t0;
+	if (took >= 16) {
+		if (zmc_perflog()) fprintf(stderr, "%s: page change set up in %u ms (scroll %.0f, %s)\n", zmc.app->app_id, took,
+			zmc.scroll, zmc.quit_after_anim ? "closing" : "turning");
+	}
+}
+
+static void begin_animation_(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start) {
 	zmc.anim_from = zmc.page;
 	zmc.anim_to = target;
 	zmc.anim_from_surface = zmc.anim_to_surface = NULL;
@@ -1634,6 +1850,7 @@ static void begin_animation(bool have_from, bool have_to, int target, double tap
 		} else if (zmg_ready() && have_from) {
 			zmc.anim_target_pending = true;
 			zmc.in_rows.n = 0;
+			bg_start(target);
 		} else if (zmg_ready()) {
 			gpu_prepare_destination(target);
 		} else {
@@ -2340,7 +2557,12 @@ void zmc_quit(void) {
 		zmc.running = false;
 		return;
 	}
-	/* closing: the page's rows leave first */
+	/* closing: the page's rows leave first, as they were last drawn. Drawn
+	 * again first (something had asked for a redraw), Settings' first page
+	 * held the exit back 350 ms on the J5 before its first frame */
+	if (zmc.cache && cairo_image_surface_get_width(zmc.cache) == zmc.width * zmc.scale) {
+		zmc.cache_stale = false;
+	}
 	zmc.quit_after_anim = true;
 	begin_animation(true, false, zmc.page, -1, 0);
 }
@@ -2931,6 +3153,14 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 	zmc.app = app;
 	zmc.page = first_page;
 	zmc.accent = zmc_config_accent();
+	/* Pixels per point: the shell's scale, rounded up, as it asks of every
+	 * surface. 4 was the S9 (1440 px) for every phone: the J5 (720 px, 1.67)
+	 * drew Settings 1728 px wide, 5.8 times the pixels its panel shows */
+	const char *shell_scale = getenv("ZTMETRO_SCALE");
+	if (shell_scale && strtod(shell_scale, NULL) >= 1.0) {
+		double s = ceil(strtod(shell_scale, NULL) - 0.01);
+		zmc.scale = s > 4 ? 4 : (int)s;
+	}
 	zmc.display = wl_display_connect(NULL);
 	if (!zmc.display) {
 		fprintf(stderr, "%s: failed to connect to Wayland display\n", app->app_id);
@@ -2982,11 +3212,11 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 		int map[MAX_SOURCES + 2], n = 0;
 		fds[n] = (struct pollfd){ wl_display_get_fd(zmc.display), POLLIN, 0 };
 		map[n++] = -1;
-		if (timer_fd >= 0 && timer_tick) {
+		if (timer_fd >= 0 && timer_tick && !bg.busy) {
 			fds[n] = (struct pollfd){ timer_fd, POLLIN, 0 };
 			map[n++] = -2;
 		}
-		for (int i = 0; i < MAX_SOURCES; i++) {
+		for (int i = 0; i < MAX_SOURCES && !bg.busy; i++) {
 			if (sources[i].ready) {
 				fds[n] = (struct pollfd){ sources[i].fd, POLLIN, 0 };
 				map[n++] = i;
@@ -3040,12 +3270,12 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 			wl_display_cancel_read(zmc.display);
 			continue;	/* the hold's time is up: round again */
 		}
-		if (ready == 0 && pivot_wants_prepare()) {
+		if (ready == 0 && !bg.busy && pivot_wants_prepare()) {
 			wl_display_cancel_read(zmc.display);
 			pivot_prepare();
 			continue;
 		}
-		if (ready == 0 && back_wants_prepare()) {
+		if (ready == 0 && !bg.busy && back_wants_prepare()) {
 			wl_display_cancel_read(zmc.display);
 			back_prepare();
 			continue;

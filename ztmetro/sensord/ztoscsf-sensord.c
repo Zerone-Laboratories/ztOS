@@ -561,9 +561,12 @@ int main(void) {
 	}
 	stream_len = 0;
 	hub_time();
-	for (int i = 0; i < N_SENSORS; i++) {	/* whatever an earlier run left streaming */
-		sensors[i].on = true;
-	}
+	/*
+	 * No blanket REMOVE of every sensor here: removing one the hub never
+	 * added (pressure, id 5) made its firmware assert (transport_layer.c
+	 * line 165, Arg2=5) at every boot and every restart of this daemon. An
+	 * earlier run takes its sensors off as it stops; a fresh hub has none on.
+	 */
 	sensors[0].wanted = true;
 	sensors_apply();
 	status();

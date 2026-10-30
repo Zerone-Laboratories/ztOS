@@ -1085,18 +1085,41 @@ static void apply(void) {
 	 * relocks; 8 ms still lets the clock follow a swipe instead of trailing it */
 	put_long(CPUFREQ "/schedutil/rate_limit_us", profile == POWERSAVE ? 40000 : 8000);
 	int n = points(perfial_gpu_file("available_frequencies"), table, 32);
-	if (n > 0) {
+	/* the GPU's limits only once ztMETRO has said it is up: by then its
+	 * renderer has brought the GPU up. On the J5 a new limit before that
+	 * (zrnperfd starts before the shell) read the Adreno's busy counters
+	 * on a GPU that was never started, an external abort that held
+	 * devfreq's lock, and the shell, logind and sshd hung behind it */
+	if (n > 0 && shell_pid > 0) {
 		long top = table[n - 1];
-		long max = idle0 ? table[0] : profile == POWERSAVE ? capped(table, n, 0.8) : top;
+		/* idle0's ceiling: the lowest step that can still draw Start, not the
+		 * lowest there is. The J5's Adreno lists only 19.2 MHz (the crystal,
+		 * an idle rate) and 400 MHz, and capped at 19.2 every frame took
+		 * 150-240 ms; the S9's Mali steps all clear a quarter of its top */
+		long rest = table[0];
+		for (int i = 0; i < n && rest < top / 4; i++)
+			rest = table[i];
+		long max = idle0 ? rest : profile == POWERSAVE ? capped(table, n, 0.8) : top;
 		if (power_level >= 4 && max > capped(table, n, 0.6))
 			max = capped(table, n, 0.6);
+		/* and awake while they change: a new limit makes devfreq read the
+		 * busy counters, which a runtime-suspended GPU cannot answer */
+		put(perfial_gpu_file("device/power/control"), "on");
 		put(perfial_gpu_file("governor"), "simple_ondemand");
+		/* The floor, with the screen on: the same usable step. With only the
+		 * crystal's 19.2 MHz below 400 MHz (the J5), simple_ondemand dropped
+		 * to 19.2 whenever a light animation left the GPU mostly idle, and
+		 * the next frames took two vblanks each (Start's tiles coming back
+		 * from an app). The GPU still idles between frames at any clock */
+		long floor = screen_on ? (rest < max ? rest : max) : table[0];
 		/* lower the floor before the ceiling, and raise them the other way */
 		put_long(perfial_gpu_file("min_freq"), table[0]);
 		put_long(perfial_gpu_file("max_freq"), max);
+		put_long(perfial_gpu_file("min_freq"), floor);
 		if (profile == PERFORMANCE && !idle0) {
 			put_long(perfial_gpu_file("min_freq"), top);
 		}
+		put(perfial_gpu_file("device/power/control"), "auto");
 	}
 	/* Programs on the efficiency cores only, and the spare big cores off,
 	 * until something needs more; coming up, the cores first and then the
@@ -1273,7 +1296,7 @@ static int command(char *line, bool persist) {
 			prioritise(shell_pid, SHELL_NICE, UI_UCLAMP);
 			fprintf(stderr, "zrnperfd: shell %d first in line\n", shell_pid);
 		}
-		return 0;
+		return 2;	/* the GPU's limits, held back until now */
 	}
 	if (strcmp(what, "tickle") == 0) {
 		for (int c = 0; c < 3; c++) {

@@ -387,6 +387,8 @@ static void config_load(void) {
 			}
 		} else if (strcmp(key, "scale") == 0) {
 			snprintf(app.scale_text, sizeof(app.scale_text), "%s", val);
+		} else if (strcmp(key, "display_size") == 0) {
+			app.scale_idx = strcmp(val, "compact") == 0 ? 0 : strcmp(val, "large") == 0 ? 2 : 1;
 		} else if (strcmp(key, "brightness") == 0) {
 			app.brightness = atoi(val);
 		} else if (strcmp(key, "demo_tiles") == 0) {
@@ -516,11 +518,15 @@ static void perf_tell(const char *command) {
 
 #include "boostpage.h"
 
-/* Auto brightness is sensord's: it has the light sensor. */
+/* Auto brightness is sensord's: it has the light sensor. Without its status
+ * the phone has no light sensor to go by (the J5), and nothing is offered. */
+static bool light_sensor;
+
 static void auto_load(void) {
 	char line[64];
 	FILE *f = fopen("/run/ztoscsf-sensors/status", "r");
 	if (!f) f = fopen("/run/zrn-sensors/status", "r");
+	light_sensor = f != NULL;
 	app.autobrightness = false;	/* no daemon, no sensor */
 	while (f && fgets(line, sizeof(line), f)) {
 		if (strncmp(line, "auto=", 5) == 0) {
@@ -534,7 +540,7 @@ static void auto_load(void) {
 
 static void config_save(void) {
 	static const int timeouts[] = { 30, 60, 180, 300, 0 };
-	enum { N_KEYS = 20 + N_HAPTIC_GROUPS };
+	enum { N_KEYS = 21 + N_HAPTIC_GROUPS };
 	struct { const char *key; char value[300]; bool written; } keys[N_KEYS] = {
 		{ .key = "accent" }, { .key = "columns" }, { .key = "haptics" },
 		{ .key = "brightness" }, { .key = "timeout" }, { .key = "demo_tiles" },
@@ -564,6 +570,9 @@ static void config_save(void) {
 	snprintf(keys[18 + N_HAPTIC_GROUPS].value, sizeof(keys[0].value), "%s", app.lock_wall);
 	keys[19 + N_HAPTIC_GROUPS].key = "nav_center_icon";
 	snprintf(keys[19 + N_HAPTIC_GROUPS].value, 32, "%d", app.nav_icon_idx);
+	static const char *const sizes[] = { "compact", "standard", "large" };
+	keys[20 + N_HAPTIC_GROUPS].key = "display_size";
+	snprintf(keys[20 + N_HAPTIC_GROUPS].value, 32, "%s", sizes[app.scale_idx]);
 	snprintf(keys[0].value, 32, "%s", ACCENTS[app.accent].name);
 	snprintf(keys[1].value, 32, "%d", app.columns);
 	snprintf(keys[2].value, 32, "%s", app.haptics ? "on" : "off");
@@ -1679,25 +1688,28 @@ static double draw_display(cairo_t *cr) {
 	zmc_slider(cr, MARGIN, y, zmc.width - 2 * MARGIN, app.brightness, "Screen brightness", ACT_BRIGHTNESS_STEP);
 	y += 62;
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "Automatically adjust brightness", FONT_SEMILIGHT, 20, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, app.autobrightness ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
-	zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.autobrightness);
-	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_AUTOBRIGHTNESS, 0);
-	y += 66;
+	if (light_sensor) {
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, "Automatically adjust brightness", FONT_SEMILIGHT, 20, MARGIN, y, 0);
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, app.autobrightness ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
+		zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.autobrightness);
+		zmc_add_hit(0, y - 4, zmc.width, 50, ACT_AUTOBRIGHTNESS, 0);
+		y += 66;
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "OpenTone", FONT_SEMILIGHT, 20, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, app.opentone ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
-	zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.opentone);
-	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPENTONE, 0);
-	y += 66;
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, "OpenTone", FONT_SEMILIGHT, 20, MARGIN, y, 0);
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, app.opentone ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
+		zmc_toggle(cr, zmc.width - MARGIN - 54, y + 6, app.opentone);
+		zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPENTONE, 0);
+		y += 66;
+	}
 
 	static const char *const timeouts[] = { "30 seconds", "1 minute", "3 minutes", "5 minutes", "Never" };
 	y = picker(cr, y, "Screen times out after", timeouts, 5, app.timeout_idx, ACT_TIMEOUT_CYCLE);
-	static const char *const scales[] = { "3.5x (Compact)", "4.0x (Standard S9)", "4.5x (Large)" };
+	/* the shell sizes itself to the panel (360 points across); this is a step either side */
+	static const char *const scales[] = { "Compact", "Standard", "Large" };
 	y = picker(cr, y, "Display scaling", scales, 3, app.scale_idx, ACT_SCALE_CYCLE);
 	static const char *const nav_sizes[] = { "Standard (48 pt)", "Compact (40 pt)", "Expanded (56 pt)" };
 	y = picker(cr, y, "Navigation bar widget size", nav_sizes, 3, app.nav_size_idx, ACT_NAV_SIZE_CYCLE);
@@ -3284,7 +3296,14 @@ static void activate(int action, int arg) {
 		config_save();
 		break;
 	case ACT_SCALE_CYCLE:
-		app.scale_idx = arg;	/* shown only: the shell's scale is fixed for now */
+		if (app.scale_idx != arg) {
+			app.scale_idx = arg;
+			config_save();
+			/* the shell takes a new scale only as it starts: it restarts
+			 * (greetd starts it again), and the apps with it */
+			char ctl[512];
+			pipe_tell(runtime_file(ctl, sizeof(ctl), "ztmetro.ctl"), "restart\n");
+		}
 		break;
 	case ACT_KEY_SOUND:
 		app.key_sound = !app.key_sound;

@@ -1643,11 +1643,17 @@ int main(int argc, char **argv)
 
 	signal(SIGPIPE, SIG_IGN);
 	setvbuf(stderr, NULL, _IOLBF, 0);
+	/* another phone's modem answers AT elsewhere (the J5's on /dev/wwan0at0):
+	 * its unit says where. Without Samsung's IPC channels there is no packet
+	 * data, but the state, SMS and calls are all AT */
+	const char *at_dev = getenv("ZTOS_MODEM_AT");
+	if (!at_dev || !at_dev[0])
+		at_dev = AT_DEV;
 	for (int tries = 0; at_fd < 0; tries++) {
-		at_fd = open(AT_DEV, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+		at_fd = open(at_dev, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
 		if (at_fd < 0) {
 			if (tries == 0)
-				fprintf(stderr, "ztoscorenetworkingd: waiting for %s\n", AT_DEV);
+				fprintf(stderr, "ztoscorenetworkingd: waiting for %s\n", at_dev);
 			sleep(2);
 		}
 	}

@@ -1,0 +1,13 @@
+[Unit]
+Description=Let a watchdog reset restart ztOS once this boot is stable (not TWRP)
+After=multi-user.target
+
+[Service]
+Type=simple
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/zboot-boot-ok start
+ExecStop=/usr/local/sbin/zboot-boot-ok stop
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

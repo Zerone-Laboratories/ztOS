@@ -32,8 +32,8 @@
 #define ZMC_TILT_DEG	14.0
 #define ZMC_TILT_LIFT	40.0
 #define ZMC_PRESS_SINK	0.045
-#define ZMC_TILT_IN_MS	70
-#define ZMC_TILT_OUT_MS	160
+#define ZMC_TILT_IN_MS	90
+#define ZMC_TILT_OUT_MS	200
 #define ZMC_MARGIN	16	/* left edge of everything: 20 px on a 450 px wide reference */
 #define ZMC_HEADER_H	104	/* the title stays; the list moves under it */
 #define ZMC_ACT_BACK	(-1)	/* the title: up a page */
@@ -188,6 +188,8 @@ struct zmc_state {
 };
 
 extern struct zmc_state zmc;
+/* ZTMETRO_PERFLOG=1: frame and page timings on stderr (off by default) */
+bool zmc_perflog(void);
 
 /* ---- running ---- */
 int zmc_run(const struct zmc_app *app, int first_page);
@@ -200,6 +202,9 @@ void zmc_turn(int dir);			/* this page's content changes: its rows swivel out an
 void zmc_back(void);
 void zmc_quit(void);
 void zmc_busy(bool busy);		/* the dots across the top, while something loads */
+/* step() runs at the start of every frame, and a frame is drawn every time,
+ * until zmc_on_frame(NULL): motion on the panel's clock, not a timer's */
+void zmc_on_frame(void (*step)(void));
 /* call `ready` from the main loop when fd is readable; NULL removes it */
 void zmc_watch_fd(int fd, void (*ready)(int fd, void *data), void *data);
 /* call `tick` every `ms` from the main loop; 0 stops it. One timer per app. */

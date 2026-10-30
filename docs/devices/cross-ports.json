@@ -1,6 +1,6 @@
 {
- "generated": "2026-10-26T05:03:51+00:00",
- "pmaports": "435205da9604633a7691d3cb9489f3aa89262c82",
+ "generated": "2026-10-28T09:41:36+00:00",
+ "pmaports": "1eb4dce28ef2d0ecc8651914bcb4972083eefb0f",
  "devices": [
   {
    "codename": "fairphone-fp4",
@@ -1575,24 +1575,6 @@
    "name": "Samsung Galaxy J3 2016",
    "manufacturer": "Samsung",
    "year": "2016",
-   "chassis": "handset",
-   "category": "archived",
-   "soc": "msm8916",
-   "gpu_driver": "freedreno",
-   "accelerated": true,
-   "archived": true,
-   "flash_method": "fastboot",
-   "kernel": "linux-postmarketos-qcom-msm8916",
-   "screen": "720x1280",
-   "warnings": [
-    "postmarketOS no longer maintains this phone's port: it is archived, so it may not build or boot, and it has had no recent testing."
-   ]
-  },
-  {
-   "codename": "samsung-j5",
-   "name": "Samsung Galaxy J5 2015",
-   "manufacturer": "Samsung",
-   "year": "2015",
    "chassis": "handset",
    "category": "archived",
    "soc": "msm8916",

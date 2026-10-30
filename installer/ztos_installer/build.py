@@ -139,10 +139,14 @@ step() { echo "STEP $*"; }
 R=$ROOTFS
 umask 022
 
-if [ "$FRESH" = 1 ] || [ ! -e "$R/etc/arch-release" ]; then
+# A run stopped half way through the unpack leaves etc/arch-release without
+# the rest (no var/lib/pacman): only a mark written after the whole tarball
+# counts as unpacked.
+if [ "$FRESH" = 1 ] || [ ! -e "$R/.ztos-unpacked" ]; then
 	step "unpacking Arch Linux ARM"
 	rm -rf "$R"; mkdir -p "$R"
 	bsdtar -xpf "$TARBALL" -C "$R" --no-xattrs --no-acls --no-fflags
+	touch "$R/.ztos-unpacked"
 fi
 
 mount --bind "$R" "$R"
@@ -298,8 +302,10 @@ echo LANG=en_US.UTF-8 > "$R/etc/locale.conf"
 step "turning on ztOS's services"
 # (systemd-resolved: names; NetworkManager hands it each network's DNS)
 # (systemd-pstore: the kernel log of a crash or hang is kept in /var/lib/systemd/pstore)
+# (zrnperfd: the CPU and GPU clocks from ztOSIAL's Perf1; without it the
+# GPU rests at its lowest step and ztMETRO lags)
 for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoresensorframework ztos-update-check.timer \
-		ztos-iald waydroid-container ztos-waydroid-images; do
+		ztos-iald zrnperfd waydroid-container ztos-waydroid-images; do
 	ch systemctl enable "$u" > /dev/null 2>&1
 done
 for u in systemd-networkd getty@tty1; do

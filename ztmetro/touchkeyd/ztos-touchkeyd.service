@@ -1,0 +1,18 @@
+[Unit]
+Description=ztos-touchkeyd: the Galaxy J5's capacitive recents and back keys
+# only the J5 has this chip on these lines; anywhere else they are other things
+ConditionFirmware=device-tree-compatible(samsung,j5)
+# before the shell (see ExecStartPost), so it finds the keys and leaves out
+# its own nav bar
+Before=greetd.service
+
+[Service]
+ExecStart=/usr/local/sbin/ztos-touchkeyd
+# the shell looks for hardware keys once, as it starts: it waits for the
+# keys' input device (up to 5 s, so a missing chip only costs the nav bar)
+ExecStartPost=/bin/sh -c 'for i in $(seq 50); do grep -qs "TC360 touch keys" /sys/class/input/input*/name && exit 0; sleep 0.1; done; exit 0'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
