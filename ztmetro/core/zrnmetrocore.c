@@ -460,7 +460,7 @@ double zmc_pivot_next(cairo_t *cr, const char *title, const char *next, int acti
 		 * does while the tabs move. Drawn at rest too, or two short titles
 		 * show a third one that was not there a moment ago, popping in at the
 		 * edge as soon as a finger moves them. */
-		zmc_text(cr, title, FONT_SEMILIGHT, 48,
+		zmc_text(cr, zmc.pivot_after ? zmc.pivot_after : title, FONT_SEMILIGHT, 48,
 			MARGIN - 3 + w + 16 + pivot_title_width(cr, next) + 16, 24, 0);
 		if (action) {
 			/* the next tab, to its right edge of the screen: before the
@@ -1469,6 +1469,14 @@ static bool draw_pivot(cairo_t *cr, int scale) {
 	for (long k = k0 - 1; k <= k0 + 3; k++) {
 		/* each title once, cut from its own header: white for the tab
 		 * nearest the middle, grey for the rest, crossing at half way */
+		if (zmc.pivot_after && k >= 2) {
+			/* more than two tabs: what follows the other tab is in that
+			 * tab's own header, already grey, not this tab again */
+			double from = pivot_title_at(2, a, b) - strip;
+			if (k == 2)
+				band_x(cr, zmc.piv_other, CAPS_H, HEADER_H, from, zmc.width, from - b, 0, 1, scale);
+			continue;
+		}
 		cairo_surface_t *src = k % 2 == 0 ? zmc.piv_cur : zmc.piv_other;
 		double at = pivot_title_at(k, a, b) - strip, span = k % 2 == 0 ? a : b;
 		double light = clamp01((w * 0.5 + 30 - fabs(u - k) * w) / 60);

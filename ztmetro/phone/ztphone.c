@@ -61,6 +61,7 @@ enum action {
 	ACT_SUGGEST,	/* arg: a contact the digits match: its number */
 	ACT_PERSON,	/* arg: a row of the contacts tab */
 	ACT_ALL_PEOPLE,
+	ACT_GOOGLE,
 	ACT_SPEED_TILE,	/* arg: which speed dial entry (n_speed: the plus) */
 	ACT_SPEED_MENU,	/* arg: 0 remove, 1 move up, 2 move down */
 	ACT_ENTRY_SPEED,	/* add the number on the entry page to speed dial */
@@ -334,6 +335,7 @@ static void describe(const struct call_item *c, char *out, size_t size) {
 }
 
 static double draw_history(cairo_t *cr) {
+	zmc.pivot_after = "keypad";
 	double y = zmc_pivot_next(cr, "history", "speed dial", ZMC_ACT_PIVOT, P_SPEED);
 	if (!sample) {
 		n_calls = calls_load(calls, MAX_CALLS);
@@ -385,6 +387,7 @@ static double draw_history(cairo_t *cr) {
 /* The speed dial: two across, a tile to each entry, in the accent colour, and
  * a plus at the end. Tap a tile to call it; hold for the menu. */
 static double draw_speed(cairo_t *cr) {
+	zmc.pivot_after = "contacts";
 	double y = zmc_pivot_next(cr, "speed dial", "keypad", ZMC_ACT_PIVOT, P_KEYPAD);
 	if (n_speed == 0) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
@@ -480,11 +483,13 @@ static void draw_suggestions(cairo_t *cr, double y, double bottom) {
  * the rest are in People. */
 #define CONTACT_ROWS 140
 static double draw_contacts(cairo_t *cr) {
+	zmc.pivot_after = "speed dial";
 	double y = zmc_pivot_next(cr, "contacts", "history", ZMC_ACT_PIVOT, P_HISTORY);
 	if (!sample) contacts_load();
 	if (n_contacts == 0) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		zmc_text(cr, "no contacts yet", FONT_REGULAR, 16, MARGIN, y, 0);
+		y = zmc_entry(cr, y + 34, "sign in with Google", "bring your contacts here", ACT_GOOGLE, 0);
 		return y + 40;
 	}
 	int shown = n_contacts < CONTACT_ROWS ? n_contacts : CONTACT_ROWS;
@@ -510,6 +515,7 @@ static double draw_keypad(cairo_t *cr) {
 		{ '1', "" }, { '2', "ABC" }, { '3', "DEF" }, { '4', "GHI" }, { '5', "JKL" }, { '6', "MNO" },
 		{ '7', "PQRS" }, { '8', "TUV" }, { '9', "WXYZ" }, { '*', "" }, { '0', "+" }, { '#', "" },
 	};
+	zmc.pivot_after = "history";
 	double y = zmc_pivot_next(cr, "keypad", "contacts", ZMC_ACT_PIVOT, P_CONTACTS) - 14;
 	/* the number so far, and under it whose it is */
 	double size = strlen(digits) > 13 ? 26 : 34;
@@ -930,6 +936,9 @@ static void activate(int action, int arg) {
 			entry_from = P_CONTACTS;
 			zmc_go(P_ENTRY, 1);
 		}
+		break;
+	case ACT_GOOGLE:
+		run_app("ztcontacts --google");
 		break;
 	case ACT_ALL_PEOPLE:
 		run_app("ztcontacts");

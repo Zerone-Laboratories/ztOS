@@ -809,6 +809,9 @@ int main(int argc, char **argv) {
 		edit_begin(-1, argv[2]);
 		first = P_EDIT;
 	}
+	if (argc == 2 && !strcmp(argv[1], "--google")) {
+		first = P_GOOGLE;
+	}
 	int ret = zmc_run(&people, first);
 	return ret;
 }

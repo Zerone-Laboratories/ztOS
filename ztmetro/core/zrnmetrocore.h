@@ -174,6 +174,7 @@ struct zmc_state {
 	/* a pivot: its tabs slide sideways, under the finger or on their own */
 	bool pivot_set;		/* the page in front is one tab of a pivot */
 	int pivot_page;		/* and the other tab */
+	const char *pivot_after;	/* more than two tabs: the title after the next one */
 	double pivot_next_dx;	/* where the next tab's title is, from this one's */
 	int axis;		/* a moving finger: 0 undecided, 1 across, 2 along the list */
 	bool swiping, spring, slide_active;
