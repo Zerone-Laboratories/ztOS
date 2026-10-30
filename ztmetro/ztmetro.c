@@ -7112,6 +7112,14 @@ static void perf_focus(struct zt_toplevel *toplevel) {
 }
 
 /* Acknowledge only the package actually visible in the compositor. */
+/* An Android window that needs Android awake while it is in front: an app
+ * ("waydroid.<package>") or Waydroid's full UI ("Waydroid", the Waydroid
+ * tile). The full UI used to count as a plain window, so opening it put
+ * Android's display to sleep and froze it, and it never came up. */
+static bool waydroid_window(const char *app_id) {
+	return app_id && (!strncmp(app_id, "waydroid.", 9) || !strcmp(app_id, "Waydroid"));
+}
+
 static void waydroid_visible(const char *runtime_app_id) {
 	const char *runtime = getenv("XDG_RUNTIME_DIR");
 	if (runtime) {
@@ -7162,12 +7170,13 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 	const char *runtime_app_id = toplevel && toplevel->xdg_toplevel ?
 		toplevel->xdg_toplevel->app_id : NULL;
 	bool demoloop = demoloop_active();
-	if (runtime_app_id && strncmp(runtime_app_id, "waydroid.", 9) == 0) {
+	if (waydroid_window(runtime_app_id)) {
 		/* in front only where it is seen: not under the lock screen or with
 		 * the screen off (screen_set and unlocking wake Android then) */
 		waydroid_power_request(!server->screen_on ? "screen-off" : server->locked ? "idle" : "active");
 		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
-		waydroid_visible(runtime_app_id);
+		if (runtime_app_id[8] == '.')
+			waydroid_visible(runtime_app_id);
 	} else {
 		waydroid_power_request(demoloop ? "active" : "idle");
 		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
@@ -10045,7 +10054,7 @@ static void screen_set(struct zt_server *server, bool on) {
 		const char *id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
 		/* an Android app under the lock screen (lock() below) is not in front */
 		bool locking = server->locked || (on && server->lock_enabled && server->width);
-		waydroid_power_request(demoloop || (id && !strncmp(id, "waydroid.", 9) && !locking) ? "active" : "idle");
+		waydroid_power_request(demoloop || (waydroid_window(id) && !locking) ? "active" : "idle");
 		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
 	}
 	if (on) {
@@ -11372,7 +11381,7 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 				animate(server, &server->app_angle, 0.0f, 450, 0, false);
 			}
 			const char *shown_id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
-			if (shown_id && !strncmp(shown_id, "waydroid.", 9)) {
+			if (waydroid_window(shown_id)) {
 				/* the Android app that was open is in front again */
 				waydroid_power_request("active");
 				run_detached("ztos-waydroid-power", "sync", NULL, NULL);
