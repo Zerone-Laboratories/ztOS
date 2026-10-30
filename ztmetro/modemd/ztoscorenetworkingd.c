@@ -26,7 +26,9 @@
  * asks of us at its start" below), each answer behind its own flag file.
  */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <dirent.h>
+#include <pwd.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -297,7 +299,7 @@ static int sms_job_head, sms_job_count;
 static void send_sms(const char *number, const char *text);
 static void sms_next(void);
 static void sms_finish(bool ok);
-static unsigned concat_ref, concat_total, concat_part, concat_dcs;
+static unsigned concat_ref, concat_total, concat_part, concat_dcs, sms_pid;
 static bool sms_test;
 static const char *sms_test_dir;
 
@@ -320,6 +322,9 @@ static void log_line(const char *path, const char *fmt, ...)
 	va_start(ap, fmt);
 	vfprintf(f, fmt, ap);
 	va_end(ap);
+	/* it may be the only copy of a message: the phone can reset in a sleep */
+	if (!fflush(f))
+		fsync(fileno(f));
 	fclose(f);
 	chmod(path, 0644);
 }
@@ -394,6 +399,7 @@ static bool sms_decode(const char *hex, char *number, size_t number_size, char *
 	}
 	number[o] = 0;
 	at += bytes;
+	sms_pid = b[at];
 	unsigned dcs = b[at + 1];
 	at += 2 + 7;				/* protocol, coding, the centre's time stamp */
 	size_t udl = b[at++], skip = 0;
@@ -482,8 +488,9 @@ static bool sms_decode(const char *hex, char *number, size_t number_size, char *
 	return true;
 }
 
-/* Parts stay on disk across daemon restarts. A completed set is kept for a
- * day to ignore SIM redelivery; a reused reference then starts a fresh set. */
+/* Parts stay on disk across daemon restarts, until the set is whole or a day
+ * has passed. Redelivery is sms_seen's to catch, by the whole PDU: a reference
+ * is only one byte, and some senders use the same one for every message. */
 static bool sms_join(const char *number, char *text, size_t size)
 {
 	if (!concat_total) return true;
@@ -493,9 +500,7 @@ static bool sms_join(const char *number, char *text, size_t size)
 	const char *dir = sms_test_dir ? sms_test_dir : SMS_DIR;
 	mkdir(dir, 0755);
 	snprintf(base, sizeof(base), "%s/parts-%08x-%u-%u-%u", dir, hash, concat_ref, concat_total, concat_dcs);
-	snprintf(path, sizeof(path), "%s.done", base);
 	struct stat st;
-	if (stat(path, &st) == 0 && time(NULL) - st.st_mtime < 86400) return false;
 	snprintf(path, sizeof(path), "%s.%u", base, concat_part);
 	FILE *f = fopen(path, "w");
 	if (!f) return false;
@@ -516,14 +521,79 @@ static bool sms_join(const char *number, char *text, size_t size)
 	}
 	joined[used] = 0;
 	memcpy(text, joined, used + 1);
+	for (unsigned i = 1; i <= concat_total; i++) {
+		snprintf(path, sizeof(path), "%s.%u", base, i);
+		unlink(path);
+	}
 	return true;
+}
+
+/* Who to say it is from: their name in the session user's People, as the
+ * apps match it (the last nine digits), or what the network gave. */
+static void sms_who(const char *number, char *who, size_t size)
+{
+	snprintf(who, size, "%s", number);
+	char want[12] = "", path[300], line[1024];
+	size_t n = 0;
+	for (const char *c = number; *c; c++) {
+		if (!isdigit((unsigned char)*c)) {
+			if (!strchr("+ ", *c))
+				return;		/* a name already */
+			continue;
+		}
+		if (n < 9)
+			want[n++] = *c;
+		else {
+			memmove(want, want + 1, 8);
+			want[8] = *c;
+		}
+	}
+	want[n] = 0;
+	if (n < 7)
+		return;
+	for (int uid = 1000; uid < 1010; uid++) {
+		struct passwd *pw = getpwuid((uid_t)uid);
+		if (!pw)
+			continue;
+		snprintf(path, sizeof(path), "%s/.local/share/ztmetro/contacts", pw->pw_dir);
+		FILE *f = fopen(path, "r");
+		while (f && fgets(line, sizeof(line), f)) {
+			char *cursor = line, *name = strsep(&cursor, "\t\n");
+			/* name, mobile, other: the fields the apps match on */
+			for (int k = 0; k < 2 && cursor; k++) {
+				char *field = strsep(&cursor, "\t\n");
+				char digits[32];
+				size_t d = 0;
+				for (const char *c = field; *c && d + 1 < sizeof(digits); c++)
+					if (isdigit((unsigned char)*c))
+						digits[d++] = *c;
+				digits[d] = 0;
+				if (d >= n && !strcmp(digits + d - n, want)) {
+					snprintf(who, size, "%s", name);
+					for (char *w = who; *w; w++)
+						if (*w == '|')
+							*w = '/';
+					fclose(f);
+					return;
+				}
+			}
+		}
+		if (f)
+			fclose(f);
+	}
 }
 
 static void sms_arrived(const char *pdu)
 {
-	char number[40], text[8192], escaped[16384], note[330];
+	char number[40], text[8192], escaped[16384], note[400];
 	if (!sms_decode(pdu, number, sizeof(number), text, sizeof(text))) {
 		fprintf(stderr, "ztoscorenetworkingd: a message that could not be read\n");
+		return;
+	}
+	/* 23.040: type 0 is to be acknowledged and thrown away, unseen (a
+	 * network's ping); the person never has one to read */
+	if (sms_pid == 0x40) {
+		fprintf(stderr, "ztoscorenetworkingd: a silent message (ignored)\n");
 		return;
 	}
 	if (!sms_join(number, text, sizeof(text))) return;
@@ -543,20 +613,20 @@ static void sms_arrived(const char *pdu)
 	}
 	escaped[o] = 0;
 	log_line(SMS_LOG, "in\t%ld\t%s\t%s\n", (long)time(NULL), number, escaped);
-	if (concat_total) {
-		unsigned hash = 2166136261u;
-		for (const unsigned char *c = (const unsigned char *)number; *c; c++) hash = (hash ^ *c) * 16777619u;
-		char path[550];
-		snprintf(path, sizeof(path), "%s/parts-%08x-%u-%u-%u.done", sms_test_dir ? sms_test_dir : SMS_DIR,
-			hash, concat_ref, concat_total, concat_dcs);
-		FILE *done = fopen(path, "w");
-		if (done) fclose(done);
-	}
 	fprintf(stderr, "ztoscorenetworkingd: a message came in (%zu characters)\n", strlen(text));
-	for (char *c = escaped; *c; c++)
-		if (*c == '|')
-			*c = '/';
-	snprintf(note, sizeof(note), "notify Messaging|%s|%.240s\n", number, escaped);
+	/* the banner: one line, nothing of the shell's own format, whole characters */
+	char line[241];
+	size_t cut = strlen(text) < sizeof(line) - 1 ? strlen(text) : sizeof(line) - 1;
+	while (cut && ((unsigned char)text[cut] & 0xc0) == 0x80)
+		cut--;
+	memcpy(line, text, cut);
+	line[cut] = 0;
+	for (char *c = line; *c; c++)
+		if (*c == '\n' || *c == '\r' || *c == '\t' || *c == '|')
+			*c = *c == '|' ? '/' : ' ';
+	char who[64];
+	sms_who(number, who, sizeof(who));
+	snprintf(note, sizeof(note), "notify Messaging|%s|%s\n", who, line);
 	if (!sms_test) tell_shell(note);
 	else fprintf(stderr, "test notification: %s", note);
 }
@@ -596,7 +666,8 @@ static void sms_seen_prune(void)
 	while (d && (e = readdir(d))) {
 		char path[512];
 		struct stat st;
-		if (strncmp(e->d_name, "seen-", 5))
+		/* a part whose other parts never came goes with them */
+		if (strncmp(e->d_name, "seen-", 5) && strncmp(e->d_name, "parts-", 6))
 			continue;
 		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
 		if (stat(path, &st) == 0 && time(NULL) - st.st_mtime >= 86400)
@@ -2148,7 +2219,17 @@ int main(int argc, char **argv)
 	if ((argc == 4 || (argc == 5 && !strcmp(argv[4], "--notify"))) && !strcmp(argv[1], "--sms-inject")) {
 		if (argv[2][0] != '/') return 1;
 		sms_test = argc == 4; sms_test_dir = argv[2];
-		sms_arrived(argv[3]);
+		if (!sms_seen(argv[3])) sms_arrived(argv[3]);
+		return 0;
+	}
+	/* The same, as the CP hands it over: a whole 0402 frame's data, in hex. */
+	if ((argc == 4 || (argc == 5 && !strcmp(argv[4], "--notify"))) && !strcmp(argv[1], "--sms-inject-ipc")) {
+		if (argv[2][0] != '/') return 1;
+		sms_test = argc == 4; sms_test_dir = argv[2];
+		unsigned char frame[300];
+		size_t len = 0;
+		for (const char *h = argv[3]; h[0] && h[1] && len < sizeof(frame); h += 2) frame[len++] = (unsigned char)hex_byte(h);
+		ipc_message(0x04, 0x02, 3, 0, frame, len);
 		return 0;
 	}
 	if (argc != 1) return 1;
