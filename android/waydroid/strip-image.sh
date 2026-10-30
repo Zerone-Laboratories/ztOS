@@ -39,6 +39,16 @@ if [[ ! -f $zygote_dir/init.zygote64.rc ]]; then
         [[ -z $label ]] || setfattr -n security.selinux -v "$label" "$zygote_dir/init.zygote64.rc"
     fi
 fi
+# Android's init drops CAP_WAKE_ALARM from its bounding set, so no Android
+# alarm can wake the SoC. The patch NOPs that one call, in place (the mode,
+# owner and SELinux label stay), and refuses any init it does not know.
+rc=0
+python3 "$(dirname "$(readlink -f "$0")")/patch-init-wake-alarm.py" "$root/system/bin/init" || rc=$?
+if (( rc == 3 )); then
+    echo 'Warning: unknown init; Android alarms will not wake the SoC with this image.' >&2
+elif (( rc != 0 )); then
+    exit "$rc"
+fi
 # HOME is com.android.launcher3/.uioverrides.QuickstepLauncher on the tested image.
 # Keep Launcher3: disabling it leaves HOME unresolved. Keep SystemUI too: hiding
 # its bars in multi-window mode does not prove its framework services are unused.
