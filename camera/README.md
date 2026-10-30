@@ -7,14 +7,20 @@ to power-domain, clock or CSIS registers, and on this SoC a write to a block
 that is powered off or gated is a silent bus hang that only the keys undo.
 Do it with someone at the phone.
 
+**Done on 2026-10-31:** `camera/driver/zrn-cam.c` powers each camera in stock's
+order from a module, reads its ID and powers it down, with `zrn-cam-probe`
+leaving a mark so a hang is not retried. Rear 0x20C3 rev 0xA5 (S5K2L3), front
+0x3081 rev 0xA3, three cycles each. Iris: no answer, `gpio_iris_en` (gpg0-7)
+ignores writes from here, so the secure world may own it (not proven).
+
 ## The hardware (stock tree, `stock/twrp-live.dts`)
 
 | Piece | Where |
 | --- | --- |
 | Rear sensor | Samsung S5K2L3 (`fimc-is-cis-2l3`), I2C `0x10` on hsi2c@10860000 (hsi2c_0) |
-| Its module | 13137: `samsung,sensor-module-2l3`, MCLK channel 0 on `gpg0-4`, reset `gpg2-6`, OIS reset `gpg0-6` |
+| Its module | 13137: `samsung,sensor-module-2l3`, MCLK channel 0 on `gpc1-4`, reset `gpg2-6`, OIS reset `gpg0-6` |
 | Around it | AK737x focus `0x0c`, OIS `0x24`, AK7372 aperture `0x4c` (5764, 5773, 5779) |
-| Rails | the S2MPB02's LDOs (6449+), which `leds/zrn-flash.ko` already reaches over its bit-banged bus |
+| Rails | mostly the S2MPB03 at 0x56 (gpm0-0 SCL, gpm1-0 SDA); VDDAF and OIS on the S2MPB02 at 0x59 (gpp6-0 SCL, gpp6-1 SDA) |
 | Receiver | CSIS0 in the ISPPRE power domain, under fimc_is@16290000 (11034), D-PHY at 0x16210500 |
 | Front | S5K3H1 at `0x35` (6360); iris S5K5F1 runs in secure mode: not attempted |
 
