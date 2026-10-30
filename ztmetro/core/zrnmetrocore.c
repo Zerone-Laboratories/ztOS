@@ -303,6 +303,47 @@ void zmc_busy(bool busy) {
 	present();
 }
 
+void zmc_picture(cairo_t *cr, cairo_surface_t *picture, double x, double y, double size) {
+	int w = cairo_image_surface_get_width(picture), h = cairo_image_surface_get_height(picture);
+	int side = w < h ? w : h;
+	if (side <= 0) return;
+	double ox = (w - side) / 2.0, oy = (h - side) / 2.0;
+	if (dotmatrix()) {
+		/* (the grid of the shapes around it: dm-wrap.c's) */
+		double pitch = dm_wrap_pitch;
+		cairo_surface_flush(picture);
+		const unsigned char *data = cairo_image_surface_get_data(picture);
+		int stride = cairo_image_surface_get_stride(picture);
+		int cells = (int)floor(size / pitch);
+		double k = (double)side / (cells > 0 ? cells : 1);
+		double r = ((zmc.dm_main >> 16) & 255) / 255.0, g = ((zmc.dm_main >> 8) & 255) / 255.0, b = (zmc.dm_main & 255) / 255.0;
+		dm_wrap_raw++;
+		for (int row = 0; row < cells; row++) {
+			const uint32_t *line = (const uint32_t *)(data + (size_t)(oy + (row + 0.5) * k) * stride);
+			for (int col = 0; col < cells; col++) {
+				uint32_t px = line[(int)(ox + (col + 0.5) * k)];
+				double lum = (0.3 * ((px >> 16) & 255) + 0.59 * ((px >> 8) & 255) + 0.11 * (px & 255)) / 255.0;
+				lum = 0.12 + 0.88 * lum;
+				cairo_set_source_rgb(cr, r * lum, g * lum, b * lum);
+				cairo_new_sub_path(cr);
+				cairo_arc(cr, x + (col + 0.5) * pitch, y + (row + 0.5) * pitch, pitch * 0.36, 0, 2 * M_PI);
+				cairo_fill(cr);
+			}
+		}
+		dm_wrap_raw--;
+		return;
+	}
+	cairo_save(cr);
+	cairo_rectangle(cr, x, y, size, size);
+	cairo_clip(cr);
+	cairo_translate(cr, x, y);
+	cairo_scale(cr, size / side, size / side);
+	cairo_set_source_surface(cr, picture, -ox, -oy);
+	cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+	cairo_paint(cr);
+	cairo_restore(cr);
+}
+
 void zmc_set_rgb(cairo_t *cr, uint32_t color) {
 	if (dotmatrix() && !dm_map_raw) {
 		color = dm_palette_colour(color, zmc.dm_main, zmc.dm_accent);	/* the palette's two */

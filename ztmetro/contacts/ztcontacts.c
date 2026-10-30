@@ -34,6 +34,7 @@
 #include "zrnmetrocore.h"
 #include "comm.h"
 #include "contact-store.h"
+#include "contact-photo.h"
 
 #define MARGIN ZMC_MARGIN
 #define WINDOW 60	/* people on the page at once: the page is cached whole, at 4x */
@@ -118,33 +119,6 @@ static int first_with_letter(char letter) {
 	return -1;
 }
 
-/* One UTF-8 character of s into out; returns its length. */
-static size_t one_char(const char *s, char *out) {
-	size_t n = 1;
-	while (s[n] && ((unsigned char)s[n] & 0xc0) == 0x80 && n < 4) {
-		n++;
-	}
-	memcpy(out, s, n);
-	out[n] = 0;
-	if (n == 1) {
-		out[0] = (char)toupper((unsigned char)out[0]);
-	}
-	return n;
-}
-
-/* the first letters of the first and last words */
-static void initials(const char *name, char *out) {
-	char a[5] = "", b[5] = "";
-	const char *last = strrchr(name, ' ');
-	if (name[0]) {
-		one_char(name, a);
-	}
-	if (last && last[1]) {
-		one_char(last + 1, b);
-	}
-	sprintf(out, "%s%s", a, b);
-}
-
 /* Numbers reach a shell command, and now come from outside: only what can be dialled. */
 static void dialable(const char *number, char *out, size_t size) {
 	size_t n = 0;
@@ -156,19 +130,8 @@ static void dialable(const char *number, char *out, size_t size) {
 	out[n] = 0;
 }
 
-static void tile(cairo_t *cr, double x, double y, double size, const char *name) {
-	char text[10];
-	initials(name, text);
-	zmc_set_rgb(cr, 0x3a3a3a);
-	cairo_rectangle(cr, x, y, size, size);
-	cairo_fill(cr);
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	double type = size * 0.42;
-	zmc_text_centred(cr, text, FONT_SEMILIGHT, type, x + size / 2, y + (size - type * 1.3) / 2);
-}
-
 static void person_row(cairo_t *cr, double y, const struct contact *c, int who) {
-	tile(cr, MARGIN, y + 3, 48, c->name);
+	contact_tile(cr, MARGIN, y + 3, 48, c->name, c->uid);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text_line(cr, c->name, FONT_SEMILIGHT, 22, MARGIN + 60, y + 13, zmc.width - 2 * MARGIN - 60);
 	zmc_add_hit(0, y, zmc.width, 54, ACT_OPEN, who);
@@ -335,7 +298,7 @@ static double draw_card(cairo_t *cr) {
 		return y;
 	}
 	struct contact *c = &contacts[shown];
-	tile(cr, MARGIN, y, 150, c->name);
+	contact_tile(cr, MARGIN, y, 150, c->name, c->uid);
 	y += 162;
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	y += zmc_text(cr, c->name, FONT_LIGHT, 34, MARGIN, y, zmc.width - 2 * MARGIN) + 12;
@@ -744,6 +707,16 @@ static void tick(void) {
 		status_stamp = stamp;
 		zmc_busy(false);
 		if (zmc.page == P_GOOGLE && !zmc.anim_active) {
+			zmc_redraw();
+		}
+	}
+	static long photos_stamp;
+	stamp = contact_photos_stamp();
+	if (stamp != photos_stamp) {
+		bool first = photos_stamp == 0;
+		photos_stamp = stamp;
+		if (!first && !zmc.anim_active && zmc.page != P_EDIT && menu_for < 0) {
+			contact_photos_forget();
 			zmc_redraw();
 		}
 	}

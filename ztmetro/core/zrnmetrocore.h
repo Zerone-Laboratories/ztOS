@@ -300,6 +300,10 @@ double zmc_text(cairo_t *cr, const char *s, const char *font, double size, doubl
 void zmc_text_line(cairo_t *cr, const char *s, const char *font, double size, double x, double y, double width);
 void zmc_add_hit(double x, double y, double w, double h, int action, int arg);
 void zmc_set_rgb(cairo_t *cr, uint32_t color);
+/* A picture (a person's photo) cut to a square at x, y, `size` points across.
+ * Under DotMatrix it is dots on the page's lattice, each as bright as what is
+ * under it, in the palette's main colour: never a photograph among the dots. */
+void zmc_picture(cairo_t *cr, cairo_surface_t *picture, double x, double y, double size);
 void zmc_accent(cairo_t *cr);
 
 /* ---- odds and ends ---- */

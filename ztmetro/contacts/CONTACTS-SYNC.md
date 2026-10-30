@@ -37,6 +37,21 @@ no lock.
 - **Full sync returns nobody while people are known:** refused, store untouched.
 - **Signing out:** the token is revoked and removed; the people stay as local contacts.
 
+## Photos
+
+Each person's photo goes to `~/.local/share/ztmetro/contact-photos/<hash>.jpg`,
+directory 700, files 600. The hash is FNV-1a 64 of the uid (`photo_name` in the sync,
+`comm/contact-photo.h` in C), so the store keeps its six columns.
+
+- Only pictures Google does not mark `default`, at 192 px (the `=s192` suffix).
+- Fetched again only when the person's etag changes (`photo_etags` in `state.json`).
+- A failed download never fails the sync. It stays in `photo_pending` and is tried again
+  on the next run; five failures in a row end that run's attempts.
+- The first sync with this version asks Google once with the old fields, to catch up, then
+  once in full with photos (`photos_version`). Etags can change with the fields asked for,
+  so that one sync only takes the new etags of known people and keeps edits made here.
+- Signing out removes the folder.
+
 ## Files
 
 In `~/.config/ztos/google-contacts/`, directory 700, files 600:

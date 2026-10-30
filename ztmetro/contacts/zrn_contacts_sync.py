@@ -33,7 +33,15 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 PEOPLE_URL = "https://people.googleapis.com/v1/people/me/connections"
 SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
-PERSON_FIELDS = "names,phoneNumbers,emailAddresses,biographies,organizations,metadata"
+# what sync tokens from before contact photos were asked for with: a token only
+# answers the same question, so the first sync after the change takes one last
+# answer with these, then starts over with PERSON_FIELDS
+OLD_PERSON_FIELDS = "names,phoneNumbers,emailAddresses,biographies,organizations,metadata"
+PERSON_FIELDS = OLD_PERSON_FIELDS + ",photos"
+PHOTOS_VERSION = 1
+PHOTO_PX = 192		# tile() in ztcontacts.c is 48 points at 4 pixels to the point
+PHOTO_MAX_BYTES = 4 * 1024 * 1024
+PHOTO_GIVE_UP = 5	# failures in a row: the network is away, try again next run
 DEFAULT_PORT = 8765
 UID_PREFIX = "g:"
 # struct contact in comm/comm.h: keep these and MAX_CONTACTS in step with it
@@ -71,7 +79,8 @@ def write_private(path, text):
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".new-")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "wb" if isinstance(text, bytes) else "w",
+                       **({} if isinstance(text, bytes) else {"encoding": "utf-8"})) as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
@@ -192,12 +201,15 @@ class Store:
             "\t".join(r[c] for c in COLUMNS) + "\n" for r in self.rows))
 
 
-def merge(rows, changes, deleted, known, full):
+def merge(rows, changes, deleted, known, full, rebase=False):
     """Apply a sync to the store's rows; returns (rows, known, counts).
 
     known maps uid to the etag last taken from Google. A person Google has not
     changed since is left alone, so what was edited or deleted on the phone
     stays that way through the full syncs an expired token forces.
+
+    rebase: the etags changed because the question asked of Google did, not the
+    people: take the new etag of everyone known and leave their rows alone.
     """
     counts = {"added": 0, "updated": 0, "removed": 0, "dropped": 0}
     by_uid = {r["uid"]: r for r in rows if r["uid"]}
@@ -208,6 +220,9 @@ def merge(rows, changes, deleted, known, full):
         uid = contact["uid"]
         seen.add(uid)
         if full and uid in known and known[uid] == etag:
+            continue
+        if rebase and uid in known:
+            known[uid] = etag
             continue
         known[uid] = etag
         if uid in by_uid:
@@ -256,10 +271,21 @@ def http_request(url, data=None, headers=None):
         return e.code, e.read().decode("utf-8", "replace")
 
 
+def http_bytes(url):
+    """A picture, whole: (status, bytes). No credentials go with it."""
+    request = urllib.request.Request(url)
+    with urllib.request.urlopen(request, timeout=20) as response:
+        if not response.headers.get("Content-Type", "").startswith("image/"):
+            return 415, b""
+        body = response.read(PHOTO_MAX_BYTES + 1)
+    return (413, b"") if len(body) > PHOTO_MAX_BYTES else (200, body)
+
+
 class Google:
-    def __init__(self, cfg=None, transport=http_request):
+    def __init__(self, cfg=None, transport=http_request, photo_transport=http_bytes):
         self.dir = cfg or config_dir()
         self.http = transport
+        self.photo_http = photo_transport
         self.client = read_json(os.path.join(self.dir, "client.json"))
         self.token = read_json(os.path.join(self.dir, "token.json"))
 
@@ -306,9 +332,9 @@ class Google:
             raise HttpFailure(status, body)
         return json.loads(body)
 
-    def pull(self, sync_token):
+    def pull(self, sync_token, fields=PERSON_FIELDS):
         """(people, next token, full?). All pages or an exception, never half."""
-        params = {"personFields": PERSON_FIELDS, "pageSize": 1000, "requestSyncToken": "true"}
+        params = {"personFields": fields, "pageSize": 1000, "requestSyncToken": "true"}
         if sync_token:
             params["syncToken"] = sync_token
         people, page_token = [], None
@@ -320,7 +346,7 @@ class Google:
                 page = self.fetch(query)
             except HttpFailure as e:
                 if sync_token and "EXPIRED_SYNC_TOKEN" in e.body:
-                    return self.pull(None)	# seven days old: start over
+                    return self.pull(None, fields)	# seven days old: start over
                 raise
             people.extend(page.get("connections") or [])
             page_token = page.get("nextPageToken")
@@ -328,10 +354,121 @@ class Google:
                 return people, page.get("nextSyncToken"), not sync_token
 
 
+def photo_dir(store_file=None):
+    return os.path.join(os.path.dirname(store_file or store_path()), "contact-photos")
+
+
+def photo_name(uid):
+    """FNV-1a, 64 bits: comm/contact-photo.h works out the same name in C."""
+    h = 0xcbf29ce484222325
+    for byte in uid.encode():
+        h = ((h ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+    return f"{h:016x}.jpg"
+
+
+def photo_url(url):
+    """The address of the same picture at PHOTO_PX: Google's size suffix."""
+    head, mark, tail = url.rpartition("=s")
+    if mark and tail.split("-")[0].isdigit():
+        return f"{head}=s{PHOTO_PX}"
+    return f"{url}=s{PHOTO_PX}" if "=" not in url.rsplit("/", 1)[-1] else url
+
+
+def photo_of(person):
+    """The address of a person's own picture, or "" for Google's default one."""
+    photos = person.get("photos") or []
+    photos = sorted(photos, key=lambda p: 0 if (p.get("metadata") or {}).get("primary") else 1)
+    if not photos or photos[0].get("default") or not photos[0].get("url"):
+        return ""
+    url = photo_url(photos[0]["url"])
+    return url if url.startswith("https://") else ""
+
+
+def remove_quietly(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def sync_photos(google, people, state, store_file, save):
+    """Each person's picture, only when their etag says it may have changed.
+
+    Never raises for a picture: what could not be fetched stays in state's
+    photo_pending and is tried again next run, since an incremental sync will
+    not mention that person again. Picture addresses are not logged anywhere.
+    """
+    folder = photo_dir(store_file)
+    done = state.setdefault("photo_etags", {})
+    pending = state.setdefault("photo_pending", {})
+    for person in people:
+        resource = person.get("resourceName")
+        if not resource:
+            continue
+        uid = uid_of(resource)
+        if (person.get("metadata") or {}).get("deleted"):
+            pending.pop(uid, None)
+            done.pop(uid, None)
+            remove_quietly(os.path.join(folder, photo_name(uid)))
+            continue
+        etag = person.get("etag", "")
+        if done.get(uid) != etag or not etag:
+            pending[uid] = {"etag": etag, "url": photo_of(person)}
+    for uid in [u for u in done if u not in state.get("known", {})]:
+        done.pop(uid)
+        remove_quietly(os.path.join(folder, photo_name(uid)))
+    fetched = failed = in_a_row = since_save = 0
+    for uid in list(pending):
+        job = pending[uid]
+        path = os.path.join(folder, photo_name(uid))
+        try:
+            if job["url"]:
+                status, body = google.photo_http(job["url"])
+                if status != 200 or not body:
+                    raise SyncError(f"HTTP {status}")
+                write_private(path, body)
+                fetched += 1
+            else:
+                remove_quietly(path)
+        except Exception:
+            # a picture is never worth failing a sync for
+            failed += 1
+            in_a_row += 1
+            if in_a_row >= PHOTO_GIVE_UP:
+                break
+            continue
+        in_a_row = 0
+        done[uid] = job["etag"]
+        del pending[uid]
+        since_save += 1
+        if since_save >= 50:
+            since_save = 0
+            save()	# a stopped run does not start over
+    return fetched, len(pending)
+
+
 def sync_once(google, store_file=None):
     state_path = os.path.join(google.dir, "state.json")
     state = read_json(state_path, {}) or {}
-    people, next_token, full = google.pull(state.get("sync_token"))
+    migrating = state.get("photos_version") != PHOTOS_VERSION
+    if migrating and state.get("sync_token"):
+        # the last answer to the old question, so that nothing changed on Google
+        # since the last sync is lost when the people's etags start over below
+        people, _, full = google.pull(state["sync_token"], OLD_PERSON_FIELDS)
+        apply_people(people, state, store_file, full, False)
+    people, next_token, full = google.pull(None if migrating else state.get("sync_token"))
+    counts = apply_people(people, state, store_file, full, migrating and bool(state.get("known")))
+    state["sync_token"] = next_token
+    state["photos_version"] = PHOTOS_VERSION
+    write_json(state_path, state)
+    counts["photos"], counts["photos_waiting"] = sync_photos(
+        google, people, state, store_file, lambda: write_json(state_path, state))
+    write_json(state_path, state)
+    return counts
+
+
+def apply_people(people, state, store_file, full, rebase):
+    """What Google said, into the store and state's known; returns the counts."""
     changes, deleted = [], []
     for person in people:
         resource = person.get("resourceName")
@@ -348,11 +485,11 @@ def sync_once(google, store_file=None):
     if full and not changes and len(known) > 5:
         raise SyncError("Google returned nobody; the store was left alone")
     with Store(store_file) as store:
-        rows, known, counts = merge(store.rows, changes, deleted, known, full)
+        rows, known, counts = merge(store.rows, changes, deleted, known, full, rebase)
         store.rows = rows
         if any(counts[k] for k in ("added", "updated", "removed")):
             store.save()
-    write_json(state_path, {"sync_token": next_token, "known": known})
+    state["known"] = known
     counts["total"] = len(known)
     counts["kind"] = "full" if full else "incremental"
     return counts
@@ -479,7 +616,8 @@ def cmd_once(_args):
         write_status("error", str(e)[:120])
         print(e, file=sys.stderr)
         return 1
-    extra = {k: counts[k] for k in ("total", "added", "updated", "removed", "dropped")}
+    extra = {k: counts[k] for k in ("total", "added", "updated", "removed", "dropped",
+                                    "photos", "photos_waiting")}
     write_status("ok", "the list is full" if counts["dropped"] else counts["kind"], **extra)
     print(" ".join(f"{k}={v}" for k, v in counts.items()))
     return 0
@@ -508,6 +646,7 @@ def cmd_signout(_args):
             row["uid"] = ""
         if store.rows:
             store.save()
+    shutil.rmtree(photo_dir(), ignore_errors=True)	# whose they were is gone with the uids
     for name in ("token.json", "state.json"):
         path = os.path.join(google.dir, name)
         if os.path.exists(path):

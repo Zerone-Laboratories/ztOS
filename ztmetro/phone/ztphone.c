@@ -38,6 +38,7 @@
 
 #include "zrnmetrocore.h"
 #include "comm.h"
+#include "contact-photo.h"
 
 #define MARGIN ZMC_MARGIN
 
@@ -495,10 +496,11 @@ static double draw_contacts(cairo_t *cr) {
 	int shown = n_contacts < CONTACT_ROWS ? n_contacts : CONTACT_ROWS;
 	for (int i = 0; i < shown; i++) {
 		struct contact *c = &contacts[i];
+		contact_tile(cr, MARGIN, y + 1, 48, c->name, c->uid);
 		cairo_set_source_rgb(cr, 1, 1, 1);
-		zmc_text_line(cr, c->name, FONT_SEMILIGHT, 24, MARGIN, y, zmc.width - 2 * MARGIN);
+		zmc_text_line(cr, c->name, FONT_SEMILIGHT, 24, MARGIN + 60, y, zmc.width - 2 * MARGIN - 60);
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		zmc_text_line(cr, c->mobile[0] ? c->mobile : c->other, FONT_REGULAR, 13.5, MARGIN, y + 31, zmc.width - 2 * MARGIN);
+		zmc_text_line(cr, c->mobile[0] ? c->mobile : c->other, FONT_REGULAR, 13.5, MARGIN + 60, y + 31, zmc.width - 2 * MARGIN - 60);
 		zmc_add_hit(0, y - 2, zmc.width, 58, ACT_PERSON, i);
 		y += 62;
 	}
@@ -611,6 +613,14 @@ static double draw_call(cairo_t *cr) {
 		snprintf(timer, sizeof(timer), "%ld:%02ld", seconds / 60, seconds % 60);
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		zmc_text(cr, timer, FONT_LIGHT, 30, MARGIN, y, 0);
+	}
+	if (!call_keys && !ending) {
+		/* their photo, if we know them and have one: no initials here */
+		const struct contact *known = contact_of_number(who);
+		cairo_surface_t *photo = known ? contact_photo_get(known->uid) : NULL;
+		if (photo) {
+			zmc_picture(cr, photo, MARGIN, y + (active ? 48 : 0), 150);
+		}
 	}
 	if (ending) return zmc.height;
 	if (call_keys && active) {

@@ -180,5 +180,99 @@ class SignIn(unittest.TestCase):
         self.assertEqual(out["code"], "abc")
 
 
+class Photos(Base):
+    PEOPLE = {"connections": [
+        {"resourceName": "people/p1", "etag": "e1", "names": [{"displayName": "Ann Example"}],
+         "photos": [{"url": "https://lh3.example/a=s100", "metadata": {"primary": True}}]},
+        {"resourceName": "people/p2", "etag": "e2", "names": [{"displayName": "Ben Example"}],
+         "photos": [{"url": "https://lh3.example/b=s100", "default": True}]},
+    ], "nextSyncToken": "t1"}
+
+    def setUp(self):
+        super().setUp()
+        self.got = []
+        self.fail = False
+
+        def photo(url):
+            self.got.append(url)
+            if self.fail:
+                raise OSError("no network")
+            return 200, b"JPEG"
+        self.google.photo_http = photo
+        self.dir = os.path.join(self.tmp.name, "share", "contact-photos")
+
+    def sync(self, reply):
+        self.fake.script.append((200, reply))
+        return z.sync_once(self.google, self.file)
+
+    def path(self, uid):
+        return os.path.join(self.dir, z.photo_name(uid))
+
+    def test_only_real_photos_at_192_private(self):
+        counts = self.sync(self.PEOPLE)
+        self.assertEqual(self.got, ["https://lh3.example/a=s192"])
+        self.assertEqual(counts["photos"], 1)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path("g:people/p1")).st_mode), 0o600)
+        self.assertFalse(os.path.exists(self.path("g:people/p2")))
+        self.assertIn("personFields=" + urllib.parse.quote(z.PERSON_FIELDS, safe=""), self.fake.urls[0])
+
+    def test_same_etag_no_download_new_etag_one(self):
+        self.sync(self.PEOPLE)
+        self.got.clear()
+        self.sync({"connections": [], "nextSyncToken": "t2"})
+        self.sync(self.PEOPLE)
+        self.assertEqual(self.got, [])
+        changed = json.loads(json.dumps(self.PEOPLE))
+        changed["connections"][0]["etag"] = "e1b"
+        self.sync(changed)
+        self.assertEqual(self.got, ["https://lh3.example/a=s192"])
+
+    def test_failed_download_does_not_fail_sync_and_is_retried(self):
+        self.fail = True
+        counts = self.sync(self.PEOPLE)
+        self.assertEqual(counts["photos"], 0)
+        self.assertEqual(counts["photos_waiting"], 1)
+        self.assertEqual(self.rows()["Ann Example"]["uid"], "g:people/p1")
+        self.fail = False
+        self.got.clear()
+        counts = self.sync({"connections": [], "nextSyncToken": "t2"})
+        self.assertEqual(self.got, ["https://lh3.example/a=s192"])
+        self.assertTrue(os.path.exists(self.path("g:people/p1")))
+
+    def test_photo_removed_when_default_or_deleted(self):
+        self.sync(self.PEOPLE)
+        now_default = json.loads(json.dumps(self.PEOPLE))
+        now_default["connections"][0].update(etag="e1b", photos=[{"url": "https://x/=s100", "default": True}])
+        self.sync(now_default)
+        self.assertFalse(os.path.exists(self.path("g:people/p1")))
+        self.sync(self.PEOPLE)
+        self.sync({"connections": [{"resourceName": "people/p1", "metadata": {"deleted": True}}],
+                   "nextSyncToken": "t3"})
+        self.assertFalse(os.path.exists(self.path("g:people/p1")))
+
+    def test_migration_once_keeps_edits_here_and_catches_up(self):
+        # as a store synced before photos: a token, etags from the old question
+        with z.Store(self.file) as s:
+            s.rows = [dict(name="Edited Here", mobile="1", other="", email="", note="", uid="g:people/p1")]
+            s.save()
+        z.write_json(os.path.join(self.cfg, "state.json"),
+                     {"sync_token": "old", "known": {"g:people/p1": "old-etag"}})
+        self.fake.script.append((200, {"connections": [], "nextSyncToken": "x"}))
+        self.sync(self.PEOPLE)
+        self.assertIn("syncToken=old", self.fake.urls[0])
+        self.assertIn("personFields=" + urllib.parse.quote(z.OLD_PERSON_FIELDS, safe="") + "&", self.fake.urls[0])
+        self.assertNotIn("syncToken=", self.fake.urls[1])
+        self.assertIn("Edited Here", self.rows())	# not overwritten by the new etag
+        self.assertEqual(self.got, ["https://lh3.example/a=s192"])
+        self.fake.urls.clear()
+        self.sync({"connections": [], "nextSyncToken": "t2"})
+        self.assertIn("syncToken=t1", self.fake.urls[0])	# once only
+
+    def test_name_is_fnv1a(self):
+        self.assertEqual(z.photo_name("g:people/c1"), z.photo_name("g:people/c1"))
+        self.assertRegex(z.photo_name("x"), r"^[0-9a-f]{16}\.jpg$")
+        self.assertEqual(z.photo_name(""), "cbf29ce484222325.jpg")
+
+
 if __name__ == "__main__":
     unittest.main()
