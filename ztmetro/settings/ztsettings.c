@@ -39,6 +39,7 @@
 #include <wayland-client.h>
 
 #include "zrnmetrocore.h"
+#include "zrnboard.h"
 #include "../background-apps.h"
 
 /* A file in the session's runtime directory: $XDG_RUNTIME_DIR, or
@@ -90,6 +91,7 @@ enum action {
 	ACT_OPEN_PAGE,
 	ACT_BACK,
 	ACT_ACCENT,
+	ACT_ACCENT_OPEN,	/* the theme page's box: the picker flips in over it */
 	ACT_PALETTE,	/* the DotMatrix style's palette, as the accent is Metro's */
 	ACT_WALL,		/* arg: 0 none, else the photo walls[arg - 1] */
 	ACT_WALL_TARGET,	/* arg: 0 start and lock, 1 start, 2 lock */
@@ -1245,7 +1247,7 @@ static void walls_scan(void) {
 #define WALL_SWIVEL_IN_MS	300	/* "swivel in": -60 to 0 about X, Log 200 */
 #define WALL_SWIVEL_OUT_MS	199	/* "swivel out": 0 to 60 about X, Exp 60 */
 #define WALL_TURN_MS		480	/* the page's rows turning in, before the photos */
-#define WALL_LEAVE_MS		220	/* a category leaving: its photos swivel out, then the page turns */
+#define WALL_LEAVE_MS		400	/* a category leaving: its photos swivel out, then the page turns */
 static unsigned char wall_state[MAX_WALLS];	/* 0 not made, 1 queued, 2 made, 3 failed */
 static uint32_t wall_arrive[MAX_WALLS];		/* when a made photo swivels in */
 static int wall_queue[MAX_WALLS], wall_q_n, wall_q_head;
@@ -1390,22 +1392,21 @@ static void wall_prefetch(int k) {
 
 /* the curves of DevTest's animations (Iris's Exp and Log, weights as there) */
 static double wall_ease(double t, bool out) {
-	double a = out ? 2.0 : 200.0 / 30.0;
+	double a = 2.0;	/* Exp 60 going, Log 60 coming */
 	t = fmin(1, fmax(0, t));
 	if (out) return (exp(a * t) - 1) / (exp(a) - 1);
 	return 1 - (exp(a * (1 - t)) - 1) / (exp(a) - 1);
 }
 
-/* a photo turned `deg` about its horizontal middle line, drawn on the GPU */
+/* a photo turned `deg` about its top edge, drawn on the GPU */
 static void wall_card(cairo_surface_t *img, unsigned rev, double x, double y, double w, double h,
 		double deg, double alpha, int cell) {
 	double a = deg * M_PI / 180, c[4][3];
 	for (int i = 0; i < 4; i++) {
 		double lx = (i & 1) ? w : 0, ly = (i & 2) ? h : 0;
-		double u = ly - h / 2;
 		c[i][0] = x + lx;
-		c[i][1] = y + h / 2 + u * cos(a);
-		c[i][2] = u * sin(a);
+		c[i][1] = y + ly * cos(a);	/* about its top edge */
+		c[i][2] = ly * sin(a);
 	}
 	if (cell < 0) zmc_gpu_quad(img, rev, c, alpha);
 	else zmc_gpu_quad_region(img, rev, (cell % 3) * WALL_PW, (cell / 3) * WALL_PH,
@@ -1435,25 +1436,26 @@ static void wall_overlay(int page) {
 		int k = cat_first[c] + i - 1;
 		double x = MARGIN + (i % 3) * (tw + gap), y = wall_grid_top + (i / 3) * (th + gap) - zmc.scroll;
 		if (y + th < ZMC_HEADER_H || y > zmc.height) continue;
-		double stagger = ((i - 1) % 3) * 60 + fmin((i - 1) / 3, 4) * 60;	/* the rows, a few at most */
+		/* a row at a time, top first, both ways: the reader board's motion */
+		double stagger = fmin(i / 3, 6) * ZB_STAGGER_MS;
 		bool leaving = wall_leave_at != 0;
-		uint32_t t0 = leaving ? wall_leave_at : wall_open_at + (uint32_t)stagger;
-		double dur = leaving ? WALL_SWIVEL_OUT_MS : WALL_SWIVEL_IN_MS;
+		uint32_t t0 = (leaving ? wall_leave_at : wall_open_at) + (uint32_t)stagger;
+		double dur = ZB_ROW_MS;
 		if ((int32_t)(now - t0) < 0) continue;	/* its turn has not come */
 		double e = wall_ease((double)(now - t0) / dur, leaving);
-		/* the cell: out (0 to 60) or in (-60 to 0) about X, grey */
-		double deg = leaving ? 60 * e : -60 * (1 - e);
+		/* the cell: out (0 to 90) or in (-45 to 0) about its top, grey */
+		double deg = leaving ? ZB_OUT_DEG * e : ZB_IN_DEG * (1 - e);
 		double alpha = leaving ? 1 - e : e;
 		if (alpha > 0) wall_card(wall_grey, 1, x, y, tw, th, deg, alpha, -1);
 		/* the photo, over its cell: its own swivel, from when it arrived */
 		if (wall_state[k] != 2) continue;
 		if (leaving) {
-			deg = 60 * e;
+			deg = ZB_OUT_DEG * e;
 			alpha = 1 - e;
 		} else {
 			if ((int32_t)(now - wall_arrive[k]) < 0) continue;
-			e = wall_ease((double)(now - wall_arrive[k]) / WALL_SWIVEL_IN_MS, false);
-			deg = -60 * (1 - e);
+			e = wall_ease((double)(now - wall_arrive[k]) / ZB_ROW_MS, false);
+			deg = ZB_IN_DEG * (1 - e);
 			alpha = e;
 		}
 		if (alpha <= 0) continue;
@@ -1651,6 +1653,61 @@ static double draw_accents(cairo_t *cr) {
 	return y + rows * (side + gap) + 20;
 }
 
+/* ---- the accent picker: the reader board, not a page ------------------------
+ * As the phone's (a Lumia 1020's, on video): the box lights up, the old page
+ * goes, the label is there at once and the colours flip in a row at a time;
+ * chosen, they flip out from the top and the old page is back with it. */
+
+static double accent_box_y;	/* on the theme page */
+
+static void accent_cell(cairo_t *cr, int i, double w, double h) {
+	zmc_set_rgb(cr, ACCENTS[i].color);
+	cairo_rectangle(cr, 0, 0, w, h);
+	cairo_fill(cr);
+	if (i == app.accent) {
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		cairo_set_line_width(cr, 3);
+		cairo_rectangle(cr, 1.5, 1.5, w - 3, h - 3);
+		cairo_stroke(cr);
+	}
+}
+
+static void palette_cell(cairo_t *cr, int i, double w, double h) {
+	dm_map_raw++;	/* its own colours, not the palette in use */
+	zmc_set_rgb(cr, dm_palettes[i][0]);
+	cairo_rectangle(cr, 4, 4, w - 8, w * 0.62);
+	cairo_fill(cr);
+	zmc_set_rgb(cr, dm_palettes[i][1]);
+	cairo_rectangle(cr, 4, 4 + w * 0.68, w - 8, w * 0.26);
+	cairo_fill(cr);
+	dm_map_raw--;
+	double k = i == app.palette ? 1 : 0.6;
+	cairo_set_source_rgb(cr, k, k, k);
+	zmc_text(cr, dm_palette_names[i], FONT_REGULAR, 14, 4, w + 4, 0);
+}
+
+/* the box, lit: the accent behind what it says */
+static void accent_box(cairo_t *cr, double w, double h) {
+	bool dots = zmc.style == ZMC_STYLE_DOTMATRIX;
+	zmc_accent(cr);
+	cairo_rectangle(cr, 0, 0, w, h);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text(cr, dots ? dm_palette_names[app.palette] : ACCENTS[app.accent].name, FONT_REGULAR, 16, 42, 10, 0);
+}
+
+static void accent_board_open(void) {
+	bool dots = zmc.style == ZMC_STYLE_DOTMATRIX;
+	double gap = dots ? 10 : 9, cols = dots ? 3 : 4;
+	double side = (zmc.width - 2 * MARGIN - (cols - 1) * gap) / cols;
+	struct zmc_board b = { .count = dots ? DM_PALETTES : N_ACCENTS, .cols = (int)cols,
+		.x0 = MARGIN, .top = 46, .cell_w = side, .cell_h = dots ? side + 30 : side, .gap = gap,
+		.draw_cell = dots ? palette_cell : accent_cell, .action = dots ? ACT_PALETTE : ACT_ACCENT,
+		.label = dots ? "PALETTES" : "ACCENTS", .picker = true, .draw_box = accent_box,
+		.box_x = MARGIN, .box_y = accent_box_y - zmc.scroll, .box_w = zmc.width - 2 * MARGIN, .box_h = 42 };
+	zmc_board_open(&b);
+}
+
 static double draw_theme(cairo_t *cr) {
 	double y = zmc_header(cr, "theme");
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
@@ -1658,6 +1715,7 @@ static double draw_theme(cairo_t *cr) {
 	/* Windows Phone's list picker, collapsed: the box shows the choice and
 	 * opens the full-screen picker (UIXMobile!ListPicker in full mode) */
 	y += 20;
+	accent_box_y = y;
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	cairo_set_line_width(cr, 2);
 	cairo_rectangle(cr, MARGIN + 1, y + 1, zmc.width - 2 * MARGIN - 2, 40);
@@ -1669,7 +1727,7 @@ static double draw_theme(cairo_t *cr) {
 	if (zmc.style == ZMC_STYLE_DOTMATRIX) dm_map_raw--;
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, zmc.style == ZMC_STYLE_DOTMATRIX ? dm_palette_names[app.palette] : ACCENTS[app.accent].name, FONT_REGULAR, 16, MARGIN + 42, y + 10, 0);
-	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPEN_PAGE, PAGE_ACCENTS);
+	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_ACCENT_OPEN, 0);
 	y += 62;
 	double gap = 8;
 
@@ -3065,17 +3123,25 @@ static void activate(int action, int arg) {
 		app.palette = arg;
 		config_save();
 		zmc_config_style();	/* this app's dots in it at once */
-		if (zmc.page == PAGE_ACCENTS) {
+		if (zmc_board_up()) {
+			zmc_board_close();
+		} else if (zmc.page == PAGE_ACCENTS) {
 			zmc_go(PAGE_THEME, -1);
 		} else {
 			zmc_redraw();
 		}
 		break;
+	case ACT_ACCENT_OPEN:
+		accent_board_open();
+		break;
 	case ACT_ACCENT:
 		app.accent = arg;
 		config_save();
-		if (zmc.page == PAGE_ACCENTS) {
-			zmc_go(PAGE_THEME, -1);	/* chosen: the picker turns away */
+		if (zmc_board_up()) {
+			zmc_board_redraw();	/* the outline on the new one, as they go */
+			zmc_board_close();
+		} else if (zmc.page == PAGE_ACCENTS) {
+			zmc_go(PAGE_THEME, -1);	/* (opened directly, by name) */
 		}
 		break;
 	case ACT_WALL_TARGET:
@@ -3090,7 +3156,7 @@ static void activate(int action, int arg) {
 			for (int i = 0; i < n && i < 6; i++) wall_prefetch(cat_first[arg] + i);
 			wall_open_at = now + WALL_TURN_MS;	/* the cells, once the rows are in */
 			for (int i = 0; i < n && i < 6; i++) {	/* their photos come in with them */
-				wall_arrive[cat_first[arg] + i] = wall_open_at + (i % 3) * 60 + (i / 3) * 60;
+				wall_arrive[cat_first[arg] + i] = wall_open_at + (uint32_t)(((i + 1) / 3) * ZB_STAGGER_MS);
 			}
 			wall_busy_until = now + WALL_TURN_MS + 360 + WALL_SWIVEL_IN_MS;	/* the cells' last swivel */
 			wall_kick();
