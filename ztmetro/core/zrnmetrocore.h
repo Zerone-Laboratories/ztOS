@@ -283,6 +283,33 @@ void zmc_present(void);
 bool zmc_transition(const char *name, double t, double x, double y, double w, double h,
 	cairo_surface_t *source, unsigned revision);
 double zmc_transition_ms(const char *name);
+
+/* The reader board: rows of cells that flip in one row at a time, top first,
+ * over the same interface with no page change, and flip out the same way. Rows
+ * are drawn once when it opens, so a frame costs only GPU quads. While it is up
+ * it takes every touch; back closes it; a page change drops it at once. */
+struct zmc_board {
+	int count, cols;
+	double x0, top, cell_w, cell_h, gap;
+	/* one cell, its top left at the origin */
+	void (*draw_cell)(cairo_t *cr, int i, double w, double h);
+	bool (*live)(int i);	/* NULL: all of them answer a tap */
+	int action;		/* a tap on a live cell gives (action, i) */
+	const char *label;	/* a line above the rows, which does not move */
+	/* a picker: the box lit in place, the old page gone behind black, then the
+	 * rows. Otherwise the page stays faintly visible under the rows. */
+	bool picker;
+	void (*draw_box)(cairo_t *cr, double w, double h);
+	double box_x, box_y, box_w, box_h;	/* on screen */
+	void (*closed)(void);	/* it has finished going */
+};
+void zmc_board_open(const struct zmc_board *board);
+void zmc_board_close(void);		/* from the top, as it came */
+bool zmc_board_up(void);
+void zmc_board_redraw(void);		/* the rows again: a cell has changed */
+/* People's and the phone's letters: # a..z and the globe. has(i) says whether a
+ * cell (see zb_letter) has anything under it; a tap gives (action, i). */
+void zmc_letter_board(bool (*has)(int i), int action);
 double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg);
 void zmc_round_button(cairo_t *cr, double cx, double y, const char *glyph, const char *label,
 	int action, int arg);

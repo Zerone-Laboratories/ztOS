@@ -28,6 +28,7 @@
 #include "viewporter-client-protocol.h"
 #include "../retro/dm-chrome.h"
 #include "zrnmetrocore.h"
+#include "zrnboard.h"
 #include "zrnmetrogpu.h"
 #include "zrnmetrorender.h"
 
@@ -138,6 +139,15 @@ static double press_geometry(double w, double h, double *rx, double *ry);
 static int out_tapped = -1;	/* the row of out_rows that was tapped, or -1 */
 static void begin_animation(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start);
 
+/* set while drawing a frame, which cannot start another: asks for the next one */
+static bool board_more;
+static void board_draw(void);
+static void board_forget(void);
+static bool board_touch_down(int32_t id, double x, double y);
+static bool board_touch_motion(int32_t id, double x, double y);
+static bool board_touch_up(int32_t id);
+static void board_touch_cancel(void);
+static void board_paint(cairo_t *cr);
 static void back_forget(void);
 static cairo_surface_t *pivot_snapshot(int page, double scroll, int scale, struct zmc_rowset *rows,
 		double *its_next_dx);
@@ -844,6 +854,12 @@ void zmc_list_show(int page, int row) {
 	double max = vl_mem_top + vl_mem_count * vl_mem_row + 24 - zmc.height;
 	vl_saved[page] = at < 0 ? 0 : at > max && max > 0 ? max : at;
 	back_forget();
+	if (page == zmc.page && !zmc.anim_active) {
+		/* the page in front: there, at once (a letter tapped on the board over it) */
+		zmc.scroll = vl_saved[page];
+		zmc.fling = false;
+		zmc.vel = 0;
+	}
 }
 
 void zmc_list_freeze(bool freeze) {
@@ -2226,6 +2242,9 @@ static void present_gpu(uint32_t ms) {
 				0, 0, zmc.width, HEADER_H, 1);
 		}
 	}
+	if (!zmc.anim_active) {
+		board_draw();
+	}
 	if (zmc.busy && !zmc.anim_active && dotmatrix()) {
 		double pitch = 6, head = busy_head() * (zmc.width + 8 * pitch);
 		for (double x = pitch / 2; x < zmc.width; x += pitch) {
@@ -2249,6 +2268,10 @@ static void present_gpu(uint32_t ms) {
 	}
 	zmc.frame = wl_surface_frame(zmc.surface);
 	wl_callback_add_listener(zmc.frame, &frame_listener, NULL);
+	if (board_more) {
+		board_more = false;
+		zmc.dirty = true;
+	}
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	bool ended = zmg_end();
 	clock_gettime(CLOCK_MONOTONIC, &t2);
@@ -2617,6 +2640,7 @@ static void collect_rows(struct rowset *set, double scroll, double tapped, bool 
  * starts, none to arrive when it closes. */
 static void begin_animation_(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start);
 static void begin_animation(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start) {
+	board_forget();
 	uint32_t t0 = now_ms();
 	begin_animation_(have_from, have_to, target, tapped, requested_start);
 	uint32_t took = now_ms() - t0;
@@ -2790,6 +2814,9 @@ static int32_t app_touch_id = -1;	/* a finger the app took (zmc_app.touch) */
 
 static void touch_down(void *data, struct wl_touch *touch, uint32_t serial, uint32_t time,
 		struct wl_surface *surface, int32_t id, wl_fixed_t x, wl_fixed_t y) {
+	if (board_touch_down(id, wl_fixed_to_double(x), wl_fixed_to_double(y))) {
+		return;
+	}
 	if (zmc.anim_active && zmc.entrance && (int32_t)(now_ms() - zmc.anim_start) > ENTER_HOLD_MS) {
 		/* a finger does not wait for the page to finish gliding in */
 		zmc.anim_start = now_ms() - zmc.anim_total;
@@ -2866,6 +2893,9 @@ static void touch_down(void *data, struct wl_touch *touch, uint32_t serial, uint
 
 static void touch_up(void *data, struct wl_touch *touch, uint32_t serial, uint32_t time,
 		int32_t id) {
+	if (board_touch_up(id)) {
+		return;
+	}
 	if (id == app_touch_id) {
 		app_touch_id = -1;
 		zmc.app->touch(2, id, 0, 0, time);
@@ -2947,6 +2977,9 @@ static int drag_axis(double dx, double dy) {
 
 static void touch_motion(void *data, struct wl_touch *touch, uint32_t time, int32_t id,
 		wl_fixed_t x, wl_fixed_t y) {
+	if (board_touch_motion(id, wl_fixed_to_double(x), wl_fixed_to_double(y))) {
+		return;
+	}
 	if (id == app_touch_id) {
 		zmc.app->touch(1, id, wl_fixed_to_double(x), wl_fixed_to_double(y), time);
 		return;
@@ -3010,6 +3043,7 @@ static void touch_motion(void *data, struct wl_touch *touch, uint32_t time, int3
 
 static void touch_frame(void *data, struct wl_touch *touch) {}
 static void touch_cancel(void *data, struct wl_touch *touch) {
+	board_touch_cancel();
 	if (app_touch_id >= 0) {
 		int32_t id = app_touch_id;
 		app_touch_id = -1;
@@ -3407,6 +3441,10 @@ void zmc_back(void) {
 	if (zmc.anim_active) {
 		return;
 	}
+	if (zmc_board_up()) {
+		zmc_board_close();
+		return;
+	}
 	if (!zmc.app->back || !zmc.app->back()) {
 		zmc_quit();
 	}
@@ -3759,12 +3797,9 @@ double zmc_transition_ms(const char *name) {
 	return A ? A->ms : 0;
 }
 
-bool zmc_transition(const char *name, double t, double x, double y, double w, double h,
-		cairo_surface_t *source, unsigned rev) {
-	const struct ztanim *A = zt_find(name);
-	if (!A) {
-		return false;
-	}
+/* Where a rectangle's corners are at progress t, and how visible it is. */
+static double zt_corners(const struct ztanim *A, double t, double x, double y, double w, double h,
+		double c[4][3]) {
 	if (t < 0) t = 0; else if (t > 1) t = 1;
 	double deg, e;
 	if (A->curve == 'o') {
@@ -3780,7 +3815,7 @@ bool zmc_transition(const char *name, double t, double x, double y, double w, do
 	double scale = A->from_scale + (A->to_scale - A->from_scale) * e;
 	double dy = A->from_dy + (A->to_dy - A->from_dy) * e;
 	double alpha = A->from_alpha + (A->to_alpha - A->from_alpha) * e;
-	double a = deg * M_PI / 180, c[4][3];
+	double a = deg * M_PI / 180;
 	double lx[4] = { 0, w, 0, w }, ly[4] = { 0, 0, h, h };
 	for (int i = 0; i < 4; i++) {
 		double px = lx[i] - w / 2, py = ly[i] - h / 2, pz = 0;
@@ -3791,9 +3826,388 @@ bool zmc_transition(const char *name, double t, double x, double y, double w, do
 		c[i][1] = y + dy + h/2 + py*scale;
 		c[i][2] = pz*scale;
 	}
+	return alpha;
+}
+
+bool zmc_transition(const char *name, double t, double x, double y, double w, double h,
+		cairo_surface_t *source, unsigned rev) {
+	const struct ztanim *A = zt_find(name);
+	if (!A) {
+		return false;
+	}
+	double c[4][3];
+	double alpha = zt_corners(A, t, x, y, w, h, c);
 	zmc_gpu_quad(source, rev, c, alpha);
 	return true;
 }
+
+/* ---- the reader board (see zrnmetrocore.h; the numbers are in zrnboard.h) ----
+ *
+ * One picture holds all the rows, laid out as on the screen, so it is one upload
+ * however many rows there are. Rows only ever move as GPU quads. */
+
+enum { BOARD_HIDDEN, BOARD_IN, BOARD_SHOWN, BOARD_OUT };
+static struct {
+	struct zmc_board b;
+	int state, rows;
+	uint32_t start;
+	cairo_surface_t *atlas, *box, *label, *black;
+	unsigned revision;
+	double label_h;
+	int touch;
+	bool touched, moved;
+	double down_x, down_y;
+} bd;
+
+static int board_scale(void) {
+	return zmc.scale > 0 ? zmc.scale : 1;
+}
+
+static void board_atlas_draw(void) {
+	int s = board_scale();
+	double pitch = bd.b.cell_h + bd.b.gap;
+	if (!bd.atlas) {
+		bd.atlas = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, zmc.width * s,
+			(int)ceil(bd.rows * pitch * s));
+	}
+	cairo_t *cr = cairo_create(bd.atlas);
+	cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+	cairo_paint(cr);
+	cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+	cairo_scale(cr, s, s);
+	for (int i = 0; i < bd.b.count; i++) {
+		cairo_save(cr);
+		cairo_translate(cr, bd.b.x0 + (i % bd.b.cols) * (bd.b.cell_w + bd.b.gap),
+			(i / bd.b.cols) * pitch);
+		bd.b.draw_cell(cr, i, bd.b.cell_w, bd.b.cell_h);
+		cairo_restore(cr);
+	}
+	cairo_destroy(cr);
+	cairo_surface_flush(bd.atlas);
+	bd.revision++;
+}
+
+static void board_free(void) {
+	cairo_surface_t **all[] = { &bd.atlas, &bd.box, &bd.label };
+	for (int i = 0; i < 3; i++) {
+		if (*all[i]) {
+			zmg_forget(*all[i]);
+			cairo_surface_destroy(*all[i]);
+			*all[i] = NULL;
+		}
+	}
+}
+
+static double board_run_ms(void) {
+	return (bd.rows - 1) * ZB_STAGGER_MS + ZB_ROW_MS;
+}
+
+/* How long before the rows start, coming in. */
+static double board_lead_ms(void) {
+	return bd.b.picker ? (bd.b.draw_box ? ZB_BOX_MS : 0) + ZB_PAGE_OUT_MS : 0;
+}
+
+void zmc_board_open(const struct zmc_board *board) {
+	/* (no GPU: no way to show it, and it would take every touch) */
+	if (!board || !board->draw_cell || board->count <= 0 || board->cols <= 0 ||
+			bd.state != BOARD_HIDDEN || zmc.anim_active || (zmc.configured && !zmg_ready())) {
+		return;
+	}
+	bd.b = *board;
+	bd.rows = (board->count + board->cols - 1) / board->cols;
+	board_atlas_draw();
+	int s = board_scale();
+	if (board->draw_box && board->box_w > 0 && board->box_h > 0) {
+		bd.box = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)ceil(board->box_w * s),
+			(int)ceil(board->box_h * s));
+		cairo_t *cr = cairo_create(bd.box);
+		cairo_scale(cr, s, s);
+		board->draw_box(cr, board->box_w, board->box_h);
+		cairo_destroy(cr);
+		cairo_surface_flush(bd.box);
+	}
+	if (board->label) {
+		bd.label_h = 24;
+		bd.label = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, zmc.width * s, (int)ceil(bd.label_h * s));
+		cairo_t *cr = cairo_create(bd.label);
+		cairo_scale(cr, s, s);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, board->label, FONT_SEMIBOLD, 13.5, board->x0, 2, 0);
+		cairo_destroy(cr);
+		cairo_surface_flush(bd.label);
+	}
+	if (!bd.black) {
+		bd.black = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+		*(uint32_t *)cairo_image_surface_get_data(bd.black) = 0xff000000;
+		cairo_surface_mark_dirty(bd.black);
+	}
+	zmc.fling = false;
+	zmc.vel = 0;
+	bd.state = zmc.configured ? BOARD_IN : BOARD_SHOWN;	/* (a picture of it: at rest) */
+	bd.start = zmc_now_ms();
+	present();
+}
+
+void zmc_board_close(void) {
+	if (bd.state == BOARD_HIDDEN || bd.state == BOARD_OUT) {
+		return;
+	}
+	bd.state = BOARD_OUT;
+	bd.start = zmc_now_ms();
+	present();
+}
+
+bool zmc_board_up(void) {
+	return bd.state != BOARD_HIDDEN;
+}
+
+void zmc_board_redraw(void) {
+	if (bd.state != BOARD_HIDDEN) {
+		board_atlas_draw();
+		present();
+	}
+}
+
+static void board_forget(void) {
+	if (bd.state == BOARD_HIDDEN) {
+		return;
+	}
+	bd.state = BOARD_HIDDEN;
+	board_free();
+}
+
+static void board_scrim(double alpha) {
+	if (alpha <= 0.001 || !bd.black) {
+		return;
+	}
+	if (dotmatrix() && !bd.b.picker) {
+		alpha *= 0.97 / ZB_SCRIM;	/* dots are open: what is behind would read through them */
+	}
+	double c[4][3] = { { 0, 0, 0 }, { zmc.width, 0, 0 }, { 0, zmc.height, 0 }, { zmc.width, zmc.height, 0 } };
+	zmc_gpu_quad(bd.black, 1, c, alpha);
+}
+
+/* One row, `ms` after its own start. */
+static void board_row(int r, double ms, bool in) {
+	const struct ztanim *A = zt_find(in ? "readerboard-in" : "readerboard-out");
+	double t = ms / ZB_ROW_MS;
+	if (t < 0 || (!in && t >= 1)) {
+		if (in || t >= 1) return;	/* its turn has not come, or it has gone */
+	}
+	if (t < 0) t = 0;
+	if (t > 1) t = 1;
+	int s = board_scale();
+	double pitch = bd.b.cell_h + bd.b.gap, w = zmc.width, h = bd.b.cell_h;
+	double y = bd.b.top + r * pitch, c[4][3];
+	double alpha = zt_corners(A, t, 0, y, w, h, c);
+	if (dotmatrix()) {
+		/* no turn in this style: the row lights up, or goes out, dot by dot */
+		double reveal = alpha;
+		if (reveal <= 0.001) return;
+		struct zmg_vertex q[4] = { { 0, (float)y, 0 }, { (float)w, (float)y, 0 },
+			{ 0, (float)(y + h), 0 }, { (float)w, (float)(y + h), 0 } };
+		zmg_reveal = (float)reveal;
+		zmg_surface(bd.atlas, bd.revision, 0, r * pitch * s, w * s, (r * pitch + h) * s, q, 1);
+		zmg_reveal = 1;
+		return;
+	}
+	zmc_gpu_quad_region(bd.atlas, bd.revision, 0, r * pitch * s, w * s, h * s, c, alpha);
+}
+
+/* A frame of it, over whatever is in front. */
+static void board_draw(void) {
+	if (bd.state == BOARD_HIDDEN) {
+		return;
+	}
+	/* a number in /tmp/zmc-board-slow: that many times slower, to record it
+	 * (the shell's recorder is coarse); read once a run */
+	static double slow;
+	if (!slow) {
+		char e[16];
+		zmc_read_file("/tmp/zmc-board-slow", e, sizeof(e));
+		slow = atof(e) > 0 ? atof(e) : 1;
+	}
+	double ms = (double)(uint32_t)(zmc_now_ms() - bd.start) / slow, run = board_run_ms();
+	if (bd.state == BOARD_OUT) {
+		double end = bd.b.picker ? run + ZB_PAGE_IN_MS : run;
+		if (ms >= end) {
+			void (*closed)(void) = bd.b.closed;
+			board_forget();
+			if (closed) {
+				closed();
+			}
+			board_more = true;
+			return;
+		}
+		board_scrim(bd.b.picker ? 1 - fmax(0, ms - run) / ZB_PAGE_IN_MS : ZB_SCRIM * (1 - ms / run));
+		if (bd.label && ms < run) {
+			double c[4][3] = { { 0, bd.b.top - bd.label_h, 0 }, { zmc.width, bd.b.top - bd.label_h, 0 },
+				{ 0, bd.b.top, 0 }, { zmc.width, bd.b.top, 0 } };
+			zmc_gpu_quad(bd.label, 1, c, 1);
+		}
+		for (int r = 0; r < bd.rows; r++) {
+			board_row(r, ms - r * ZB_STAGGER_MS, false);
+		}
+		board_more = true;
+		return;
+	}
+	double lead = board_lead_ms(), rows_ms = ms - lead;
+	if (bd.b.picker) {
+		double box_end = bd.box ? ZB_BOX_MS : 0;
+		if (ms < box_end) {
+			double c[4][3] = { { bd.b.box_x, bd.b.box_y, 0 }, { bd.b.box_x + bd.b.box_w, bd.b.box_y, 0 },
+				{ bd.b.box_x, bd.b.box_y + bd.b.box_h, 0 }, { bd.b.box_x + bd.b.box_w, bd.b.box_y + bd.b.box_h, 0 } };
+			zmc_gpu_quad(bd.box, 1, c, 1);
+		} else {
+			board_scrim(fmin(1, (ms - box_end) / ZB_PAGE_OUT_MS));
+		}
+	} else {
+		board_scrim(ZB_SCRIM * fmin(1, ms / ZB_SCRIM_IN_MS));
+	}
+	if (bd.label && rows_ms >= 0) {
+		double c[4][3] = { { 0, bd.b.top - bd.label_h, 0 }, { zmc.width, bd.b.top - bd.label_h, 0 },
+			{ 0, bd.b.top, 0 }, { zmc.width, bd.b.top, 0 } };
+		zmc_gpu_quad(bd.label, 1, c, 1);
+	}
+	if (bd.state == BOARD_SHOWN) {
+		rows_ms = run + ZB_ROW_MS;
+	}
+	if (rows_ms >= 0) {
+		for (int r = 0; r < bd.rows; r++) {
+			board_row(r, rows_ms - r * ZB_STAGGER_MS, true);
+		}
+	}
+	if (bd.state == BOARD_IN) {
+		if (rows_ms >= run) {
+			bd.state = BOARD_SHOWN;
+		}
+		board_more = true;	/* (one more: the last row at rest) */
+	}
+}
+
+/* The same picture on a Cairo page, for --render: a board at rest. */
+static void board_paint(cairo_t *cr) {
+	if (bd.state == BOARD_HIDDEN) {
+		return;
+	}
+	cairo_save(cr);
+	cairo_set_source_rgba(cr, 0, 0, 0, bd.b.picker ? 1 : dotmatrix() ? 0.97 : ZB_SCRIM);
+	dm_wrap_raw++;
+	cairo_paint(cr);
+	dm_wrap_raw--;
+	cairo_set_source_surface(cr, bd.atlas, 0, bd.b.top * board_scale());
+	dm_wrap_raw++;
+	cairo_paint(cr);
+	if (bd.label) {
+		cairo_set_source_surface(cr, bd.label, 0, (bd.b.top - bd.label_h) * board_scale());
+		cairo_paint(cr);
+	}
+	dm_wrap_raw--;
+	cairo_restore(cr);
+}
+
+static bool board_touch_down(int32_t id, double x, double y) {
+	if (bd.state == BOARD_HIDDEN) {
+		return false;
+	}
+	if (!bd.touched) {
+		bd.touched = true;
+		bd.touch = id;
+		bd.moved = false;
+		bd.down_x = x;
+		bd.down_y = y;
+	}
+	return true;
+}
+
+static bool board_touch_motion(int32_t id, double x, double y) {
+	if (!bd.touched || bd.touch != id) {
+		return false;
+	}
+	if (hypot(x - bd.down_x, y - bd.down_y) > 12) {
+		bd.moved = true;
+	}
+	return true;
+}
+
+static bool board_touch_up(int32_t id) {
+	if (!bd.touched || bd.touch != id) {
+		return false;
+	}
+	bd.touched = false;
+	if (bd.moved || bd.state == BOARD_HIDDEN || bd.state == BOARD_OUT) {
+		return true;
+	}
+	double pitch = bd.b.cell_h + bd.b.gap, w = bd.b.cell_w + bd.b.gap;
+	double px = bd.down_x - bd.b.x0, py = bd.down_y - bd.b.top;
+	if (px < 0 || py < 0) {
+		return true;
+	}
+	int col = (int)(px / w), row = (int)(py / pitch), i = row * bd.b.cols + col;
+	if (col >= bd.b.cols || px - col * w >= bd.b.cell_w || py - row * pitch >= bd.b.cell_h ||
+			i >= bd.b.count || (bd.b.live && !bd.b.live(i))) {
+		return true;	/* a dim letter, or between the tiles: nothing */
+	}
+	struct zmc_hit hit = { .action = bd.b.action, .arg = i };
+	zmc_activate(&hit);
+	return true;
+}
+
+static void board_touch_cancel(void) {
+	bd.touched = false;
+}
+
+static bool (*letter_has)(int i);
+
+static bool letter_live(int i) {
+	return i < 27 && letter_has(i);
+}
+
+static void letter_cell(cairo_t *cr, int i, double w, double h) {
+	bool has = letter_live(i);
+	if (has) {
+		zmc_accent(cr);
+	} else {
+		zmc_set_rgb(cr, ZB_DIM_RGB);
+	}
+	cairo_rectangle(cr, 0, 0, w, h);
+	cairo_fill(cr);
+	if (has) {
+		cairo_set_source_rgb(cr, 1, 1, 1);
+	} else {
+		cairo_set_source_rgb(cr, ZB_DIM_TEXT, ZB_DIM_TEXT, ZB_DIM_TEXT);
+	}
+	if (i < 27) {
+		char text[2] = { zb_letter(i), 0 };
+		double y = h - ZB_INSET - ZB_FONT * 1.2;
+		zmc_text(cr, text, FONT_SEMILIGHT, ZB_FONT, ZB_INSET, y, 0);
+		return;
+	}
+	/* the globe */
+	double r = 11, cx = ZB_INSET + r, cy = h - ZB_INSET - r;
+	cairo_set_line_width(cr, 1.5);
+	cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
+	cairo_stroke(cr);
+	cairo_save(cr);
+	cairo_translate(cr, cx, cy);
+	cairo_scale(cr, 0.45, 1);
+	cairo_arc(cr, 0, 0, r, 0, 2 * M_PI);
+	cairo_restore(cr);
+	cairo_stroke(cr);
+	cairo_move_to(cr, cx - r, cy);
+	cairo_line_to(cr, cx + r, cy);
+	cairo_stroke(cr);
+}
+
+void zmc_letter_board(bool (*has)(int i), int action) {
+	letter_has = has;
+	double side = (zmc.width - 2 * MARGIN - (ZB_COLS - 1) * ZB_GAP) / ZB_COLS;
+	struct zmc_board b = { .count = ZB_CELLS, .cols = ZB_COLS, .x0 = MARGIN, .top = ZB_TOP,
+		.cell_w = side, .cell_h = side, .gap = ZB_GAP, .draw_cell = letter_cell,
+		.live = letter_live, .action = action };
+	zmc_board_open(&b);
+}
+
 
 double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg) {
 	const double h = 40, line = 2;
@@ -4045,6 +4459,11 @@ int zmc_render_png(const struct zmc_app *app, int page, int height, const char *
 	struct zmc_rowset rows;
 	cairo_surface_t *surface = scroll ? pivot_snapshot(page, atof(scroll), zmc.scale, &rows, &next_dx) :
 		page_snapshot(page, 0, zmc.scale);
+	{
+		cairo_t *cr = cairo_create(surface);
+		board_paint(cr);
+		cairo_destroy(cr);
+	}
 	cairo_status_t status = cairo_surface_write_to_png(surface, path);
 	cairo_surface_destroy(surface);
 	return status == CAIRO_STATUS_SUCCESS ? 0 : 1;
