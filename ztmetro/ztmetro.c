@@ -791,6 +791,8 @@ struct zt_server {
 	char (*hyper_files)[256];	/* names under the home folders, read when it opens */
 	int n_hyper_files;
 	uint32_t record_until;		/* "record MS": frames saved to /tmp/ztrec until then */
+	uint32_t ftrace_until;		/* "frametrace MS": frame times to /tmp/zt-frametrace.log */
+	FILE *ftrace;
 	bool record_top;
 
 	struct tile tiles[MAX_TILES];
@@ -820,13 +822,15 @@ struct zt_server {
 	double list_h, list_scroll;
 	float list_v;
 	int tapped_item;	/* the row that leaves last, or -1 */
-	/* the app list's letters, flipped in over it (core/zrnboard.h) */
+	/* the app list's letters, swivelled in over it (core/zrnboard.h) */
 	int board_state;	/* 0 hidden, 1 in, 2 shown, 3 out */
 	uint32_t board_start;
-	double board_came_ms;	/* closing: how far the rows had got coming in */
+	double board_came_ms;	/* closing: how far it had got coming in */
+	bool board_more;	/* it moves: another frame, asked for once this one is done */
 	bool board_clock_waits;	/* the clock starts at the frame that shows it */
-	struct zt_layer board_rows[ZB_ROWS];
-	bool board_live[ZB_CELLS];
+	struct zt_layer board_layer;	/* all the tiles, one texture */
+	bool board_live[ZB_CELLS], board_drawn[ZB_CELLS];	/* what the layer shows */
+	unsigned board_drawn_accent;
 	uint32_t turn_seed;	/* for the chance in each return */
 	struct glyph *glyphs;
 	int n_glyphs;
@@ -944,6 +948,8 @@ static void auth_input(struct zt_server *, uint32_t, const char *);
 static void auth_submit(struct zt_server *);
 static void auth_finish(struct zt_server *);
 static void draw_dialog(struct zt_server *);
+static void ftrace_mark(struct zt_server *server, const char *what, double ms);
+static double ftrace_clock(void);
 static void run_detached(const char *, const char *, const char *, const char *);
 
 /* In a window on another desktop (scripts/dev/run-nested.sh, any machine),
@@ -4523,9 +4529,10 @@ static void draw_item(struct zt_server *server, int i) {
 
 static double scroll_max(struct zt_server *server, bool list);
 
-/* ---- the app list's letters: the reader board over the list ------------------
+/* ---- the app list's letters: Swivel over the list ----------------------------
  * The same numbers and motion as ZrnMetroCore's (core/zrnboard.h), on the
- * shell's own quads: one texture a row, drawn once when it opens. Metro only:
+ * shell's own quads: one texture, kept until the letters or accent change, so
+ * opening again is nothing but the motion. Metro only:
  * DotMatrix's launcher has its own letter index, in dots. */
 
 static double board_side(struct zt_server *server) {
@@ -4536,6 +4543,7 @@ static void board_open(struct zt_server *server) {
 	if (server->board_state || !server->n_items) {
 		return;
 	}
+	double trace0 = ftrace_clock();
 	memset(server->board_live, 0, sizeof(server->board_live));
 	for (int i = 0; i < server->n_items; i++) {
 		struct app_item *it = &server->items[i];
@@ -4546,28 +4554,29 @@ static void board_open(struct zt_server *server) {
 		}
 	}
 	double side = board_side(server);
-	for (int r = 0; r < ZB_ROWS; r++) {
+	if (!server->board_layer.tex || server->board_drawn_accent != (unsigned)server->accent ||
+			memcmp(server->board_live, server->board_drawn, sizeof(server->board_live))) {
 		cairo_t *cr;
-		struct zt_buffer *buffer = zt_buffer_create(server, server->width, side, &cr);
-		for (int c = 0; c < ZB_COLS; c++) {
-			int i = r * ZB_COLS + c;
-			double x = BOARD_MARGIN + c * (side + ZB_GAP);
+		double pitch = side + ZB_GAP;
+		struct zt_buffer *buffer = zt_buffer_create(server, server->width, ZB_ROWS * pitch - ZB_GAP, &cr);
+		for (int i = 0; i < ZB_CELLS; i++) {
+			double x = BOARD_MARGIN + (i % ZB_COLS) * pitch, top = (i / ZB_COLS) * pitch;
 			bool has = server->board_live[i];
 			if (has) {
 				set_rgb(cr, server->accent);
 			} else {
 				set_rgb(cr, ZB_DIM_RGB);
 			}
-			cairo_rectangle(cr, x, 0, side, side);
+			cairo_rectangle(cr, x, top, side, side);
 			cairo_fill(cr);
 			double k = has ? 1 : ZB_DIM_TEXT;
 			cairo_set_source_rgb(cr, k, k, k);
 			if (i < 27) {
 				char text[2] = { zb_letter(i), 0 };
-				draw_text(cr, text, FONT_SEMILIGHT, ZB_FONT, x + ZB_INSET, side - ZB_INSET - ZB_FONT * 1.2,
+				draw_text(cr, text, FONT_SEMILIGHT, ZB_FONT, x + ZB_INSET, top + side - ZB_INSET - ZB_FONT * 1.2,
 					0, 0, false);
 			} else {
-				double gr = 11, cx = x + ZB_INSET + gr, cy = side - ZB_INSET - gr;
+				double gr = 11, cx = x + ZB_INSET + gr, cy = top + side - ZB_INSET - gr;
 				cairo_set_line_width(cr, 1.5);
 				cairo_arc(cr, cx, cy, gr, 0, 2 * M_PI);
 				cairo_stroke(cr);
@@ -4582,20 +4591,27 @@ static void board_open(struct zt_server *server) {
 				cairo_stroke(cr);
 			}
 		}
-		zt_buffer_show(server, &server->board_rows[r], buffer, cr, server->width, side);
+		zt_buffer_show(server, &server->board_layer, buffer, cr, server->width, ZB_ROWS * pitch - ZB_GAP);
+		memcpy(server->board_drawn, server->board_live, sizeof(server->board_live));
+		server->board_drawn_accent = (unsigned)server->accent;
 	}
 	server->list_v = 0;
+	motion_lease(now_ms() + (uint32_t)(zb_delay(ZB_CELLS - 1) + ZB_SWIVEL_IN_MS));	/* as for any other animation */
+	ftrace_mark(server, "board_open", ftrace_clock() - trace0);
 	server->board_state = 1;
 	server->board_start = now_ms();
 	server->board_clock_waits = true;
 	damage(server);
 }
 
+static void board_go(struct zt_server *server, int i);
+
 static void board_close(struct zt_server *server) {
 	if (server->board_state == 1 || server->board_state == 2) {
-		/* a row that had not started in has nothing to take out */
+		/* closed on its way in: each tile goes from the angle it has */
 		server->board_came_ms = server->board_state == 1 ? (uint32_t)(now_ms() - server->board_start) : HUGE_VAL;
 		server->board_state = 3;
+		motion_lease(now_ms() + (uint32_t)(zb_delay(ZB_CELLS - 1) + ZB_SWIVEL_OUT_MS));
 		server->board_start = now_ms();
 		server->board_clock_waits = true;
 		damage(server);
@@ -4622,10 +4638,17 @@ static void board_tap(struct zt_server *server, double x, double y) {
 		return;
 	}
 	if (server->board_state == 1 &&
-			(uint32_t)(now_ms() - server->board_start) < r * ZB_STAGGER_MS + ZB_ROW_MS / 2) {
-		return;	/* not on the screen yet: a double tap must not choose */
+			(server->board_clock_waits ||
+			(uint32_t)(now_ms() - server->board_start) < zb_delay(i) + ZB_TAP_READY_MS)) {
+		return;	/* not where it looks yet: a double tap must not choose */
 	}
+	board_go(server, i);
+}
+
+/* Cell `i` chosen: the list goes there and the board leaves. */
+static void board_go(struct zt_server *server, int i) {
 	hap(server, HAP_TAP, HG_NAV);
+	ftrace_mark(server, "board_go", 0);
 	for (int k = 0; k < server->n_items; k++) {
 		struct app_item *it = &server->items[k];
 		if (it->header && it->name[0] == zb_letter(i)) {
@@ -4864,9 +4887,12 @@ static bool list_prepare(struct zt_server *server) {
 		bool on = i == pinned || (in_sight && !it->hidden && it->y + LIST_ICON > top && it->y < bottom);
 		bool near = it->y + LIST_ICON > top - visible && it->y < bottom + visible;
 		if (!it->layer.tex && (on || near)) {
-			if (on || built < 2) {
+			/* the letters leaving over a list that has just jumped: a little
+			 * each frame under them, or their first frames wait for it all */
+			bool now_needed = on && (server->board_state != 3 || i == pinned);
+			if (now_needed || built < (server->board_state == 3 ? 1 : 2)) {
 				draw_item(server, i);
-				built += !on;
+				built += !now_needed;
 			} else {
 				more = true;
 			}
@@ -12266,6 +12292,18 @@ static void ctl_command(struct zt_server *server, char *line) {
 		} else {
 			note_add(server, "System", line + 7, bar ? bar + 1 : "");
 		}
+	} else if (!strcmp(line, "boardtest open")) {
+		if (!server->shown && !server->locked && server->page > 0.99f) board_open(server);
+	} else if (sscanf(line, "boardtest go %d", &id) == 1) {
+		if (server->board_state && id >= 0 && id < ZB_CELLS && server->board_live[id]) board_go(server, id);
+	} else if (!strcmp(line, "boardtest close")) {
+		board_close(server);
+	} else if (sscanf(line, "frametrace %d", &id) == 1) {
+		if (!server->ftrace) {
+			server->ftrace = fopen("/tmp/zt-frametrace.log", "w");
+		}
+		server->ftrace_until = now_ms() + (uint32_t)id;
+		damage(server);
 	} else if (sscanf(line, "recordtop %d", &id) == 1) {
 		mkdir("/tmp/ztrec", 0755);
 		server->record_top = true;
@@ -12840,13 +12878,9 @@ static float smooth01(float x) {
 	return x * x * (3.0f - 2.0f * x);
 }
 
-/* The curves ZrnMetroCore's readerboard uses: Log 60 coming, Exp 60 going. */
-static double board_ease(double t, bool in) {
-	double k = 2.0;
-	return in ? 1 - (exp(k * (1 - t)) - 1) / (exp(k) - 1) : (exp(k * t) - 1) / (exp(k) - 1);
-}
-
-/* A frame of the letters, over the list. Each row turns about its own top. */
+/* A frame of the letters, over the list: each tile turns about its own middle,
+ * with its own start. Time alone moves them, so it asks for its next frame
+ * through board_more: damage from inside a frame is lost when the frame ends. */
 static void board_frame(struct zt_server *server) {
 	if (!server->board_state) {
 		return;
@@ -12855,18 +12889,18 @@ static void board_frame(struct zt_server *server) {
 		server->board_clock_waits = false;
 		server->board_start = now_ms();
 	}
-	double ms = (uint32_t)(now_ms() - server->board_start), run = (ZB_ROWS - 1) * ZB_STAGGER_MS + ZB_ROW_MS;
+	double ms = (uint32_t)(now_ms() - server->board_start);
 	bool out = server->board_state == 3;
+	double last = zb_delay(ZB_CELLS - 1);
+	double run = last + (out ? ZB_SWIVEL_OUT_MS : ZB_SWIVEL_IN_MS);
 	if (out && ms >= run) {
 		server->board_state = 0;
-		damage(server);
+		server->board_more = true;
 		return;
 	}
 	if (server->board_state == 1 && ms >= run) {
 		server->board_state = 2;
-	}
-	if (server->board_state == 2) {
-		ms = run + ZB_ROW_MS;
+		server->board_more = true;	/* (one more: at rest) */
 	}
 	float m[16];
 	double scrim = out ? ZB_SCRIM * (1 - ms / run) : ZB_SCRIM * fmin(1, ms / ZB_SCRIM_IN_MS);
@@ -12874,34 +12908,39 @@ static void board_frame(struct zt_server *server) {
 	mat_translate(m, 0, STATUS_H);
 	mat_scale(m, server->width, server->height - STATUS_H - NAV_H);
 	quad(server, GL_TEXTURE_2D, server->black_tex, m, (float)scrim, false, false, 1.0f, 1.0f);
-	double side = (server->width - 2 * BOARD_MARGIN - (ZB_COLS - 1) * ZB_GAP) / ZB_COLS;
-	for (int r = 0; r < ZB_ROWS; r++) {
-		struct zt_layer *l = &server->board_rows[r];
-		double t = (ms - r * ZB_STAGGER_MS) / ZB_ROW_MS;
-		if (out && server->board_came_ms <= r * ZB_STAGGER_MS) {
-			continue;
-		}
-		if (t < 0 || (out && t >= 1) || !l->tex) {
-			if (out && t < 0) {
-				t = 0;	/* still in its place until its turn */
-			} else {
-				continue;
+	struct zt_layer *l = &server->board_layer;
+	double side = board_side(server), pitch = side + ZB_GAP;
+	for (int i = 0; l->tex && i < ZB_CELLS; i++) {
+		double delay = zb_delay(i), own = server->board_state == 2 ? run : ms - delay;
+		double from = ZB_SWIVEL_IN_DEG, deg;
+		if (out) {
+			double came = server->board_came_ms - delay;
+			if (came <= 0 || own >= ZB_SWIVEL_OUT_MS) {
+				continue;	/* never came, or gone */
 			}
+			from = came < ZB_SWIVEL_IN_MS ? ZB_SWIVEL_IN_DEG * (1 - zb_swivel_ease(came / ZB_SWIVEL_IN_MS, 1)) : 0;
+			deg = from + (ZB_SWIVEL_OUT_DEG - from) * zb_swivel_ease(own / ZB_SWIVEL_OUT_MS, 0);
+		} else {
+			if (own < 0) {
+				continue;	/* its turn has not come */
+			}
+			deg = from * (1 - zb_swivel_ease(own / ZB_SWIVEL_IN_MS, 1));
 		}
-		t = fmin(1, t);
-		double e = board_ease(t, !out);
-		/* mat_rotate_x: positive carries the bottom away */
-		double deg = out ? -ZB_OUT_DEG * e : -ZB_IN_DEG * (1 - e);
-		double alpha = out ? 1 - e : e;
+		float x = BOARD_MARGIN + (float)((i % ZB_COLS) * pitch), y = (float)((i / ZB_COLS) * pitch);
 		mat_identity(m);
-		mat_translate(m, 0, (float)(STATUS_H + ZB_TOP + r * (side + ZB_GAP)));
-		mat_rotate_x(m, (float)deg);
-		mat_scale(m, (float)l->w, (float)l->h);
-		quad(server, GL_TEXTURE_2D, l->tex, m, (float)alpha, true, false,
-			(float)l->pw / l->tw, (float)l->ph / l->th);
+		mat_translate(m, x, (float)(STATUS_H + ZB_TOP + y + side / 2));
+		/* as the firmware numbers them; mat_rotate_x has the other sign */
+		mat_rotate_x(m, (float)-deg);
+		mat_translate(m, 0, (float)-side / 2);
+		mat_scale(m, (float)side, (float)side);
+		server->uv_off[0] = x * (float)l->pw / (float)l->w / l->tw;
+		server->uv_off[1] = y * (float)l->ph / (float)l->h / l->th;
+		quad(server, GL_TEXTURE_2D, l->tex, m, 1.0f, true, false,
+			(float)(side * l->pw / l->w / l->tw), (float)(side * l->ph / l->h / l->th));
 	}
+	server->uv_off[0] = server->uv_off[1] = 0;
 	if (server->board_state != 2) {
-		damage(server);
+		server->board_more = true;
 	}
 }
 
@@ -13125,6 +13164,20 @@ no:
 	}
 	return false;
 #undef PLANE_NO
+}
+
+/* A mark in the frame trace ("frametrace MS" on the control pipe). */
+static void ftrace_mark(struct zt_server *server, const char *what, double ms) {
+	if (server->ftrace) {
+		fprintf(server->ftrace, "mark %u %s %.1f\n", now_ms(), what, ms);
+		fflush(server->ftrace);
+	}
+}
+
+static double ftrace_clock(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
 static void render_frame(struct zt_server *server) {
@@ -13797,6 +13850,10 @@ static void render_frame(struct zt_server *server) {
 	}
 	wlr_output_state_finish(&state);
 	server->dirty = false;
+	if (server->board_more) {
+		server->board_more = false;
+		damage(server);
+	}
 	if (server->boot_logo_stage) {
 		damage(server);	/* drawn by time, not by an anim slot: ask for the next frame */
 	}
@@ -13805,6 +13862,17 @@ static void render_frame(struct zt_server *server) {
 		damage(server);
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t3);
+	if (server->ftrace) {
+		/* when, then ms drawing, finishing, committing; quads; uploads */
+		fprintf(server->ftrace, "frame %.1f %.1f %.1f %.1f %d %d\n", t3.tv_sec * 1e3 + t3.tv_nsec / 1e6,
+			(t1.tv_sec * 1e3 + t1.tv_nsec / 1e6) - now,
+			(t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6,
+			(t3.tv_sec - t2.tv_sec) * 1e3 + (t3.tv_nsec - t2.tv_nsec) / 1e6, (int)frame_quads, (int)frame_uploads);
+		if ((int32_t)(now - server->ftrace_until) >= 0) {
+			fclose(server->ftrace);
+			server->ftrace = NULL;
+		}
+	}
 	running = running || loading_active(server);
 	if (running) {
 		server->anim_draw_ms += (t1.tv_sec * 1e3 + t1.tv_nsec / 1e6) - now;

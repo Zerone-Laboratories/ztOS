@@ -7,7 +7,7 @@
  *   people	everyone, under the letter their name starts with; round
  *		buttons to add, search and see Google. Tap a name for its
  *		card; hold it for a menu (edit, delete). A letter's square
- *		flips in all the letters over the list, those without anyone
+ *		swivels in all the letters over the list, those without anyone
  *		dimmed (zmc_letter_board); no page of its own.
  *   search	by name, number or e-mail, as it is typed.
  *   profile	one person: call, text, the other number; edit and delete.
@@ -253,7 +253,7 @@ static double draw_all(cairo_t *cr) {
 	return y + 24;
 }
 
-/* ---- all the letters: the reader board over the list ---------------------- */
+/* ---- all the letters: Swivel over the list --------------------------------- */
 
 static bool letter_has_person(int i) {
 	return first_with_letter(LETTERS[i]) >= 0;

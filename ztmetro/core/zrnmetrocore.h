@@ -284,9 +284,9 @@ bool zmc_transition(const char *name, double t, double x, double y, double w, do
 	cairo_surface_t *source, unsigned revision);
 double zmc_transition_ms(const char *name);
 
-/* The reader board: rows of cells that flip in one row at a time, top first,
- * over the same interface with no page change, and flip out the same way. Rows
- * are drawn once when it opens, so a frame costs only GPU quads. While it is up
+/* The board: rows of cells, each swivelling in by itself, staggered, over the
+ * same interface with no page change, and out the same way (zrnboard.h). They are drawn once when
+ * it opens, so a frame costs only GPU quads. While it is up
  * it takes every touch; back closes it; a page change drops it at once. */
 struct zmc_board {
 	int count, cols;

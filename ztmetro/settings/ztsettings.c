@@ -91,7 +91,7 @@ enum action {
 	ACT_OPEN_PAGE,
 	ACT_BACK,
 	ACT_ACCENT,
-	ACT_ACCENT_OPEN,	/* the theme page's box: the picker flips in over it */
+	ACT_ACCENT_OPEN,	/* the theme page's box: the picker swivels in over it */
 	ACT_PALETTE,	/* the DotMatrix style's palette, as the accent is Metro's */
 	ACT_WALL,		/* arg: 0 none, else the photo walls[arg - 1] */
 	ACT_WALL_TARGET,	/* arg: 0 start and lock, 1 start, 2 lock */
@@ -1244,10 +1244,11 @@ static void walls_scan(void) {
 #define WALL_PH			384
 #define WALL_FRAME_MS		16
 #define WALL_PER_TICK		2
-#define WALL_SWIVEL_IN_MS	300	/* "swivel in": -60 to 0 about X, Log 200 */
-#define WALL_SWIVEL_OUT_MS	199	/* "swivel out": 0 to 60 about X, Exp 60 */
+#define WALL_SWIVEL_IN_MS	((uint32_t)ZB_SWIVEL_IN_MS)	/* see zrnboard.h */
+#define WALL_SWIVEL_OUT_MS	((uint32_t)ZB_SWIVEL_OUT_MS)
+#define WALL_PHOTO_IN_MS	120.0	/* a photo made late, over its cell */
 #define WALL_TURN_MS		480	/* the page's rows turning in, before the photos */
-#define WALL_LEAVE_MS		400	/* a category leaving: its photos swivel out, then the page turns */
+#define WALL_LEAVE_MS		400	/* a category leaving: its cells swivel out, then the page turns */
 static unsigned char wall_state[MAX_WALLS];	/* 0 not made, 1 queued, 2 made, 3 failed */
 static uint32_t wall_arrive[MAX_WALLS];		/* when a made photo swivels in */
 static int wall_queue[MAX_WALLS], wall_q_n, wall_q_head;
@@ -1391,32 +1392,24 @@ static void wall_prefetch(int k) {
 }
 
 /* the curves of DevTest's animations (Iris's Exp and Log, weights as there) */
-static double wall_ease(double t, bool out) {
-	double a = 2.0;	/* Exp 60 going, Log 60 coming */
-	t = fmin(1, fmax(0, t));
-	if (out) return (exp(a * t) - 1) / (exp(a) - 1);
-	return 1 - (exp(a * (1 - t)) - 1) / (exp(a) - 1);
-}
-
-/* a photo turned `deg` about its top edge, drawn on the GPU */
 static void wall_card(cairo_surface_t *img, unsigned rev, double x, double y, double w, double h,
 		double deg, double alpha, int cell) {
 	double a = deg * M_PI / 180, c[4][3];
 	for (int i = 0; i < 4; i++) {
-		double lx = (i & 1) ? w : 0, ly = (i & 2) ? h : 0;
+		double lx = (i & 1) ? w : 0, u = ((i & 2) ? h : 0) - h / 2;
 		c[i][0] = x + lx;
-		c[i][1] = y + ly * cos(a);	/* about its top edge */
-		c[i][2] = ly * sin(a);
+		c[i][1] = y + h / 2 + u * cos(a);	/* about its own middle */
+		c[i][2] = u * sin(a);
 	}
 	if (cell < 0) zmc_gpu_quad(img, rev, c, alpha);
 	else zmc_gpu_quad_region(img, rev, (cell % 3) * WALL_PW, (cell / 3) * WALL_PH,
 		WALL_PW, WALL_PH, c, alpha);
 }
 
-/* the grid's cells and photos, on the GPU over the page. A cell is a grey
- * quad that swivels in when the category opens (in order, from the first);
- * its photo swivels in over it when made. Leaving, the photos and the cells
- * swivel out together, then the page turns back. */
+/* the grid's cells and photos, on the GPU over the page: each swivels in by
+ * itself, staggered, when the category opens and out when it leaves, then the
+ * page turns back. A cell is a grey quad; its photo fades in over it when made.
+ * DotMatrix has no turn: each cell fades, as dots do not take perspective. */
 static cairo_surface_t *wall_grey;
 
 static void wall_overlay(int page) {
@@ -1432,35 +1425,29 @@ static void wall_overlay(int page) {
 	const char *current = app.wall_target == 2 ? app.lock_wall : app.start_wall;
 	unsigned col = ACCENTS[app.accent].color;
 	double ar = ((col >> 16) & 255) / 255.0, ag = ((col >> 8) & 255) / 255.0, ab = (col & 255) / 255.0;
+	bool leaving = wall_leave_at != 0, dots = zmc.style == ZMC_STYLE_DOTMATRIX;
+	uint32_t t0 = leaving ? wall_leave_at : wall_open_at;
+	if ((int32_t)(now - t0) < 0) return;	/* the page is still turning */
 	for (int i = 1; i <= cat_count[c]; i++) {
 		int k = cat_first[c] + i - 1;
 		double x = MARGIN + (i % 3) * (tw + gap), y = wall_grid_top + (i / 3) * (th + gap) - zmc.scroll;
 		if (y + th < ZMC_HEADER_H || y > zmc.height) continue;
-		/* a row at a time, top first, both ways: the reader board's motion */
-		double stagger = fmin(i / 3, 6) * ZB_STAGGER_MS;
-		bool leaving = wall_leave_at != 0;
-		uint32_t t0 = (leaving ? wall_leave_at : wall_open_at) + (uint32_t)stagger;
-		double dur = ZB_ROW_MS;
-		if ((int32_t)(now - t0) < 0) continue;	/* its turn has not come */
-		double e = wall_ease((double)(now - t0) / dur, leaving);
-		/* the cell: out (0 to 90) or in (-45 to 0) about its top, grey */
-		double deg = leaving ? ZB_OUT_DEG * e : ZB_IN_DEG * (1 - e);
-		double alpha = leaving ? 1 - e : e;
-		if (alpha > 0) wall_card(wall_grey, 1, x, y, tw, th, deg, alpha, -1);
-		/* the photo, over its cell: its own swivel, from when it arrived */
-		if (wall_state[k] != 2) continue;
-		if (leaving) {
-			deg = ZB_OUT_DEG * e;
-			alpha = 1 - e;
-		} else {
-			if ((int32_t)(now - wall_arrive[k]) < 0) continue;
-			e = wall_ease((double)(now - wall_arrive[k]) / ZB_ROW_MS, false);
-			deg = ZB_IN_DEG * (1 - e);
-			alpha = e;
+		double own = (int32_t)(now - t0) - zb_delay(i), run = leaving ? ZB_SWIVEL_OUT_MS : ZB_SWIVEL_IN_MS;
+		if (own < 0 && !leaving) continue;	/* its turn has not come */
+		if (own >= run && leaving) continue;	/* gone */
+		double e = zb_swivel_ease(own / run, !leaving);
+		double deg = leaving ? ZB_SWIVEL_OUT_DEG * e : ZB_SWIVEL_IN_DEG * (1 - e), alpha = 1;
+		if (dots) {
+			alpha = leaving ? 1 - e : e;
+			deg = 0;
 		}
-		if (alpha <= 0) continue;
-		wall_card(wall_atlas[c], wall_atlas_revision[c], x, y, tw, th, deg, alpha, k - cat_first[c]);
-		if (!leaving && current[0] && strcmp(current, walls[k]) == 0) {
+		if (alpha > 0) wall_card(wall_grey, 1, x, y, tw, th, deg, alpha, -1);
+		/* the photo, over its cell, from when it arrived */
+		if (wall_state[k] != 2 || (int32_t)(now - wall_arrive[k]) < 0) continue;
+		double photo = leaving ? alpha : alpha * fmin(1, (now - wall_arrive[k]) / WALL_PHOTO_IN_MS);
+		if (photo <= 0) continue;
+		wall_card(wall_atlas[c], wall_atlas_revision[c], x, y, tw, th, deg, photo, k - cat_first[c]);
+		if (!leaving && own >= run && current[0] && strcmp(current, walls[k]) == 0) {
 			zmc_gpu_rect(x, y, tw, 4, ar, ag, ab);
 			zmc_gpu_rect(x, y + th - 4, tw, 4, ar, ag, ab);
 			zmc_gpu_rect(x, y, 4, th, ar, ag, ab);
@@ -1653,10 +1640,10 @@ static double draw_accents(cairo_t *cr) {
 	return y + rows * (side + gap) + 20;
 }
 
-/* ---- the accent picker: the reader board, not a page ------------------------
+/* ---- the accent picker: Swivel over the page, not a page ---------------------
  * As the phone's (a Lumia 1020's, on video): the box lights up, the old page
- * goes, the label is there at once and the colours flip in a row at a time;
- * chosen, they flip out from the top and the old page is back with it. */
+ * goes, the label is there and the colours swivel in, each by itself;
+ * chosen, they swivel out and the old page is back with it. */
 
 static double accent_box_y;	/* on the theme page */
 static bool board_unsaved;
@@ -3188,9 +3175,9 @@ static void activate(int action, int arg) {
 			for (int i = 0; i < n && i < 6; i++) wall_prefetch(cat_first[arg] + i);
 			wall_open_at = now + WALL_TURN_MS;	/* the cells, once the rows are in */
 			for (int i = 0; i < n && i < 6; i++) {	/* their photos come in with them */
-				wall_arrive[cat_first[arg] + i] = wall_open_at + (uint32_t)(((i + 1) / 3) * ZB_STAGGER_MS);
+				wall_arrive[cat_first[arg] + i] = wall_open_at - (uint32_t)WALL_PHOTO_IN_MS;
 			}
-			wall_busy_until = now + WALL_TURN_MS + 360 + WALL_SWIVEL_IN_MS;	/* the cells' last swivel */
+			wall_busy_until = now + WALL_TURN_MS + (uint32_t)(zb_delay(n) + ZB_SWIVEL_IN_MS) + 50;	/* the last cell's swivel */
 			wall_kick();
 			zmc_turn(1);
 			wall_cat_open = arg;
