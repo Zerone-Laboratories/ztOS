@@ -28,8 +28,8 @@
  *     past the end of playback, so the gap between two tracks does not
  *     pause the player.
  *   - Only the core shell (ztMETRO and its ztos-* helpers, such as the
- *     polkit agent) is never touched, nor is anything that is not an app
- *     ztMETRO has shown. ztOS's own apps are tickled like any other.
+ *     polkit agent) and the Phone are never touched, nor is anything that
+ *     is not an app ztMETRO has shown. ztOS's other apps are tickled.
  *   - With the screen off, no app is in front: the grace period starts then.
  */
 #define _GNU_SOURCE
@@ -119,7 +119,7 @@ static void freeze(struct app *a, bool on) {
 
 static bool own(const char *id) {
 	if (bg_contains(id)) return false;
-	return strcmp(id, "ztmetro") == 0 || strncmp(id, "ztos-", 5) == 0;
+	return strcmp(id, "ztmetro") == 0 || strcmp(id, "ztphone") == 0 || strncmp(id, "ztos-", 5) == 0;
 }
 
 /* /proc/PID/cgroup's path, "" if gone */
