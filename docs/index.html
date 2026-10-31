@@ -380,7 +380,7 @@
         <p class="crumb">Zerone Laboratories / operating systems</p>
         <h1>ztOS</h1>
         <p class="lead">A phone operating system with Windows Phone 8.1's look and motion, on Arch Linux ARM and mainline Linux.</p>
-        <p>ztOS is the ztMETRO shell, its own apps, an updater and an SDK for apps in Python and Qt, on an ordinary Arch Linux ARM system. It runs on the phones in the <a href="#devices">device list</a> and in the QEMU emulator. Everything that moves is drawn by the GPU.</p>
+        <p>ztOS is the ztMETRO shell, its own apps, an updater and <a href="https://sdk.ztos.online">an SDK</a> for apps, on an ordinary Arch Linux ARM system. It runs on the phones in the <a href="#devices">device list</a> and in the QEMU emulator. Everything that moves is drawn by the GPU.</p>
         <p>It is beta software. Since BETA-1 ztOS is a generic system image (GSI) plus a small layer per phone, the two meeting at ztOSIAL (Zerone Technologies Operating System Interface Abstraction Layer), its hardware interface layer. The S9 port runs a mainline 7.1 kernel with the phone's GPU, display, touch, Wi-Fi, 4G data, sound and sensors working. ztConflo, its image builder, is how it reaches other phones.</p>
         <div class="actions">
           <a class="btn" href="https://devices.ztos.online">View Device List</a>
@@ -542,8 +542,15 @@
 
   <section class="section" id="sdk">
     <div class="wrap">
-      <div><h2>The SDK</h2><p class="sub">Apps in Python and Qt that look and move like the built-in ones.</p></div>
+      <div><h2>The SDK</h2><p class="sub">Make apps in C, C++, Rust or Python.</p></div>
       <div class="body">
+        <p>The new SDK is <b>zrn-sdk</b>: one small GPU toolkit, libzrnui, under all four languages, in zrnCoolStyle or Metro. Apps ship as one signed <code>.zexec</code> file, and the store builds them from your source. It runs on a computer today and has not yet run on a phone.</p>
+<pre>zrn new "Notes" --lang c  <span class="c"># or cpp, rust, python</span>
+cd notes &amp;&amp; zrn build
+zrn render out.png        <span class="c"># see it with no phone, no display</span></pre>
+        <p><a class="btn" href="https://sdk.ztos.online">Open the SDK wiki</a></p>
+        <p>The wiki at <a href="https://sdk.ztos.online">sdk.ztos.online</a> covers every way to make an app, every UI element with real renders and code in each language, every animation running live with its real numbers (swivel, turnstile, fade, tilt), publishing to the store, and what is still missing.</p>
+        <h3>The older Python SDK</h3>
         <p>The ztOS SDK builds an app into a single file: a small C launcher with the app's Python code, pages, pictures and the <code>ztos</code> runtime zipped behind it. Pages, lists, pivots, entries, toggles, round buttons, app bars and dialogs all come from the runtime, with the toolkit's own numbers for every motion.</p>
 <pre>ztos-sdk new "Notes"     <span class="c"># a new app, from the template</span>
 ztos-sdk run             <span class="c"># try it on the computer</span>
