@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=WhatsApp
+Comment=WhatsApp messages, on this phone as a linked device
+Exec=ztwhatsapp %u
+Terminal=false
+Type=Application
+Icon=ztwhatsapp
+Categories=Network;InstantMessaging;

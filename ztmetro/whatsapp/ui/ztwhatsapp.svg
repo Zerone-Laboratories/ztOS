@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <!-- a round speech bubble with a tail at the bottom left and a handset-free dot row -->
+  <path fill="#ffffff" fill-rule="evenodd"
+    d="M24 5a19 19 0 1 1-9.6 35.4L5 43l2.7-9.2A19 19 0 0 1 24 5z M15 21.5a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M24 21.5a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M33 21.5a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/>
+</svg>
