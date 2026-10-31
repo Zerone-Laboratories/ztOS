@@ -26,7 +26,10 @@ import (
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/binary/token"
+	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waServerSync"
 	"go.mau.fi/whatsmeow/socket"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/util/keys"
 	"go.mau.fi/whatsmeow/types"
@@ -146,6 +149,79 @@ func emitPayload() {
 		panic(err)
 	}
 	fmt.Println("payload login", hx(login))
+}
+
+type memKeys struct {
+	store.AppStateSyncKeyStore
+	k map[string]*store.AppStateSyncKey
+}
+
+func (m *memKeys) GetAppStateSyncKey(_ context.Context, id []byte) (*store.AppStateSyncKey, error) {
+	return m.k[string(id)], nil
+}
+
+type memState struct {
+	store.AppStateStore
+	macs map[string][]byte
+}
+
+func (m *memState) PutAppStateVersion(context.Context, string, uint64, [128]byte) error { return nil }
+func (m *memState) DeleteAppStateMutationMACs(_ context.Context, _ string, l [][]byte) error {
+	for _, i := range l {
+		delete(m.macs, string(i))
+	}
+	return nil
+}
+func (m *memState) PutAppStateMutationMACs(_ context.Context, _ string, _ uint64, l []store.AppStateMutationMAC) error {
+	for _, i := range l {
+		m.macs[string(i.IndexMAC)] = i.ValueMAC
+	}
+	return nil
+}
+func (m *memState) GetAppStateMutationMAC(_ context.Context, _ string, i []byte) ([]byte, error) {
+	return m.macs[string(i)], nil
+}
+
+// Patches made by whatsmeow's own encoder, and the hash its decoder reaches.
+func emitAppState() {
+	ctx := context.Background()
+	keyID, keyData := []byte("key-one"), uh(strings.Repeat("5a", 32))
+	st := &memState{macs: map[string][]byte{}}
+	d := &store.Device{
+		AppStateKeys: &memKeys{k: map[string]*store.AppStateSyncKey{string(keyID): {Data: keyData}}},
+		AppState:     st,
+	}
+	p := appstate.NewProcessor(d, waLog.Noop)
+	fmt.Println("appstate keyid", hx(keyID))
+	fmt.Println("appstate key", hx(keyData))
+	target := types.JID{User: "61400000009", Server: types.DefaultUserServer}
+	state := appstate.HashState{}
+	infos := []appstate.PatchInfo{
+		appstate.BuildMute(target, true, 0),
+		appstate.BuildMute(target, false, 0), // replaces the same index: exercises removal
+		appstate.BuildPin(target, true),
+	}
+	for i, info := range infos {
+		raw, err := p.EncodePatch(ctx, keyID, state, info)
+		if err != nil {
+			panic(err)
+		}
+		var patch waServerSync.SyncdPatch
+		if err := proto.Unmarshal(raw, &patch); err != nil {
+			panic(err)
+		}
+		patch.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(state.Version + 1)}
+		final, _ := proto.Marshal(&patch)
+		muts, next, err := p.DecodePatches(ctx, &appstate.PatchList{Name: info.Type, Patches: []*waServerSync.SyncdPatch{&patch}}, state, true)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("appstate patch%d %s\n", i, hx(final))
+		fmt.Printf("appstate name%d %s\n", i, hx([]byte(info.Type)))
+		fmt.Printf("appstate hash%d %s\n", i, hx(next.Hash[:]))
+		fmt.Printf("appstate index%d %s\n", i, hx([]byte(strings.Join(muts[0].Index, "|"))))
+		state = next
+	}
 }
 
 func emitSig() {
@@ -326,6 +402,7 @@ func main() {
 		emitNoise()
 		emitSig()
 		emitPayload()
+		emitAppState()
 	case "peer":
 		newPeer().serve()
 	}

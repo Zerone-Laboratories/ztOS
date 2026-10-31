@@ -18,6 +18,7 @@ struct Jid {
     bool isGroup() const { return server == "g.us"; }
     bool isLid() const { return server == "lid"; }
     bool isPn() const { return server == "s.whatsapp.net"; }
+    bool groupish() const { return server == "g.us" || server == "broadcast"; }
     bool operator==(const Jid& o) const {
         return user == o.user && server == o.server && device == o.device && agent == o.agent;
     }

@@ -7,7 +7,7 @@ LDLIBS = $(shell pkg-config --libs $(PKGS)) -pthread
 BUILD ?= build
 PREFIX ?= /usr
 
-CORE = crypto node noise sigproto
+CORE = crypto node noise sigproto appstate
 SRV = $(CORE) ws store ipc fake client wamsg
 OBJS = $(SRV:%=$(BUILD)/%.o) $(BUILD)/main.o
 

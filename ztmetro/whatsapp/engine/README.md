@@ -75,10 +75,10 @@ whatsmeow shipped. To update without a rebuild, put `a.b.c` in
 ## Not implemented
 
 - Calls: stanzas are acknowledged and ignored, by decision.
-- App state sync: address-book contact names, and mute, pin and archive changes made after
-  the first sync. Names come from history sync and push names.
+- Changing app state from here (mute, pin, archive, star, contact edits): it is read-only.
+  Missing app-state keys are not requested from the phone; the daemon waits for its next share.
 - Sending media. Downloading anything other than images.
-- Status updates and newsletters: acknowledged and dropped.
+- Newsletters and broadcast lists: acknowledged and dropped. Status posts are text only.
 - `cstoken` for first contact. Only `tctoken` is attached, so a first message to someone
   who has never messaged this account may be refused. This has not been tried live.
 - Identity pinning: a contact's changed identity key is accepted, which is also whatsmeow's

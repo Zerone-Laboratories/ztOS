@@ -5,6 +5,7 @@
 #include <sqlite3.h>
 
 #include <nlohmann/json.hpp>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -33,6 +34,7 @@ public:
 
     void begin();
     void commit();
+    void rollback();
 
     void putChat(const std::string& chatId, const json& chat);
     std::optional<json> getChat(const std::string& chatId);
@@ -50,6 +52,13 @@ public:
     void clearUnread(const std::string& chat, const std::string& id);
     int unreadCount(const std::string& chat);
     std::optional<json> lastMessage(const std::string& chat);
+
+    void putContact(const std::string& jid, const json& c);
+    std::vector<json> allContacts();
+    // Returns a self-contained scan for a worker thread: it opens its own read connection,
+    // so a search over a large store never stalls the socket.
+    using SearchFn = std::function<std::vector<json>(bool* more)>;
+    SearchFn searchJob(const std::string& query, const std::string& chat, int limit, std::optional<int64_t> beforeTs);
 
 private:
     void open();

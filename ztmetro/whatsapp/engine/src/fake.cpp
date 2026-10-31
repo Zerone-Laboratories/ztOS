@@ -94,6 +94,38 @@ public:
             rp.ok({{"marked", n}});
         } else if (cmd == "download_media") {
             rp.err("unsupported", "the fake engine has no media");
+        } else if (cmd == "statuses") {
+            json it = {{"chat", "status@broadcast"}, {"id", "FAKES1"}, {"from_me", false}, {"sender", "61400000001@s.whatsapp.net"},
+                       {"sender_name", "Sam Example"}, {"timestamp", (int64_t)time(nullptr) - 600}, {"kind", "text"},
+                       {"text", "A fake status"}, {"status", "received"}, {"quoted_id", ""}, {"media", nullptr}, {"seen", statusSeen_}};
+            rp.ok({{"contacts", {{{"sender", "61400000001@s.whatsapp.net"}, {"name", "Sam Example"}, {"last_ts", it["timestamp"]},
+                                  {"unseen", statusSeen_ ? 0 : 1}, {"items", {it}}}}}});
+        } else if (cmd == "status_seen") {
+            statusSeen_ = true;
+            rp.ok(json::object());
+        } else if (cmd == "post_status") {
+            rp.ok({{"id", "FAKEPOST"}, {"timestamp", (int64_t)time(nullptr)}});
+        } else if (cmd == "contacts") {
+            json c = json::array();
+            c.push_back({{"jid", "61400000002@s.whatsapp.net"}, {"name", "Alex Test"}, {"push_name", "Alex"}, {"phone", "+61400000002"}});
+            c.push_back({{"jid", "61400000001@s.whatsapp.net"}, {"name", "Sam Example"}, {"push_name", "Sam"}, {"phone", "+61400000001"}});
+            rp.ok({{"contacts", c}, {"total", 2}});
+        } else if (cmd == "profile_picture") {
+            rp.err("not_found", "the fake engine has no pictures");
+        } else if (cmd == "group_info") {
+            rp.ok({{"id", r.at("chat")}, {"subject", "Family (fake)"}, {"topic", "A fake group"}, {"owner", kSelf}, {"created", 1700000000},
+                   {"announce", false}, {"locked", false},
+                   {"participants", {{{"jid", kSelf}, {"name", "You"}, {"is_admin", true}, {"is_super_admin", true}},
+                                     {{"jid", "61400000001@s.whatsapp.net"}, {"name", "Sam Example"}, {"is_admin", false}, {"is_super_admin", false}}}}});
+        } else if (cmd == "search") {
+            std::string q = r.at("query").get<std::string>();
+            json hits = json::array();
+            for (auto& [_, v] : msgs_)
+                for (auto& m : v)
+                    if (hits.size() < 50 && m["text"].get<std::string>().find(q) != std::string::npos) hits.push_back(m);
+            rp.ok({{"messages", hits}, {"more", false}});
+        } else if (cmd == "starred") {
+            rp.ok({{"messages", json::array()}});
         } else if (cmd == "typing" || cmd == "set_presence" || cmd == "subscribe_presence") {
             rp.ok(json::object());
         } else {
@@ -164,7 +196,7 @@ private:
 
     Loop& loop_;
     IpcServer& ipc_;
-    bool paired_ = false;
+    bool paired_ = false, statusSeen_ = false;
     std::string state_ = "unpaired", code_;
     std::map<std::string, json> chats_;
     std::map<std::string, std::vector<json>> msgs_;

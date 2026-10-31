@@ -89,6 +89,7 @@ void Store::open() {
     exec("CREATE TABLE IF NOT EXISTS msgs(seq INTEGER PRIMARY KEY AUTOINCREMENT, chat BLOB, id BLOB,"
          " ts INT, unread INT, v BLOB, UNIQUE(chat,id))");
     exec("CREATE INDEX IF NOT EXISTS msgs_page ON msgs(chat,ts,seq)");
+    exec("CREATE TABLE IF NOT EXISTS contacts(id BLOB PRIMARY KEY, v BLOB)");
 }
 
 void Store::wipe() {
@@ -116,6 +117,7 @@ void Store::exec(const char* sql) {
 
 void Store::begin() { exec("BEGIN IMMEDIATE"); }
 void Store::commit() { exec("COMMIT"); }
+void Store::rollback() { exec("ROLLBACK"); }
 
 Bytes Store::seal(const Bytes& pt) {
     Bytes o(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + pt.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES);
@@ -271,6 +273,74 @@ std::optional<json> Store::lastMessage(const std::string& chat) {
     s.b(1, name(chat));
     if (!s.step()) return std::nullopt;
     return openJson(s.s, 0);
+}
+
+void Store::putContact(const std::string& jid, const json& c) {
+    Stmt s(db_, "INSERT OR REPLACE INTO contacts(id,v) VALUES(?,?)");
+    s.b(1, name(jid)).b(2, sealJson(c));
+    s.step();
+}
+
+std::vector<json> Store::allContacts() {
+    Stmt s(db_, "SELECT v FROM contacts");
+    std::vector<json> r;
+    while (s.step()) r.push_back(openJson(s.s, 0));
+    return r;
+}
+
+static std::string lowerAscii(std::string s) {
+    for (auto& c : s)
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+    return s;
+}
+
+Store::SearchFn Store::searchJob(const std::string& query, const std::string& chat, int limit, std::optional<int64_t> beforeTs) {
+    std::string path = dir_ + "/store.db";
+    Bytes key = key_, chatName = chat.empty() ? Bytes{} : name(chat);
+    std::string q = lowerAscii(query);
+    int64_t before = beforeTs.value_or(INT64_MAX);
+    return [=](bool* more) {
+        std::vector<json> out;
+        *more = false;
+        sqlite3* db = nullptr;
+        if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+            sqlite3_close(db);
+            return out;
+        }
+        sqlite3_busy_timeout(db, 2000);
+        const char* sql = chatName.empty() ? "SELECT v FROM msgs WHERE ts<? ORDER BY ts DESC, seq DESC"
+                                           : "SELECT v FROM msgs WHERE ts<? AND chat=? ORDER BY ts DESC, seq DESC";
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) {
+            fprintf(stderr, "ztwhatsappd: search: %s\n", sqlite3_errmsg(db));
+        } else {
+            sqlite3_bind_int64(st, 1, before);
+            if (!chatName.empty()) sqlite3_bind_blob(st, 2, chatName.data(), (int)chatName.size(), SQLITE_TRANSIENT);
+            const size_t np = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, ab = crypto_aead_xchacha20poly1305_ietf_ABYTES;
+            int rc;
+            while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+                auto* d = (const uint8_t*)sqlite3_column_blob(st, 0);
+                size_t n = (size_t)sqlite3_column_bytes(st, 0);
+                if (n < np + ab) continue;
+                Bytes p(n - np - ab);
+                unsigned long long m = 0;
+                if (crypto_aead_xchacha20poly1305_ietf_decrypt(p.data(), &m, nullptr, d + np, n - np, nullptr, 0, d, key.data()) != 0) continue;
+                json j = json::parse(p.begin(), p.end(), nullptr, false);
+                if (!j.is_object() || j.value("chat", "") == "status@broadcast") continue;
+                if (lowerAscii(j.value("text", "")).find(q) == std::string::npos) continue;
+                if ((int)out.size() == limit) {
+                    *more = true;
+                    break;
+                }
+                j.erase("_s");
+                out.push_back(std::move(j));
+            }
+            if (rc != SQLITE_ROW && rc != SQLITE_DONE) fprintf(stderr, "ztwhatsappd: search: %s\n", sqlite3_errmsg(db));
+        }
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+        return out;
+    };
 }
 
 }  // namespace zw

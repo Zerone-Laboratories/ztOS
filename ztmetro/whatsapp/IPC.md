@@ -91,7 +91,7 @@ Contact:
 ```
 
 `name` is the address-book name from app-state sync, falling back to the push name, then the
-number. Message gains `"starred":bool`.
+number. Message gains `"starred":bool`; absent means false.
 
 App-state values (`muted`, `pinned`, `archived`, `starred`, contact names) are **read-only**
 here: the phone's changes are followed, and there are no commands that change them.

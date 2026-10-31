@@ -11,6 +11,7 @@
 #include <map>
 #include <sstream>
 
+#include "../src/appstate.h"
 #include "../src/noise.h"
 #include "../src/node.h"
 #include "../src/pb.h"
@@ -205,6 +206,43 @@ static void sigFixture(const std::map<std::string, std::string>& w) {
     CHECK(xedVerify(pub, msg, sig.data()));
     msg[0] ^= 1;
     CHECK(!xedVerify(pub, msg, sig.data()));
+}
+
+static void appState(const std::map<std::string, std::string>& w) {
+    using namespace appstate;
+    Bytes keyId = unhex(w.at("appstate.keyid")), key = unhex(w.at("appstate.key"));
+    std::map<Bytes, Bytes> macs;
+    Env env;
+    env.key = [&](const Bytes& id) -> std::optional<Bytes> { if (id == keyId) return key; return std::nullopt; };
+    env.prevValueMac = [&](const Bytes& i) -> std::optional<Bytes> { auto it = macs.find(i); if (it == macs.end()) return std::nullopt; return it->second; };
+    HashState st;
+    for (int i = 0; i < 3; i++) {
+        std::string n = std::to_string(i);
+        Bytes raw = unhex(w.at("appstate.patch" + n));
+        pb::Msg patch(raw);
+        std::string name = S(unhex(w.at("appstate.name" + n)));
+        if (i == 2) { st = HashState{}; macs.clear(); }  // whatsmeow's third patch is a new collection
+        if (i == 2) continue;
+        auto muts = decodePatch(name, patch, patch.repeated(2), st, env);
+        EQH(st.hash, w.at("appstate.hash" + n).c_str());
+        CHECK(!muts.empty() && muts[0].index[0] + "|" + muts[0].index[1] == S(unhex(w.at("appstate.index" + n))));
+        for (auto& m : muts) { if (m.set) macs[m.indexMac] = m.valueMac; else macs.erase(m.indexMac); }
+    }
+    // Tampering is refused and leaves the state untouched.
+    HashState fresh;
+    macs.clear();
+    Bytes raw = unhex(w.at("appstate.patch0"));
+    raw[raw.size() / 2] ^= 1;
+    bool threw = false;
+    try { pb::Msg p(raw); decodePatch(S(unhex(w.at("appstate.name0"))), p, p.repeated(2), fresh, env); } catch (const std::exception&) { threw = true; }
+    CHECK(threw && fresh.version == 0);
+    // Unknown key.
+    Env none = env;
+    none.key = [](const Bytes&) -> std::optional<Bytes> { return std::nullopt; };
+    threw = false;
+    pb::Msg ok(unhex(w.at("appstate.patch0")));
+    try { HashState s; decodePatch(S(unhex(w.at("appstate.name0"))), ok, ok.repeated(2), s, none); } catch (const MissingKey&) { threw = true; }
+    CHECK(threw);
 }
 
 // A local party for self tests and interop.
@@ -436,6 +474,7 @@ int main(int argc, char** argv) {
         codec(w);
         noise(w);
         sigFixture(w);
+        appState(w);
         selfSession();
         if (argc > 2) interop(argv[2]);
         else printf("interop: skipped, no gofix binary given\n");

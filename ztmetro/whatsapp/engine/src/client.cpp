@@ -14,6 +14,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <sys/socket.h>
+
+#include "appstate.h"
 #include "engine.h"
 #include "node.h"
 #include "noise.h"
@@ -101,6 +106,9 @@ public:
         ws_.onMessage = [this](Bytes&& m) { wsMessage(std::move(m)); };
         ws_.onClose = [this](const std::string& why) { wsClosed(why); };
         pairState_ = paired() ? "paired" : "unpaired";
+        loadStarred();
+        restoreQueueOnly_ = true;
+        watchNetwork();
         // An unpaired daemon stays off the network until a client asks to pair.
         if (paired()) connect();
     }
@@ -109,6 +117,10 @@ public:
         *alive_ = false;
         gen_++;
         ws_.close();
+        if (nlFd_ >= 0) {
+            loop_.del(nlFd_);
+            close(nlFd_);
+        }
     }
 
     std::vector<json> greeting() override { return {connectionEv(), pairingEv()}; }
@@ -144,7 +156,7 @@ private:
     void sendFrame(const Bytes& payload);
     void keepalive(uint64_t gen);
     using IqCb = std::function<void(const Node*)>;  // null on timeout or disconnect
-    void iq(const std::string& xmlns, const std::string& type, std::vector<Node> content, IqCb cb, Jid to = kServerJid);
+    void iq(const std::string& xmlns, const std::string& type, std::vector<Node> content, IqCb cb, Jid to = kServerJid, Jid target = {});
     std::string nextId();
     void clearIqs();
     json connectionEv() const { return {{"event", "connection"}, {"state", conn_}, {"detail", connDetail_}}; }
@@ -238,6 +250,41 @@ private:
     void markRead(const json& r, Reply rp);
     void reportProbe(bool ok, const std::string& what);
 
+    // Network watch: the kernel says when an address appears, so nothing polls.
+    void watchNetwork();
+    void networkChanged();
+    int nlFd_ = -1;
+    uint64_t netT_ = 0;
+    bool restoreQueueOnly_ = false;
+
+    // App state
+    void syncAppState(std::vector<std::string> names);
+    void appStateNext();
+    void appStateFetch(const std::string& name, bool snapshot);
+    void appStateReply(const std::string& name, const Node* r, bool snapshot);
+    void appStateApply(const std::string& name, const Bytes& snapshot, const std::vector<std::pair<Bytes, std::vector<pb::Msg>>>& patches, bool hasMore);
+    void applyMutation(const appstate::Mutation& m);
+    void setChatFlag(const Jid& chat, const char* flag, const json& value);
+    void overlayFlags(json& chat);
+    void loadStarred();
+    void saveStarred();
+    std::deque<std::string> asQueue_;
+    bool asRunning_ = false, asContacts_ = false;
+    std::set<std::string> asRetried_, starred_;
+
+    // Status and other surfaces
+    void storeStatus(const Jid& sender, bool fromMe, int64_t ts, const std::string& id, ParsedMsg& p, bool live, const std::string& push);
+    json statusList();
+    void cmdStatusSeen(const json& r, Reply rp);
+    void cmdPostStatus(const json& r, Reply rp);
+    void cmdContacts(const json& r, Reply rp);
+    void cmdPicture(const json& r, Reply rp);
+    void cmdGroupInfo(const json& r, Reply rp);
+    void cmdSearch(const json& r, Reply rp);
+    void cmdStarred(const json& r, Reply rp);
+    void statusAudience(std::function<void(std::optional<std::vector<Jid>>)> cb);
+    json groupJson(const std::string& gid);
+
     Loop& loop_;
     IpcServer& ipc_;
     RealConfig cfg_;
@@ -294,6 +341,7 @@ private:
     struct GroupInfo {
         std::vector<Jid> participants;
         bool lid = false;
+        json info;
     };
     std::map<std::string, GroupInfo> groups_;
     std::set<std::string> groupFetching_;
@@ -555,10 +603,11 @@ void RealEngine::sendNode(const Node& n) {
 
 std::string RealEngine::nextId() { return idPrefix_ + "." + std::to_string(++idCounter_); }
 
-void RealEngine::iq(const std::string& xmlns, const std::string& type, std::vector<Node> content, IqCb cb, Jid to) {
+void RealEngine::iq(const std::string& xmlns, const std::string& type, std::vector<Node> content, IqCb cb, Jid to, Jid target) {
     std::string id = nextId();
     Node n("iq");
     n.a("id", id).a("xmlns", xmlns).a("type", type).a("to", to);
+    if (!target.empty()) n.a("target", target);
     for (auto& k : content) n.add(std::move(k));
     uint64_t t = later(30000, [this, id] {
         auto it = iqs_.find(id);
@@ -680,6 +729,8 @@ void RealEngine::afterLogin() {
             if (gen != gen_) return;
             restoreQueue();
             setConn("connected");
+            if (store_.get("meta", "askeys"))
+                syncAppState({"critical_block", "critical_unblock_low", "regular_high", "regular", "regular_low"});
             if (active_ && !dev_.pushName.empty()) {
                 Node p("presence");
                 p.a("type", "available").a("name", dev_.pushName);
@@ -1110,10 +1161,12 @@ void RealEngine::saveSession(const std::string& k, const signal::Record& r, cons
 
 std::string RealEngine::nameOf(const Jid& bare) {
     if (bare.user.empty()) return bare.str();
-    if (auto v = store_.get("name", bare.str())) return S(*v);
     Jid c = canon(bare);
-    if (!(c == bare))
-        if (auto v = store_.get("name", c.str())) return S(*v);
+    for (const char* ns : {"cname", "name"}) {
+        if (auto v = store_.get(ns, bare.str())) return S(*v);
+        if (!(c == bare))
+            if (auto v = store_.get(ns, c.str())) return S(*v);
+    }
     return bare.isGroup() ? "Group" : (bare.isPn() ? "+" + bare.user : "Unknown");
 }
 
@@ -1186,14 +1239,14 @@ void RealEngine::handleMessage(const Node& n) {
         sendAck(n);
         return;
     }
-    // Newsletters and status updates are not part of this app.
-    if (from.server == "newsletter" || from.server == "broadcast") {
+    // Newsletters and broadcast lists are not part of this app. Status is.
+    if (from.server == "newsletter" || (from.server == "broadcast" && from.user != "status")) {
         sendAck(n);
         return;
     }
     Jid chat, sender;
     bool fromMe = false;
-    if (from.isGroup()) {
+    if (from.groupish()) {
         chat = from;
         sender = n.jid("participant");
         fromMe = isSelf(sender);
@@ -1213,7 +1266,7 @@ void RealEngine::handleMessage(const Node& n) {
         if (from.isLid()) mapLid(n.jid("sender_pn"), from);
         if (from.isPn()) mapLid(from, n.jid("sender_lid"));
     }
-    chat = chat.isGroup() ? chat : canon(chat);
+    chat = chat.groupish() ? chat : canon(chat);
     std::string push = n.attr("notify");
     bool live = n.attr("offline").empty() && now() - ts < 300;
 
@@ -1236,7 +1289,7 @@ void RealEngine::handleMessage(const Node& n) {
                 else plain = signal::decryptMessage(rec, enc->data);
                 saveSession(k, rec, sender);
                 if (used) store_.del("prekey", std::to_string(*used));
-            } else if (t == "skmsg" && chat.isGroup()) {
+            } else if (t == "skmsg" && chat.groupish()) {
                 std::string k = chat.str() + "|" + sessionKey(sender);
                 auto v = store_.get("sender", k);
                 if (!v) {
@@ -1302,9 +1355,14 @@ void RealEngine::processPlain(const Node& stanza, const Bytes& plain, const Jid&
     Jid realChat = chat;
     if (!p.dsmDest.empty()) {
         Jid d = Jid::parse(p.dsmDest);
-        if (!d.empty()) realChat = d.isGroup() ? d : canon(d);
+        if (!d.empty()) realChat = d.groupish() ? d : canon(d);
     }
     if (p.isProtocol) {
+        if (fromMe && !p.appKeys.empty()) {
+            for (auto& [id, data] : p.appKeys) store_.put("askey", hex(id), data);
+            store_.put("meta", "askeys", B("1"));
+            syncAppState({"critical_block", "critical_unblock_low", "regular_high", "regular", "regular_low"});
+        }
         if (fromMe && p.history) {
             Node r("receipt");
             r.a("id", id).a("type", "hist_sync").a("to", self().bare());
@@ -1352,6 +1410,7 @@ void RealEngine::touchChat(const Jid& chat, const std::string& nameHint) {
     if (!nameHint.empty()) setName(chat, nameHint);
     c["name"] = nameOf(chat);
     c["unread"] = store_.unreadCount(cid);
+    overlayFlags(c);
     if (auto m = store_.lastMessage(cid)) {
         c["last_text"] = previewOf((*m)["kind"].get<std::string>(), (*m)["text"].get<std::string>());
         c["last_ts"] = (*m)["timestamp"];
@@ -1364,6 +1423,10 @@ void RealEngine::touchChat(const Jid& chat, const std::string& nameHint) {
 
 void RealEngine::storeIncoming(const Jid& chat, const Jid& sender, bool fromMe, int64_t ts, const std::string& id,
                                ParsedMsg& p, bool live, bool replaceUndecryptable, const std::string& push) {
+    if (chat.server == "broadcast") {
+        storeStatus(sender, fromMe, ts, id, p, live, push);
+        return;
+    }
     std::string cid = chat.str();
     Jid sBare = canon(sender);
     if (fromMe && !push.empty() && dev_.pushName != push && push != "-") {
@@ -1422,6 +1485,21 @@ void RealEngine::fetchGroup(const Jid& g, std::function<void(bool)> cb) {
             if (j.isLid()) mapLid(pn, j);
             if (j.isPn()) mapLid(j, lid);
         }
+        json parts = json::array();
+        for (auto p : gn->children("participant")) {
+            Jid j = p->jid("jid");
+            if (j.empty()) continue;
+            std::string kind = p->attr("type");
+            parts.push_back({{"jid", canon(j).str()}, {"name", isSelf(j) ? "You" : nameOf(canon(j))},
+                             {"is_admin", kind == "admin" || kind == "superadmin"}, {"is_super_admin", kind == "superadmin"}});
+        }
+        std::string topic;
+        if (auto d = gn->child("description"))
+            if (auto b = d->child("body")) topic = S(b->data);
+        Jid owner = gn->jid("creator");
+        info.info = {{"id", gid}, {"subject", gn->attr("subject")}, {"topic", topic}, {"owner", owner.empty() ? "" : canon(owner).str()},
+                     {"created", atoll(gn->attr("creation").c_str())}, {"announce", gn->child("announcement") != nullptr},
+                     {"locked", gn->child("locked") != nullptr}, {"participants", parts}};
         groups_[gid] = info;
         std::string subject = gn->attr("subject");
         if (!subject.empty() && store_.get("name", gid).value_or(Bytes{}) != B(subject)) {
@@ -1533,6 +1611,15 @@ void RealEngine::handleNotification(const Node& n) {
         if (auto toks = n.child("tokens"))
             for (auto t : toks->children("token"))
                 if (t->attr("type") == "trusted_contact" && !t->data.empty()) store_.put("tctoken", from.bare().str(), t->data);
+    } else if (type == "server_sync") {
+        std::vector<std::string> names;
+        if (auto col = n.child("sync"))
+            for (auto c : col->children("collection")) names.push_back(c->attr("name"));
+        for (auto c : n.children("collection")) names.push_back(c->attr("name"));
+        syncAppState(names);
+    } else if (type == "picture") {
+        store_.del("picture", from.bare().str());
+        ipc_.broadcast({{"event", "picture"}, {"jid", from.isGroup() ? from.str() : canon(from).str()}});
     } else if (type == "w:gp2") {
         groups_.erase(from.str());
         if (auto s = n.child("subject")) {
@@ -1652,7 +1739,12 @@ void RealEngine::sendOne(const Pending& p) {
             });
         });
     };
-    if (p.chat.isGroup()) {
+    if (p.chat.server == "broadcast") {
+        statusAudience([withUsers, done](std::optional<std::vector<Jid>> users) {
+            if (!users) return done(false, "could not read the status privacy setting");
+            withUsers(*users);
+        });
+    } else if (p.chat.isGroup()) {
         auto proceed = [this, p, withUsers, done](bool ok) {
             auto it = groups_.find(p.chat.str());
             if (!ok || it == groups_.end()) return done(false, "could not fetch the group members");
@@ -1783,7 +1875,7 @@ Node RealEngine::encryptFor(const Jid& device, const Bytes& plain, bool* preKey)
 }
 
 void RealEngine::finishSend(const Pending& p, const std::vector<Jid>& devices) {
-    bool group = p.chat.isGroup();
+    bool group = p.chat.groupish();
     Bytes forPeers = p.proto, forSelf;
     Bytes skmsg;
     if (group) {
@@ -1858,14 +1950,14 @@ void RealEngine::handleRetry(const Node& n) {
     Jid chat = Jid::parse(out["chat"].get<std::string>());
     Bytes proto = b64dec(out["proto"].get<std::string>());
     Jid from = n.jid("from");
-    Jid target = chat.isGroup() ? n.jid("participant") : from;
+    Jid target = chat.groupish() ? n.jid("participant") : from;
     if (target.empty()) return;
     int count = atoi(retry->attr("count").c_str());
     int& tries = retryCount_["in:" + id + "|" + target.str()];
     if (++tries >= 10) return;
 
     Bytes plain = proto;
-    if (chat.isGroup()) {
+    if (chat.groupish()) {
         std::string k = chat.str() + "|self";
         signal::SenderRecord rec;
         if (auto v = store_.get("sender", k)) rec = signal::deserializeSender(*v);
@@ -1889,7 +1981,7 @@ void RealEngine::handleRetry(const Node& n) {
         for (auto& a : n.attrs)
             if (a.key == "from") m.attrs.push_back({"to", a.val, a.jid});
         m.a("type", "text").a("id", id).a("t", n.child("retry")->attr("t"));
-        if (!chat.isGroup()) m.a("device_fanout", "false");
+        if (!chat.groupish()) m.a("device_fanout", "false");
         for (auto& a : n.attrs)
             if (a.key == "participant" || a.key == "recipient") m.attrs.push_back(a);
         m.add(std::move(enc));
@@ -2140,6 +2232,7 @@ void RealEngine::importBatch() {
             (*row)["last_from_me"] = (*m)["from_me"];
         }
         (*row)["name"] = nameOf(c);
+        overlayFlags(*row);
         store_.putChat(cid, *row);
     }
     histTouched_.clear();
@@ -2203,6 +2296,552 @@ void RealEngine::cmdDownload(const json& r, Reply rp) {
             });
         }).detach();
     });
+}
+
+// ---------------------------------------------------------------- network
+
+void RealEngine::watchNetwork() {
+    nlFd_ = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (nlFd_ < 0) return;
+    sockaddr_nl a{};
+    a.nl_family = AF_NETLINK;
+    a.nl_groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+    if (bind(nlFd_, (sockaddr*)&a, sizeof a) != 0) {
+        close(nlFd_);
+        nlFd_ = -1;
+        return;
+    }
+    loop_.add(nlFd_, EPOLLIN, [this](uint32_t) {
+        char buf[8192];
+        bool added = false;
+        for (;;) {
+            ssize_t n = recv(nlFd_, buf, sizeof buf, 0);
+            if (n <= 0) break;
+            for (auto* h = (nlmsghdr*)buf; NLMSG_OK(h, (unsigned)n); h = NLMSG_NEXT(h, n))
+                if (h->nlmsg_type == RTM_NEWADDR) added = true;
+        }
+        if (added) networkChanged();
+    });
+}
+
+// A new address means Wi-Fi or mobile data came back. Coalesced, as a join sends several.
+void RealEngine::networkChanged() {
+    if (netT_) return;
+    netT_ = later(cfg_.rootKey ? 10 : 500, [this] {
+        netT_ = 0;
+        if (!wanted_) return;
+        if (reconnectT_ || conn_ == "offline") {
+            attempts_ = 0;
+            connect();
+        } else if (hs_ == Hs::Done) {
+            // The old socket may be dead on the old network. Ask, and replace it if silent.
+            uint64_t gen = gen_;
+            iq("w:p", "get", {}, [this, gen](const Node* r) {
+                if (r || gen != gen_) return;
+                ws_.close();
+                wsClosed("no answer after network change");
+                attempts_ = 0;
+            });
+        }
+    });
+}
+
+// ---------------------------------------------------------------- app state
+
+void RealEngine::syncAppState(std::vector<std::string> names) {
+    for (auto& n : names) {
+        if (n.empty()) continue;
+        if (std::find(asQueue_.begin(), asQueue_.end(), n) == asQueue_.end()) asQueue_.push_back(n);
+    }
+    if (asRunning_ || asQueue_.empty() || hs_ != Hs::Done) return;
+    asRunning_ = true;
+    asContacts_ = false;
+    ipc_.broadcast({{"event", "app_state"}, {"state", "running"}});
+    appStateNext();
+}
+
+void RealEngine::appStateNext() {
+    if (asQueue_.empty()) {
+        asRunning_ = false;
+        ipc_.broadcast({{"event", "app_state"}, {"state", "done"}});
+        if (asContacts_) {
+            ipc_.broadcast({{"event", "contacts"}, {"total", store_.allContacts().size()}});
+            asContacts_ = false;
+        }
+        return;
+    }
+    std::string name = asQueue_.front();
+    asQueue_.pop_front();
+    appStateFetch(name, !store_.get("asver", name));
+}
+
+void RealEngine::appStateFetch(const std::string& name, bool snapshot) {
+    Node col("collection");
+    col.a("name", name).a("return_snapshot", snapshot ? "true" : "false");
+    if (!snapshot) {
+        json v = json::parse(S(*store_.get("asver", name)));
+        col.a("version", std::to_string(v["v"].get<uint64_t>()));
+    }
+    Node sync("sync");
+    sync.add(col);
+    iq("w:sync:app:state", "set", {sync}, [this, name, snapshot](const Node* r) { appStateReply(name, r, snapshot); });
+}
+
+// Fetches one external blob, verifying it. Worker threads only.
+static std::optional<Bytes> fetchBlob(const pb::Msg& ref, const std::vector<std::string>& bases) {
+    Bytes key = ref.bytes(1), sha = ref.bytes(5), enc = ref.bytes(6);
+    std::string tail = ref.str(2) + "&hash=" + b64url(enc) + "&mms-type=md-app-state&__wa-mms=";
+    for (auto& b : bases) {
+        HttpResult r = httpGet(b + tail);
+        if (r.status != 200) continue;
+        try {
+            return openMedia(r.body, key, "WhatsApp App State Keys", enc, sha);
+        } catch (const std::exception&) {
+        }
+    }
+    return std::nullopt;
+}
+
+void RealEngine::appStateReply(const std::string& name, const Node* r, bool) {
+    const Node* sync = (r && r->attr("type") == "result") ? r->child("sync") : nullptr;
+    const Node* col = sync ? sync->child("collection") : nullptr;
+    if (!col) {
+        logLine("app state fetch failed for " + name);
+        appStateNext();
+        return;
+    }
+    bool hasMore = col->attr("has_more_patches") == "true";
+    std::optional<pb::Msg> snapRef;
+    std::vector<pb::Msg> patches;
+    try {
+        if (auto s = col->child("snapshot")) snapRef = pb::Msg(s->data);
+        if (auto ps = col->child("patches"))
+            for (auto p : ps->children("patch")) patches.emplace_back(p->data);
+    } catch (const std::exception&) {
+        logLine("bad app state reply for " + name);
+        appStateNext();
+        return;
+    }
+    bool external = snapRef.has_value();
+    for (auto& p : patches) external = external || p.has(3);
+    auto finish = [this, name, hasMore](std::optional<Bytes> snap, std::vector<std::pair<Bytes, std::vector<pb::Msg>>> out) {
+        appStateApply(name, snap.value_or(Bytes{}), out, hasMore);
+    };
+    // Patches are re-serialised by keeping each field's bytes, so the original is held for MACs.
+    std::vector<Bytes> rawPatches;
+    if (auto ps = col->child("patches"))
+        for (auto p : ps->children("patch")) rawPatches.push_back(p->data);
+    if (!external) {
+        std::vector<std::pair<Bytes, std::vector<pb::Msg>>> out;
+        for (size_t i = 0; i < patches.size(); i++) out.push_back({rawPatches[i], patches[i].repeated(2)});
+        finish(std::nullopt, out);
+        return;
+    }
+    ensureMediaConn([this, name, snapRef, patches, rawPatches, finish](bool ok) {
+        if (!ok) {
+            appStateNext();
+            return;
+        }
+        std::vector<std::string> bases;
+        if (!cfg_.mediaBase.empty()) bases.push_back(cfg_.mediaBase);
+        else
+            for (auto& h : media_.hosts) bases.push_back("https://" + h);
+        std::thread([this, name, snapRef, patches, rawPatches, finish, bases] {
+            std::optional<Bytes> snap;
+            std::vector<std::pair<Bytes, std::vector<pb::Msg>>> out;
+            bool good = true;
+            try {
+                if (snapRef) {
+                    snap = fetchBlob(*snapRef, bases);
+                    good = snap.has_value();
+                }
+                for (size_t i = 0; good && i < patches.size(); i++) {
+                    std::vector<pb::Msg> muts = patches[i].repeated(2);
+                    if (auto ext = patches[i].sub(3)) {
+                        auto b = fetchBlob(*ext, bases);
+                        if (!b) {
+                            good = false;
+                            break;
+                        }
+                        muts = pb::Msg(*b).repeated(1);
+                    }
+                    out.push_back({rawPatches[i], std::move(muts)});
+                }
+            } catch (const std::exception&) {
+                good = false;
+            }
+            posted([this, name, good, snap, out, finish] {
+                if (!good) {
+                    logLine("app state download failed for " + name);
+                    appStateNext();
+                    return;
+                }
+                finish(snap, out);
+            });
+        }).detach();
+    });
+}
+
+void RealEngine::appStateApply(const std::string& name, const Bytes& snapshot,
+                               const std::vector<std::pair<Bytes, std::vector<pb::Msg>>>& patches, bool hasMore) {
+    appstate::HashState st;
+    if (auto v = store_.get("asver", name)) {
+        json j = json::parse(S(*v));
+        st.version = j["v"];
+        st.hash = b64dec(j["h"].get<std::string>());
+    }
+    appstate::Env env;
+    env.key = [this](const Bytes& id) { return store_.get("askey", hex(id)); };
+    env.prevValueMac = [this, name](const Bytes& i) { return store_.get("asmac", name + "|" + hex(i)); };
+    store_.begin();
+    bool ok = true;
+    auto commitMuts = [&](const std::vector<appstate::Mutation>& ms) {
+        for (auto& m : ms) {
+            std::string k = name + "|" + hex(m.indexMac);
+            if (m.set) store_.put("asmac", k, m.valueMac, name);
+            else store_.del("asmac", k);
+            try {
+                applyMutation(m);
+            } catch (const std::exception& e) {
+                logLine(std::string("skipped one app state change: ") + e.what());
+            }
+        }
+    };
+    try {
+        if (!snapshot.empty()) {
+            store_.delGroup("asmac", name);
+            commitMuts(appstate::decodeSnapshot(name, snapshot, st, env));
+        }
+        for (auto& [raw, muts] : patches) {
+            pb::Msg patch(raw);
+            commitMuts(appstate::decodePatch(name, patch, muts, st, env));
+        }
+        store_.put("asver", name, B(json{{"v", st.version}, {"h", b64(st.hash)}}.dump()));
+    } catch (const appstate::MissingKey&) {
+        // Nothing was committed. The phone's next key share restarts this collection.
+        ok = false;
+        store_.rollback();
+        logLine("app state key not held yet for " + name);
+        appStateNext();
+        return;
+    } catch (const std::exception& e) {
+        ok = false;
+        store_.rollback();
+        logLine(std::string("app state rejected for ") + name + ": " + e.what());
+        // One clean restart from a snapshot, then give up until the next notification.
+        if (!asRetried_.count(name)) {
+            asRetried_.insert(name);
+            store_.del("asver", name);
+            store_.delGroup("asmac", name);
+            appStateFetch(name, true);
+        } else {
+            appStateNext();
+        }
+        return;
+    }
+    if (ok) store_.commit();
+    if (hasMore) appStateFetch(name, false);
+    else {
+        asRetried_.erase(name);
+        appStateNext();
+    }
+}
+
+void RealEngine::overlayFlags(json& c) {
+    auto v = store_.get("chatflags", c["id"].get<std::string>());
+    if (!v) return;
+    json f = json::parse(S(*v));
+    if (f.contains("pinned")) c["pinned"] = f["pinned"];
+    if (f.contains("archived")) c["archived"] = f["archived"];
+    if (f.contains("muted_until")) {
+        int64_t u = f["muted_until"];
+        c["muted"] = u != 0 && (u < 0 || u > now() * 1000);
+    }
+}
+
+void RealEngine::setChatFlag(const Jid& chat, const char* flag, const json& value) {
+    std::string cid = chat.str();
+    json f = json::object();
+    if (auto v = store_.get("chatflags", cid)) f = json::parse(S(*v));
+    f[flag] = value;
+    store_.put("chatflags", cid, B(f.dump()));
+    if (store_.getChat(cid)) touchChat(chat, "");
+}
+
+void RealEngine::loadStarred() {
+    starred_.clear();
+    if (auto v = store_.get("meta", "starred"))
+        for (auto& s : json::parse(S(*v))) starred_.insert(s.get<std::string>());
+}
+
+void RealEngine::saveStarred() { store_.put("meta", "starred", B(json(starred_).dump())); }
+
+void RealEngine::applyMutation(const appstate::Mutation& m) {
+    if (m.index.empty()) return;
+    pb::Msg act(m.action);
+    const std::string& kind = m.index[0];
+    Jid jid = m.index.size() > 1 ? Jid::parse(m.index[1]) : Jid{};
+    if (kind == "setting_pushName") {
+        if (!m.set) return;
+        auto s = act.sub(7);
+        if (s && !s->str(1).empty() && s->str(1) != dev_.pushName) {
+            dev_.pushName = s->str(1);
+            saveDevice();
+        }
+        return;
+    }
+    if (jid.empty()) return;
+    if (kind == "contact" || kind == "lid_contact") {
+        if (!m.set) return;
+        auto c = act.sub(3);
+        if (!c) return;
+        if (jid.isLid()) mapLid(Jid::parse(c->str(5)), jid);
+        if (jid.isPn()) mapLid(jid, Jid::parse(c->str(3)));
+        Jid can = canon(jid);
+        if (isSelf(can)) return;
+        std::string nm = c->str(1).empty() ? c->str(2) : c->str(1);
+        if (!nm.empty()) store_.put("cname", can.str(), B(nm));
+        std::string push;
+        if (auto v = store_.get("name", can.str())) push = S(*v);
+        store_.putContact(can.str(), {{"jid", can.str()}, {"name", nameOf(can)}, {"push_name", push},
+                                      {"phone", can.isPn() ? "+" + can.user : ""}});
+        asContacts_ = true;
+        if (store_.getChat(can.str())) touchChat(can, "");
+    } else if (kind == "mute") {
+        auto a = act.sub(4);
+        int64_t until = 0;
+        if (m.set && a && a->num(1)) until = (int64_t)a->num(2) == 0 ? -1 : (int64_t)a->num(2);
+        setChatFlag(jid.isGroup() ? jid : canon(jid), "muted_until", until);
+    } else if (kind == "pin_v1") {
+        auto a = act.sub(5);
+        setChatFlag(jid.isGroup() ? jid : canon(jid), "pinned", m.set && a && a->num(1));
+    } else if (kind == "archive") {
+        auto a = act.sub(17);
+        setChatFlag(jid.isGroup() ? jid : canon(jid), "archived", m.set && a && a->num(1));
+    } else if (kind == "star" && m.index.size() >= 3) {
+        auto a = act.sub(2);
+        std::string k = (jid.isGroup() ? jid : canon(jid)).str() + "|" + m.index[2];
+        if (m.set && a && a->num(1)) starred_.insert(k);
+        else starred_.erase(k);
+        saveStarred();
+    }
+}
+
+// ---------------------------------------------------------------- status
+
+static const char* const kStatusChat = "status@broadcast";
+
+void RealEngine::storeStatus(const Jid& sender, bool fromMe, int64_t ts, const std::string& id, ParsedMsg& p, bool live,
+                             const std::string& push) {
+    if (p.kind == "undecryptable" || p.kind == "reaction" || p.kind.empty()) return;
+    Jid sBare = canon(sender);
+    if (!fromMe && !push.empty()) setName(sBare, push);
+    json m = {{"chat", kStatusChat}, {"id", id}, {"from_me", fromMe}, {"sender", sBare.str()},
+              {"sender_name", fromMe ? "You" : nameOf(sBare)}, {"timestamp", ts}, {"kind", p.kind}, {"text", p.text},
+              {"status", fromMe ? "sent" : "received"}, {"quoted_id", ""}, {"media", p.media}, {"seen", fromMe}};
+    if (!p.secret.is_null()) m["_s"] = p.secret;
+    if (!store_.insertMessage(kStatusChat, id, ts, false, m)) return;
+    json pub = m;
+    pub.erase("_s");
+    ipc_.broadcast({{"event", "status"}, {"sender", sBare.str()}, {"sender_name", pub["sender_name"]}, {"item", pub}, {"live", live}});
+}
+
+json RealEngine::statusList() {
+    bool more = false;
+    auto rows = store_.pageMessages(kStatusChat, 500, std::nullopt, "", &more);
+    std::map<std::string, json> by;
+    int64_t cutoff = now() - 86400;
+    for (auto& m : rows) {
+        if (m["timestamp"].get<int64_t>() < cutoff) continue;
+        m.erase("_s");
+        std::string s = m["sender"];
+        if (!by.count(s)) by[s] = {{"sender", s}, {"name", m["sender_name"]}, {"last_ts", 0}, {"unseen", 0}, {"items", json::array()}};
+        json& c = by[s];
+        if (m["timestamp"].get<int64_t>() > c["last_ts"].get<int64_t>()) c["last_ts"] = m["timestamp"];
+        if (!m.value("seen", false)) c["unseen"] = c["unseen"].get<int>() + 1;
+        c["items"].push_back(m);
+    }
+    std::vector<json> v;
+    for (auto& [_, c] : by) v.push_back(c);
+    std::sort(v.begin(), v.end(), [](const json& a, const json& b) { return a["last_ts"].get<int64_t>() > b["last_ts"].get<int64_t>(); });
+    return v;
+}
+
+void RealEngine::cmdStatusSeen(const json& r, Reply rp) {
+    if (hs_ != Hs::Done) return rp.err("not_connected", "not connected");
+    Jid sender = Jid::parse(r.at("sender").get<std::string>());
+    std::vector<std::string> ids;
+    for (auto& i : r.at("ids")) {
+        std::string id = i.get<std::string>();
+        auto m = store_.getMessage(kStatusChat, id);
+        if (!m) continue;
+        (*m)["seen"] = true;
+        store_.updateMessage(kStatusChat, id, *m);
+        ids.push_back(id);
+    }
+    if (!ids.empty()) {
+        Node n("receipt");
+        n.a("id", ids[0]).a("type", readReceipts_ ? "read" : "read-self").a("to", Jid::parse(kStatusChat)).a("t", std::to_string(now()));
+        n.a("participant", sender.bare());
+        if (ids.size() > 1) {
+            Node l("list");
+            for (size_t i = 1; i < ids.size(); i++) l.add(Node("item").a("id", ids[i]));
+            n.add(std::move(l));
+        }
+        sendNode(n);
+    }
+    rp.ok(json::object());
+}
+
+// Honours the account's status privacy. If that cannot be read, nothing is posted.
+void RealEngine::statusAudience(std::function<void(std::optional<std::vector<Jid>>)> cb) {
+    iq("status", "get", {Node("privacy")}, [this, cb](const Node* r) {
+        const Node* pr = (r && r->attr("type") == "result") ? r->child("privacy") : nullptr;
+        const Node* def = nullptr;
+        if (pr)
+            for (auto l : pr->children("list"))
+                if (l->attr("default") == "true" || !def) {
+                    def = l;
+                    if (l->attr("default") == "true") break;
+                }
+        if (!def) {
+            cb(std::nullopt);
+            return;
+        }
+        std::string type = def->attr("type");
+        std::set<std::string> listed;
+        for (auto u : def->children("user")) listed.insert(canon(u->jid("jid")).str());
+        std::vector<Jid> out{self().bare()};
+        if (type == "whitelist") {
+            for (auto& s : listed) out.push_back(Jid::parse(s));
+        } else if (type == "contacts" || type == "blacklist") {
+            for (auto& c : store_.allContacts()) {
+                std::string j = c["jid"];
+                if (!listed.count(j)) out.push_back(Jid::parse(j));
+            }
+        } else {
+            cb(std::nullopt);
+            return;
+        }
+        cb(out);
+    });
+}
+
+void RealEngine::cmdPostStatus(const json& r, Reply rp) {
+    if (!paired()) return rp.err("not_paired", "not paired");
+    std::string text = r.at("text").get<std::string>();
+    if (text.empty() || text.size() > 700) return rp.err("bad_request", "bad text");
+    Pending p;
+    p.chat = Jid::parse(kStatusChat);
+    std::string h = hex(randomBytes(9));
+    for (auto& c : h) c = (char)toupper(c);
+    p.id = "3EB0" + h;
+    p.proto = buildStatusText(text);
+    p.ts = now();
+    ParsedMsg pm;
+    pm.kind = "text";
+    pm.text = text;
+    storeStatus(self(), true, p.ts, p.id, pm, false, "");
+    rp.ok({{"id", p.id}, {"timestamp", p.ts}});
+    enqueueSend(std::move(p));
+}
+
+// ---------------------------------------------------------------- contacts, pictures, groups, search
+
+void RealEngine::cmdContacts(const json& r, Reply rp) {
+    std::string q = r.value("query", "");
+    for (auto& c : q) c = (char)tolower((unsigned char)c);
+    std::vector<json> all = store_.allContacts(), hit;
+    for (auto& c : all) {
+        std::string n = c.value("name", "") + " " + c.value("push_name", "") + " " + c.value("phone", "");
+        for (auto& x : n) x = (char)tolower((unsigned char)x);
+        if (q.empty() || n.find(q) != std::string::npos) {
+            c["name"] = nameOf(Jid::parse(c["jid"].get<std::string>()));
+            hit.push_back(c);
+        }
+    }
+    std::sort(hit.begin(), hit.end(), [](const json& a, const json& b) { return a["name"].get<std::string>() < b["name"].get<std::string>(); });
+    int total = (int)hit.size(), off = r.value("offset", 0), lim = r.value("limit", 200);
+    json out = json::array();
+    for (int i = off; i < total && (int)out.size() < lim; i++) out.push_back(hit[(size_t)i]);
+    rp.ok({{"contacts", out}, {"total", total}});
+}
+
+void RealEngine::cmdPicture(const json& r, Reply rp) {
+    if (hs_ != Hs::Done) return rp.err("not_connected", "not connected");
+    std::string js = r.at("jid").get<std::string>();
+    Jid j = Jid::parse(js);
+    if (j.empty() || j.user.empty()) return rp.err("bad_request", "bad jid");
+    bool preview = r.value("preview", true);
+    std::string file = cfg_.dataDir + "/media/pic-" + hex(sha256(B(js + (preview ? "|p" : "|f")))).substr(0, 40) + ".jpg";
+    if (store_.get("picture", j.bare().str()) && access(file.c_str(), R_OK) == 0) return rp.ok({{"path", file}});
+    Node pic("picture");
+    pic.a("query", "url").a("type", preview ? "preview" : "image");
+    if (auto tok = store_.get("tctoken", j.bare().str())) pic.add(Node("tctoken").bytes(*tok));
+    iq("w:profile:picture", "get", {pic}, [this, rp, file, j](const Node* resp) {
+        const Node* p = (resp && resp->attr("type") == "result") ? resp->child("picture") : nullptr;
+        if (!resp) return rp.err("timeout", "no answer");
+        std::string url = p ? p->attr("url") : "";
+        // Only WhatsApp's own https links, unless a local test server stands in.
+        if (url.empty() || (url.rfind("https://", 0) != 0 && cfg_.mediaBase.empty())) return rp.err("not_found", "no picture");
+        std::thread([this, rp, file, url, j] {
+            HttpResult h = httpGet(url);
+            bool good = false;
+            if (h.status == 200 && !h.body.empty() && h.body.size() < (8u << 20)) {
+                int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                if (fd >= 0) {
+                    good = write(fd, h.body.data(), h.body.size()) == (ssize_t)h.body.size();
+                    close(fd);
+                }
+            }
+            posted([this, rp, file, good, j] {
+                if (!good) return rp.err("not_found", "could not fetch the picture");
+                store_.put("picture", j.bare().str(), B("1"));
+                rp.ok({{"path", file}});
+            });
+        }).detach();
+    }, kServerJid, j.bare());
+}
+
+void RealEngine::cmdGroupInfo(const json& r, Reply rp) {
+    if (hs_ != Hs::Done) return rp.err("not_connected", "not connected");
+    std::string gid = r.at("chat").get<std::string>();
+    Jid g = Jid::parse(gid);
+    if (!g.isGroup()) return rp.err("bad_request", "not a group");
+    fetchGroup(g, [this, rp, gid](bool ok) {
+        auto it = groups_.find(gid);
+        if (!ok || it == groups_.end()) return rp.err("not_found", "could not fetch the group");
+        rp.ok(it->second.info);
+    });
+}
+
+void RealEngine::cmdSearch(const json& r, Reply rp) {
+    std::string q = r.at("query").get<std::string>();
+    if (q.empty()) return rp.err("bad_request", "empty query");
+    std::optional<int64_t> before;
+    if (r.contains("before_ts")) before = r["before_ts"].get<int64_t>();
+    auto job = store_.searchJob(q, r.value("chat", ""), std::min(r.value("limit", 50), 500), before);
+    std::thread([this, job, rp] {
+        bool more = false;
+        auto rows = job(&more);
+        posted([rows = std::move(rows), more, rp] { rp.ok({{"messages", rows}, {"more", more}}); });
+    }).detach();
+}
+
+void RealEngine::cmdStarred(const json& r, Reply rp) {
+    std::vector<json> out;
+    for (auto& k : starred_) {
+        auto bar = k.find('|');
+        auto m = store_.getMessage(k.substr(0, bar), k.substr(bar + 1));
+        if (!m) continue;
+        m->erase("_s");
+        (*m)["starred"] = true;
+        out.push_back(*m);
+    }
+    std::sort(out.begin(), out.end(), [](const json& a, const json& b) { return a["timestamp"].get<int64_t>() > b["timestamp"].get<int64_t>(); });
+    int lim = r.value("limit", 100);
+    if ((int)out.size() > lim) out.resize((size_t)lim);
+    rp.ok({{"messages", out}});
 }
 
 // ---------------------------------------------------------------- commands
@@ -2296,7 +2935,11 @@ void RealEngine::command(const std::string& cmd, const json& r, Reply rp) {
         std::optional<int64_t> ts;
         if (r.contains("before_ts")) ts = r["before_ts"].get<int64_t>();
         auto page = store_.pageMessages(r.at("chat").get<std::string>(), std::min(r.value("limit", 50), 500), ts, r.value("before_id", ""), &more);
-        for (auto& m : page) m.erase("_s");
+        std::string pc = r.at("chat").get<std::string>();
+        for (auto& m : page) {
+            m.erase("_s");
+            if (starred_.count(pc + "|" + m.value("id", ""))) m["starred"] = true;
+        }
         rp.ok({{"messages", page}, {"more", more}});
     } else if (cmd == "send_text") {
         if (!paired()) return rp.err("not_paired", "not paired");
@@ -2321,6 +2964,25 @@ void RealEngine::command(const std::string& cmd, const json& r, Reply rp) {
                         {"text", text}, {"timestamp", p.ts}, {"id", p.id}, {"from_me", true}, {"is_group", cj.isGroup()},
                         {"muted", false}, {"live", true}, {"message", m}});
         enqueueSend(std::move(p));
+    } else if (cmd == "statuses") {
+        rp.ok({{"contacts", statusList()}});
+    } else if (cmd == "status_seen") {
+        cmdStatusSeen(r, rp);
+    } else if (cmd == "post_status") {
+        cmdPostStatus(r, rp);
+    } else if (cmd == "contacts") {
+        cmdContacts(r, rp);
+    } else if (cmd == "profile_picture") {
+        cmdPicture(r, rp);
+    } else if (cmd == "group_info") {
+        cmdGroupInfo(r, rp);
+    } else if (cmd == "search") {
+        cmdSearch(r, rp);
+    } else if (cmd == "starred") {
+        cmdStarred(r, rp);
+    } else if (cmd == "_test_network" && cfg_.rootKey) {
+        networkChanged();
+        rp.ok(json::object());
     } else if (cmd == "mark_read") {
         markRead(r, rp);
     } else if (cmd == "download_media") {

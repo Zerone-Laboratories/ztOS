@@ -24,6 +24,11 @@ public:
         varint(v);
         return *this;
     }
+    Writer& f32(int f, uint32_t v) {
+        varint((uint64_t)f << 3 | 5);
+        for (int i = 0; i < 4; i++) out.push_back((uint8_t)(v >> (i * 8)));
+        return *this;
+    }
     Writer& b(int f, const Bytes& v) {
         varint((uint64_t)f << 3 | 2);
         varint(v.size());

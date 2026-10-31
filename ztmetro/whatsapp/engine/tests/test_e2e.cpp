@@ -15,6 +15,9 @@
 #include <sstream>
 #include <thread>
 
+#include <openssl/hmac.h>
+
+#include "../src/appstate.h"
 #include "../src/engine.h"
 #include "../src/sigproto.h"
 #include "../src/wamsg.h"
@@ -166,6 +169,7 @@ struct H {
         consumed.clear();
     }
     std::string mediaBase;
+    bool mediaBaseUsed = false;
 };
 
 // The primary phone, or another contact's device: a full Signal party.
@@ -1099,6 +1103,270 @@ static void testQrRotationAndCancel() {
     CHECK(h.srv.connections == before);  // cancelled means off the network
 }
 
+// Status, app state, contacts, pictures, group info, search, network return.
+static void testSurfaces() {
+    H h(scratch("surf"));
+    Phone phone, peer;
+    Uploaded up = quickPair(h, phone);
+    h.clearNodes();
+    signal::Record ph, pr;
+    signal::initFromBundle(ph, phone.id, phone.reg, bundleOf(up));
+    signal::initFromBundle(pr, peer.id, peer.reg, bundleOf(up));
+
+    // A contact's status: the sender key arrives in a direct message, then the item.
+    signal::SenderRecord sk;
+    Bytes dist = buildSkdmMessage("status@broadcast", signal::senderKeyDistribution(sk));
+    auto ce = signal::encrypt(pr, signal::pad(dist));
+    auto sm = signal::senderEncrypt(sk, signal::pad(buildTextMessage("my status", "", "")));
+    Node st("message");
+    st.a("from", Jid{"status", "broadcast"}).a("participant", Jid::parse(kPeer)).a("id", "ST1").a("t", std::to_string(time(nullptr))).a("type", "text").a("notify", "Sam");
+    st.add(Node("enc").a("v", "2").a("type", "pkmsg").bytes(ce.data));
+    st.add(Node("enc").a("v", "2").a("type", "skmsg").bytes(sm));
+    h.srv.send(st);
+    json se = h.event("status", [](const json& e) { return e["item"]["id"] == "ST1"; });
+    CHECK(!se.is_null() && se["item"]["text"] == "my status" && se["sender"] == kPeer);
+    json list = h.call({{"cmd", "statuses"}})["result"]["contacts"];
+    CHECK(list.size() == 1 && list[0]["unseen"] == 1 && list[0]["items"][0]["id"] == "ST1");
+    CHECK(h.call({{"cmd", "chats"}})["result"]["total"] == 0);  // status is not a chat
+    for (auto& e : h.events) CHECK(e["event"] != "message" || e["id"] != "ST1");
+    CHECK(h.call({{"cmd", "status_seen"}, {"sender", kPeer}, {"ids", {"ST1"}}})["ok"] == true);
+    const Node* sr = h.node([](const Node& n) { return n.tag == "receipt" && n.attr("id") == "ST1" && (n.attr("type") == "read" || n.attr("type") == "read-self"); });
+    CHECK(sr && sr->attr("to") == "status@broadcast" && sr->attr("participant") == kPeer);
+    CHECK(h.call({{"cmd", "statuses"}})["result"]["contacts"][0]["unseen"] == 0);
+
+    // App state: keys from the phone, then a snapshot that names a contact, and a patch.
+    Bytes keyId = B("key-one"), keyData = randomBytes(32);
+    auto msgOf = [&](pb::Writer& pm) { pb::Writer m; m.m(12, pm); return m.out; };
+    pb::Writer kid; kid.b(1, keyId);
+    pb::Writer kd; kd.b(1, keyData);
+    pb::Writer kk; kk.m(1, kid).m(2, kd);
+    pb::Writer share; share.m(1, kk);
+    pb::Writer pm; pm.u(2, 6).m(7, share);
+    auto ck = signal::encrypt(ph, signal::pad(msgOf(pm)));
+    h.srv.send(msgFrom(kSelfPn + "@s.whatsapp.net", "KS1", ck.data, true));
+    CHECK(!h.event("app_state", [](const json& e) { return e["state"] == "running"; }).is_null());
+
+    Bytes km = hkdf(keyData, {}, "WhatsApp Mutation Keys", 160);
+    auto part = [&](int i) { return Bytes(km.begin() + i * 32, km.begin() + (i + 1) * 32); };
+    auto be64 = [](uint64_t v) { Bytes o(8); for (int i = 0; i < 8; i++) o[i] = (uint8_t)(v >> (56 - i * 8)); return o; };
+    auto mkRecord = [&](const std::string& index, const Bytes& action) {
+        pb::Writer data;
+        data.b(1, B(index)).b(2, action).u(4, 2);
+        Bytes iv = randomBytes(16), content = iv;
+        append(content, aesCbcEncrypt(part(1), iv, data.out));
+        Bytes in{1};
+        append(in, keyId); append(in, content); append(in, be64(keyId.size() + 1));
+        Bytes mac(64); unsigned n = 64;
+        HMAC(EVP_sha512(), part(2).data(), 32, in.data(), in.size(), mac.data(), &n);
+        mac.resize(32);
+        append(content, mac);
+        pb::Writer idx; idx.b(1, hmacSha256(part(0), B(index)));
+        pb::Writer val; val.b(1, content);
+        pb::Writer ki; ki.b(1, keyId);
+        pb::Writer rec; rec.m(1, idx).m(2, val).m(3, ki);
+        return std::make_pair(rec, mac);
+    };
+    auto snapMac = [&](const Bytes& hash, uint64_t ver, const std::string& name) {
+        Bytes in = hash; append(in, be64(ver)); append(in, B(name));
+        return hmacSha256(part(3), in);
+    };
+    // Each collection is requested in turn. Only regular_high gets real content below.
+    std::map<std::string, Bytes> hashes;
+    auto contactAct = [&](const std::string& full) { pb::Writer c; c.s(1, full).s(2, "F"); pb::Writer v; v.u(1, 1).m(3, c); return v.out; };
+    auto muteAct = [&]() { pb::Writer c; c.u(1, 1).u(2, (uint64_t)-1); pb::Writer v; v.u(1, 1).m(4, c); return v.out; };
+    auto archAct = [&]() { pb::Writer c; c.u(1, 1); pb::Writer v; v.u(1, 1).m(17, c); return v.out; };
+    auto starAct = [&]() { pb::Writer c; c.u(1, 1); pb::Writer v; v.u(1, 1).m(2, c); return v.out; };
+    for (int i = 0; i < 5; i++) {
+        const Node* q = h.iqNs("w:sync:app:state", "sync");
+        CHECK(q != nullptr);
+        if (!q) return;
+        const Node* qc = q->child("sync")->child("collection");
+        std::string name = qc->attr("name");
+        CHECK(qc->attr("return_snapshot") == "true");
+        Node col("collection");
+        col.a("name", name).a("version", "1");
+        pb::Writer patch;
+        Bytes hash(128, 0);
+        pb::Writer ver; ver.u(1, 1);
+        patch.m(1, ver);
+        std::vector<std::pair<pb::Writer, Bytes>> recs;
+        if (name == "critical_unblock_low") recs.push_back(mkRecord("[\"contact\",\"" + kPeer + "\"]", contactAct("Book Name")));
+        if (name == "regular_high") {
+            recs.push_back(mkRecord("[\"mute\",\"" + kPeer + "\"]", muteAct()));
+            recs.push_back(mkRecord("[\"star\",\"" + kPeer + "\",\"IN9\",\"0\",\"0\"]", starAct()));
+        }
+        if (name == "regular_low") recs.push_back(mkRecord("[\"archive\",\"" + kPeer + "\"]", archAct()));
+        std::vector<Bytes> added;
+        Bytes macs;
+        for (auto& [rec, mac] : recs) {
+            pb::Writer mu; mu.u(1, 0).m(2, rec);
+            patch.m(2, mu);
+            added.push_back(mac);
+            append(macs, mac);
+        }
+        appstate::ltHashApply(hash, {}, added);
+        Bytes sm2 = snapMac(hash, 1, name);
+        Bytes pin = sm2; append(pin, macs); append(pin, be64(1)); append(pin, B(name));
+        pb::Writer kp; kp.b(1, keyId);
+        patch.b(4, sm2).b(5, hmacSha256(part(4), pin)).m(6, kp);
+        Node ps("patches");
+        ps.add(Node("patch").bytes(patch.out));
+        col.add(ps);
+        Node sy("sync");
+        sy.add(col);
+        h.result(*q, {sy});
+    }
+    CHECK(!h.event("app_state", [](const json& e) { return e["state"] == "done"; }).is_null());
+    CHECK(!h.event("contacts", nullptr).is_null());
+    json cs = h.call({{"cmd", "contacts"}})["result"];
+    CHECK(cs["total"] == 1 && cs["contacts"][0]["name"] == "Book Name" && cs["contacts"][0]["phone"] == "+61400000009");
+    CHECK(h.call({{"cmd", "contacts"}, {"query", "book"}})["result"]["total"] == 1);
+    CHECK(h.call({{"cmd", "contacts"}, {"query", "zzz"}})["result"]["total"] == 0);
+
+    // A message now: the chat takes the book name, muted and archived, and no push name wins.
+    auto c9 = signal::encrypt(pr, signal::pad(buildTextMessage("Find Me Here", "", "")));
+    h.srv.send(msgFrom(kPeer, "IN9", c9.data, c9.preKey));
+    json ev = h.event("message", [](const json& e) { return e["id"] == "IN9"; });
+    CHECK(ev["chat_name"] == "Book Name" && ev["muted"] == true && ev["text"] == "Find Me Here");
+    json rows = h.call({{"cmd", "chats"}})["result"]["chats"];
+    CHECK(rows[0]["archived"] == true && rows[0]["muted"] == true);
+    auto stars = h.call({{"cmd", "starred"}})["result"]["messages"];
+    CHECK(stars.size() == 1 && stars[0]["id"] == "IN9" && stars[0]["starred"] == true);
+    CHECK(h.call({{"cmd", "messages"}, {"chat", kPeer}})["result"]["messages"][0]["starred"] == true);
+
+    // A forged patch is refused: the state holds, and one clean snapshot is requested.
+    {
+        h.clearNodes();
+        Node note("notification");
+        Node sy("sync");
+        sy.add(Node("collection").a("name", "regular_low").a("version", "2"));
+        note.a("from", Jid{"", "s.whatsapp.net"}).a("id", "ss1").a("type", "server_sync").add(sy);
+        h.srv.send(note);
+        const Node* q = h.iqNs("w:sync:app:state", "sync");
+        CHECK(q && q->child("sync")->child("collection")->attr("return_snapshot") == "false");
+        if (q) {
+            auto rec = mkRecord("[\"archive\",\"" + kPeer + "\"]", contactAct("x"));
+            pb::Writer mu; mu.u(1, 0).m(2, rec.first);
+            pb::Writer ver; ver.u(1, 2);
+            pb::Writer kp; kp.b(1, keyId);
+            pb::Writer patch; patch.m(1, ver).m(2, mu).b(4, Bytes(32, 0)).b(5, Bytes(32, 0)).m(6, kp);
+            Node ps("patches"); ps.add(Node("patch").bytes(patch.out));
+            Node col("collection"); col.a("name", "regular_low").add(ps);
+            Node s2("sync"); s2.add(col);
+            h.result(*q, {s2});
+            const Node* again = h.iqNs("w:sync:app:state", "sync");
+            CHECK(again && again->child("sync")->child("collection")->attr("return_snapshot") == "true");
+            if (again) h.result(*again);  // an empty answer ends the attempt
+        }
+        CHECK(h.call({{"cmd", "chats"}})["result"]["chats"][0]["archived"] == true);
+    }
+
+    // Search: case-insensitive, finds text, leaves status out, works per chat.
+    auto found = h.call({{"cmd", "search"}, {"query", "find me"}})["result"];
+    if (found["messages"].size() != 1) printf("search got %s\n", found.dump().substr(0, 300).c_str());
+    CHECK(found["messages"].size() == 1 && found["messages"][0]["id"] == "IN9");
+    CHECK(h.call({{"cmd", "search"}, {"query", "my status"}})["result"]["messages"].empty());
+    CHECK(h.call({{"cmd", "search"}, {"query", "find"}, {"chat", kGroup}})["result"]["messages"].empty());
+
+    // Group info with roles and resolved names.
+    {
+        json req = {{"id", 700}, {"cmd", "group_info"}, {"chat", kGroup}};
+        std::string l = req.dump() + "\n";
+        (void)!::send(h.cfd, l.data(), l.size(), MSG_NOSIGNAL);
+        const Node* gq = h.iqNs("w:g2");
+        CHECK(gq != nullptr);
+        if (gq) {
+            Node gr("group");
+            gr.a("id", "120363000000000001").a("subject", "Subj").a("creator", Jid::parse(kPeer)).a("creation", "1700000000");
+            gr.add(Node("participant").a("jid", Jid::parse(kPeer)).a("type", "superadmin"));
+            gr.add(Node("participant").a("jid", Jid::parse(kPeer2)));
+            Node desc("description");
+            desc.a("id", "d").add(Node("body").bytes(B("About us")));
+            gr.add(desc);
+            gr.add(Node("announcement"));
+            h.result(*gq, {gr});
+            h.wait([&] { return h.replies.count(700) > 0; });
+            json g = h.replies[700]["result"];
+            CHECK(g["subject"] == "Subj" && g["topic"] == "About us" && g["announce"] == true && g["owner"] == kPeer);
+            CHECK(g["participants"].size() == 2 && g["participants"][0]["name"] == "Book Name" && g["participants"][0]["is_super_admin"] == true);
+            CHECK(g["participants"][1]["is_admin"] == false);
+        }
+    }
+
+    // Status post: refuses to go out without knowing the privacy list, honours a block list.
+    {
+        json p1 = h.call({{"cmd", "post_status"}, {"text", "first post"}});
+        CHECK(p1["ok"] == true);
+        const Node* pq = h.iqNs("status");
+        CHECK(pq != nullptr);
+        if (pq) {
+            Node pv("privacy");
+            Node lst("list");
+            lst.a("type", "blacklist").a("default", "true");
+            lst.add(Node("user").a("jid", Jid::parse(kPeer)));
+            pv.add(lst);
+            h.result(*pq, {pv});
+            const Node* us = h.iqNs("usync");
+            CHECK(us != nullptr);
+            if (us) {
+                // The blocked contact is the only contact, so only our own account is asked for.
+                auto users = us->child("usync")->child("list")->children("user");
+                CHECK(users.size() == 1 && users[0]->attr("jid") == kSelfPn + "@s.whatsapp.net");
+                Node dl("device-list");
+                dl.add(Node("device").a("id", "7"));
+                Node d("devices"); d.add(dl);
+                Node u("user"); u.a("jid", Jid::parse(kSelfPn + "@s.whatsapp.net")).add(d);
+                Node ul("list"); ul.add(u);
+                Node uu("usync"); uu.add(ul);
+                h.result(*us, {uu});
+                std::string pid = p1["result"]["id"];
+                const Node* sent = h.node([&](const Node& n) { return n.tag == "message" && n.attr("id") == pid; });
+                CHECK(sent && sent->attr("to") == "status@broadcast");
+            }
+        }
+    }
+
+    // Profile picture: fetched once, cached, and absent reports not_found.
+    {
+        Bytes jpeg = randomBytes(300);
+        HttpOnce http(jpeg);
+        json req = {{"id", 701}, {"cmd", "profile_picture"}, {"jid", kPeer}};
+        std::string l = req.dump() + "\n";
+        (void)!::send(h.cfd, l.data(), l.size(), MSG_NOSIGNAL);
+        h.mediaBaseUsed = true;
+        const Node* q = h.iqNs("w:profile:picture");
+        CHECK(q && q->attr("target") == kPeer && q->child("picture")->attr("type") == "preview");
+        if (q) {
+            Node pic("picture");
+            // https is required outside tests, so this expects the refusal path.
+            pic.a("url", "http://127.0.0.1:" + std::to_string(http.port) + "/p.jpg");
+            h.result(*q, {pic});
+            h.wait([&] { return h.replies.count(701) > 0; });
+            CHECK(h.replies[701]["error"] == "not_found");
+        }
+        // Unblock the one-shot server's accept.
+        int f = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((uint16_t)http.port);
+        ::connect(f, (sockaddr*)&a, sizeof a);
+        (void)!::send(f, "x", 1, 0);
+        close(f);
+    }
+
+    // Wi-Fi back: during backoff, a new address reconnects at once.
+    {
+        Bytes pay;
+        h.srv.onLogin = [&](const Bytes& p) { pay = p; };
+        h.srv.drop();
+        CHECK(!h.event("connection", [](const json& e) { return e["state"] == "offline"; }).is_null());
+        // Burn attempts so the normal retry would be many seconds away.
+        h.call({{"cmd", "_test_network"}});
+        auto t0 = Loop::Clock::now();
+        CHECK(h.wait([&] { return !pay.empty(); }, 1500));
+        CHECK(Loop::Clock::now() - t0 < std::chrono::milliseconds(1500));
+        h.srv.onLogin = nullptr;
+    }
+}
+
 int main() {
     cryptoInit();
     ::signal(SIGPIPE, SIG_IGN);
@@ -1107,6 +1375,7 @@ int main() {
         testPhonePairing();
         testQrRotationAndCancel();
         testMedia();
+        testSurfaces();
     } catch (const std::exception& e) {
         fails++;
         printf("FAIL exception: %s\n", e.what());

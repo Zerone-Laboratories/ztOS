@@ -54,6 +54,12 @@ ParsedMsg parseMessage(const Bytes& proto) {
         p.protoType = pm->num(2);
         if (auto k = pm->sub(1)) p.targetId = k->str(3);
         if (auto h = pm->sub(6)) p.history = std::move(*h);
+        if (auto share = pm->sub(7))
+            for (auto& k : share->repeated(1)) {
+                auto id = k.sub(1);
+                auto data = k.sub(2);
+                if (id && data && !id->bytes(1).empty() && !data->bytes(1).empty()) p.appKeys.push_back({id->bytes(1), data->bytes(1)});
+            }
         if (auto e = pm->sub(14)) {
             ParsedMsg ed = parseMessage(e->fields.empty() ? Bytes{} : pm->bytes(14));
             p.editText = ed.text;
@@ -132,6 +138,14 @@ Bytes buildTextMessage(const std::string& text, const std::string& quotedId, con
     if (!quotedSender.empty()) ctx.s(2, quotedSender);
     pb::Writer e;
     e.s(1, text).m(17, ctx);
+    w.m(6, e);
+    return w.out;
+}
+
+Bytes buildStatusText(const std::string& text) {
+    pb::Writer e;
+    e.s(1, text).f32(7, 0xFFFFFFFFu).f32(8, 0xFF00796Bu).u(9, 0);  // white text on a plain background
+    pb::Writer w;
     w.m(6, e);
     return w.out;
 }
