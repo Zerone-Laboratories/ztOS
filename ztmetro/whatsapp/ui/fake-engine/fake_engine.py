@@ -21,6 +21,7 @@ ap.add_argument("--socket", default=os.path.join(os.environ.get("XDG_RUNTIME_DIR
 ap.add_argument("--messages", type=int, default=300)
 ap.add_argument("--unpaired", action="store_true")
 ap.add_argument("--every", type=float, default=20)
+ap.add_argument("--picture", default="", help="a JPEG to give as everyone's profile picture")
 args = ap.parse_args()
 
 now = int(time.time())
@@ -41,6 +42,16 @@ def make(chat, i, ts):
 
 for c in chats:
 	store[c["id"]] = [make(c, i, c["last_ts"] - (args.messages - i) * 400) for i in range(args.messages)]
+
+chats[6]["archived"] = True
+store[chats[1]["id"]][-3]["starred"] = True
+def status_item(sender, i, ts, seen=False):
+	return dict(chat="status@broadcast", id=f"S{sender[:12]}{i}", from_me=False, sender=sender, sender_name="", timestamp=ts,
+		kind="text", text=f"Invented status number {i}", status="received", quoted_id="", media=None, seen=seen)
+status_people = [dict(sender=chats[i]["id"], name=chats[i]["name"], last_ts=now - i * 900, unseen=2 if i == 0 else 0,
+	items=[status_item(chats[i]["id"], k, now - i * 900 - k, seen=i != 0) for k in range(2)]) for i in (0, 3)]
+people = [dict(jid=c["id"], name=c["name"], push_name=c["name"].split()[0], phone="+" + c["id"].split("@")[0])
+	for c in chats if not c["is_group"]] + [dict(jid="61400000050@s.whatsapp.net", name="Lee Invented", push_name="Lee", phone="+61400000050")]
 
 pairing = "unpaired" if args.unpaired else "paired"
 clients, buffers = [], {}
@@ -108,6 +119,35 @@ def handle(c, req):
 		pairing_event("unpaired")
 	elif cmd == "download_media":
 		ok(path="")	# no real file: the app says it could not open it
+	elif cmd == "statuses":
+		ok(contacts=status_people)
+	elif cmd == "status_seen":
+		for p in status_people:
+			if p["sender"] == req["sender"]:
+				for it in p["items"]:
+					if it["id"] in req["ids"] and not it["seen"]:
+						it["seen"] = True
+						p["unseen"] -= 1
+		ok()
+	elif cmd == "post_status":
+		counter += 1
+		ok(id=f"S{counter}", timestamp=int(time.time()))
+	elif cmd == "contacts":
+		ok(contacts=people, total=len(people))
+	elif cmd == "profile_picture":
+		if args.picture:
+			ok(path=args.picture)
+		else:
+			send(c, dict(id=rid, ok=False, error="not_found", message=""))
+	elif cmd == "group_info":
+		ok(id=req["chat"], subject="", topic="An invented group", owner="", created=now, announce=False, locked=False,
+			participants=[dict(jid=p["jid"], name=p["name"], is_admin=i == 0, is_super_admin=False) for i, p in enumerate(people)])
+	elif cmd == "search":
+		q = req["query"].lower()
+		hits = [m for ms in store.values() for m in ms if q in m["text"].lower()][-req.get("limit", 50):]
+		ok(messages=hits[::-1], more=False)
+	elif cmd == "starred":
+		ok(messages=[m for ms in store.values() for m in ms if m.get("starred")])
 	elif cmd in ("typing", "set_presence", "subscribe_presence"):
 		ok()
 	elif cmd == "status":

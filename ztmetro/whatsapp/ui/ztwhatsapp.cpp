@@ -15,7 +15,8 @@
  *	ztwhatsapp			the chats
  *	ztwhatsapp JID			that chat (from a notification)
  *	ztwhatsapp --render PAGE FILE	a page to a PNG, invented data
- *					(link qr code chats chat account)
+ *					(link qr code chats status starred archived chat
+ *					view post search new info account)
  *	ztwhatsapp --bench N [PNG]	cost of strips for N invented messages
  *	ztwhatsapp --selftest		the socket with no window, against an engine
  *
@@ -36,6 +37,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <string>
+#include <sys/inotify.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -64,8 +66,15 @@ constexpr size_t MAX_DRAFT = 8000, LAYOUT_KEEP = 96, THUMB_KEEP = 48;
 constexpr int PAGE_SIZE = 60;
 constexpr int STEP_MS = 220;
 
-enum Page { P_LINK, P_CHATS, P_CHAT, P_ACCOUNT, P_IMAGE };
-enum Action { ACT_OPEN = 1, ACT_PAIR_QR, ACT_PAIR_PHONE, ACT_PHONE_BOX, ACT_CANCEL, ACT_IMAGE, ACT_RETRY, ACT_LOGOUT, ACT_LOGOUT_SURE };
+enum Page { P_LINK, P_CHATS, P_CHAT, P_ACCOUNT, P_IMAGE, P_STATUS, P_STARRED, P_ARCHIVED, P_STATUS_VIEW, P_STATUS_POST, P_INFO, P_SEARCH, P_NEW };
+enum Action { ACT_OPEN = 1, ACT_PAIR_QR, ACT_PAIR_PHONE, ACT_PHONE_BOX, ACT_CANCEL, ACT_IMAGE, ACT_RETRY, ACT_LOGOUT, ACT_LOGOUT_SURE,
+	ACT_ACCENT, ACT_OPEN_ARCHIVED, ACT_OPEN_STARRED, ACT_OPEN_ID, ACT_STATUS, ACT_STATUS_NEXT, ACT_POST_BOX, ACT_POST, ACT_INFO_BOX,
+	ACT_SEARCH_BOX, ACT_SEARCH_MESSAGES, ACT_NEW_BOX, ACT_NEW_PICK, ACT_NONE };
+
+/* The app's own colour, WhatsApp's teal green: its brighter brand green is too
+ * pale under the white text of a bubble. A choice on the account page gives the
+ * system's accent instead. DotMatrix keeps its palette either way. */
+constexpr uint32_t WA_GREEN = 0x00a884;
 
 /* ---- what is shown ------------------------------------------------------- */
 
@@ -78,6 +87,7 @@ struct Chat {
 
 struct Msg {
 	std::string id, sender_name, text, kind, status, thumb_b64, path;
+	bool starred = false;
 	bool from_me = false, system = false, is_image = false, new_day = false;
 	long ts = 0;
 	int media_w = 0, media_h = 0;
@@ -101,8 +111,28 @@ uint64_t list_rev = 2;		/* even: chats list +0, conversation +1 */
 double entry_off;		/* a page turn in shows the end of the conversation */
 bool sample;
 
-std::string draft, phone;
-int focus = -1;			/* 0 the message, 1 the phone number */
+std::string draft, phone, post_text, search_text, new_text;
+int focus = -1;			/* 0 the message, 1 the phone number, 2 the status, 3 search, 4 new chat */
+
+struct StatusItem { std::string id, text, kind, thumb_b64, path; long ts = 0; bool seen = false; };
+struct StatusPerson { std::string sender, name; long last_ts = 0; int unseen = 0; std::vector<StatusItem> items; };
+struct Contact { std::string jid, name, phone; };
+struct Found { std::string chat, chat_name, who, text; long ts = 0; };
+struct Member { std::string name; bool admin = false; };
+
+std::vector<Chat> archived;
+std::vector<StatusPerson> statuses;
+std::vector<Contact> contacts, contacts_shown;
+std::vector<Found> starred_list, search_found;
+std::vector<Member> members;
+std::string info_topic, info_note, post_note;
+int status_person = -1, status_item = 0;
+bool follow_system_accent;
+
+/* pictures by JID; nullptr: asked, there is none */
+std::map<std::string, cairo_surface_t *> pictures;
+std::vector<std::string> picture_queue;
+bool picture_busy;
 double box_h = 44;
 unsigned footer_rev = 1;
 bool logout_ask, foreground;
@@ -194,9 +224,8 @@ std::string when_text(long ts) {
 	localtime_r(&now, &b);
 	char out[32];
 	if (a.tm_yday == b.tm_yday && a.tm_year == b.tm_year) strftime(out, sizeof(out), "%H:%M", &a);
-	else if (now - ts < 6 * 86400) strftime(out, sizeof(out), "%a", &a);
-	else strftime(out, sizeof(out), "%d/%m/%y", &a);
-	for (char *c = out; *c; c++) *c = char(tolower((unsigned char)*c));
+	else if (now - ts < 6 * 86400) strftime(out, sizeof(out), "%a %H:%M", &a);
+	else strftime(out, sizeof(out), "%d %b", &a);
 	return out;
 }
 
@@ -211,7 +240,7 @@ std::string day_text(long ts) {
 }
 
 std::string stamp_of(const Msg &m) {
-	std::string s = when_text(m.ts);
+	std::string s = (m.starred ? "* " : "") + when_text(m.ts);
 	if (!m.from_me) return s;
 	if (m.status == "pending") s += "  sending...";
 	else if (m.status == "sent") s += "  sent";
@@ -278,7 +307,7 @@ void measure(Msg &m) {
 }
 
 int footer_height(int page) {
-	if (page == P_CHATS) return 76;
+	if (page == P_CHATS || page == P_STATUS) return 76;
 	if (page == P_CHAT) return int(box_h) + 94;
 	return 0;
 }
@@ -321,7 +350,30 @@ void place() {
 	list_total = y;
 }
 
-void list_changed() { list_rev += 2; }
+void list_changed() { list_rev += 32; }	/* page + rev: no two lists share a texture */
+
+void accent_apply() {
+	if (dots()) return;
+	zmc.accent = follow_system_accent ? zmc_config_accent() : WA_GREEN;
+}
+
+std::string prefs_path() {
+	const char *home = getenv("HOME");
+	return std::string(home ? home : "") + "/.config/ztmetro/ztwhatsapp";
+}
+void prefs_load() {
+	char line[64];
+	if (FILE *f = fopen(prefs_path().c_str(), "r")) {
+		while (fgets(line, sizeof(line), f)) if (!strncmp(line, "follow_system_accent=1", 22)) follow_system_accent = true;
+		fclose(f);
+	}
+}
+void prefs_save() {
+	if (FILE *f = fopen(prefs_path().c_str(), "w")) {
+		fprintf(f, "follow_system_accent=%d\n", follow_system_accent);
+		fclose(f);
+	}
+}
 
 /* ---- drawing a bubble: cut to its strip by the caller ---------------------- */
 
@@ -510,18 +562,26 @@ bool strip_hit(int row, double x, double y, struct zmc_hit *hit) {
 	return true;
 }
 
-/* ---- the chat list -------------------------------------------------------- */
+/* Called while drawing, maybe on the core's thread: the main loop does the asking. */
+cairo_surface_t *picture_of(const std::string &jid) {
+	auto it = pictures.find(jid);
+	if (it != pictures.end()) return it->second;
+	pictures[jid] = nullptr;
+	picture_queue.push_back(jid);
+	if (older_pipe[1] >= 0) (void)!write(older_pipe[1], "p", 1);
+	return nullptr;
+}
 
-void draw_chat_row(cairo_t *cr, int row) {
-	if (row < 0 || size_t(row) >= chats.size()) return;
-	const Chat &c = chats[size_t(row)];
-	const double tile = 56, left = MARGIN + tile + 12, y = 6;
-	bool unread = c.unread > 0;
-	/* who: a square with their initial, as Messaging has */
+/* Messaging's square, with the person's picture in it when there is one. */
+void draw_tile(cairo_t *cr, const std::string &jid, const std::string &name, double y, double tile = 56) {
+	if (cairo_surface_t *pic = sample || !jid.empty() ? picture_of(jid) : nullptr) {
+		zmc_picture(cr, pic, MARGIN, y, tile);
+		return;
+	}
 	std::string initial = "#";
-	if (!c.name.empty()) {
-		const char *next = g_utf8_next_char(c.name.c_str());
-		gchar *up = g_utf8_strup(c.name.c_str(), next - c.name.c_str());
+	if (!name.empty() && !isdigit(static_cast<unsigned char>(name[0])) && name[0] != '+') {
+		const char *next = g_utf8_next_char(name.c_str());
+		gchar *up = g_utf8_strup(name.c_str(), next - name.c_str());
 		initial = up;
 		g_free(up);
 	}
@@ -531,6 +591,14 @@ void draw_chat_row(cairo_t *cr, int row) {
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text_centred(cr, initial.c_str(), FONT_SEMILIGHT, 26, MARGIN + tile / 2, y + 12);
 	cairo_new_path(cr);
+}
+
+/* ---- the chat list -------------------------------------------------------- */
+
+void draw_chat(cairo_t *cr, const Chat &c) {
+	const double tile = 56, left = MARGIN + tile + 12, y = 0;
+	bool unread = c.unread > 0;
+	draw_tile(cr, c.id, c.name, y);
 
 	std::string when = when_text(c.last_ts);
 	double when_w = zmc_text_width(when.c_str(), FONT_REGULAR, 12.5);
@@ -568,11 +636,60 @@ void draw_chat_row(cairo_t *cr, int row) {
 	cairo_new_path(cr);
 }
 
-bool chat_row_hit(int row, double, double, struct zmc_hit *hit) {
-	if (row < 0 || size_t(row) >= chats.size()) return false;
-	*hit = zmc_hit{.x = 0, .y = 2, .w = double(zmc.width), .h = 66, .action = ACT_OPEN, .arg = row, .slider = false, .button = false};
+void draw_chat_row(cairo_t *cr, int row) {
+	if (row >= 0 && size_t(row) < chats.size()) draw_chat(cr, chats[size_t(row)]);
+}
+void draw_archived_row(cairo_t *cr, int row) {
+	if (row >= 0 && size_t(row) < archived.size()) draw_chat(cr, archived[size_t(row)]);
+}
+
+bool row_hit_as(int action, size_t count, int row, struct zmc_hit *hit) {
+	if (row < 0 || size_t(row) >= count) return false;
+	*hit = zmc_hit{.x = 0, .y = -2, .w = double(zmc.width), .h = 58, .action = action, .arg = row, .slider = false, .button = false};
 	return true;
 }
+bool chat_row_hit(int row, double, double, struct zmc_hit *hit) { return row_hit_as(ACT_OPEN, chats.size(), row, hit); }
+bool archived_row_hit(int row, double, double, struct zmc_hit *hit) { return row_hit_as(ACT_OPEN_ARCHIVED, archived.size(), row, hit); }
+
+/* a row with a tile, a name, when, and a grey line: status, starred, new chat */
+void draw_plain_row(cairo_t *cr, const std::string &jid, const std::string &name, const std::string &when, const std::string &line, bool lit) {
+	const double left = MARGIN + 56 + 12;
+	draw_tile(cr, jid, name, 0);
+	double when_w = when.empty() ? 0 : zmc_text_width(when.c_str(), FONT_REGULAR, 12.5);
+	if (lit) zmc_accent(cr); else cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text_line(cr, name.c_str(), lit ? FONT_SEMIBOLD : FONT_SEMILIGHT, 24, left, -3, zmc.width - left - MARGIN - when_w - 10);
+	cairo_new_path(cr);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	if (!when.empty()) zmc_text(cr, when.c_str(), FONT_REGULAR, 12.5, zmc.width - MARGIN - when_w, 8, 0);
+	cairo_new_path(cr);
+	std::string flat = line;
+	std::replace(flat.begin(), flat.end(), '\n', ' ');
+	if (flat.size() > 160) { size_t cut = 160; while (cut && (static_cast<unsigned char>(flat[cut]) & 0xc0) == 0x80) cut--; flat.resize(cut); }
+	zmc_text_line(cr, flat.c_str(), FONT_REGULAR, 14, left, 30, zmc.width - left - MARGIN);
+	cairo_new_path(cr);
+}
+
+void draw_status_row(cairo_t *cr, int row) {
+	if (row < 0 || size_t(row) >= statuses.size()) return;
+	const StatusPerson &p = statuses[size_t(row)];
+	std::string line = p.unseen ? std::to_string(p.unseen) + " new" : "seen";
+	draw_plain_row(cr, p.sender, p.name, when_text(p.last_ts), line, p.unseen > 0);
+}
+bool status_row_hit(int row, double, double, struct zmc_hit *hit) { return row_hit_as(ACT_STATUS, statuses.size(), row, hit); }
+
+void draw_starred_row(cairo_t *cr, int row) {
+	if (row < 0 || size_t(row) >= starred_list.size()) return;
+	const Found &f = starred_list[size_t(row)];
+	draw_plain_row(cr, f.chat, f.chat_name, when_text(f.ts), f.text, false);
+}
+bool starred_row_hit(int row, double, double, struct zmc_hit *hit) { return row_hit_as(ACT_OPEN_STARRED, starred_list.size(), row, hit); }
+
+void draw_contact_row(cairo_t *cr, int row) {
+	if (row < 0 || size_t(row) >= contacts_shown.size()) return;
+	const Contact &c = contacts_shown[size_t(row)];
+	draw_plain_row(cr, c.jid, c.name, "", c.phone, false);
+}
+bool contact_row_hit(int row, double, double, struct zmc_hit *hit) { return row_hit_as(ACT_NEW_PICK, contacts_shown.size(), row, hit); }
 
 /* ---- the socket ----------------------------------------------------------- */
 
@@ -629,11 +746,14 @@ json_object *jget(json_object *o, const char *key) {
 
 void chats_sort() {
 	chats.clear();
-	for (auto &[id, c] : all_chats) if (!c.archived) chats.push_back(c);
-	std::stable_sort(chats.begin(), chats.end(), [](const Chat &a, const Chat &b) {
+	archived.clear();
+	for (auto &[id, c] : all_chats) (c.archived ? archived : chats).push_back(c);
+	auto order = [](const Chat &a, const Chat &b) {
 		if (a.pinned != b.pinned) return a.pinned;
 		return a.last_ts > b.last_ts;
-	});
+	};
+	std::stable_sort(chats.begin(), chats.end(), order);
+	std::stable_sort(archived.begin(), archived.end(), order);
 	list_changed();
 }
 
@@ -664,6 +784,7 @@ std::unique_ptr<Msg> msg_from(json_object *o) {
 	m->kind = kind;
 	m->text = jstr(o, "text");
 	m->status = jstr(o, "status");
+	m->starred = jbool(o, "starred");
 	m->system = kind == "system";
 	if (kind == "unsupported" || kind == "undecryptable") { /* text is a placeholder */ }
 	else if (kind == "video" && m->text.empty()) m->text = "video";
@@ -724,6 +845,17 @@ void mark_open_read() {
 	request("mark_read", {{"chat", str(open_id)}});
 }
 
+std::string pending_open;
+void show_chat(const std::string &id, const std::string &name_if_new = "");
+void load_extras();
+
+void open_pending() {
+	if (pending_open.empty() || sock_fd < 0 || (pair_state != "paired" && pair_state != "connecting")) return;
+	std::string id = pending_open;
+	pending_open.clear();
+	if (id != open_id || zmc.page != P_CHAT) show_chat(id, "");
+}
+
 void load_chats() {
 	request("chats", {{"limit", json_object_new_int(500)}}, [](json_object *r, const char *err) {
 		if (err || !r) return;
@@ -735,7 +867,134 @@ void load_chats() {
 		chats_sort();
 		zmc_list_lock(false);
 		batch_page = true;
+		open_pending();
 	});
+}
+
+Found found_from(json_object *o) {
+	Found f;
+	f.chat = jstr(o, "chat");
+	auto it = all_chats.find(f.chat);
+	f.chat_name = it != all_chats.end() ? it->second.name : jstr(o, "sender_name");
+	f.who = jstr(o, "sender_name");
+	f.text = jstr(o, "text");
+	if (f.text.empty()) f.text = jstr(o, "kind");
+	f.ts = jint(o, "timestamp");
+	return f;
+}
+
+void load_statuses() {
+	request("statuses", {}, [](json_object *r, const char *err) {
+		json_object *list = err ? nullptr : jget(r, "contacts");
+		if (!list) return;
+		zmc_list_lock(true);
+		statuses.clear();
+		for (size_t i = 0; i < json_object_array_length(list); i++) {
+			json_object *c = json_object_array_get_idx(list, i);
+			StatusPerson p;
+			p.sender = jstr(c, "sender");
+			p.name = jstr(c, "name");
+			p.last_ts = jint(c, "last_ts");
+			p.unseen = int(jint(c, "unseen"));
+			json_object *items = jget(c, "items");
+			for (size_t k = 0; items && k < json_object_array_length(items); k++) {
+				json_object *it = json_object_array_get_idx(items, k);
+				StatusItem si;
+				si.id = jstr(it, "id");
+				si.text = jstr(it, "text");
+				si.kind = jstr(it, "kind");
+				si.ts = jint(it, "timestamp");
+				si.seen = jbool(it, "seen");
+				if (json_object *media = jget(it, "media")) {
+					si.thumb_b64 = jstr(media, "thumb_b64");
+					si.path = jstr(media, "path");
+				}
+				p.items.push_back(std::move(si));
+			}
+			statuses.push_back(std::move(p));
+		}
+		list_changed();
+		zmc_list_lock(false);
+		batch_page = true;
+	});
+}
+
+void load_starred() {
+	request("starred", {{"limit", json_object_new_int(200)}}, [](json_object *r, const char *err) {
+		json_object *list = err ? nullptr : jget(r, "messages");
+		if (!list) return;
+		zmc_list_lock(true);
+		starred_list.clear();
+		for (size_t i = 0; i < json_object_array_length(list); i++) starred_list.push_back(found_from(json_object_array_get_idx(list, i)));
+		list_changed();
+		zmc_list_lock(false);
+		batch_page = true;
+	});
+}
+
+void contacts_filter() {
+	std::string q = new_text;
+	gchar *fq = g_utf8_casefold(q.c_str(), -1);
+	contacts_shown.clear();
+	for (auto &c : contacts) {
+		gchar *fn = g_utf8_casefold(c.name.c_str(), -1);
+		if (!fq[0] || strstr(fn, fq) || c.phone.find(q) != std::string::npos) contacts_shown.push_back(c);
+		g_free(fn);
+	}
+	g_free(fq);
+	list_changed();
+}
+
+void load_contacts() {
+	request("contacts", {{"limit", json_object_new_int(5000)}}, [](json_object *r, const char *err) {
+		json_object *list = err ? nullptr : jget(r, "contacts");
+		if (!list) return;
+		zmc_list_lock(true);
+		contacts.clear();
+		for (size_t i = 0; i < json_object_array_length(list); i++) {
+			json_object *c = json_object_array_get_idx(list, i);
+			contacts.push_back({jstr(c, "jid"), jstr(c, "name"), jstr(c, "phone")});
+		}
+		contacts_filter();
+		zmc_list_lock(false);
+		batch_page = true;
+	});
+}
+
+void load_extras() {
+	load_statuses();
+	load_starred();
+}
+
+/* one picture at a time: each may repaint the rows in sight */
+void pictures_next() {
+	while (!picture_busy && sock_fd >= 0) {
+		zmc_list_lock(true);
+		bool none = picture_queue.empty();
+		zmc_list_lock(false);
+		if (none) return;
+		zmc_list_lock(true);	/* the drawing thread adds to these */
+		std::string jid = picture_queue.back();
+		picture_queue.pop_back();
+		zmc_list_lock(false);
+		picture_busy = true;
+		request("profile_picture", {{"jid", str(jid)}, {"preview", json_object_new_boolean(true)}}, [jid](json_object *r, const char *err) {
+			picture_busy = false;
+			std::string path = err ? "" : jstr(r, "path");
+			GdkPixbuf *p = path.empty() ? nullptr : gdk_pixbuf_new_from_file_at_scale(path.c_str(), 224, 224, TRUE, nullptr);
+			if (p) {
+				cairo_surface_t *s = surface_of_pixbuf(p);
+				g_object_unref(p);
+				zmc_list_lock(true);
+				if (pictures[jid]) cairo_surface_destroy(pictures[jid]);
+				pictures[jid] = s;
+				list_changed();
+				zmc_list_lock(false);
+				batch_page = true;
+			}
+			pictures_next();
+		});
+	}
 }
 
 void go_to(int page, int dir) {
@@ -745,13 +1004,13 @@ void go_to(int page, int dir) {
 	zmc_go(page, dir);
 }
 
-void show_chat(const std::string &id) {
+void show_chat(const std::string &id, const std::string &name_if_new) {
 	static bool opening;
 	if (opening) return;	/* a second tap while the first is on its way */
 	opening = true;
 	auto it = all_chats.find(id);
 	open_id = id;
-	open_name = it != all_chats.end() ? it->second.name : "";
+	open_name = it != all_chats.end() ? it->second.name : name_if_new;
 	open_group = it != all_chats.end() && it->second.is_group;
 	presence_line.clear();
 	draft.clear();
@@ -811,9 +1070,11 @@ void load_older() {
 
 void older_wake(int fd, void *) {
 	char drain[16];
-	while (read(fd, drain, sizeof(drain)) > 0) {}
-	older_asked = false;
-	load_older();
+	bool older = false;
+	ssize_t n;
+	while ((n = read(fd, drain, sizeof(drain))) > 0) for (ssize_t i = 0; i < n; i++) older = older || drain[i] == 'o';
+	if (older) { older_asked = false; load_older(); }
+	pictures_next();
 }
 
 void qr_set(const std::string &text) {
@@ -828,7 +1089,7 @@ void on_event(json_object *o) {
 	} else if (ev == "connection") {
 		std::string was = connection;
 		connection = jstr(o, "state");
-		if (connection == "connected" && was != "connected") load_chats();
+		if (connection == "connected" && was != "connected") { load_chats(); load_extras(); }
 		batch_page = true;
 	} else if (ev == "pairing") {
 		std::string state = jstr(o, "state");
@@ -901,14 +1162,26 @@ void on_event(json_object *o) {
 		else if (long seen = jint(o, "last_seen")) presence_line = "last seen " + when_text(seen);
 		else presence_line.clear();
 		batch_page = true;
-	} else if (ev == "history_sync") {
-		if (jstr(o, "state") == "done") load_chats();
+	} else if (ev == "history_sync" || ev == "app_state") {
+		if (jstr(o, "state") == "done") { load_chats(); load_extras(); }
+	} else if (ev == "status") {
+		load_statuses();
+	} else if (ev == "contacts") {
+		if (zmc.page == P_NEW) load_contacts();
+	} else if (ev == "picture") {
+		zmc_list_lock(true);
+		std::string jid = jstr(o, "jid");
+		auto it = pictures.find(jid);
+		if (it != pictures.end() && !it->second) { pictures.erase(it); list_changed(); batch_page = true; }
+		else if (it != pictures.end()) { picture_queue.push_back(jid); }
+		zmc_list_lock(false);
+		pictures_next();
 	}
-	/* call_offer and call_end: calls are not part of this app */
 }
 
 void disconnect_daemon();
 void tick();
+void focus_sync();
 
 void sock_ready(int fd, void *) {
 	char chunk[65536];
@@ -1015,6 +1288,7 @@ void tick() {
 		if (!connect_daemon()) start_daemon();
 		return;
 	}
+	focus_sync();
 	if (foreground && !zmc.active) {
 		foreground = false;
 		request("set_presence", {{"available", json_object_new_boolean(false)}});
@@ -1090,38 +1364,66 @@ double draw_link(cairo_t *cr) {
 	return y + 24;
 }
 
+/* four tabs going round, as the phone's */
+double tab_header(cairo_t *cr, const char *title, const char *next, const char *after, int next_page) {
+	zmc.pivot_after = after;
+	return zmc_pivot_next(cr, title, next, ZMC_ACT_PIVOT, next_page);
+}
+
+double tab_list(cairo_t *cr, double y, int page, int count, void (*draw)(cairo_t *, int), bool (*hit)(int, double, double, struct zmc_hit *)) {
+	struct zmc_list l{};
+	l.count = count;
+	l.row_h = ROW_H;
+	l.revision = list_rev + uint64_t(page);
+	l.draw_row = draw;
+	l.row_hit = hit;
+	return zmc_list(cr, y, &l);
+}
+
 double draw_chats(cairo_t *cr) {
-	double y = zmc_header(cr, "chats");
+	double y = tab_header(cr, "chats", "status", "starred", P_STATUS);
 	if (connection != "connected") {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		const char *s = connection == "offline" ? "offline, waiting to reconnect" : "connecting...";
-		zmc_text(cr, s, FONT_REGULAR, 12.5, MARGIN, y - 18, 0);
+		zmc_text(cr, s, FONT_REGULAR, 12.5, MARGIN, y - 20, 0);
 		cairo_new_path(cr);
 	}
 	if (chats.empty()) return centred_note(cr, "No chats yet.", y);
-	struct zmc_list l{};
-	l.count = int(chats.size());
-	l.row_h = ROW_H;
-	l.revision = list_rev;
-	l.draw_row = draw_chat_row;
-	l.row_hit = chat_row_hit;
-	return zmc_list(cr, y, &l) + 76 + 12;
+	return tab_list(cr, y, P_CHATS, int(chats.size()), draw_chat_row, chat_row_hit) + 76 + 12;
+}
+
+double draw_status(cairo_t *cr) {
+	double y = tab_header(cr, "status", "starred", "archived", P_STARRED);
+	if (statuses.empty()) return centred_note(cr, "No status updates in the last 24 hours.", y);
+	return tab_list(cr, y, P_STATUS, int(statuses.size()), draw_status_row, status_row_hit) + 76 + 12;
+}
+
+double draw_starred(cairo_t *cr) {
+	double y = tab_header(cr, "starred", "archived", "chats", P_ARCHIVED);
+	if (starred_list.empty()) return centred_note(cr, "Messages you star on your phone show here.", y);
+	return tab_list(cr, y, P_STARRED, int(starred_list.size()), draw_starred_row, starred_row_hit) + 24;
+}
+
+double draw_archived(cairo_t *cr) {
+	double y = tab_header(cr, "archived", "chats", "status", P_CHATS);
+	if (archived.empty()) return centred_note(cr, "No archived chats.", y);
+	return tab_list(cr, y, P_ARCHIVED, int(archived.size()), draw_archived_row, archived_row_hit) + 24;
 }
 
 double draw_chat(cairo_t *cr) {
 	double y = zmc_header(cr, "");
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text_line(cr, open_name.c_str(), FONT_SEMILIGHT, 28, MARGIN, presence_line.empty() ? 46 : 38, zmc.width - 2 * MARGIN);
+	zmc_text_line(cr, open_name.c_str(), FONT_SEMILIGHT, 28, MARGIN, 46, zmc.width - 2 * MARGIN);
 	cairo_new_path(cr);
 	if (!presence_line.empty()) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		zmc_text_line(cr, presence_line.c_str(), FONT_REGULAR, 13, MARGIN, 76, zmc.width - 2 * MARGIN);
+		zmc_text_line(cr, presence_line.c_str(), FONT_REGULAR, 13, MARGIN, 82, zmc.width - 2 * MARGIN);
 		cairo_new_path(cr);
 	}
 	struct zmc_list l{};
 	l.count = std::max(1, int(std::ceil(list_total / ROW_H)));
 	l.row_h = ROW_H;
-	l.revision = list_rev + 1;
+	l.revision = list_rev + P_CHAT;
 	l.draw_row = draw_strip;
 	l.row_hit = strip_hit;
 	return zmc_list(cr, y, &l) + footer_height(P_CHAT) + 12;
@@ -1130,6 +1432,7 @@ double draw_chat(cairo_t *cr) {
 double draw_account(cairo_t *cr) {
 	double y = zmc_header(cr, "account");
 	y = zmc_field(cr, y, "connection", connection.c_str());
+	if (!dots()) y = zmc_switch(cr, y, "system accent", follow_system_accent, ACT_ACCENT);
 	if (!self_jid.empty()) y = zmc_field(cr, y, "signed in", "yes");
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	if (logout_ask) {
@@ -1166,18 +1469,154 @@ double draw_image(cairo_t *cr) {
 }
 
 void draw_compose(cairo_t *cr);
-void draw_chats_footer(cairo_t *cr);
+void draw_chats_footer(cairo_t *cr, int page);
+
+double draw_status_view(cairo_t *cr) {
+	if (status_person < 0 || size_t(status_person) >= statuses.size() || statuses[size_t(status_person)].items.empty()) return zmc_header(cr, "status");
+	const StatusPerson &p = statuses[size_t(status_person)];
+	const StatusItem &it = p.items[size_t(status_item)];
+	double y = zmc_header(cr, "");
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text_line(cr, p.name.c_str(), FONT_SEMILIGHT, 28, MARGIN, 46, zmc.width - 2 * MARGIN);
+	cairo_new_path(cr);
+	std::string line = std::to_string(status_item + 1) + " of " + std::to_string(p.items.size()) + ", " + when_text(it.ts);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text_line(cr, line.c_str(), FONT_REGULAR, 13, MARGIN, 82, zmc.width - 2 * MARGIN);
+	cairo_new_path(cr);
+	double room = zmc.height - y - MARGIN, w = zmc.width - 2 * MARGIN;
+	if (it.kind == "image" && full_image) {
+		if (dots()) {
+			zmc_picture(cr, full_image, MARGIN, y, w);
+			y += w + 12;
+		} else {
+			double iw = cairo_image_surface_get_width(full_image), ih = cairo_image_surface_get_height(full_image);
+			double k = std::min(w / iw, (room - 80) / ih);
+			cairo_save(cr);
+			cairo_translate(cr, (zmc.width - iw * k) / 2, y);
+			cairo_scale(cr, k, k);
+			cairo_set_source_surface(cr, full_image, 0, 0);
+			cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+			cairo_paint(cr);
+			cairo_restore(cr);
+			y += ih * k + 12;
+		}
+	} else if (it.kind == "image" || it.kind == "video") {
+		y = centred_note(cr, it.kind == "video" ? "Video updates can only be seen on your phone." : image_note, y);
+	}
+	if (!it.text.empty()) {
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, it.text.c_str(), FONT_SEMILIGHT, it.kind == "text" ? 28 : 16, MARGIN, y, w);
+		cairo_new_path(cr);
+	}
+	zmc_add_hit(0, ZMC_HEADER_H, zmc.width, zmc.height - ZMC_HEADER_H, ACT_STATUS_NEXT, 0);
+	return zmc.height;
+}
+
+double draw_status_post(cairo_t *cr) {
+	double y = zmc_header(cr, "new status");
+	y = zmc_textbox(cr, y, "what is on your mind", post_text.c_str(), focus == 2, ACT_POST_BOX, 0);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	y = zmc_button(cr, MARGIN, y, 160, "post", ACT_POST, 0);
+	if (!post_note.empty()) y = centred_note(cr, post_note, y + 12);
+	return y + 24;
+}
+
+double draw_info(cairo_t *cr) {
+	double y = zmc_header(cr, "");
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text_line(cr, open_name.c_str(), FONT_SEMILIGHT, 28, MARGIN, 46, zmc.width - 2 * MARGIN);
+	cairo_new_path(cr);
+	double side = 180;
+	if (cairo_surface_t *pic = picture_of(open_id)) {
+		zmc_picture(cr, pic, MARGIN, y, side);
+		y += side + 14;
+	}
+	auto it = all_chats.find(open_id);
+	if (!open_group) {
+		size_t at = open_id.find("@s.whatsapp.net");
+		if (at != std::string::npos) y = zmc_field(cr, y, "number", ("+" + open_id.substr(0, at)).c_str());
+	}
+	if (!info_topic.empty()) y = zmc_field(cr, y, "about", info_topic.c_str());
+	if (it != all_chats.end()) {
+		y = zmc_field(cr, y, "notifications", it->second.muted ? "muted" : "on");
+		if (it->second.pinned) y = zmc_field(cr, y, "pinned", "yes");
+		if (it->second.archived) y = zmc_field(cr, y, "archived", "yes");
+	}
+	if (open_group && !members.empty()) {
+		std::string caption = std::to_string(members.size()) + " participants";
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, caption.c_str(), FONT_REGULAR, 14, MARGIN, y + 6, 0);
+		cairo_new_path(cr);
+		y += 32;
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		for (const Member &m : members) {
+			zmc_text_line(cr, m.name.c_str(), FONT_SEMILIGHT, 20, MARGIN, y, zmc.width - 2 * MARGIN - (m.admin ? 60 : 0));
+			if (m.admin) {
+				cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+				zmc_text(cr, "admin", FONT_REGULAR, 12.5, zmc.width - MARGIN - 40, y + 7, 0);
+				cairo_set_source_rgb(cr, 1, 1, 1);
+			}
+			cairo_new_path(cr);
+			y += 34;
+		}
+	}
+	if (!info_note.empty()) y = centred_note(cr, info_note, y);
+	y += 8;
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	y += zmc_text(cr, "Mute, pin and archive are changed on your phone.", FONT_REGULAR, 13, MARGIN, y, zmc.width - 2 * MARGIN);
+	cairo_new_path(cr);
+	return y + 24;
+}
+
+double draw_search(cairo_t *cr) {
+	double y = zmc_header(cr, "search");
+	y = zmc_textbox(cr, y, "names, or messages with the button", search_text.c_str(), focus == 3, ACT_SEARCH_BOX, 0);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	if (search_text.empty()) return y + 24;
+	y = zmc_button(cr, MARGIN, y, 220, "search messages", ACT_SEARCH_MESSAGES, 0) + 10;
+	gchar *q = g_utf8_casefold(search_text.c_str(), -1);
+	int shown = 0;
+	for (size_t i = 0; i < chats.size() + archived.size() && shown < 8; i++) {
+		const Chat &c = i < chats.size() ? chats[i] : archived[i - chats.size()];
+		gchar *n = g_utf8_casefold(c.name.c_str(), -1);
+		if (strstr(n, q)) {
+			y = zmc_entry(cr, y, c.name.c_str(), c.last_text.c_str(), i < chats.size() ? ACT_OPEN : ACT_OPEN_ARCHIVED, int(i < chats.size() ? i : i - chats.size()));
+			shown++;
+		}
+		g_free(n);
+	}
+	g_free(q);
+	for (size_t i = 0; i < search_found.size() && i < 40; i++)
+		y = zmc_entry(cr, y, search_found[i].chat_name.c_str(), search_found[i].text.c_str(), ACT_OPEN_ID, int(i));
+	return y + 24;
+}
+
+double draw_new(cairo_t *cr) {
+	double y = zmc_header(cr, "new chat");
+	y = zmc_textbox(cr, y, "a name or a number", new_text.c_str(), focus == 4, ACT_NEW_BOX, 0);
+	if (contacts_shown.empty()) return centred_note(cr, contacts.empty() ? "Your contacts have not reached this phone yet." : "Nobody by that name.", y + 8);
+	return tab_list(cr, y + 8, P_NEW, int(contacts_shown.size()), draw_contact_row, contact_row_hit) + 24;
+}
 
 double render(cairo_t *cr, int page) {
+	accent_apply();
 	switch (page) {
 	case P_LINK: return draw_link(cr);
+	case P_STATUS_VIEW: return draw_status_view(cr);
+	case P_STATUS_POST: return draw_status_post(cr);
+	case P_INFO: return draw_info(cr);
+	case P_SEARCH: return draw_search(cr);
+	case P_NEW: return draw_new(cr);
+	case P_STARRED: return draw_starred(cr);
+	case P_ARCHIVED: return draw_archived(cr);
 	case P_CHATS:
+	case P_STATUS:
 	case P_CHAT: {
-		double y = page == P_CHATS ? draw_chats(cr) : draw_chat(cr);
+		double y = page == P_CHATS ? draw_chats(cr) : page == P_STATUS ? draw_status(cr) : draw_chat(cr);
 		if (sample) {	/* a PNG has no overlay: the footer in its place */
 			cairo_save(cr);
 			cairo_translate(cr, 0, zmc.height - footer_height(page));
-			if (page == P_CHAT) draw_compose(cr); else draw_chats_footer(cr);
+			if (page == P_CHAT) draw_compose(cr); else draw_chats_footer(cr, page);
 			cairo_restore(cr);
 		}
 		return y;
@@ -1236,15 +1675,73 @@ void draw_compose(cairo_t *cr) {
 	cairo_set_source_rgb(cr, dim, dim, dim);
 	zmc_round_button(cr, 46, y + box_h + 18, "send", "send", 0, 0);
 	cairo_new_path(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text(cr, "...", FONT_SEMIBOLD, 24, zmc.width - 40, y + box_h + 19, 0);	/* who this is */
+	cairo_new_path(cr);
 }
 
-void draw_chats_footer(cairo_t *cr) {
+void draw_chats_footer(cairo_t *cr, int page) {
 	cairo_set_source_rgb(cr, 0.1, 0.1, 0.1);
 	cairo_rectangle(cr, 0, 0, zmc.width, 76);
 	cairo_fill(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_round_button(cr, 62, 8, "people", "account", 0, 0);
+	if (page == P_STATUS) {
+		zmc_round_button(cr, 62, 8, "add", "new", 0, 0);
+	} else {
+		zmc_round_button(cr, 62, 8, "add", "new", 0, 0);
+		cairo_new_path(cr);
+		zmc_round_button(cr, zmc.width / 2.0, 8, "search", "search", 0, 0);
+		cairo_new_path(cr);
+		zmc_round_button(cr, zmc.width - 62, 8, "people", "account", 0, 0);
+	}
 	cairo_new_path(cr);
+}
+
+/* ---- the notifier's two files (notify/README.md) ---------------------------- */
+
+std::string run_file(const char *name) {
+	const char *run = getenv("XDG_RUNTIME_DIR");
+	return std::string(run ? run : "/tmp") + "/" + name;
+}
+
+/* PID CHAT, only while a chat is on screen and the app in front */
+void focus_sync() {
+	static std::string written;
+	std::string want = zmc.page == P_CHAT && zmc.active && !open_id.empty() ? open_id : "";
+	if (want == written) return;
+	written = want;
+	std::string path = run_file("ztwhatsapp.focus");
+	if (want.empty()) { unlink(path.c_str()); return; }
+	std::string temp = path + ".new";
+	if (FILE *f = fopen(temp.c_str(), "w")) {
+		fprintf(f, "%d %s\n", int(getpid()), want.c_str());
+		fclose(f);
+		rename(temp.c_str(), path.c_str());
+	}
+}
+
+void focus_clear() { unlink(run_file("ztwhatsapp.focus").c_str()); }
+
+void open_file_check() {
+	std::string path = run_file("ztwhatsapp.open");
+	FILE *f = fopen(path.c_str(), "r");
+	if (!f) return;
+	char line[512] = "";
+	char *got = fgets(line, sizeof(line), f);
+	fclose(f);
+	unlink(path.c_str());
+	if (!got) return;
+	line[strcspn(line, " \r\n")] = 0;
+	if (line[0]) {
+		pending_open = line;
+		if (!all_chats.empty()) open_pending();
+	}
+}
+
+void run_dir_event(int fd, void *) {
+	char drain[1024];
+	while (read(fd, drain, sizeof(drain)) > 0) {}
+	open_file_check();
 }
 
 void overlay(int page) {
@@ -1253,6 +1750,8 @@ void overlay(int page) {
 		request("set_presence", {{"available", json_object_new_boolean(true)}});
 		mark_open_read();
 	}
+	focus_sync();
+	accent_apply();
 	int h = footer_height(page);
 	if (!h) return;
 	static cairo_surface_t *strip;
@@ -1270,7 +1769,7 @@ void overlay(int page) {
 		cairo_t *cr = cairo_create(strip);
 		cairo_scale(cr, zmc.scale, zmc.scale);
 		int hits = zmc.n_hits;
-		if (page == P_CHAT) draw_compose(cr); else draw_chats_footer(cr);
+		if (page == P_CHAT) draw_compose(cr); else draw_chats_footer(cr, page);
 		zmc.n_hits = hits;
 		cairo_destroy(cr);
 		cairo_surface_flush(strip);
@@ -1301,7 +1800,7 @@ void image_load(const std::string &path) {
 void image_ready(int fd, void *) {
 	cairo_surface_t *s = nullptr;
 	if (read(fd, &s, sizeof(s)) != sizeof(s)) return;
-	if (zmc.page != P_IMAGE) { if (s) cairo_surface_destroy(s); return; }
+	if (zmc.page != P_IMAGE && zmc.page != P_STATUS_VIEW) { if (s) cairo_surface_destroy(s); return; }
 	full_image = s;
 	if (!s) image_note = "Could not open this photo.";
 	zmc_redraw();
@@ -1314,7 +1813,7 @@ void open_image(Msg &m) {
 	if (!m.path.empty()) {
 		image_load(m.path);
 	} else {
-		request("download_media", {{"chat", str(open_id)}, {"id", str(id)}}, [id](json_object *r, const char *err) {
+		request("download_media", {{"chat", str(open_id)}, {"message_id", str(id)}}, [id](json_object *r, const char *err) {
 			std::string path = err ? "" : jstr(r, "path");
 			if (path.empty()) {
 				image_note = "Could not download this photo.";
@@ -1347,10 +1846,118 @@ void send_draft() {
 	footer_rev++;
 }
 
+void status_show() {
+	StatusPerson &p = statuses[size_t(status_person)];
+	StatusItem &it = p.items[size_t(status_item)];
+	if (full_image) { cairo_surface_destroy(full_image); full_image = nullptr; }
+	image_note = "Downloading...";
+	if (it.kind == "image") {
+		if (!it.path.empty()) {
+			image_load(it.path);
+		} else {
+			int who = status_person, which = status_item;
+			request("download_media", {{"chat", str("status@broadcast")}, {"message_id", str(it.id)}}, [who, which](json_object *r, const char *err) {
+				std::string path = err ? "" : jstr(r, "path");
+				if (who != status_person || which != status_item) return;
+				if (path.empty()) image_note = "Could not download this update.";
+				else image_load(path);
+				if (zmc.page == P_STATUS_VIEW) zmc_redraw();
+			});
+		}
+	}
+	if (!it.seen) {
+		it.seen = true;
+		if (p.unseen > 0) p.unseen--;
+		json_object *ids = json_object_new_array();
+		json_object_array_add(ids, str(it.id));
+		request("status_seen", {{"sender", str(p.sender)}, {"ids", ids}});
+		zmc_list_lock(true);
+		list_changed();
+		zmc_list_lock(false);
+	}
+}
+
+void back_from_status() {
+	status_person = -1;
+	if (full_image) { cairo_surface_destroy(full_image); full_image = nullptr; }
+	go_to(P_STATUS, -1);
+}
+
 void activate(int action, int arg) {
 	switch (action) {
 	case ACT_OPEN:
 		if (arg >= 0 && size_t(arg) < chats.size()) show_chat(chats[size_t(arg)].id);
+		break;
+	case ACT_OPEN_ARCHIVED:
+		if (arg >= 0 && size_t(arg) < archived.size()) show_chat(archived[size_t(arg)].id);
+		break;
+	case ACT_OPEN_STARRED:
+		if (arg >= 0 && size_t(arg) < starred_list.size()) show_chat(starred_list[size_t(arg)].chat);
+		break;
+	case ACT_OPEN_ID:
+		if (arg >= 0 && size_t(arg) < search_found.size()) show_chat(search_found[size_t(arg)].chat);
+		break;
+	case ACT_ACCENT:
+		follow_system_accent = !follow_system_accent;
+		prefs_save();
+		accent_apply();
+		zmc_list_lock(true);
+		list_changed();
+		zmc_list_lock(false);
+		footer_rev++;
+		break;
+	case ACT_STATUS:
+		if (arg >= 0 && size_t(arg) < statuses.size()) {
+			status_person = arg;
+			status_item = 0;
+			for (size_t i = 0; i < statuses[size_t(arg)].items.size(); i++)
+				if (!statuses[size_t(arg)].items[i].seen) { status_item = int(i); break; }
+			status_show();
+			zmc_go(P_STATUS_VIEW, 1);
+		}
+		break;
+	case ACT_STATUS_NEXT:
+		if (status_person >= 0 && size_t(status_item + 1) < statuses[size_t(status_person)].items.size()) {
+			status_item++;
+			status_show();
+		} else {
+			back_from_status();
+		}
+		break;
+	case ACT_POST_BOX: focus = 2; zmc_keyboard(true); break;
+	case ACT_POST:
+		if (post_text.empty()) break;
+		if (post_text.size() > 700) { post_note = "That is too long: a status holds 700 bytes."; break; }
+		focus = -1;
+		zmc_keyboard(false);
+		request("post_status", {{"text", str(post_text)}}, [](json_object *, const char *err) {
+			if (err) { post_note = "Not posted. Your text is kept."; zmc_redraw(); return; }
+			post_text.clear();
+			post_note.clear();
+			load_statuses();
+			go_to(P_STATUS, -1);
+		});
+		break;
+	case ACT_SEARCH_BOX: focus = 3; zmc_keyboard(true); break;
+	case ACT_SEARCH_MESSAGES:
+		focus = -1;
+		zmc_keyboard(false);
+		zmc_busy(true);
+		request("search", {{"query", str(search_text)}, {"limit", json_object_new_int(40)}}, [](json_object *r, const char *err) {
+			zmc_busy(false);
+			search_found.clear();
+			json_object *list = err ? nullptr : jget(r, "messages");
+			for (size_t i = 0; list && i < json_object_array_length(list); i++) search_found.push_back(found_from(json_object_array_get_idx(list, i)));
+			batch_page = true;
+		});
+		break;
+	case ACT_NEW_BOX: focus = 4; zmc_keyboard(true); break;
+	case ACT_NEW_PICK:
+		if (arg >= 0 && size_t(arg) < contacts_shown.size()) {
+			focus = -1;
+			zmc_keyboard(false);
+			show_chat(contacts_shown[size_t(arg)].jid, contacts_shown[size_t(arg)].name);
+		}
 		break;
 	case ACT_PAIR_QR:
 		pair_error.clear();
@@ -1396,6 +2003,29 @@ void activate(int action, int arg) {
 	}
 }
 
+void open_info() {
+	focus = -1;
+	zmc_keyboard(false);
+	info_topic.clear();
+	info_note.clear();
+	members.clear();
+	if (open_group) {
+		std::string id = open_id;
+		request("group_info", {{"chat", str(id)}}, [id](json_object *r, const char *err) {
+			if (id != open_id) return;
+			if (err) { info_note = "Could not get the group's details."; zmc_redraw(); return; }
+			info_topic = jstr(r, "topic");
+			json_object *list = jget(r, "participants");
+			for (size_t i = 0; list && i < json_object_array_length(list) && i < 80; i++) {
+				json_object *m = json_object_array_get_idx(list, i);
+				members.push_back({jstr(m, "name"), jbool(m, "is_admin") || jbool(m, "is_super_admin")});
+			}
+			zmc_redraw();
+		});
+	}
+	zmc_go(P_INFO, 1);
+}
+
 bool touch(int phase, int id, double x, double y, uint32_t) {
 	static double down_x, down_y;
 	static int finger = -1;
@@ -1412,8 +2042,14 @@ bool touch(int phase, int id, double x, double y, uint32_t) {
 	if (phase == 1) { down_x = std::abs(x - down_x) >= 20 || std::abs(y - down_y) >= 20 ? -1000 : down_x; return true; }
 	if (phase == 2 && down_x > -1000) {
 		double fy = down_y - top;
-		if (zmc.page == P_CHATS) {
-			if (down_x < zmc.width / 2) { logout_ask = false; go_to(P_ACCOUNT, 1); }
+		if (zmc.page == P_STATUS) {
+			if (down_x < zmc.width / 3) { post_note.clear(); focus = 2; go_to(P_STATUS_POST, 1); zmc_keyboard(true); }
+		} else if (zmc.page == P_CHATS) {
+			if (down_x < zmc.width / 3) { new_text.clear(); zmc_list_lock(true); contacts_filter(); zmc_list_lock(false); load_contacts(); focus = 4; go_to(P_NEW, 1); zmc_keyboard(true); }
+			else if (down_x < 2 * zmc.width / 3) { search_found.clear(); focus = 3; go_to(P_SEARCH, 1); zmc_keyboard(true); }
+			else { logout_ask = false; go_to(P_ACCOUNT, 1); }
+		} else if (fy >= box_h + 14 && down_x >= zmc.width - 54) {
+			open_info();
 		} else if (fy < box_h + 14) {
 			focus = 0;
 			zmc_keyboard(true);
@@ -1431,13 +2067,18 @@ bool touch(int phase, int id, double x, double y, uint32_t) {
 
 void typed(const char *text) {
 	if (focus < 0) return;
-	std::string &f = focus == 1 ? phone : draft;
-	size_t cap = focus == 1 ? 24 : MAX_DRAFT;
+	std::string &f = focus == 1 ? phone : focus == 2 ? post_text : focus == 3 ? search_text : focus == 4 ? new_text : draft;
+	size_t cap = focus == 1 ? 24 : focus == 2 ? 700 : focus >= 3 ? 80 : MAX_DRAFT;
 	if (text[0] == '\b') {
 		while (!f.empty() && (static_cast<unsigned char>(f.back()) & 0xc0) == 0x80) f.pop_back();
 		if (!f.empty()) f.pop_back();
 	} else if (f.size() + strlen(text) <= cap) {
 		f += text;
+	}
+	if (focus == 4) {
+		zmc_list_lock(true);
+		contacts_filter();
+		zmc_list_lock(false);
 	}
 	if (focus == 0) {
 		box_measure();
@@ -1452,6 +2093,10 @@ void typed(const char *text) {
 
 bool back() {
 	if (zmc.page == P_IMAGE) { go_to(P_CHAT, -1); return true; }
+	if (zmc.page == P_INFO) { go_to(P_CHAT, -1); return true; }
+	if (zmc.page == P_STATUS_VIEW) { back_from_status(); return true; }
+	if (zmc.page == P_STATUS_POST) { focus = -1; zmc_keyboard(false); go_to(P_STATUS, -1); return true; }
+	if (zmc.page == P_SEARCH || zmc.page == P_NEW) { focus = -1; zmc_keyboard(false); go_to(P_CHATS, -1); return true; }
 	if (zmc.page == P_CHAT) {
 		if (focus == 0) {
 			focus = -1;
@@ -1483,6 +2128,11 @@ void arrived(int page) {
 		zmc_redraw();
 	}
 	if (page == P_CHAT) mark_open_read();
+	if (page == P_CHATS || page == P_STATUS || page == P_STARRED || page == P_ARCHIVED) {
+		zmc_pivot_changed();
+		footer_rev++;	/* each tab has its own buttons */
+	}
+	focus_sync();
 }
 
 const struct zmc_app app = {
@@ -1513,7 +2163,47 @@ void sample_fill(int n) {
 		c.last_from_me = i == 1;
 		all_chats[c.id] = c;
 	}
+	all_chats["c6"].archived = true;
 	chats_sort();
+	{
+		const char *who[] = {"Alex Example", "Robin Test", "Book Club"};
+		long ago[] = {600, 7000, 30000};
+		int unseen[] = {2, 0, 1};
+		for (int i = 0; i < 3; i++) {
+			StatusPerson p;
+			p.sender = "s" + std::to_string(i);
+			p.name = who[i];
+			p.last_ts = now - ago[i];
+			p.unseen = unseen[i];
+			StatusItem it;
+			it.id = "i" + std::to_string(i);
+			it.text = "Invented status text, about nothing at all";
+			it.kind = "text";
+			it.ts = p.last_ts;
+			p.items.push_back(it);
+			statuses.push_back(p);
+		}
+		starred_list.push_back({"c1", "Sam Sample", "", sample_lines[2], now - 90000});
+		starred_list.push_back({"c3", "Robin Test", "", sample_lines[0], now - 400000});
+		contacts = {{"c1", "Sam Sample", "+61400000001"}, {"c3", "Robin Test", "+61400000003"}, {"n1", "Lee Invented", "+61400000011"}};
+		contacts_shown = contacts;
+		members = {{"Alex Example", true}, {"Sam Sample", false}, {"Robin Test", false}};
+		info_topic = "An invented group, for looking at the page";
+		/* a made-up picture, to see one in place */
+		cairo_surface_t *pic = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 224, 224);
+		cairo_t *pc = cairo_create(pic);
+		cairo_pattern_t *g = cairo_pattern_create_linear(0, 0, 224, 224);
+		cairo_pattern_add_color_stop_rgb(g, 0, 0.9, 0.5, 0.2);
+		cairo_pattern_add_color_stop_rgb(g, 1, 0.2, 0.3, 0.7);
+		cairo_set_source(pc, g);
+		dm_wrap_raw++;
+		cairo_paint(pc);
+		dm_wrap_raw--;
+		cairo_pattern_destroy(g);
+		cairo_destroy(pc);
+		pictures["c1"] = pic;
+		pictures["s1"] = pic;
+	}
 	open_id = "c0";
 	open_name = names[0];
 	presence_line = "online";
@@ -1525,7 +2215,15 @@ void sample_fill(int n) {
 		m->kind = "text";
 		m->ts = now - (n - i) * 3000;
 		m->text = sample_lines[size_t(i) % 7];
-		if (i % 17 == 5) {
+		if (!m->from_me) m->sender_name = i % 2 ? "Sam Sample" : "Robin Test";
+		if (i == n - 2) {
+			m->kind = "image";
+			m->is_image = true;
+			m->media_w = 800;
+			m->media_h = 600;
+			m->text = "Caption of a photo";
+			thumbs.push_back({m->id, pictures["c1"]});
+		} else if (i % 17 == 5) {
 			m->kind = "image";
 			m->is_image = true;
 			m->media_w = 800;
@@ -1654,6 +2352,45 @@ int selftest() {
 	send_draft();
 	pump(0.5);
 	printf("sent: %zu new, status %s, box empty %d, oldest first %d\n", msgs.size() - before, msgs.empty() ? "" : msgs.back()->status.c_str(), draft.empty(), sorted);
+	/* the notifier's two files */
+	zmc.active = true;
+	zmc.page = P_CHAT;
+	focus_sync();
+	char line[300] = "";
+	if (FILE *f = fopen(run_file("ztwhatsapp.focus").c_str(), "r")) { (void)!fgets(line, sizeof(line), f); fclose(f); }
+	int pid = 0;
+	sscanf(line, "%d", &pid);
+	bool focus_ok = pid == getpid() && strstr(line, open_id.c_str());
+	zmc.active = false;
+	focus_sync();
+	bool focus_gone = access(run_file("ztwhatsapp.focus").c_str(), F_OK) != 0;
+	zmc.active = true;
+	if (FILE *f = fopen(run_file("ztwhatsapp.open").c_str(), "w")) { fprintf(f, "%s\n", chats[1].id.c_str()); fclose(f); }
+	zmc.page = P_CHATS;
+	open_file_check();
+	pump(0.3);
+	bool open_ok = access(run_file("ztwhatsapp.open").c_str(), F_OK) != 0 && open_id == chats[1].id;
+	printf("focus written %d, removed when hidden %d, open file taken and chat opened %d\n", focus_ok, focus_gone, open_ok);
+	if (!focus_ok || !focus_gone || !open_ok) return 1;
+	zmc.active = false;
+	statuses.clear(); starred_list.clear();
+	load_extras();
+	load_contacts();
+	pump(0.5);
+	printf("statuses %zu, starred %zu, contacts %zu, archived %zu\n", statuses.size(), starred_list.size(), contacts.size(), archived.size());
+	if (!statuses.empty()) {
+		status_person = 0; status_item = 0;
+		int was = statuses[0].unseen;
+		status_show();
+		pump(0.3);
+		printf("status seen: unseen %d to %d\n", was, statuses[0].unseen);
+	}
+	picture_of(chats[0].id);
+	pictures_next();
+	pump(0.5);
+	printf("picture fetched: %d\n", pictures[chats[0].id] != nullptr);
+	bool extra = !statuses.empty() && !contacts.empty() && !starred_list.empty();
+	if (!extra) return 1;
 	return msgs.size() == before + 1 && msgs.size() > first && sorted && msgs.back()->status != "pending" ? 0 : 1;
 }
 
@@ -1661,6 +2398,7 @@ int render_page(const char *name, const char *file) {
 	sample = true;
 	zmc_config_style();
 	zmc.height = 740;
+	open_group = !strcmp(name, "chat");
 	sample_fill(80);
 	connection = "connected";
 	int page = P_CHATS;
@@ -1668,8 +2406,17 @@ int render_page(const char *name, const char *file) {
 	if (n == "link") { page = P_LINK; pair_state = "unpaired"; }
 	else if (n == "qr") { page = P_LINK; pair_state = "qr"; qr_set("2@InventedPairingStringForLookingAtTheLayoutOnly0123456789abcdefghijklmnopqrstuvwxyz,0123456789abcdefghijklmnopqrstuvwxyz0123456789,abcdefghijklmnopqrstuvwxyz0123456789"); }
 	else if (n == "code") { page = P_LINK; pair_state = "phone_code"; pair_code = "ABCD-EFGH"; }
-	else if (n == "chat") page = P_CHAT;
+	else if (n == "chat") { page = P_CHAT; open_group = true; }
 	else if (n == "account") page = P_ACCOUNT;
+	else if (n == "status") page = P_STATUS;
+	else if (n == "starred") page = P_STARRED;
+	else if (n == "archived") page = P_ARCHIVED;
+	else if (n == "view") { page = P_STATUS_VIEW; status_person = 0; }
+	else if (n == "post") { page = P_STATUS_POST; focus = 2; post_text = "Invented status"; }
+	else if (n == "search") { page = P_SEARCH; search_text = "a"; }
+	else if (n == "new") page = P_NEW;
+	else if (n == "info") { page = P_INFO; open_group = true; open_name = "Family"; }
+
 	return zmc_render_png(&app, page, 740, file);
 }
 
@@ -1686,17 +2433,14 @@ int main(int argc, char **argv) {
 		start_daemon();
 		zmc_every(500, tick);
 	}
-	if (argc == 2 && argv[1][0] != '-') {
-		/* from a notification: once the list has it, or straight away */
-		std::string id = argv[1];
-		request("chats", {{"limit", json_object_new_int(500)}}, [id](json_object *r, const char *err) {
-			json_object *list = err ? nullptr : jget(r, "chats");
-			zmc_list_lock(true);
-			for (size_t i = 0; list && i < json_object_array_length(list); i++) chat_from(json_object_array_get_idx(list, i));
-			chats_sort();
-			zmc_list_lock(false);
-			show_chat(id);
-		});
+	if (argc == 2 && argv[1][0] != '-') pending_open = argv[1];
+	open_file_check();
+	{
+		int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+		if (fd >= 0 && inotify_add_watch(fd, run_file("x").substr(0, run_file("x").size() - 2).c_str(), IN_CLOSE_WRITE | IN_MOVED_TO) >= 0)
+			zmc_watch_fd(fd, run_dir_event, nullptr);
 	}
+	prefs_load();
+	atexit(focus_clear);
 	return zmc_run(&app, P_CHATS);
 }
