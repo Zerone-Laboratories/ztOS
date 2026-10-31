@@ -74,6 +74,28 @@ Message:
   "thumb_b64":"<small JPEG, may be empty>","path":""}`. `path` is filled in once
   downloaded. It is a decrypted file in `~/.local/share/ztwhatsapp/media`, mode 0600.
 
+StatusContact:
+
+```json
+{"sender":"...@s.whatsapp.net","name":"Sam","last_ts":1793400000,"unseen":2,"items":[StatusItem]}
+```
+
+StatusItem is a Message with `chat` = `status@broadcast`, plus `"seen":bool`. Text, image
+and video items all arrive; fetch an image with `download_media` using that chat and the
+item's id. Video stays `unsupported` for download, as for chats.
+
+Contact:
+
+```json
+{"jid":"...@s.whatsapp.net","name":"Sam Example","push_name":"Sam","phone":"+61400000000"}
+```
+
+`name` is the address-book name from app-state sync, falling back to the push name, then the
+number. Message gains `"starred":bool`.
+
+App-state values (`muted`, `pinned`, `archived`, `starred`, contact names) are **read-only**
+here: the phone's changes are followed, and there are no commands that change them.
+
 ## Commands
 
 | cmd | fields | result |
@@ -87,7 +109,15 @@ Message:
 | `messages` | `chat`, `limit` (default 50), `before_ts` (optional), `before_id` (optional) | `{"messages":[Message],"more":bool}`, **oldest first within the page**. Omit `before_*` for the newest page. To page back, pass the oldest message's `timestamp` and `id`. |
 | `send_text` | `chat`, `text` (at most 65536 bytes), `quoted_id` (optional) | `{"id":"...","timestamp":N}`. Returns once stored as `pending`. Progress arrives in `receipt` events. |
 | `mark_read` | `chat`, `ids` (optional, default all unread) | `{"marked":N}` |
-| `download_media` | `chat`, `id` | `{"path":"..."}`. Replies when finished; other commands keep working meanwhile. Images only at first, others give `unsupported`. |
+| `download_media` | `chat`, `message_id` (the top-level `id` is the request id) | `{"path":"..."}`. Replies when finished; other commands keep working meanwhile. Images only at first, others give `unsupported`. |
+| `statuses` | | `{"contacts":[StatusContact]}`, newest first. Items older than 24 hours are left out. |
+| `status_seen` | `sender`, `ids` | `{}`. Sends seen receipts, unless the account has read receipts off. |
+| `post_status` | `text` (at most 700 bytes) | `{"id":"...","timestamp":N}`. Text only. |
+| `contacts` | `query` (optional, matches name or number), `limit` (default 200), `offset` | `{"contacts":[Contact],"total":N}`, by name. Use it to start a new chat: pass `jid` as `chat` to `send_text`. |
+| `profile_picture` | `jid`, `preview` (bool, default true) | `{"path":"..."}`, a JPEG in `media/`, mode 0600. `not_found` when there is none or privacy hides it. |
+| `group_info` | `chat` | `{"id":"","subject":"","topic":"","owner":"","created":N,"announce":bool,"locked":bool,"participants":[{"jid":"","name":"","is_admin":bool,"is_super_admin":bool}]}` |
+| `search` | `query`, `chat` (optional), `limit` (default 50), `before_ts` (optional) | `{"messages":[Message],"more":bool}`, newest first, case-insensitive. Runs over decrypted rows, so it may take a moment on a large store. |
+| `starred` | `limit` (default 100) | `{"messages":[Message]}`, newest first |
 | `typing` | `chat`, `state` (`composing` or `paused`) | `{}` |
 | `set_presence` | `available` (bool) | `{}`. The UI sends true when in the foreground, false when hidden. |
 | `subscribe_presence` | `chat` | `{}`. Later changes arrive in `presence` events. |
@@ -126,8 +156,8 @@ New message or a change to one. **This is the notification trigger.**
 ```
 
 `chat`, `sender_name`, `text` and `timestamp` are duplicated at the top level for
-clients that need nothing else. `live` is false for offline backlog and history
-sync. **Notify only when `live` is true, `from_me` is false and `muted` is false.**
+clients that need nothing else. `live` is false for offline backlog, history sync
+and anything older than five minutes. **Notify only when `live` is true, `from_me` is false and `muted` is false.**
 
 ### `chat`
 `{"event":"chat","chat":{Chat}}`. A row was created or changed, or its unread count moved.
@@ -145,6 +175,20 @@ sync. **Notify only when `live` is true, `from_me` is false and `muted` is false
 
 `state`: `running` or `done`. The chat list should be reloaded on `done`, or as `chat`
 events come in.
+
+### `status`
+`{"event":"status","sender":"...","sender_name":"Sam","item":{StatusItem},"live":true}`
+
+A status arrived. Never a notification trigger by itself.
+
+### `contacts`
+`{"event":"contacts","total":N}`. The contact list changed: reload it.
+
+### `app_state`
+`{"event":"app_state","state":"running"}`, then `"done"`. Chat rows follow as `chat` events.
+
+### `picture`
+`{"event":"picture","jid":"..."}`. A contact or group changed picture: fetch again if shown.
 
 ### `error`
 `{"event":"error","code":"...","message":"..."}`. Daemon-level problems worth a log
