@@ -21,6 +21,7 @@ ap.add_argument("--socket", default=os.path.join(os.environ.get("XDG_RUNTIME_DIR
 ap.add_argument("--messages", type=int, default=300)
 ap.add_argument("--unpaired", action="store_true")
 ap.add_argument("--every", type=float, default=20)
+ap.add_argument("--chats", type=int, default=7, help="how many chats, with invented names")
 ap.add_argument("--picture", default="", help="a JPEG to give as everyone's profile picture")
 args = ap.parse_args()
 
@@ -30,6 +31,9 @@ now = int(time.time())
 chats = [dict(id=f"6140000000{i}@{'g.us' if i in (2, 5) else 's.whatsapp.net'}", name=n, is_group=i in (2, 5),
 	unread=[2, 0, 11, 0, 0, 1, 0][i], last_text=LINES[i % len(LINES)].replace("\n", " "), last_ts=now - i * 5000,
 	last_from_me=i == 1, muted=False, pinned=False, archived=False) for i, n in enumerate(NAMES)]
+for i in range(7, args.chats):
+	chats.append(dict(id=f"6141{i:07d}@s.whatsapp.net", name=f"Invented Person {i}", is_group=False, unread=i % 5, last_text=LINES[i % len(LINES)].replace("\n", " "),
+		last_ts=now - i * 5000, last_from_me=False, muted=False, pinned=False, archived=False))
 store = {}
 
 def make(chat, i, ts):
@@ -42,8 +46,9 @@ def make(chat, i, ts):
 			media=dict(mime="image/jpeg", size=9000, width=800, height=600, file_name="", thumb_b64=THUMB, path=""))
 	return m
 
-for c in chats:
-	store[c["id"]] = [make(c, i, c["last_ts"] - (args.messages - i) * 400) for i in range(args.messages)]
+for n, c in enumerate(chats):
+	count = args.messages if n < 7 else 40
+	store[c["id"]] = [make(c, i, c["last_ts"] - (count - i) * 400) for i in range(count)]
 
 chats[6]["archived"] = True
 store[chats[1]["id"]][-3]["starred"] = True

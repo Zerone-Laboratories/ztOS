@@ -816,12 +816,27 @@ void msgs_clear() {
 /* the list glides to its new end rather than jumping */
 double glide_from, glide_to;
 uint32_t glide_start;
-void glide_step() {
-	double t = std::min(1.0, (zmc_now_ms() - glide_start) / double(STEP_MS));
-	double e = 1 - (1 - t) * (1 - t) * (1 - t);
-	if (zmc.touching) { zmc_on_frame(nullptr); return; }
-	zmc.scroll = glide_from + (glide_to - glide_from) * e;
-	if (t >= 1) zmc_on_frame(nullptr);
+bool gliding;
+json_object *older_held;	/* a page of older messages, waiting for the list to stop */
+void older_apply();
+
+/* one hook for both: never asks for a frame itself, the core draws while it is set */
+void frame_step() {
+	if (gliding) {
+		double t = std::min(1.0, (zmc_now_ms() - glide_start) / double(STEP_MS));
+		double e = 1 - (1 - t) * (1 - t) * (1 - t);
+		if (zmc.touching) gliding = false;
+		else zmc.scroll = glide_from + (glide_to - glide_from) * e;
+		if (t >= 1) gliding = false;
+	}
+	/* Applying it repaints every strip in sight: do that with nothing moving,
+	 * unless the list is about to run out of what it has. */
+	if (older_held && ((!zmc.fling && !zmc.touching) || zmc.scroll < 400)) {
+		older_apply();
+		zmc.cache_stale = true;
+		zmc.dirty = true;
+	}
+	if (!gliding && !older_held) zmc_on_frame(nullptr);
 }
 
 double end_scroll() {
@@ -835,7 +850,8 @@ void glide_to_end() {
 	glide_from = zmc.scroll;
 	glide_to = end_scroll();
 	glide_start = zmc_now_ms();
-	zmc_on_frame(glide_step);
+	gliding = true;
+	zmc_on_frame(frame_step);
 }
 
 void mark_open_read() {
@@ -1023,6 +1039,7 @@ void show_chat(const std::string &id, const std::string &name_if_new) {
 		opening = false;
 		if (id != open_id) return;
 		zmc_list_lock(true);
+		if (older_held) { json_object_put(older_held); older_held = nullptr; }
 		msgs_clear();
 		json_object *list = err ? nullptr : jget(r, "messages");
 		for (size_t i = 0; list && i < json_object_array_length(list); i++)
@@ -1042,7 +1059,7 @@ void show_chat(const std::string &id, const std::string &name_if_new) {
 }
 
 void load_older() {
-	if (older_pending || !older_more || open_id.empty() || msgs.empty()) return;
+	if (older_pending || older_held || !older_more || open_id.empty() || msgs.empty()) return;
 	older_pending = true;
 	const Msg &oldest = *msgs.front();
 	std::string id = open_id;
@@ -1050,22 +1067,28 @@ void load_older() {
 			{"before_ts", json_object_new_int64(oldest.ts)}, {"before_id", str(oldest.id)}},
 			[id](json_object *r, const char *err) {
 		older_pending = false;
-		if (id != open_id) return;
-		json_object *list = err ? nullptr : jget(r, "messages");
-		if (!list) return;
-		zmc_list_lock(true);
-		double before = list_total;
-		size_t count = json_object_array_length(list);
-		for (size_t i = count; i-- > 0;)
-			if (auto m = msg_from(json_object_array_get_idx(list, i))) msgs.push_front(std::move(m));
-		older_more = jbool(r, "more");
-		place();
-		list_changed();
-		/* what is on the screen stays where it is */
-		zmc.scroll += list_total - before;
-		zmc_list_lock(false);
-		batch_page = true;
+		if (id != open_id || err || !r || !jget(r, "messages")) return;
+		older_held = json_object_get(r);
+		zmc_on_frame(frame_step);
 	});
+}
+
+void older_apply() {
+	json_object *r = older_held;
+	older_held = nullptr;
+	json_object *list = jget(r, "messages");
+	zmc_list_lock(true);
+	double before = list_total;
+	size_t count = json_object_array_length(list);
+	for (size_t i = count; i-- > 0;)
+		if (auto m = msg_from(json_object_array_get_idx(list, i))) msgs.push_front(std::move(m));
+	older_more = jbool(r, "more");
+	place();
+	list_changed();
+	/* what is on the screen stays where it is */
+	zmc.scroll += list_total - before;
+	zmc_list_lock(false);
+	json_object_put(r);
 }
 
 void older_wake(int fd, void *) {
@@ -1636,7 +1659,9 @@ const char *box_shown() {
 }
 
 void box_measure() {
+	zmc_list_lock(true);
 	double h = dm_text_height(box_shown(), BOX_FONT, zmc.width - 2 * MARGIN - 20) + 22;
+	zmc_list_lock(false);
 	box_h = draft.empty() ? 44 : std::clamp(h, 44.0, BOX_MAX);
 }
 
@@ -1769,7 +1794,10 @@ void overlay(int page) {
 		cairo_t *cr = cairo_create(strip);
 		cairo_scale(cr, zmc.scale, zmc.scale);
 		int hits = zmc.n_hits;
+		/* Pango is one thread's at a time, and the core's row thread may be drawing */
+		zmc_list_lock(true);
 		if (page == P_CHAT) draw_compose(cr); else draw_chats_footer(cr, page);
+		zmc_list_lock(false);
 		zmc.n_hits = hits;
 		cairo_destroy(cr);
 		cairo_surface_flush(strip);
@@ -2345,6 +2373,7 @@ int selftest() {
 	printf("first page %zu messages, more %d, height %.0f, page %d\n", first, older_more, height, zmc.page);
 	load_older();
 	pump(0.5);
+	if (older_held) older_apply();
 	printf("after older %zu messages, scroll moved by %.0f, height grew by %.0f\n", msgs.size(), zmc.scroll - was_scroll, list_total - height);
 	bool sorted = true;
 	for (size_t i = 1; i < msgs.size(); i++) sorted = sorted && msgs[i - 1]->ts <= msgs[i]->ts;
