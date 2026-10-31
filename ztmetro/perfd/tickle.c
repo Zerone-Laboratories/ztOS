@@ -27,8 +27,9 @@
  *     its cgroup, so the whole app is exempt; and the exemption lasts 10 s
  *     past the end of playback, so the gap between two tracks does not
  *     pause the player.
- *   - ztMETRO and everything of its own (app ids zt*, zrn*) are never
- *     touched, nor is anything that is not an app ztMETRO has shown.
+ *   - Only the core shell (ztMETRO and its ztos-* helpers, such as the
+ *     polkit agent) is never touched, nor is anything that is not an app
+ *     ztMETRO has shown. ztOS's own apps are tickled like any other.
  *   - With the screen off, no app is in front: the grace period starts then.
  */
 #define _GNU_SOURCE
@@ -118,7 +119,7 @@ static void freeze(struct app *a, bool on) {
 
 static bool own(const char *id) {
 	if (bg_contains(id)) return false;
-	return strncmp(id, "zt", 2) == 0 || strncmp(id, "zrn", 3) == 0;
+	return strcmp(id, "ztmetro") == 0 || strncmp(id, "ztos-", 5) == 0;
 }
 
 /* /proc/PID/cgroup's path, "" if gone */
