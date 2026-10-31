@@ -2222,6 +2222,7 @@ void sample_fill(int n) {
 			m->media_w = 800;
 			m->media_h = 600;
 			m->text = "Caption of a photo";
+			m->thumb_b64 = "sample";
 			thumbs.push_back({m->id, pictures["c1"]});
 		} else if (i % 17 == 5) {
 			m->kind = "image";
@@ -2352,6 +2353,12 @@ int selftest() {
 	send_draft();
 	pump(0.5);
 	printf("sent: %zu new, status %s, box empty %d, oldest first %d\n", msgs.size() - before, msgs.empty() ? "" : msgs.back()->status.c_str(), draft.empty(), sorted);
+	bool core_ok = msgs.size() == before + 1 && msgs.size() > first && sorted && msgs.back()->status != "pending";
+	/* a thumbnail as the engine sends it, decoded */
+	int thumbs_seen = 0, thumbs_ok = 0;
+	for (auto &m : msgs) if (m->is_image && !m->thumb_b64.empty()) { thumbs_seen++; thumbs_ok += thumb_of(*m) != nullptr; }
+	printf("thumbnails %d, decoded %d\n", thumbs_seen, thumbs_ok);
+	if (!thumbs_seen || thumbs_ok != thumbs_seen) return 1;
 	/* the notifier's two files */
 	zmc.active = true;
 	zmc.page = P_CHAT;
@@ -2390,8 +2397,7 @@ int selftest() {
 	pump(0.5);
 	printf("picture fetched: %d\n", pictures[chats[0].id] != nullptr);
 	bool extra = !statuses.empty() && !contacts.empty() && !starred_list.empty();
-	if (!extra) return 1;
-	return msgs.size() == before + 1 && msgs.size() > first && sorted && msgs.back()->status != "pending" ? 0 : 1;
+	return extra && core_ok ? 0 : 1;
 }
 
 int render_page(const char *name, const char *file) {

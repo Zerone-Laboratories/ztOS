@@ -24,6 +24,8 @@ ap.add_argument("--every", type=float, default=20)
 ap.add_argument("--picture", default="", help="a JPEG to give as everyone's profile picture")
 args = ap.parse_args()
 
+if args.picture:
+	THUMB = base64.b64encode(open(args.picture, "rb").read()).decode()
 now = int(time.time())
 chats = [dict(id=f"6140000000{i}@{'g.us' if i in (2, 5) else 's.whatsapp.net'}", name=n, is_group=i in (2, 5),
 	unread=[2, 0, 11, 0, 0, 1, 0][i], last_text=LINES[i % len(LINES)].replace("\n", " "), last_ts=now - i * 5000,
