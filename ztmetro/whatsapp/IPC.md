@@ -91,7 +91,6 @@ Message:
 | `typing` | `chat`, `state` (`composing` or `paused`) | `{}` |
 | `set_presence` | `available` (bool) | `{}`. The UI sends true when in the foreground, false when hidden. |
 | `subscribe_presence` | `chat` | `{}`. Later changes arrive in `presence` events. |
-| `call_reject` | `caller`, `call_id` | `{}`. Declines an incoming call. |
 
 ## Events
 
@@ -147,27 +146,15 @@ sync. **Notify only when `live` is true, `from_me` is false and `muted` is false
 `state`: `running` or `done`. The chat list should be reloaded on `done`, or as `chat`
 events come in.
 
-### `call_offer`
-`{"event":"call_offer","caller":"...@s.whatsapp.net","caller_name":"Sam","call_id":"...","video":false,"timestamp":1793400000,"live":true}`
-
-Ring only when `live` is true. Offers from the offline backlog are `live:false`.
-
-### `call_end`
-`{"event":"call_end","caller":"...","call_id":"...","reason":"timeout"}`
-
-`reason`: `timeout`, `rejected`, `accepted_elsewhere`, `terminated`, or empty.
-
 ### `error`
 `{"event":"error","code":"...","message":"..."}`. Daemon-level problems worth a log
 line. Never contains message content or keys.
 
-## Calls: the limit
+## Calls
 
-The engine signals incoming calls and can decline them. **It does not carry call
-media or answer calls.** WhatsApp's call transport (its relay protocol and media
-encryption) has no public specification and is not implemented. Answering belongs
-on the phone that owns the account. The notifier should offer Decline, and say the
-call can be answered on the phone.
+Calls are out of scope. The engine has no call events or commands, and it
+acknowledges and ignores incoming call stanzas. An incoming call rings only on
+the user's other devices.
 
 ## Privacy
 
@@ -177,6 +164,6 @@ to the same rule.
 ## Trying it
 
 `ztwhatsappd --fake` serves this same socket with a scripted account: fake chats, a
-new message every 20 seconds, a QR pairing flow, and a call offer. It never touches
+new message every 20 seconds, and a QR pairing flow. It never touches
 the network, so UI and notifier work can be tested with it without a real account.
 `--socket PATH` overrides the socket path.
