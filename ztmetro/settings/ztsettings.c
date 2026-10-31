@@ -1473,8 +1473,11 @@ static void draw_wall_tile(cairo_t *cr, cairo_surface_t *img, double x, double y
 	cairo_save(cr);
 	cairo_rectangle(cr, x, y, w, h);
 	cairo_clip(cr);
-	cairo_translate(cr, x, y);
-	cairo_scale(cr, w / cairo_image_surface_get_width(img), h / cairo_image_surface_get_height(img));
+	/* cover the tile, cropped about the middle: a photo keeps its shape */
+	double iw = cairo_image_surface_get_width(img), ih = cairo_image_surface_get_height(img);
+	double k = fmax(w / iw, h / ih);
+	cairo_translate(cr, x + (w - iw * k) / 2, y + (h - ih * k) / 2);
+	cairo_scale(cr, k, k);
 	cairo_set_source_surface(cr, img, 0, 0);
 	cairo_paint(cr);
 	cairo_restore(cr);
