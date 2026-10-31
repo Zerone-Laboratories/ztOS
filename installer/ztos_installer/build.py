@@ -233,6 +233,12 @@ rm -rf "$R/usr/src/zrn-pushd"
 step "adding ztOS's files"
 cp -a "$SRC/os/overlay/." "$R/"
 cp -a "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
+# the wallpapers and ringtones, local only: scripts/pack-media.sh
+if [ -f "$SRC/build/ztos-media.tar.xz" ]; then
+	tar -C "$R" --no-same-owner -xJf "$SRC/build/ztos-media.tar.xz"
+else
+	echo "WARNING: no build/ztos-media.tar.xz: this image has no wallpapers or ringtones (run scripts/pack-media.sh)" >&2
+fi
 ch update-desktop-database /usr/share/applications
 
 step "adding Android (Waydroid and the recipe for its image)"

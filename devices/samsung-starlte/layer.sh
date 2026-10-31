@@ -30,11 +30,6 @@ install -m755 "$DEVROOT/power/rtc/initialize-calendar.py" \
 install -m644 "$DEVROOT/prebuilts/power/zrn-sleep-init.ko" \
 	"$DEVROOT/prebuilts/power/zrn-exynos-rtc.ko" \
 	"$DEVROOT/prebuilts/power/exynos9810_acpm_tmu.fw" "$PW/mif-trial/"
-# the Windows Phone / Lumia photos, made from the OneDrive zip by os/wallpapers/make-wallpapers.py
-if [ -d "$DEVROOT/build/wallpapers/backgrounds/ztos" ]; then
-	install -d "$R/usr/local/share/backgrounds"
-	cp -a "$DEVROOT/build/wallpapers/backgrounds/ztos" "$R/usr/local/share/backgrounds/"
-fi
 install -Dm644 -t "$R/usr/lib/firmware/brcm" "$DEVROOT"/firmware/bcmdhd* "$DEVROOT"/firmware/nvram*
 install -Dm644 "$DEVROOT/third_party/s9plus/firmware/bcm4361B2_semco.hcd" \
 	"$R/usr/lib/firmware/brcm/BCM.samsung,starlte.hcd"
