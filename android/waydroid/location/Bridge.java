@@ -406,6 +406,10 @@ public final class Bridge {
         for (String p : PROVIDERS) {
             try { call("removeTestProvider", p, pkg, null); } catch (Exception e) { }
             call("addTestProvider", p, p.equals("gps") ? gps : network, pkg, null);
+            // no GNSS HAL: addTestProvider has just made "gps", and listeners only
+            // reach providers that exist when they are added. Before it is enabled,
+            // so no request comes first. A second copy on "network" would only repeat.
+            if (p.equals("gps")) call("addProviderRequestListener", iface);
             call("setTestProviderEnabled", p, true, pkg, null);
         }
         log("\"gps\" and \"network\" providers ready as " + pkg + "; NMEA from " + host + ":" + port + " on demand");
