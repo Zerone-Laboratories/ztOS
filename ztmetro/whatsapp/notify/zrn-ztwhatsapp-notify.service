@@ -1,0 +1,15 @@
+[Unit]
+Description=ztWhatsApp notifications
+After=zrn-ztwhatsappd.service
+# Not Requires: it reconnects whenever the engine comes back.
+
+[Service]
+ExecStart=/usr/bin/ztwhatsapp-notify
+Restart=always
+RestartSec=3
+Nice=5
+NoNewPrivileges=yes
+MemoryHigh=24M
+
+[Install]
+WantedBy=default.target
