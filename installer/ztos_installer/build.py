@@ -82,7 +82,7 @@ def packages(target: str) -> list:
 def check_host():
     """What building needs on this computer."""
     missing = []
-    for tool in ("unshare", "newuidmap", "bsdtar", "mkfs.fat", "mcopy", "mmd", "sfdisk", "python3"):
+    for tool in ("unshare", "newuidmap", "bsdtar", "mkfs.fat", "mcopy", "mmd", "sfdisk", "python3", "xz"):
         if shutil.which(tool) is None:
             missing.append(tool)
     if not Path("/usr/bin/mke2fs").exists() and not Path("/usr/sbin/mke2fs").exists():
