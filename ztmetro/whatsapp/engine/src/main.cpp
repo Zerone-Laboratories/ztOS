@@ -64,8 +64,8 @@ int main(int argc, char** argv) {
     // The probe uses a throwaway identity and must never see the real store or socket.
     std::string probeDir;
     if (probe) {
-        char tmpl[] = "/tmp/ztwa-probe-XXXXXX";
-        char* d = mkdtemp(tmpl);
+        std::string t = env("TMPDIR", "/tmp") + "/ztwa-probe-XXXXXX";
+        char* d = mkdtemp(t.data());
         if (!d) {
             perror("mkdtemp");
             return 1;
@@ -93,7 +93,8 @@ int main(int argc, char** argv) {
 
     int rc = 0;
     try {
-        Loop loop;
+        // Deliberately never freed: a detached download thread may still post to it at exit.
+        Loop& loop = *new Loop;
         loop.add(sfd, EPOLLIN, [&](uint32_t) { loop.stop(); });
         IpcServer ipc(loop, sock);
         std::unique_ptr<Engine> engine = fake ? makeFakeEngine(loop, ipc) : makeRealEngine(loop, ipc, cfg);

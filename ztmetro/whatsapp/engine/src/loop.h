@@ -80,12 +80,17 @@ public:
     }
     void stop() { stop_ = true; }
     void run() {
+        while (!stop_) tick(-1);
+    }
+    // For tests: blocks at most maxMs in one pass.
+    void tick(int maxMs) {
         epoll_event evs[16];
-        while (!stop_) {
-            int to = -1;
+        {
+            int to = maxMs;
             if (!timers_.empty()) {
                 auto d = std::chrono::duration_cast<std::chrono::milliseconds>(timers_.begin()->first - Clock::now()).count();
-                to = d <= 0 ? 0 : (int)(d > 3600000 ? 3600000 : d + 1);
+                int due = d <= 0 ? 0 : (int)(d > 3600000 ? 3600000 : d + 1);
+                to = (to < 0 || due < to) ? due : to;
             }
             int n = epoll_wait(ep_, evs, 16, to);
             for (int i = 0; i < n; i++) {

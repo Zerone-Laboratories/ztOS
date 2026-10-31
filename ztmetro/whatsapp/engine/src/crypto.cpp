@@ -40,6 +40,7 @@ Bytes unhex(std::string_view s) {
 }
 
 static std::string b64v(const Bytes& b, int variant) {
+    if (b.empty()) return "";
     std::string o(sodium_base64_encoded_len(b.size(), variant), 0);
     sodium_bin2base64(o.data(), o.size(), b.data(), b.size(), variant);
     o.resize(std::strlen(o.c_str()));
@@ -49,6 +50,7 @@ std::string b64(const Bytes& b) { return b64v(b, sodium_base64_VARIANT_ORIGINAL)
 std::string b64url(const Bytes& b) { return b64v(b, sodium_base64_VARIANT_URLSAFE); }
 
 Bytes b64dec(std::string_view s) {
+    if (s.empty()) return {};
     Bytes o(s.size());
     size_t n = 0;
     if (sodium_base642bin(o.data(), o.size(), s.data(), s.size(), nullptr, &n, nullptr,

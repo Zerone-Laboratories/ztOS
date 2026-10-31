@@ -22,10 +22,13 @@ import (
 	"go.mau.fi/libsignal/state/record"
 	"go.mau.fi/libsignal/tests"
 	"go.mau.fi/libsignal/util/optional"
+	"google.golang.org/protobuf/proto"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/binary/token"
 	"go.mau.fi/whatsmeow/socket"
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/util/keys"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -123,6 +126,26 @@ func emitNoise() {
 		panic(err)
 	}
 	fmt.Println("noise enc3", hx(nh.Encrypt(csPub[:])))
+}
+
+// Client payloads, for field-by-field comparison of everything except per-device keys.
+func emitPayload() {
+	store.SetOSInfo("ztOS", [3]uint32{1, 0, 0})
+	kp := keys.NewKeyPair()
+	spk := kp.CreateSignedPreKey(1)
+	d := &store.Device{NoiseKey: kp, IdentityKey: kp, SignedPreKey: spk, RegistrationID: 1234, AdvSecretKey: make([]byte, 32)}
+	reg, err := proto.Marshal(d.GetClientPayload())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("payload reg", hx(reg))
+	id := types.JID{User: "61400000000", Server: types.DefaultUserServer, Device: 7}
+	d.ID = &id
+	login, err := proto.Marshal(d.GetClientPayload())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("payload login", hx(login))
 }
 
 func emitSig() {
@@ -302,6 +325,7 @@ func main() {
 		emitCodec()
 		emitNoise()
 		emitSig()
+		emitPayload()
 	case "peer":
 		newPeer().serve()
 	}
