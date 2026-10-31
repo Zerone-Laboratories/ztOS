@@ -233,11 +233,11 @@ rm -rf "$R/usr/src/zrn-pushd"
 step "adding ztOS's files"
 cp -a "$SRC/os/overlay/." "$R/"
 cp -a "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
-# the wallpapers and ringtones, local only: scripts/pack-media.sh
-if [ -f "$SRC/build/ztos-media.tar.xz" ]; then
-	tar -C "$R" --no-same-owner -xJf "$SRC/build/ztos-media.tar.xz"
+# the wallpapers and ringtones: scripts/pack-media.sh
+if [ -f "$SRC/prebuilts/ztos-media/ztos-media.tar.xz.partaa" ]; then
+	cat "$SRC"/prebuilts/ztos-media/ztos-media.tar.xz.part* | tar -C "$R" --no-same-owner -xJf -
 else
-	echo "WARNING: no build/ztos-media.tar.xz: this image has no wallpapers or ringtones (run scripts/pack-media.sh)" >&2
+	echo "WARNING: no prebuilts/ztos-media: this image has no wallpapers or ringtones (run scripts/pack-media.sh)" >&2
 fi
 ch update-desktop-database /usr/share/applications
 
