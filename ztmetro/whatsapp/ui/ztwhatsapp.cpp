@@ -139,6 +139,7 @@ bool logout_ask, foreground;
 long last_typing;
 
 cairo_surface_t *full_image;
+bool image_wanted;
 std::string image_note;
 
 /* ---- text ---------------------------------------------------------------- */
@@ -1816,6 +1817,7 @@ int image_pipe[2] = {-1, -1};
 void image_load(const std::string &path) {
 	if (full_image) { cairo_surface_destroy(full_image); full_image = nullptr; }
 	image_note = "Opening...";
+	image_wanted = true;
 	int w = zmc.width * zmc.scale, h = zmc.height * zmc.scale, fd = image_pipe[1];
 	std::thread([path, w, h, fd] {
 		GdkPixbuf *p = gdk_pixbuf_new_from_file_at_scale(path.c_str(), w, h, TRUE, nullptr);
@@ -1828,7 +1830,9 @@ void image_load(const std::string &path) {
 void image_ready(int fd, void *) {
 	cairo_surface_t *s = nullptr;
 	if (read(fd, &s, sizeof(s)) != sizeof(s)) return;
-	if (zmc.page != P_IMAGE && zmc.page != P_STATUS_VIEW) { if (s) cairo_surface_destroy(s); return; }
+	/* not by zmc.page: a quick load finishes while the page is still turning to it */
+	if (!image_wanted) { if (s) cairo_surface_destroy(s); return; }
+	if (full_image) cairo_surface_destroy(full_image);
 	full_image = s;
 	if (!s) image_note = "Could not open this photo.";
 	zmc_redraw();
@@ -1849,7 +1853,7 @@ void open_image(Msg &m) {
 				for (auto &x : msgs) if (x->id == id) x->path = path;
 				image_load(path);
 			}
-			if (zmc.page == P_IMAGE) zmc_redraw();
+			zmc_redraw();	/* maybe mid-turn: arrived() redraws too, so the note cannot stick */
 		});
 	}
 	zmc_go(P_IMAGE, 1);
@@ -2153,9 +2157,13 @@ void arrived(int page) {
 		list_changed();
 		zmc.scroll = to;
 		zmc_list_lock(false);
-		zmc_redraw();
+		/* the core's limit is still the previous page's until a draw measures this
+		 * one, and it held the view mid-list: ask for the end after that measure */
+		zmc_scroll_end();
 	}
 	if (page == P_CHAT) mark_open_read();
+	if (page == P_IMAGE || page == P_STATUS_VIEW) zmc_redraw();
+	else image_wanted = false;
 	if (page == P_CHATS || page == P_STATUS || page == P_STARRED || page == P_ARCHIVED) {
 		zmc_pivot_changed();
 		footer_rev++;	/* each tab has its own buttons */

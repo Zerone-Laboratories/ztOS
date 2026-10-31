@@ -1,5 +1,10 @@
 // `ztwhatsappd --fake`: the IPC contract with invented data and no network or disk.
 // It exists so the UI and notifier can be built without a real account.
+#include <sys/stat.h>
+#include <zlib.h>
+
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <deque>
 
@@ -8,6 +13,47 @@
 namespace zw {
 
 namespace {
+// An invented picture: a gradient PNG with a hue chosen by the caller.
+std::string writePng(const std::string& name, int w, int h, int hue) {
+    const char* run = getenv("XDG_RUNTIME_DIR");
+    std::string dir = std::string(run ? run : "/tmp") + "/ztwhatsapp-fake";
+    mkdir(dir.c_str(), 0700);
+    std::string path = dir + "/" + name + ".png";
+    Bytes raw;
+    for (int y = 0; y < h; y++) {
+        raw.push_back(0);
+        for (int x = 0; x < w; x++) {
+            raw.push_back((uint8_t)(hue == 0 ? 40 + x * 200 / w : 30));
+            raw.push_back((uint8_t)(hue == 1 ? 40 + x * 200 / w : 60 + y * 120 / h));
+            raw.push_back((uint8_t)(hue == 2 ? 40 + x * 200 / w : 90));
+        }
+    }
+    uLongf zn = compressBound(raw.size());
+    Bytes z(zn);
+    compress(z.data(), &zn, raw.data(), raw.size());
+    z.resize(zn);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return "";
+    fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+    auto chunk = [&](const char* t, const Bytes& d) {
+        Bytes all(t, t + 4);
+        append(all, d);
+        uint32_t n = (uint32_t)d.size(), c = (uint32_t)crc32(0, all.data(), (uInt)all.size());
+        uint8_t l[4] = {(uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n};
+        uint8_t k[4] = {(uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c};
+        fwrite(l, 1, 4, f);
+        fwrite(all.data(), 1, all.size(), f);
+        fwrite(k, 1, 4, f);
+    };
+    Bytes ihdr = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+                  (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 2, 0, 0, 0};
+    chunk("IHDR", ihdr);
+    chunk("IDAT", z);
+    chunk("IEND", {});
+    fclose(f);
+    return path;
+}
+
 class FakeEngine : public Engine {
 public:
     FakeEngine(Loop& l, IpcServer& ipc) : loop_(l), ipc_(ipc) {
@@ -21,6 +67,20 @@ public:
                 std::string sender = me ? kSelf : (c["is_group"].get<bool>() ? "61400000001@s.whatsapp.net" : id);
                 push(id, sender, me, "Fake message " + std::to_string(i + 1), t + i * 60, false);
             }
+        add("61400000003@s.whatsapp.net", "Old Archive", false);
+        chats_["61400000003@s.whatsapp.net"]["archived"] = true;
+        chats_["61400000002@s.whatsapp.net"]["muted"] = true;
+        push("61400000003@s.whatsapp.net", "61400000003@s.whatsapp.net", false, "An archived chat", t, false);
+        // One photo, a starred message, for the pages that need them.
+        std::string pid = push("61400000001@s.whatsapp.net", "61400000001@s.whatsapp.net", false, "A fake photo", t + 7000, false);
+        json& pm = msgs_["61400000001@s.whatsapp.net"].back();
+        pm["kind"] = "image";
+        pm["media"] = {{"mime", "image/png"}, {"size", 2048}, {"width", 320}, {"height", 240}, {"file_name", ""}, {"thumb_b64", ""}, {"path", ""}};
+        imageId_ = pid;
+        msgs_["61400000001@s.whatsapp.net"][5]["starred"] = true;
+        starred_ = msgs_["61400000001@s.whatsapp.net"][5];
+        statusItems_.push_back(statusItem("FAKES1", "61400000001@s.whatsapp.net", "Sam Example", "A fake status", 600));
+        statusItems_.push_back(statusItem("FAKES2", "61400000002@s.whatsapp.net", "Alex Test", "Another fake status", 1800));
         timer();
     }
 
@@ -93,25 +153,43 @@ public:
             }
             rp.ok({{"marked", n}});
         } else if (cmd == "download_media") {
-            rp.err("unsupported", "the fake engine has no media");
+            // Strict on purpose: this is what proves a client sends message_id.
+            std::string mid = r.at("message_id").get<std::string>();
+            if (mid != imageId_) return rp.err("not_found", "no such message");
+            rp.ok({{"path", writePng("photo", 640, 480, 1)}});
         } else if (cmd == "statuses") {
-            json it = {{"chat", "status@broadcast"}, {"id", "FAKES1"}, {"from_me", false}, {"sender", "61400000001@s.whatsapp.net"},
-                       {"sender_name", "Sam Example"}, {"timestamp", (int64_t)time(nullptr) - 600}, {"kind", "text"},
-                       {"text", "A fake status"}, {"status", "received"}, {"quoted_id", ""}, {"media", nullptr}, {"seen", statusSeen_}};
-            rp.ok({{"contacts", {{{"sender", "61400000001@s.whatsapp.net"}, {"name", "Sam Example"}, {"last_ts", it["timestamp"]},
-                                  {"unseen", statusSeen_ ? 0 : 1}, {"items", {it}}}}}});
+            std::map<std::string, json> by;
+            for (auto& it : statusItems_) {
+                std::string who = it["sender"];
+                if (!by.count(who)) by[who] = {{"sender", who}, {"name", it["sender_name"]}, {"last_ts", it["timestamp"]}, {"unseen", 0}, {"items", json::array()}};
+                if (!it["seen"].get<bool>()) by[who]["unseen"] = by[who]["unseen"].get<int>() + 1;
+                by[who]["items"].push_back(it);
+            }
+            json out = json::array();
+            for (auto& [_, c] : by) out.push_back(c);
+            rp.ok({{"contacts", out}});
         } else if (cmd == "status_seen") {
-            statusSeen_ = true;
+            for (auto& id : r.at("ids"))
+                for (auto& it : statusItems_)
+                    if (it["id"] == id) it["seen"] = true;
             rp.ok(json::object());
         } else if (cmd == "post_status") {
-            rp.ok({{"id", "FAKEPOST"}, {"timestamp", (int64_t)time(nullptr)}});
+            std::string id = "FAKEPOST" + std::to_string(++seq_);
+            json it = statusItem(id, kSelf, "You", r.at("text").get<std::string>(), 0);
+            it["from_me"] = true;
+            it["seen"] = true;
+            statusItems_.push_back(it);
+            rp.ok({{"id", id}, {"timestamp", (int64_t)time(nullptr)}});
+            ipc_.broadcast({{"event", "status"}, {"sender", kSelf}, {"sender_name", "You"}, {"item", it}, {"live", false}});
         } else if (cmd == "contacts") {
             json c = json::array();
             c.push_back({{"jid", "61400000002@s.whatsapp.net"}, {"name", "Alex Test"}, {"push_name", "Alex"}, {"phone", "+61400000002"}});
             c.push_back({{"jid", "61400000001@s.whatsapp.net"}, {"name", "Sam Example"}, {"push_name", "Sam"}, {"phone", "+61400000001"}});
             rp.ok({{"contacts", c}, {"total", 2}});
         } else if (cmd == "profile_picture") {
-            rp.err("not_found", "the fake engine has no pictures");
+            std::string j = r.at("jid").get<std::string>();
+            if (j == "61400000002@s.whatsapp.net") return rp.err("not_found", "no picture");  // privacy case
+            rp.ok({{"path", writePng("pic-" + j.substr(9, 2), 96, 96, j[10] % 3)}});
         } else if (cmd == "group_info") {
             rp.ok({{"id", r.at("chat")}, {"subject", "Family (fake)"}, {"topic", "A fake group"}, {"owner", kSelf}, {"created", 1700000000},
                    {"announce", false}, {"locked", false},
@@ -125,7 +203,7 @@ public:
                     if (hits.size() < 50 && m["text"].get<std::string>().find(q) != std::string::npos) hits.push_back(m);
             rp.ok({{"messages", hits}, {"more", false}});
         } else if (cmd == "starred") {
-            rp.ok({{"messages", json::array()}});
+            rp.ok({{"messages", {starred_}}});
         } else if (cmd == "typing" || cmd == "set_presence" || cmd == "subscribe_presence") {
             rp.ok(json::object());
         } else {
@@ -166,7 +244,7 @@ private:
         auto& c = chats_[chat];
         std::string sname = me ? "You" : (sender == chat ? c["name"].get<std::string>() : "Sam Example");
         json m = {{"chat", chat}, {"id", id}, {"from_me", me}, {"sender", sender}, {"sender_name", sname},
-                  {"timestamp", ts}, {"kind", "text"}, {"text", text}, {"status", me ? "pending" : "received"},
+                  {"timestamp", ts}, {"kind", "text"}, {"text", text}, {"status", me ? (live ? "pending" : "read") : "received"},
                   {"quoted_id", ""}, {"media", nullptr}};
         msgs_[chat].push_back(m);
         c["last_text"] = text;
@@ -196,7 +274,15 @@ private:
 
     Loop& loop_;
     IpcServer& ipc_;
-    bool paired_ = false, statusSeen_ = false;
+    static json statusItem(const std::string& id, const std::string& who, const std::string& name, const std::string& text, int age) {
+        return {{"chat", "status@broadcast"}, {"id", id}, {"from_me", false}, {"sender", who}, {"sender_name", name},
+                {"timestamp", (int64_t)time(nullptr) - age}, {"kind", "text"}, {"text", text}, {"status", "received"},
+                {"quoted_id", ""}, {"media", nullptr}, {"seen", false}};
+    }
+    bool paired_ = false;
+    std::string imageId_;
+    json starred_;
+    std::vector<json> statusItems_;
     std::string state_ = "unpaired", code_;
     std::map<std::string, json> chats_;
     std::map<std::string, std::vector<json>> msgs_;
