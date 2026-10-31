@@ -1,0 +1,17 @@
+[Unit]
+Description=ztOS WhatsApp engine
+
+[Service]
+ExecStart=/usr/bin/ztwhatsappd
+Restart=on-failure
+RestartSec=5
+# Exit code 3 means another instance already holds the lock.
+RestartPreventExitStatus=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/ztwhatsapp %t
+
+[Install]
+WantedBy=default.target
