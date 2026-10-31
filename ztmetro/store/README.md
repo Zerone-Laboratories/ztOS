@@ -8,6 +8,11 @@ categories and pacman groups, and **installed** shows updates and your apps.
 There is also search across both sources, a details page, and installing,
 removing and building from the AUR.
 
+**ztOS apps** lists what the ztOS store offers: built from source at an approved
+commit and signed. `zrn store` (zrn-sdk) reads the signed index, trusting only
+`/usr/share/zrn/trusted-keys/store.pub`, and checks each package against it. A
+revoked version is withdrawn from the app list and `zrn-exec` refuses it.
+
 ## Nothing is written into it
 
 | What | Where it comes from |

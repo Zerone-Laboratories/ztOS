@@ -123,7 +123,7 @@ contacts/ztcontacts: contacts/ztcontacts.c comm/comm.h comm/contact-store.h $(CO
 
 # the App Store: the repos in pacman.conf and the AUR (see store/README.md)
 STORE = store/ztstore.c store/util.c store/json.c store/pkg.c store/repo.c store/appstream.c store/aur.c \
-	store/sections.c store/search.c store/jobs.c store/icons.c store/install.c
+	store/sections.c store/search.c store/jobs.c store/icons.c store/install.c store/ztapps.c
 STORE_PKGS = librsvg-2.0 zlib
 store/ztstore: $(STORE) $(wildcard store/*.h) $(CORE_DEPS)
 	$(APP_BUILD) -DHAVE_RSVG $(shell pkg-config --cflags $(STORE_PKGS)) -o $@ $(STORE) $(CORE) $(APP_LIBS) \

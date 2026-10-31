@@ -27,6 +27,7 @@
 #include "jobs.h"
 #include "search.h"
 #include "sections.h"
+#include "ztapps.h"
 #include "zrnmetrocore.h"
 
 #define MARGIN		ZMC_MARGIN
@@ -38,11 +39,11 @@
 #define LIST_MAX	100	/* rows on one page (each is a hit; the core keeps 160) */
 #define GREY		0.6
 
-enum page { P_TOP, P_CATS, P_INSTALLED, P_SEARCH, P_LIST, P_DETAIL, P_PROGRESS };
+enum page { P_TOP, P_CATS, P_INSTALLED, P_SEARCH, P_LIST, P_DETAIL, P_PROGRESS, P_ZAPPS, P_ZAPP };
 enum action {
 	ACT_PKG = 1, ACT_SEARCHBOX, ACT_FILTER, ACT_SEE_ALL, ACT_CAT, ACT_GROUP, ACT_INSTALL, ACT_REMOVE,
 	ACT_OPEN, ACT_UPDATE, ACT_PROGRESS, ACT_CANCEL, ACT_DONE, ACT_CHECK_UPDATES, ACT_UPDATE_ALL,
-	ACT_RECIPE, ACT_FIND, ACT_RETRY,
+	ACT_RECIPE, ACT_FIND, ACT_RETRY, ACT_ZAPP, ACT_ZINSTALL, ACT_ZREMOVE, ACT_ZOPEN, ACT_ZREFRESH,
 };
 
 /* ---- what the pages show (touched only on the main loop) ------------------------- */
@@ -623,7 +624,104 @@ static struct pkg *spotlight(int *from) {
 	return NULL;
 }
 
+/* ---- ztOS apps: the store's own, built from source and signed ---------------------- */
+static struct zapps zapps;
+static bool zapps_busy, zapps_loaded;
+static int zapp_shown = -1;
+static char zapp_note[240];
+
+struct zjob { struct zapps got; bool refresh; char id[128]; bool remove; const char *err; };
+
+static void zapps_done(void *arg) {
+	struct zjob *j = arg;
+	zapps_free(&zapps);
+	zapps = j->got;
+	zapps_busy = false;
+	zapps_loaded = true;
+	zmc_busy(false);
+	if (j->err && j->err[0]) snprintf(zapp_note, sizeof(zapp_note), "%s", j->err);
+	free(j);
+	zmc_redraw();
+}
+
+static void zapps_work(void *arg) {
+	struct zjob *j = arg;
+	if (j->id[0]) j->err = j->remove ? zapps_remove(j->id) : zapps_install(j->id);
+	zapps_load(&j->got, j->refresh);
+}
+
+static void zapps_start(bool refresh, const char *id, bool remove) {
+	if (zapps_busy) return;
+	struct zjob *j = calloc(1, sizeof(*j));
+	j->refresh = refresh;
+	j->remove = remove;
+	if (id) snprintf(j->id, sizeof(j->id), "%s", id);
+	zapps_busy = true;
+	zapp_note[0] = 0;
+	zmc_busy(true);
+	job_run(zapps_work, zapps_done, j);
+}
+
+static double draw_zapps(cairo_t *cr) {
+	zmc.pivot_after = "categories";
+	double y = zmc_pivot_next(cr, "ztOS apps", "top", ZMC_ACT_PIVOT, P_TOP);
+	grey(cr);
+	y += zmc_text(cr, "Built by the store from their source and signed. Moderators approve each one.",
+		FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 12;
+	if (zapps.error[0]) {
+		zmc_accent(cr);
+		y += zmc_text(cr, zapps.error, FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 12;
+	}
+	if (zapp_note[0]) {
+		zmc_accent(cr);
+		y += zmc_text(cr, zapp_note, FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 12;
+	}
+	for (int i = 0; i < zapps.n; i++) {
+		struct zapp *a = &zapps.apps[i];
+		char detail[200];
+		snprintf(detail, sizeof(detail), "%s%s", a->update ? "update available: " : a->installed[0] ? "installed: " : "", a->summary);
+		y = zmc_entry(cr, y, a->name, detail, ACT_ZAPP, i);
+	}
+	if (!zapps.n && !zapps_busy && !zapps.error[0]) {
+		grey(cr);
+		y += zmc_text(cr, "Nothing here yet.", FONT_REGULAR, 16, MARGIN, y, 0) + 12;
+	}
+	for (int i = 0; i < zapps.n_revoked; i++) {
+		char line[300];
+		snprintf(line, sizeof(line), "%s %s was withdrawn: %s", zapps.revoked[i].id, zapps.revoked[i].version, zapps.revoked[i].reason);
+		grey(cr);
+		y += zmc_text(cr, line, FONT_REGULAR, 13, MARGIN, y, zmc.width - 2 * MARGIN) + 8;
+	}
+	y = button(cr, MARGIN, y + 8, zmc.width - 2 * MARGIN, "check the store", ACT_ZREFRESH, 0) + 18;
+	return y + 24;
+}
+
+static double draw_zapp(cairo_t *cr) {
+	if (zapp_shown < 0 || zapp_shown >= zapps.n) return zmc_header(cr, "app");
+	struct zapp *a = &zapps.apps[zapp_shown];
+	double y = zmc_header(cr, a->name), w = zmc.width - 2 * MARGIN;
+	y = zmc_field(cr, y, "what it is", a->summary);
+	y = zmc_field(cr, y, "version", a->version);
+	y = zmc_field(cr, y, "by", a->author);
+	y = zmc_field(cr, y, "licence", a->licence);
+	y = zmc_field(cr, y, "it asks for", a->permissions[0] ? a->permissions : "nothing");
+	y = zmc_field(cr, y, "source", a->source);
+	if (zapp_note[0]) {
+		zmc_accent(cr);
+		y += zmc_text(cr, zapp_note, FONT_REGULAR, 14, MARGIN, y, w) + 12;
+	}
+	if (zapps_busy) {
+		grey(cr);
+		y += zmc_text(cr, "working...", FONT_REGULAR, 16, MARGIN, y, 0) + 12;
+	} else if (a->update || !a->installed[0]) {
+		y = button(cr, MARGIN, y, w, a->update ? "update" : "install", ACT_ZINSTALL, 0) + 12;
+	}
+	if (!zapps_busy && a->installed[0]) y = button(cr, MARGIN, y, w, "remove", ACT_ZREMOVE, 0) + 12;
+	return y + 24;
+}
+
 static double draw_top(cairo_t *cr) {
+	zmc.pivot_after = "installed";
 	double y = zmc_pivot_next(cr, "top", "categories", ZMC_ACT_PIVOT, P_CATS);
 	y = zmc_textbox(cr, y - 8, "search your repos and the AUR", "", false, ACT_SEARCHBOX, 0);
 	if (load_note[0]) {
@@ -705,6 +803,7 @@ static double draw_top(cairo_t *cr) {
 }
 
 static double draw_cats(cairo_t *cr) {
+	zmc.pivot_after = "ztOS apps";
 	double y = zmc_pivot_next(cr, "categories", "installed", ZMC_ACT_PIVOT, P_INSTALLED);
 	y = heading(cr, y, "apps", n_apps ? "AppStream categories · your repos" : NULL);
 	if (!cats.n) {
@@ -740,7 +839,8 @@ static double draw_cats(cairo_t *cr) {
 }
 
 static double draw_installed(cairo_t *cr) {
-	double y = zmc_pivot_next(cr, "installed", "top", ZMC_ACT_PIVOT, P_TOP);
+	zmc.pivot_after = "top";
+	double y = zmc_pivot_next(cr, "installed", "ztOS apps", ZMC_ACT_PIVOT, P_ZAPPS);
 	/* the system's updates come from ztos-update: Arch updates everything at
 	 * once, never one package on its own */
 	y = heading(cr, y, "updates", "your repos, through the system updater");
@@ -1041,6 +1141,8 @@ static double render(cairo_t *cr, int page) {
 	case P_LIST: return draw_list(cr);
 	case P_DETAIL: return draw_detail(cr);
 	case P_PROGRESS: return draw_progress(cr);
+	case P_ZAPPS: return draw_zapps(cr);
+	case P_ZAPP: return draw_zapp(cr);
 	}
 	return 0;
 }
@@ -1123,6 +1225,18 @@ static void activate(int action, int arg) {
 		zmc_keyboard(false);
 	}
 	switch (action) {
+	case ACT_ZAPP:
+		zapp_shown = arg;
+		zapp_note[0] = 0;
+		zmc_go(P_ZAPP, 1);
+		break;
+	case ACT_ZREFRESH:
+		zapps_start(true, NULL, false);
+		break;
+	case ACT_ZINSTALL:
+	case ACT_ZREMOVE:
+		if (zapp_shown >= 0 && zapp_shown < zapps.n) zapps_start(false, zapps.apps[zapp_shown].id, action == ACT_ZREMOVE);
+		break;
 	case ACT_PKG:
 		if (arg >= 0 && arg < n_rows && rows[arg]) {
 			open_details(rows[arg]);
@@ -1224,8 +1338,12 @@ static bool back(void) {
 		typing = false;
 		zmc_keyboard(false);
 	}
-	if (zmc.page == P_TOP || zmc.page == P_CATS || zmc.page == P_INSTALLED) {
+	if (zmc.page == P_TOP || zmc.page == P_CATS || zmc.page == P_INSTALLED || zmc.page == P_ZAPPS) {
 		return false;	/* close */
+	}
+	if (zmc.page == P_ZAPP) {
+		zmc_go(P_ZAPPS, -1);
+		return true;
 	}
 	int to = n_nav > 0 ? nav[--n_nav] : P_TOP;
 	if (zmc.page == P_PROGRESS && inst.state != INST_RUNNING) {
@@ -1236,6 +1354,8 @@ static bool back(void) {
 }
 
 static void arrived(int page) {
+	if (page == P_TOP || page == P_CATS || page == P_INSTALLED || page == P_ZAPPS) zmc_pivot_changed();
+	if (page == P_ZAPPS && !zapps_loaded) zapps_start(true, NULL, false);
 	if (page == P_INSTALLED) {
 		read_updates();
 		check_aur_updates();
@@ -1303,9 +1423,9 @@ int main(int argc, char **argv) {
 		load_local(l);
 		apply_load(l);
 		loading = false;
-		const char *names[] = { "top", "categories", "installed", "search", "list", "detail", "progress" };
+		const char *names[] = { "top", "categories", "installed", "search", "list", "detail", "progress", "ztosapps", "ztosapp" };
 		int page = P_TOP;
-		for (int i = 0; i < 7; i++) {
+		for (int i = 0; i < 9; i++) {
 			if (!strcmp(argv[2], names[i])) {
 				page = i;
 			}
@@ -1323,6 +1443,7 @@ int main(int argc, char **argv) {
 				search_repo(ri, query, 50, &found_repo);
 			}
 		}
+		if (page >= P_ZAPPS) { zapps_load(&zapps, false); zapp_shown = 0; }
 		read_updates();
 		return zmc_render_png(&app, page, 2400, argv[3]);
 	}

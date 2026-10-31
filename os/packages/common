@@ -51,6 +51,11 @@ base-devel
 wayland-protocols
 git
 
+# zrn-sdk: libzrnui, zrn-exec, and what its apps link (every one named, none assumed)
+wayland freetype2 harfbuzz fontconfig libpng libglvnd
+python-cryptography
+libsodium openssl sqlite zlib curl systemd-libs
+
 # the SDK: apps in Python and Qt
 python
 pyside6
