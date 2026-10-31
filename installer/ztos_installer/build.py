@@ -120,7 +120,7 @@ def build_apps(stage: Path):
     out.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(SDK))
     from ztos_sdk import cli as sdk
-    projects = (OS / "apps" / "welcome", OS / "apps" / "whatsapp", ROOT / "apps" / "music")
+    projects = (OS / "apps" / "welcome", ROOT / "apps" / "music")
     for project in projects:
         p = sdk.find_project(str(project))
         python = "%d.%d" % sys.version_info[:2]
