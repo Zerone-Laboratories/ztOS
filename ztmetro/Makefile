@@ -20,7 +20,7 @@ endif
 
 all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
 	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles splash/ztos-splash \
-	store/ztstore power/ztpower camera/ztcamera sound/ztsound osial/ztosial
+	store/ztstore power/ztpower camera/ztcamera sound/ztsound osial/ztosial whatsapp
 
 sounds/ztos-sounds: sounds/ztos-sounds.c
 	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags libpulse) -o $@ $< $(shell pkg-config --libs libpulse) -lm
@@ -144,6 +144,23 @@ browser/superscan: $(BROWSER) browser/webview.h browser/linux-dmabuf-v1-client-p
 
 # kept out of `all`/`install` until WPE is confirmed on the phone, so a missing
 # package cannot break the main build
+# ztWhatsApp: each part has its own Makefile. The engine needs nlohmann-json to build.
+.PHONY: whatsapp install-whatsapp clean-whatsapp
+whatsapp:
+	$(MAKE) -C whatsapp/engine
+	$(MAKE) -C whatsapp/ui
+	$(MAKE) -C whatsapp/notify
+
+install-whatsapp: whatsapp
+	$(MAKE) -C whatsapp/engine install
+	$(MAKE) -C whatsapp/ui install
+	$(MAKE) -C whatsapp/notify install
+
+clean-whatsapp:
+	$(MAKE) -C whatsapp/engine clean
+	$(MAKE) -C whatsapp/ui clean
+	$(MAKE) -C whatsapp/notify clean
+
 .PHONY: install-browser
 install-browser: browser/superscan
 	install -Dm755 browser/superscan /usr/local/bin/superscan
@@ -194,7 +211,7 @@ check-arch: all
 		if [ "$$m" != "$(HOST_ELF)" ]; then echo "$$f: built for another machine; run make clean"; bad=1; fi; \
 	done; exit $$bad
 
-install: check-arch
+install: install-whatsapp check-arch
 	install -Dm755 demoloop/ztos-demoloop /usr/local/bin/ztos-demoloop
 	install -Dm644 demoloop/ztos-demoloop.service /usr/lib/systemd/user/ztos-demoloop.service
 	install -Dm755 auth/ztos-polkit-agent /usr/local/bin/ztos-polkit-agent
@@ -251,7 +268,7 @@ install: check-arch
 	install -Dm644 csf/components /etc/ztoscoresensorframework/components
 	install -Dm644 csf/ztoscoresensorframework.service /etc/systemd/system/ztoscoresensorframework.service
 
-clean:
+clean: clean-whatsapp
 	rm -f sound/ztsound osial/ztosial auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices power/ztpower perfd/zrnperfd touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
 		phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles store/ztstore camera/ztcamera core/viewporter-protocol.c core/viewporter-client-protocol.h \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c

@@ -639,6 +639,7 @@ struct zt_server {
 	struct {
 		char app[32], title[48], text[200];
 		char who[96];		/* whose it is, as the sender said (note_key) */
+		uint32_t nid;		/* ztnotifyd's id, when a tap is to reach its sender */
 		time_t at;
 		bool expanded;		/* tapped in the action centre: all of its text */
 	} notes[MAX_NOTES];
@@ -7928,6 +7929,21 @@ static void modem_tell(const char *line) {
 	}
 }
 
+/* A notification goes from the list, by its place in it. */
+static void note_remove(struct zt_server *server, int i) {
+	memmove(&server->notes[i], &server->notes[i + 1], sizeof(server->notes[0]) * (size_t)(server->n_notes - i - 1));
+	server->n_notes--;
+	server->notes_dirty = true;
+	lock_notes_changed(server);
+}
+
+/* A tap on a notification whose sender offered to open: it hears of it. */
+static void note_invoke(uint32_t nid) {
+	char id[16];
+	snprintf(id, sizeof(id), "%u", nid);
+	run_detached("ztnotifyd", "--invoke", id, NULL);
+}
+
 static void shade_activate(struct zt_server *server, int index) {
 	if (index >= 8) {
 		hap(server, HAP_TICK, HG_SYSTEM);
@@ -8045,6 +8061,15 @@ static void shade_activate(struct zt_server *server, int index) {
 		break;
 	default:
 		if (index >= 20 && index - 20 < server->n_notes) {
+			if (server->notes[index - 20].nid) {
+				/* its sender opens it */
+				note_invoke(server->notes[index - 20].nid);
+				note_remove(server, index - 20);
+				draw_shade(server);
+				shade_set_open(server, false);
+				damage(server);
+				break;
+			}
 			/* a notification: opened to all of its text, or shut again */
 			server->notes[index - 20].expanded = !server->notes[index - 20].expanded;
 			server->notes_dirty = true;
@@ -10034,7 +10059,7 @@ static void note_add_from(struct zt_server *server, const char *who, const char 
 	if (server->n_notes < MAX_NOTES) {
 		server->n_notes++;
 	}
-	wlr_log(WLR_INFO, "notification: %s: %s", title, text);
+	wlr_log(WLR_INFO, "notification from %s", app);	/* (never who or what: a log is kept) */
 	ui_sound(server, UIS_NOTIFY);
 	if (server->width == 0) {
 		return;	/* no screen yet: it is in the list when there is one */
@@ -10048,6 +10073,44 @@ static void note_add_from(struct zt_server *server, const char *who, const char 
 	lock_notes_changed(server);
 	hap(server, HAP_HEAVY, HG_SYSTEM);
 	damage(server);
+}
+
+/* notifyx: one notification by its sender's id. A new message for it moves it to
+ * the top and alerts; a quiet one changes it where it is. */
+static void note_by_id(struct zt_server *server, uint32_t nid, bool quiet, const char *who,
+		const char *app, const char *title, const char *text) {
+	int i = 0;
+	while (i < server->n_notes && server->notes[i].nid != nid)
+		i++;
+	if (i < server->n_notes && quiet) {
+		snprintf(server->notes[i].title, sizeof(server->notes[i].title), "%s", title);
+		snprintf(server->notes[i].text, sizeof(server->notes[i].text), "%s", text);
+		server->notes_dirty = true;
+		if (server->width == 0) {
+			return;
+		}
+		if (server->shade_open || server->shade_h > 0.1f) {
+			draw_shade(server);
+		}
+		lock_notes_changed(server);
+		damage(server);
+		return;
+	}
+	if (i < server->n_notes) {
+		note_remove(server, i);
+	}
+	if (quiet) {
+		note_quiet(server, who, app, title, text);
+		for (i = 0; i < server->n_notes; i++) {
+			if (!server->notes[i].nid && !strcmp(server->notes[i].app, app) && !strcmp(server->notes[i].title, title)) {
+				server->notes[i].nid = nid;
+				break;
+			}
+		}
+	} else {
+		note_add_from(server, who, app, title, text);
+		server->notes[0].nid = nid;
+	}
 }
 
 static void note_add(struct zt_server *server, const char *app, const char *title, const char *text) {
@@ -11073,7 +11136,12 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		return;
 	}
 	if (server->toast_y > 0.5f && y < TOAST_H) {
-		/* a finger on a notification's banner puts it away */
+		/* a finger on a notification's banner puts it away, and opens it
+		 * if its sender can (behind the lock, it stays in the list) */
+		if (!server->locked && server->n_notes > 0 && server->notes[0].nid) {
+			note_invoke(server->notes[0].nid);
+			note_remove(server, 0);
+		}
 		wl_event_source_timer_update(server->toast_timer, 0);
 		toast_hide(server);
 		p->role = ROLE_NONE;
@@ -12263,6 +12331,32 @@ static void ctl_command(struct zt_server *server, char *line) {
 		if (second) {
 			*bar = *second = 0;
 			note_quiet(server, "", line + 8, bar + 1, second + 1);
+		}
+	} else if (strncmp(line, "notifyx ", 8) == 0 || strncmp(line, "notifyxq ", 9) == 0) {
+		/* notifyx ID|WHO|APP|TITLE|TEXT, from ztnotifyd: see note_by_id */
+		bool quiet = line[7] == 'q';
+		char *num = line + (quiet ? 9 : 8);
+		char *who = strchr(num, '|'), *app = who ? strchr(who + 1, '|') : NULL;
+		char *title = app ? strchr(app + 1, '|') : NULL;
+		char *text = title ? strchr(title + 1, '|') : NULL;
+		if (text) {
+			*who++ = 0;
+			*app++ = 0;
+			*title++ = 0;
+			*text++ = 0;
+			note_by_id(server, (uint32_t)strtoul(num, NULL, 10), quiet, who, app, title, text);
+		}
+	} else if (strncmp(line, "notifyclose ", 12) == 0) {
+		uint32_t nid = (uint32_t)strtoul(line + 12, NULL, 10);
+		for (int i = 0; nid && i < server->n_notes; i++) {
+			if (server->notes[i].nid == nid) {
+				note_remove(server, i);
+				if (server->width && (server->shade_open || server->shade_h > 0.1f)) {
+					draw_shade(server);
+				}
+				damage(server);
+				break;
+			}
 		}
 	} else if (strncmp(line, "notifyh ", 8) == 0 || strncmp(line, "notifyqh ", 9) == 0) {
 		/* notifyh WHO|APP|TITLE|TEXT, from ztnotifyd: WHO says whose it is */

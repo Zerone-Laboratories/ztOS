@@ -223,6 +223,11 @@ def push_active():
 	return kv(PUSH).get('identity') == 'known'
 
 
+def whatsapp_active():
+	"""ztwhatsapp-notify holds a linked account, so messages must not wait 1800 s."""
+	return kv(Path(ztos_user.RUNTIME_DIR) / 'ztwhatsapp-notify.status').get('paired') == '1'
+
+
 def push_online_since():
 	"""When zrn-pushd last logged in (wall clock), or 0 while it is not."""
 	status = kv(PUSH)
@@ -928,7 +933,7 @@ last_sleep = {}
 def cycle(ignore=(), ignore_inhibits=()):
 	"""One sleep and the way back. Returns why it woke. `ignore_inhibits`:
 	inhibit names the re-check does not count (a bench)."""
-	dozing = background_apps_active(fresh=True) or push_active()
+	dozing = background_apps_active(fresh=True) or push_active() or whatsapp_active()
 	alarm_s = min(MAX_SLEEP_S, DOZE_SLEEP_S) if dozing else MAX_SLEEP_S
 	cap = battery_cap()
 	if cap is not None and cap < alarm_s:
