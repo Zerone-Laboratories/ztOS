@@ -568,6 +568,8 @@ static int moves_left = MOVES_PER_LOAD;
 static struct i2c_client *ap_cl, *af_cl;
 static struct platform_device *act_pdev;
 static u32 act_saved_pud;
+/* the bus of the camera in use: rear above; front is gpp5-4/5 by stock's DT */
+static unsigned int act_scl = ACT_SCL, act_sda = ACT_SDA, act_pud = ACT_PUD, act_bank = BANK_GPC0;
 static struct gpiod_lookup_table act_gpios = {
 	.dev_id = "i2c-gpio.102",
 	.table = {
@@ -590,7 +592,7 @@ static int act_write(struct i2c_client *cl, u8 reg, u8 val)
 
 static void act_bus_off(void)
 {
-	u32 mask = (0xf << (ACT_SCL * 4)) | (0xf << (ACT_SDA * 4));
+	u32 mask = (0xf << (act_scl * 4)) | (0xf << (act_sda * 4));
 
 	if (ap_cl)
 		i2c_unregister_device(ap_cl);
@@ -603,9 +605,21 @@ static void act_bus_off(void)
 		platform_device_unregister(act_pdev);
 		act_pdev = NULL;
 		gpiod_remove_lookup_table(&act_gpios);
-		v = readl(peri + BANK_GPC0 + REG_PUD);
-		writel((v & ~mask) | (act_saved_pud & mask), peri + BANK_GPC0 + REG_PUD);
+		v = readl(peri + act_bank + REG_PUD);
+		writel((v & ~mask) | (act_saved_pud & mask), peri + act_bank + REG_PUD);
 	}
+}
+
+static void act_select(bool front)
+{
+	act_scl = front ? 4 : ACT_SCL;
+	act_sda = front ? 5 : ACT_SDA;
+	act_pud = front ? 0 : ACT_PUD;
+	act_bank = front ? BANK_GPP5 : BANK_GPC0;
+	act_gpios.table[0].key = front ? "gpp5" : "gpc0";
+	act_gpios.table[1].key = act_gpios.table[0].key;
+	act_gpios.table[0].chip_hwnum = act_sda;
+	act_gpios.table[1].chip_hwnum = act_scl;
 }
 
 static int act_bus_on(void)
@@ -615,15 +629,15 @@ static int act_bus_on(void)
 	struct i2c_client *a, *f;
 
 	gpiod_add_lookup_table(&act_gpios);
-	act_saved_pud = readl(peri + BANK_GPC0 + REG_PUD);
-	field(BANK_GPC0 + REG_PUD, ACT_SCL, ACT_PUD);
-	field(BANK_GPC0 + REG_PUD, ACT_SDA, ACT_PUD);
+	act_saved_pud = readl(peri + act_bank + REG_PUD);
+	field(act_bank + REG_PUD, act_scl, act_pud);
+	field(act_bank + REG_PUD, act_sda, act_pud);
 	pd = platform_device_register_data(NULL, "i2c-gpio", BUS_ACT, &i2c_100k, sizeof(i2c_100k));
 	if (IS_ERR(pd)) {
-		u32 mask = (0xf << (ACT_SCL * 4)) | (0xf << (ACT_SDA * 4));
-		u32 v = readl(peri + BANK_GPC0 + REG_PUD);
+		u32 mask = (0xf << (act_scl * 4)) | (0xf << (act_sda * 4));
+		u32 v = readl(peri + act_bank + REG_PUD);
 
-		writel((v & ~mask) | (act_saved_pud & mask), peri + BANK_GPC0 + REG_PUD);
+		writel((v & ~mask) | (act_saved_pud & mask), peri + act_bank + REG_PUD);
 		gpiod_remove_lookup_table(&act_gpios);
 		return PTR_ERR(pd);
 	}
@@ -749,7 +763,7 @@ static bool af_known(void)
 	int r3 = i2c_smbus_read_byte_data(af_cl, 0x03);
 
 	note("focus: id f3=%d 03=%d", f3, r3);
-	return f3 == 0x0e || r3 == 0x09 || r3 == 0x0e;
+	return f3 == 0x0e || r3 == 0x09 || r3 == 0x0e || r3 == 0x0c;
 }
 
 /* Init at vendor_first_pos, a small move and back, then stock's landing: to 0, 200 ms */
@@ -787,7 +801,10 @@ static int af_move(void)
 
 static void act_run(bool move)
 {
-	int ret = act_bus_on();
+	int ret;
+
+	act_select(false);
+	ret = act_bus_on();
 
 	if (ret) {
 		note("actuator bus: %d", ret);
@@ -1049,5 +1066,6 @@ static int __init zrn_cam_init(void)
 }
 module_init(zrn_cam_init);
 MODULE_SOFTDEP("pre: i2c-gpio");
+MODULE_IMPORT_NS("DMA_BUF");
 MODULE_DESCRIPTION("Galaxy S9 cameras: power, chip ID, power down");
 MODULE_LICENSE("GPL");

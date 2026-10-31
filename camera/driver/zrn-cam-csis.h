@@ -30,6 +30,13 @@
 #define FMT_NONE	0x3f
 #define SETTLE_1352	66	/* fimc-is-hw-settle-10nm-lpp.h, 1360 */
 #define SETTLE_719	36	/* the same, 720 */
+#define SETTLE_2054	10	/* the same, 2050: at 1.5 Gbps and up with skew calibration */
+#define SETTLE_1473	72	/* the same, 1470 */
+#define FULL_W		4032
+#define FULL_H		3024
+#define FULL_PDAF_H	756
+#define FRONT_FULL_W	3264
+#define FRONT_FULL_H	2448
 
 /* one sensor's way in: stock DT fimc_is_sensor0/1, fimc-is-hw-csi-v5_1.h */
 struct csi_path {
@@ -37,14 +44,23 @@ struct csi_path {
 	u32 rst_bit, iso;		/* iso: PMU offset */
 	u32 sc_06, sc_02, sd[2 + 2];
 	u32 lanes, w, h, pd_h, settle, interleave;
+	u32 skew_sel;			/* csi_hw_s_phy_config at 1.5 Gbps and up, 0 below it */
 };
 static const struct csi_path path_rear = {
 	0x16230000, 0x16160000, 0x162b0000, 0, 0x70c, 0x2418, 0x2484,
-	{ 0x2800, 0x2c00, 0x3000, 0x3400 }, 4, SENSOR_W, SENSOR_H, PDAF_H, SETTLE_1352, 2,
+	{ 0x2800, 0x2c00, 0x3000, 0x3400 }, 4, SENSOR_W, SENSOR_H, PDAF_H, SETTLE_1352, 2, 0,
+};
+static const struct csi_path path_rear_full = {
+	0x16230000, 0x16160000, 0x162b0000, 0, 0x70c, 0x2418, 0x2484,
+	{ 0x2800, 0x2c00, 0x3000, 0x3400 }, 4, FULL_W, FULL_H, FULL_PDAF_H, SETTLE_2054, 2, 2,
 };
 static const struct csi_path path_front = {
 	0x16240000, 0x16180000, 0x162c0000, 2, 0x730, 0x1018, 0x1084,
-	{ 0x1400, 0x1800, 0x1c00, 0x2000 }, 2, FRONT_W, FRONT_H, 0, SETTLE_719, 3,
+	{ 0x1400, 0x1800, 0x1c00, 0x2000 }, 2, FRONT_W, FRONT_H, 0, SETTLE_719, 3, 0,
+};
+static const struct csi_path path_front_full = {
+	0x16240000, 0x16180000, 0x162c0000, 2, 0x730, 0x1018, 0x1084,
+	{ 0x1400, 0x1800, 0x1c00, 0x2000 }, 2, FRONT_FULL_W, FRONT_FULL_H, 0, SETTLE_1473, 3, 0,
 };
 static const struct csi_path *pth;
 
@@ -307,17 +323,24 @@ static void csis_on(void)
 		udelay(10);
 
 	/* csi_hw_s_phy_default_value */
-	if (p == &path_rear) {
+	if (p->csis == path_rear.csis) {
 		writel(0x10, csis_phy + 0x404);
 		writel(0x05, csis_phy + 0x40c);
 		writel(0x68, csis_phy + 0x414);
 		writel(0x6c, csis_phy + 0x418);
 	}
 	writel(0x02, csis_phy + p->sc_06);
-	/* csi_hw_s_phy_config below 1.5 Gbps: no skew calibration, HS mode 1 */
+	/* csi_hw_s_phy_config: below 1.5 Gbps no skew calibration, HS mode 1 */
 	rmw(csis_phy + p->sc_02, 0xff, 1);
 	for (i = 0; i < p->lanes; i++) {
-		rmw(csis_phy + p->sd[i] + 0xac, BIT(2), BIT(2));
+		if (p->skew_sel) {
+			rmw(csis_phy + p->sd[i] + 0xe0, BIT(0), BIT(0));
+			rmw(csis_phy + p->sd[i] + 0x3c, 3 << 5, p->skew_sel << 5);
+		} else {
+			rmw(csis_phy + p->sd[i] + 0xe0, BIT(0), 0);
+			rmw(csis_phy + p->sd[i] + 0x3c, 3 << 5, 0);
+		}
+		rmw(csis_phy + p->sd[i] + 0xac, BIT(2), p->skew_sel ? 0 : BIT(2));
 		rmw(csis_phy + p->sd[i] + 0xb0, 0xff, p->settle);
 	}
 
@@ -376,7 +399,7 @@ static void csis_off(void)
 	writel(0, csis + CSIS_MSK1);
 	writel(0, csis_vc + CMN_MASK);
 	rmw(sys_phy, BIT(pth->rst_bit), 0);
-	if (pth == &path_front)	/* the rear PHY's isolation was off bypass at no time; leave it */
+	if (pth->csis == path_front.csis)	/* the rear PHY's isolation was off bypass at no time; leave it */
 		rmw(pmu + pth->iso, BIT(0), 0);
 }
 

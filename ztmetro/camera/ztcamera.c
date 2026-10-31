@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -210,6 +211,20 @@ static void roll_scan(void) {
 	closedir(d);
 }
 
+/* A photo can be 12 megapixels: the thumbnail is drawn on every chrome redraw, so keep it small. */
+static cairo_surface_t *thumb_of(cairo_surface_t *s) {
+	int w = cairo_image_surface_get_width(s), h = cairo_image_surface_get_height(s);
+	double k = fmin(1, 200.0 / (w > h ? w : h));
+	cairo_surface_t *t = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)(w * k), (int)(h * k));
+	cairo_t *cr = cairo_create(t);
+	cairo_scale(cr, k, k);
+	cairo_set_source_surface(cr, s, 0, 0);
+	cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+	cairo_paint(cr);
+	cairo_destroy(cr);
+	return t;
+}
+
 static void thumb_load(void) {
 	cairo_surface_destroy(last_shot);
 	last_shot = NULL;
@@ -218,10 +233,9 @@ static void thumb_load(void) {
 	}
 	cairo_surface_t *s = cairo_image_surface_create_from_png(last_path);
 	if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS) {
-		last_shot = s;
-	} else {
-		cairo_surface_destroy(s);
+		last_shot = thumb_of(s);
 	}
+	cairo_surface_destroy(s);
 	chrome_redraw_mark();
 }
 
@@ -366,7 +380,7 @@ static void source_start(enum source_kind want) {
 	case SRC_RAW:
 		if (raw_open(raw.cam)) {
 			src.kind = SRC_RAW;
-			frame_alloc(raw.cw, raw.ch);	/* photos only: the viewfinder is on the GPU */
+			frame_alloc(raw.info.h, raw.info.w);	/* the review's size: the viewfinder is on the GPU */
 			snprintf(src.name, sizeof(src.name), "%s raw, no ISP",
 				raw.cam == RAW_FRONT ? "front" : "rear");
 			break;
@@ -660,7 +674,22 @@ static void yuyv_frame(const uint8_t *in) {
 
 /* ---- captures ------------------------------------------------------------- */
 
+static struct {
+	cairo_surface_t *shot;
+	char path[320];
+	cairo_status_t status;
+	bool busy, done;
+} save;
+
+static void *save_thread(void *unused) {
+	(void)unused;
+	save.status = cairo_surface_write_to_png(save.shot, save.path);
+	__atomic_store_n(&save.done, true, __ATOMIC_RELEASE);
+	return NULL;
+}
+
 static void capture_photo(void) {
+	cairo_surface_t *shot = NULL;
 	if (cairo_surface_status(src.frame) != CAIRO_STATUS_SUCCESS) {
 		return;
 	}
@@ -669,7 +698,14 @@ static void capture_photo(void) {
 			note("no frame yet");
 			return;
 		}
-		raw_to_surface(src.frame);
+		note("taking a photo");
+		shot = raw_capture();
+		if (!shot) {
+			note("could not take a photo");
+			return;
+		}
+	} else {
+		shot = cairo_surface_reference(src.frame);
 	}
 	time_t now = time(NULL);
 	struct tm tm;
@@ -684,23 +720,50 @@ static void capture_photo(void) {
 	} while (access(path, F_OK) == 0 && n < 10000);
 	if (access(path, F_OK) == 0) {
 		note("too many captures this second");
+		cairo_surface_destroy(shot);
 		return;
 	}
-	cairo_status_t st = cairo_surface_write_to_png(src.frame, path);
-	if (st != CAIRO_STATUS_SUCCESS) {
-		note("could not save (%s)", cairo_status_to_string(st));
+	/* a full-size PNG takes seconds: on a thread, so the viewfinder keeps going */
+	if (save.busy) {
+		note("still saving the last photo");
+		cairo_surface_destroy(shot);
+		return;
+	}
+	save.shot = shot;
+	snprintf(save.path, sizeof(save.path), "%s", path);
+	save.status = CAIRO_STATUS_SUCCESS;
+	save.done = false;
+	save.busy = true;
+	pthread_t t;
+	if (pthread_create(&t, NULL, save_thread, NULL) != 0) {
+		save_thread(NULL);
+	} else {
+		pthread_detach(t);
+	}
+	ui.flash_at = zmc_now_ms();
+	zmc_haptic("click");
+	note("saving");
+}
+
+static void save_finish(void) {
+	if (!save.busy || !__atomic_load_n(&save.done, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	save.busy = false;
+	if (save.status != CAIRO_STATUS_SUCCESS) {
+		note("could not save (%s)", cairo_status_to_string(save.status));
+		cairo_surface_destroy(save.shot);
 		return;
 	}
 	cairo_surface_destroy(last_shot);
-	last_shot = cairo_surface_reference(src.frame);
+	last_shot = thumb_of(save.shot);
+	cairo_surface_destroy(save.shot);
 	cairo_surface_destroy(review_shot);
 	review_shot = NULL;
-	snprintf(last_path, sizeof(last_path), "%s", path);
+	snprintf(last_path, sizeof(last_path), "%s", save.path);
 	roll_scan();
-	thumb_load();
-	ui.flash_at = zmc_now_ms();
-	zmc_haptic("click");
-	note("saved %s", strrchr(path, '/') + 1);
+	chrome_redraw_mark();
+	note("saved %s", strrchr(save.path, '/') + 1);
 }
 
 static void record_start(void) {
@@ -1769,6 +1832,7 @@ static void tick(void) {
 	}
 	if (now - last_scene >= FPS_MS) {
 		last_scene = now;
+		save_finish();
 		if (src.kind == SRC_RAW) {
 			uint32_t was = raw.seq;
 			const char *why = raw_poll();

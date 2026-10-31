@@ -62,6 +62,34 @@ sudo zrn-cam-probe pmic    # loads the module; the rails stay off
 5. A V4L2 device, or a simple dump to a file first, and Bayer to RGB in
    software.
 
+## Image quality (2026-10-31)
+
+The whole picture is now made on the GPU, once per sensor frame, from the driver's memory read directly as a
+DMA-BUF (R16 on Panfrost, no copy). `ztmetro/camera/raw-source.h`: black 64, radial shading, Malvar-He-Cutler
+demosaic, grey-world white balance, colour matrix, sRGB, light S curve; unsharp mask on the screen.
+
+| What | Value | Where from |
+| --- | --- | --- |
+| Sensor orientation | rear 90, front 270 | observed: `libexynoscamera3.so`, `ExynosCameraSensor2L3Base` and `...IMX320_3H1Base`, field read by `ANDROID_SENSOR_ORIENTATION` in `constructStaticInfo` |
+| Black, white | 64, 1023 | observed: same constructors; black also read from dark frames |
+| Max analog sensitivity | rear 640, front 800 | observed: same field block |
+| Rear colour | forward matrices at 0x1c2944 (A) and 0x1c298c (D65), turned into camera to linear sRGB; rows sum to 1 | observed: data; the constructor picks this set or the one at 0x1c3a94 by an argument not traced, so which is this phone's is inferred |
+| Front colour | 330 -80 6 / -72 346 -18 / -12 -119 387, over 256 | observed in `setfile_3h1.bin` at 0x18137; that it means camera to sRGB for daylight is inferred. The 3H1 constructor has no forward matrices |
+| WDR on the front's full table | table leaves 0x0216 = 0x0100, and each line alternates a long exposure stock sets | observed: table and `sensor_3h1_cis_set_exposure_time`; the driver writes 0 |
+| Full modes | rear 4032x3024 at 2054 Mbps, skew calibration on, PDAF VC 4032x756; front 3264x2448 at 1473 | observed: vendor `fimc-is-device-module-*.c`, `fimc-is-hw-settle-10nm-lpp.h` |
+
+What each frame costs, front camera, app held on the four efficiency cores with `taskset`: 21 % of one core
+while focusing, 23 to 28 fps on its own counter.
+
+- Photos stop the preview, power the sensor up at full size, take the fifth frame, develop it with the same shaders,
+  read it back and write a PNG on a thread. Rear 12 MP, front 8 MP.
+- Focus is contrast only, across the lens range, after exposure settles: `af N` in the driver, in the app's loop.
+- Lens shading is a guess (a mild radial gain). Stock's is calibration in the FROM and tables in the setfile, not read.
+- The receiver reports a stray DMA bit 12 about once a minute with no visible damage. Its meaning is not known. The
+  driver now stops only on 30 errors in 5 s, and logs the first eight.
+- Not proven on the rear: a real scene. The phone lay on its back through all of this, so rear AE, AF and colour on
+  light are untested; colour bars passed at both sizes.
+
 ## Aperture and focus (2026-10-31)
 
 `act-read` and `act-move` in `camera/driver/zrn-cam.c` bring the rear camera up, drive the actuators on bit-banged
