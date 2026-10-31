@@ -1,6 +1,6 @@
 #!/bin/sh
 # Pack the wallpapers and sounds with xz -9 into prebuilts/ztos-media/, which the
-# installer unpacks into the image. In 25 MiB parts: GitHub refuses files over 100 MB and large pushes time out.
+# installer unpacks into the image. In 8 MiB parts: GitHub refuses files over 100 MB and large pushes time out.
 # Needs build/wallpapers (os/wallpapers/make-wallpapers.py) and the local sound
 # pack in os/overlay.
 set -eu
@@ -18,6 +18,6 @@ tar --owner=0 --group=0 --sort=name -cf - \
 xz -t "$OUT.tmp"
 mv "$OUT.tmp" "$OUT"
 rm -rf "$P"; mkdir -p "$P"
-split -b 25M "$OUT" "$P/ztos-media.tar.xz.part"
+split -b 8M "$OUT" "$P/ztos-media.tar.xz.part"
 rm -f "$OUT"
 ls -l "$P"
