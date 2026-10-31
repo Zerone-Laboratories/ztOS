@@ -1,6 +1,6 @@
 # Installing ztOS
 
-This guide installs **ztOS BETA-1**. The release version is recorded in the
+This guide installs **ztOS BETA-1.1**. The release version is recorded in the
 repository's `VERSION` file.
 
 ztOS is a phone operating system: the ztMETRO shell on Arch Linux ARM, with
