@@ -5,7 +5,7 @@
 #define ZTSTORE_ZTAPPS_H
 #include <stdbool.h>
 
-struct zapp { char *id, *name, *summary, *author, *licence, *source, *version, *installed, *permissions; bool update; double size; };
+struct zapp { char *icon_b64, *id, *name, *summary, *author, *licence, *source, *version, *installed, *permissions; bool update; double size; };
 struct zrevoked { char *id, *version, *reason; };
 struct zapps {
 	struct zapp *apps; int n;

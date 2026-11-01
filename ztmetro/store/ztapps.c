@@ -50,6 +50,7 @@ void zapps_load(struct zapps *z, bool refresh) {
 		for (int i = 0; i < apps->n; i++) {
 			struct json *o = apps->items[i];
 			struct zapp *a = &z->apps[z->n++];
+			a->icon_b64 = dup_or_empty(json_str(o, "icon_b64"));
 			a->id = dup_or_empty(json_str(o, "id"));
 			a->name = dup_or_empty(json_str(o, "name"));
 			a->summary = dup_or_empty(json_str(o, "summary"));
@@ -87,7 +88,7 @@ void zapps_load(struct zapps *z, bool refresh) {
 void zapps_free(struct zapps *z) {
 	for (int i = 0; i < z->n; i++) {
 		struct zapp *a = &z->apps[i];
-		free(a->id); free(a->name); free(a->summary); free(a->author); free(a->licence);
+		free(a->icon_b64); free(a->id); free(a->name); free(a->summary); free(a->author); free(a->licence);
 		free(a->source); free(a->version); free(a->installed); free(a->permissions);
 	}
 	for (int i = 0; i < z->n_revoked; i++) {

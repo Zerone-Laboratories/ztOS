@@ -1,3 +1,7 @@
+#ifdef HAVE_RSVG
+#include <strings.h>
+#include <librsvg/rsvg.h>
+#endif
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * ztstore: the ztOS App Store. Apps from the repos in pacman.conf and from the
@@ -862,6 +866,25 @@ static void zapps_start(bool refresh, const char *id, bool remove) {
 	job_run(zapps_work, zapps_done, j);
 }
 
+/* An app's picture from the signed index. false: it has none. */
+static bool zapp_icon(cairo_t *cr, struct zapp *a, double x, double y, double size) {
+#ifdef HAVE_RSVG
+	if (!a->icon_b64 || !a->icon_b64[0]) return false;
+	gsize n = 0;
+	guchar *raw = g_base64_decode(a->icon_b64, &n);
+	RsvgHandle *h = raw ? rsvg_handle_new_from_data(raw, n, NULL) : NULL;
+	g_free(raw);
+	if (!h) return false;
+	RsvgRectangle box = { x, y, size, size };
+	bool ok = rsvg_handle_render_document(h, cr, &box, NULL);
+	g_object_unref(h);
+	return ok;
+#else
+	(void)cr; (void)a; (void)x; (void)y; (void)size;
+	return false;
+#endif
+}
+
 static double draw_zapps(cairo_t *cr) {
 	zmc.pivot_after = "categories";
 	double y = zmc_pivot_next(cr, "ztOS apps", "top", ZMC_ACT_PIVOT, P_TOP);
@@ -880,7 +903,22 @@ static double draw_zapps(cairo_t *cr) {
 		struct zapp *a = &zapps.apps[i];
 		char detail[200];
 		snprintf(detail, sizeof(detail), "%s%s", a->update ? "update available: " : a->installed[0] ? "installed: " : "", a->summary);
-		y = zmc_entry(cr, y, a->name, detail, ACT_ZAPP, i);
+		double tile = 56, tx = MARGIN + tile + 12;
+		if (!zapp_icon(cr, a, MARGIN, y, tile)) {
+			zmc_accent(cr);
+			cairo_rectangle(cr, MARGIN, y, tile, tile);
+			cairo_fill(cr);
+			white(cr);
+			char first[2] = { a->name[0], 0 };
+			zmc_text_centred(cr, first, FONT_SEMILIGHT, 28, MARGIN + tile / 2, y + 8);
+			cairo_new_path(cr);
+		}
+		white(cr);
+		zmc_text_line(cr, a->name, FONT_SEMILIGHT, 25.5, tx, y - 4, zmc.width - tx - MARGIN);
+		grey(cr);
+		zmc_text_line(cr, detail, FONT_REGULAR, 12, tx, y + 31, zmc.width - tx - MARGIN);
+		zmc_add_hit(0, y - 2, zmc.width, 60, ACT_ZAPP, i);
+		y += 68;
 	}
 	if (!zapps.n && !zapps_busy && !zapps.error[0]) {
 		grey(cr);
@@ -901,13 +939,15 @@ static double draw_zapp(cairo_t *cr) {
 	struct zapp *a = &zapps.apps[zapp_shown];
 	double y = detail_head(cr, a->name, "details", "more", P_ZAPP_MORE), w = zmc.width - 2 * MARGIN;
 	double x = MARGIN + 134;
-	zmc_accent(cr);
-	cairo_rectangle(cr, MARGIN, y, 120, 120);
-	cairo_fill(cr);
-	white(cr);
-	char initial[2] = { a->name[0], 0 };
-	zmc_text_centred(cr, initial, FONT_SEMILIGHT, 56, MARGIN + 60, y + 24);
-	cairo_new_path(cr);
+	if (!zapp_icon(cr, a, MARGIN, y, 120)) {
+		zmc_accent(cr);
+		cairo_rectangle(cr, MARGIN, y, 120, 120);
+		cairo_fill(cr);
+		white(cr);
+		char initial[2] = { a->name[0], 0 };
+		zmc_text_centred(cr, initial, FONT_SEMILIGHT, 56, MARGIN + 60, y + 24);
+		cairo_new_path(cr);
+	}
 	zmc_text_line(cr, a->name, FONT_SEMILIGHT, 24, x, y - 4, zmc.width - x - MARGIN);
 	grey(cr);
 	zmc_text_line(cr, a->update ? "update available" : a->installed[0] ? "installed" : "not installed", FONT_REGULAR, 14, x, y + 94, zmc.width - x - MARGIN);
