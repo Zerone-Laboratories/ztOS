@@ -44,7 +44,7 @@ enum page { P_TOP, P_CATS, P_INSTALLED, P_SEARCH, P_LIST, P_DETAIL, P_PROGRESS, 
 enum action {
 	ACT_PKG = 1, ACT_SEARCHBOX, ACT_FILTER, ACT_SEE_ALL, ACT_CAT, ACT_GROUP, ACT_INSTALL, ACT_REMOVE,
 	ACT_OPEN, ACT_UPDATE, ACT_PROGRESS, ACT_CANCEL, ACT_DONE, ACT_CHECK_UPDATES, ACT_UPDATE_ALL,
-	ACT_RECIPE, ACT_FIND, ACT_RETRY, ACT_ZAPP, ACT_ZINSTALL, ACT_ZREMOVE, ACT_ZOPEN, ACT_ZREFRESH,
+	ACT_RECIPE, ACT_FIND, ACT_RETRY, ACT_LROW, ACT_ZAPP, ACT_ZINSTALL, ACT_ZREMOVE, ACT_ZOPEN, ACT_ZREFRESH,
 };
 
 /* ---- what the pages show (touched only on the main loop) ------------------------- */
@@ -190,11 +190,7 @@ static void meta_of(const struct pkg *p, char *out, size_t size) {
 }
 
 /* One package: its tile, its name, a line about it, and where it is from. */
-static double row(cairo_t *cr, double y, struct pkg *p) {
-	int idx = add_row(p);
-	if (idx < 0) {
-		return y;
-	}
+static void row_paint(cairo_t *cr, double y, struct pkg *p) {
 	double x = MARGIN + 68, w = zmc.width - x - MARGIN;
 	draw_tile(cr, MARGIN, y, 56, p);
 	white(cr);
@@ -216,6 +212,14 @@ static double row(cairo_t *cr, double y, struct pkg *p) {
 	char meta[128];
 	meta_of(p, meta, sizeof(meta));
 	zmc_text_line(cr, meta, FONT_REGULAR, 11.5, x + bw + 8, y + 43, w - bw - 8);
+}
+
+static double row(cairo_t *cr, double y, struct pkg *p) {
+	int idx = add_row(p);
+	if (idx < 0) {
+		return y;
+	}
+	row_paint(cr, y, p);
 	zmc_add_hit(0, y - 6, zmc.width, 70, ACT_PKG, idx);
 	return y + 76;
 }
@@ -320,7 +324,16 @@ static void free_retired(void) {
 static void start_load(void);
 
 /* the first half: the phone's own packages and lists from cached copies */
+static void lrows_forget(void);
+static void apply_load_(void *arg);
 static void apply_load(void *arg) {
+	zmc_list_lock(true);
+	lrows_forget();
+	apply_load_(arg);
+	lrows_forget();
+	zmc_list_lock(false);
+}
+static void apply_load_(void *arg) {
 	struct load *l = arg;
 	rows_forget();
 	if (ri) {
@@ -628,6 +641,106 @@ static struct pkg *spotlight(int *from) {
 static double detail_head(cairo_t *cr, const char *title, const char *tab, const char *next, int next_page);
 static void action_band(cairo_t *cr, double y, double h);
 
+/* ---- long pages as a zmc_list, as People's: rows are painted once on the core's
+ * thread and then only moved, icons are decoded there, and no page-sized texture
+ * is ever uploaded when a page changes. What rows read changes under the list lock. */
+enum lkind { L_SPOT0, L_SPOT1, L_HEAD, L_PKG, L_NOTE, L_SKEL };
+struct lrow { int kind, sec; struct pkg *p; const char *t, *c; };
+#define LROWS_MAX 900
+/* one table for each page: a neighbouring tab is drawn ahead while another is in front */
+enum { SET_TOP, SET_LIST, SET_MINE, SETS };
+static struct { struct lrow r[LROWS_MAX]; int n; uint64_t rev; bool built; } lset[SETS];
+
+/* the data changed: nothing may read the old rows again (under the list lock) */
+static void lrows_forget(void) {
+	for (int i = 0; i < SETS; i++) {
+		lset[i].n = 0;
+		lset[i].built = false;
+		lset[i].rev += 8;
+	}
+}
+static struct section *spot_sec;
+
+static void lrows_add(int set, int kind, int sec, struct pkg *p, const char *t, const char *c) {
+	if (lset[set].n < LROWS_MAX) lset[set].r[lset[set].n++] = (struct lrow){ kind, sec, p, t, c };
+}
+
+static void lrow_draw(cairo_t *cr, int set, int i) {
+	if (i >= lset[set].n) return;
+	struct lrow *r = &lset[set].r[i];
+	switch (r->kind) {
+	case L_SPOT0: case L_SPOT1: {
+		struct pkg *spot = r->p;
+		double w = zmc.width - 2 * MARGIN, h = 150, y = r->kind == L_SPOT0 ? 0 : -76;
+		cairo_save(cr);
+		cairo_rectangle(cr, 0, 0, zmc.width, 76);
+		cairo_clip(cr);
+		zmc_accent(cr);
+		cairo_rectangle(cr, MARGIN, y, w, h);
+		cairo_fill(cr);
+		draw_tile_shaded(cr, MARGIN + w - 76, y + 14, 62, spot);
+		white(cr);
+		char caps[200];
+		snprintf(caps, sizeof(caps), "TOP OF \u201c%s\u201d", r->t);
+		for (char *c = caps; *c; c++) *c = (*c >= 'a' && *c <= 'z') ? *c - 32 : *c;
+		zmc_text_line(cr, caps, FONT_SEMIBOLD, 10.5, MARGIN + 14, y + 14, w - 104);
+		zmc_text_line(cr, pkg_title(spot), FONT_LIGHT, 30, MARGIN + 14, y + 66, w - 28);
+		zmc_text_line(cr, pkg_blurb(spot), FONT_REGULAR, 13, MARGIN + 14, y + 112, w - 28);
+		cairo_restore(cr);
+		break;
+	}
+	case L_HEAD:
+		if (r->sec >= 0) {
+			grey(cr);
+			double sw = zmc_text_width("see all", FONT_REGULAR, 14);
+			zmc_text(cr, "see all", FONT_REGULAR, 14, zmc.width - MARGIN - sw, 28, 0);
+		}
+		heading(cr, 20, r->t, r->c);
+		break;
+	case L_PKG:
+		row_paint(cr, 6, r->p);
+		break;
+	case L_NOTE:
+		note(cr, 8, r->t);
+		break;
+	case L_SKEL:
+		skel_row(cr, 6);
+		break;
+	}
+}
+
+static bool lrow_hit(int set, int i, double x, double y, struct zmc_hit *hit) {
+	if (i >= lset[set].n) return false;
+	struct lrow *r = &lset[set].r[i];
+	if (r->kind == L_HEAD && r->sec >= 0) {
+		double sw = zmc_text_width("see all", FONT_REGULAR, 14);
+		if (x < zmc.width - MARGIN - sw - 16) return false;
+		*hit = (struct zmc_hit){ .x = zmc.width - MARGIN - sw - 16, .y = 16, .w = sw + 32, .h = 44, .action = ACT_SEE_ALL, .arg = r->sec };
+		return true;
+	}
+	if (r->kind == L_PKG || r->kind == L_SPOT0 || r->kind == L_SPOT1) {
+		*hit = (struct zmc_hit){ .x = 0, .y = 0, .w = zmc.width, .h = 76, .action = ACT_LROW, .arg = set * 1000 + i };
+		return true;
+	}
+	return false;
+}
+
+static void draw0(cairo_t *cr, int i) { lrow_draw(cr, 0, i); }
+static void draw1(cairo_t *cr, int i) { lrow_draw(cr, 1, i); }
+static void draw2(cairo_t *cr, int i) { lrow_draw(cr, 2, i); }
+static bool hit0(int i, double x, double y, struct zmc_hit *h) { return lrow_hit(0, i, x, y, h); }
+static bool hit1(int i, double x, double y, struct zmc_hit *h) { return lrow_hit(1, i, x, y, h); }
+static bool hit2(int i, double x, double y, struct zmc_hit *h) { return lrow_hit(2, i, x, y, h); }
+
+static double lrows_show(cairo_t *cr, double y, int set) {
+	static void (*const draws[])(cairo_t *, int) = { draw0, draw1, draw2 };
+	static bool (*const hits[])(int, double, double, struct zmc_hit *) = { hit0, hit1, hit2 };
+	/* (+ the set: two lists never share a row's texture) */
+	struct zmc_list l = { .count = lset[set].n, .row_h = 76, .revision = lset[set].rev + (uint64_t)set + 16,
+		.draw_row = draws[set], .row_hit = hits[set] };
+	return zmc_list(cr, y, &l) + 24;
+}
+
 /* ---- ztOS apps: the store's own, built from source and signed ---------------------- */
 static struct zapps zapps;
 static bool zapps_busy, zapps_loaded;
@@ -635,6 +748,10 @@ static int zapp_shown = -1;
 static char zapp_note[240];
 
 struct zjob { struct zapps got; bool refresh; char id[128]; bool remove; const char *err; };
+
+static bool zapps_refreshed, zapps_acting, pend_remove;
+static char pend_id[128];
+static void zapps_start(bool refresh, const char *id, bool remove);
 
 static void zapps_done(void *arg) {
 	struct zjob *j = arg;
@@ -644,8 +761,20 @@ static void zapps_done(void *arg) {
 	zapps_loaded = true;
 	zmc_busy(false);
 	if (j->err && j->err[0]) snprintf(zapp_note, sizeof(zapp_note), "%s", j->err);
+	bool then_refresh = !j->refresh && !j->id[0] && !zapps_refreshed;
 	free(j);
 	zmc_redraw();
+	/* what is held shows at once; the network comes behind it */
+	zapps_acting = false;
+	if (pend_id[0]) {
+		char id[128];
+		snprintf(id, sizeof(id), "%s", pend_id);
+		pend_id[0] = 0;
+		zapps_start(false, id, pend_remove);
+	} else if (then_refresh) {
+		zapps_refreshed = true;
+		zapps_start(true, NULL, false);
+	}
 }
 
 static void zapps_work(void *arg) {
@@ -655,7 +784,12 @@ static void zapps_work(void *arg) {
 }
 
 static void zapps_start(bool refresh, const char *id, bool remove) {
-	if (zapps_busy) return;
+	if (zapps_busy) {
+		/* a refresh on a slow network must not hold up a tap */
+		if (id) { snprintf(pend_id, sizeof(pend_id), "%s", id); pend_remove = remove; zapps_acting = true; zmc_redraw(); }
+		return;
+	}
+	zapps_acting = id != NULL;
 	struct zjob *j = calloc(1, sizeof(*j));
 	j->refresh = refresh;
 	j->remove = remove;
@@ -728,10 +862,10 @@ static double draw_zapp(cairo_t *cr) {
 		zmc_accent(cr);
 		y += zmc_text(cr, zapp_note, FONT_REGULAR, 14, MARGIN, y, w) + 12;
 	}
-	int rows = (zapps_busy ? 0 : (a->update || !a->installed[0]) + (a->installed[0] ? 1 : 0));
+	int rows = (zapps_acting ? 0 : (a->update || !a->installed[0]) + (a->installed[0] ? 1 : 0));
 	action_band(cr, y, (rows ? rows : 1) * 58 + 12);
 	y += 12;
-	if (zapps_busy) {
+	if (zapps_acting) {
 		white(cr);
 		zmc_text_centred(cr, "working...", FONT_SEMILIGHT, 17, zmc.width / 2.0, y + 11);
 		cairo_new_path(cr);
@@ -751,6 +885,29 @@ static double draw_zapp_more(cairo_t *cr) {
 	y = zmc_field(cr, y, "licence", a->licence);
 	y = zmc_field(cr, y, "source", a->source);
 	return y + 24;
+}
+
+static void lrows_top(void) {
+	if (lset[SET_TOP].built) return;
+	lset[SET_TOP].built = true;
+	int from = -1;
+	struct pkg *spot = spotlight(&from);
+	if (spot) {
+		struct section *sp = sections.v[from];
+		lrows_add(SET_TOP, L_SPOT0, 0, spot, sp->title, NULL);
+		lrows_add(SET_TOP, L_SPOT1, 0, spot, sp->title, NULL);
+	}
+	for (int i = 0; i < sections.n; i++) {
+		struct section *sc = sections.v[i];
+		int first = i == from ? 1 : 0;
+		lrows_add(SET_TOP, L_HEAD, sc->items.n > first ? i : -1, NULL, sc->title, sc->caption);
+		if (!sc->items.n) {
+			if (loading && !sc->note) for (int k = 0; k < ROWS_SHOWN; k++) lrows_add(SET_TOP, L_SKEL, 0, NULL, NULL, NULL);
+			else lrows_add(SET_TOP, L_NOTE, 0, NULL, sc->note ? sc->note : "Nothing here yet.", NULL);
+			continue;
+		}
+		for (int k = first; k < sc->items.n && k < first + ROWS_SHOWN; k++) lrows_add(SET_TOP, L_PKG, 0, sc->items.v[k], NULL, NULL);
+	}
 }
 
 static double draw_top(cairo_t *cr) {
@@ -777,62 +934,8 @@ static double draw_top(cairo_t *cr) {
 		}
 		return y + 20;
 	}
-	/* the first list's first package, large */
-	int from = -1;
-	struct pkg *spot = spotlight(&from);
-	if (!spot && loading) {
-		skel_box(cr, MARGIN, y, zmc.width - 2 * MARGIN, 150);
-		y += 150 + 26;
-	}
-	if (spot) {
-		struct section *s = sections.v[from];
-		double w = zmc.width - 2 * MARGIN, h = 150;
-		zmc_accent(cr);
-		cairo_rectangle(cr, MARGIN, y, w, h);
-		cairo_fill(cr);
-		draw_tile_shaded(cr, MARGIN + w - 76, y + 14, 62, spot);
-		white(cr);
-		char caps[200];
-		snprintf(caps, sizeof(caps), "TOP OF “%s”", s->title);
-		for (char *c = caps; *c; c++) {
-			*c = (*c >= 'a' && *c <= 'z') ? *c - 32 : *c;
-		}
-		zmc_text_line(cr, caps, FONT_SEMIBOLD, 10.5, MARGIN + 14, y + 14, w - 104);
-		zmc_text_line(cr, pkg_title(spot), FONT_LIGHT, 30, MARGIN + 14, y + 66, w - 28);
-		zmc_text_line(cr, pkg_blurb(spot), FONT_REGULAR, 13, MARGIN + 14, y + 112, w - 28);
-		int idx = add_row(spot);
-		if (idx >= 0) {
-			zmc_add_hit(MARGIN, y, w, h, ACT_PKG, idx);
-		}
-		y += h + 26;
-	}
-	for (int i = 0; i < sections.n; i++) {
-		struct section *s = sections.v[i];
-		int first = (i == from) ? 1 : 0;	/* (the spotlight is already up there) */
-		if (s->items.n > first) {
-			grey(cr);
-			double sw = zmc_text_width("see all", FONT_REGULAR, 14);
-			zmc_text(cr, "see all", FONT_REGULAR, 14, zmc.width - MARGIN - sw, y + 8, 0);
-			zmc_add_hit(zmc.width - MARGIN - sw - 16, y - 4, sw + 32, 40, ACT_SEE_ALL, i);
-		}
-		y = heading(cr, y, s->title, s->caption);
-		if (!s->items.n) {
-			if (loading && !s->note) {
-				for (int k = 0; k < ROWS_SHOWN; k++) {
-					y = skel_row(cr, y);
-				}
-				y += 14;
-			} else {
-				y = note(cr, y, s->note ? s->note : "Nothing here yet.");
-			}
-			continue;
-		}
-		for (int k = first; k < s->items.n && k < first + ROWS_SHOWN; k++) {
-			y = row(cr, y, s->items.v[k]);
-		}
-		y += 14;
-	}
-	return y + 20;
+	lrows_top();
+	return lrows_show(cr, y, SET_TOP);
 }
 
 static double draw_cats(cairo_t *cr) {
@@ -929,10 +1032,12 @@ static double draw_installed(cairo_t *cr) {
 	if (!mine.n) {
 		y = note(cr, y, loading ? "Reading…" : "Nothing yet.");
 	}
-	for (int i = 0; i < mine.n && i < LIST_MAX; i++) {
-		y = row(cr, y, mine.v[i]);
+	if (!lset[SET_MINE].built) {
+		lset[SET_MINE].built = true;
+		for (int i = 0; i < mine.n && i < LIST_MAX; i++) lrows_add(SET_MINE, L_PKG, 0, mine.v[i], NULL, NULL);
 	}
-	return y + 20;
+	if (!lset[SET_MINE].n) return y + 20;
+	return lrows_show(cr, y, SET_MINE);
 }
 
 static double draw_search(cairo_t *cr) {
@@ -999,15 +1104,12 @@ static double draw_list(cairo_t *cr) {
 	if (!list_items.n) {
 		return note(cr, y, "Nothing here.");
 	}
-	for (int i = 0; i < list_items.n && i < LIST_MAX; i++) {
-		y = row(cr, y, list_items.v[i]);
+	if (!lset[SET_LIST].built) {
+		lset[SET_LIST].built = true;
+		for (int i = 0; i < list_items.n && i < LIST_MAX; i++) lrows_add(SET_LIST, L_PKG, 0, list_items.v[i], NULL, NULL);
+		if (list_items.n > LIST_MAX) lrows_add(SET_LIST, L_NOTE, 0, NULL, "and more: search to find them.", NULL);
 	}
-	if (list_items.n > LIST_MAX) {
-		char more[96];
-		snprintf(more, sizeof(more), "and %d more: search to find them.", list_items.n - LIST_MAX);
-		y = note(cr, y, more);
-	}
-	return y + 20;
+	return lrows_show(cr, y, SET_LIST);
 }
 
 static struct zmc_app app;
@@ -1294,11 +1396,21 @@ static void install_finished(bool ok) {
 }
 
 static void activate(int action, int arg) {
+	if (action == ACT_SEE_ALL || action == ACT_CAT || action == ACT_GROUP) {
+		zmc_list_lock(true);	/* the list's items are about to be replaced */
+		lset[SET_LIST].n = 0;
+		lset[SET_LIST].built = false;
+		lset[SET_LIST].rev += 8;
+		zmc_list_lock(false);
+	}
 	if (action != ACT_SEARCHBOX && zmc.page == P_SEARCH && typing) {
 		typing = false;
 		zmc_keyboard(false);
 	}
 	switch (action) {
+	case ACT_LROW:
+		if (arg / 1000 < SETS && arg % 1000 < lset[arg / 1000].n && lset[arg / 1000].r[arg % 1000].p) open_details(lset[arg / 1000].r[arg % 1000].p);
+		break;
 	case ACT_ZAPP:
 		zapp_shown = arg;
 		zapp_note[0] = 0;
@@ -1419,7 +1531,7 @@ static bool back(void) {
 		zmc_go(P_ZAPPS, -1);
 		return true;
 	}
-	int to = n_nav > 0 ? nav[--n_nav] : P_TOP;
+	int to = n_nav > 0 ? nav[--n_nav] : P_ZAPPS;
 	if (zmc.page == P_PROGRESS && inst.state != INST_RUNNING) {
 		inst_clear();
 	}
@@ -1429,7 +1541,7 @@ static bool back(void) {
 
 static void arrived(int page) {
 	if (page == P_TOP || page == P_CATS || page == P_INSTALLED || page == P_ZAPPS) zmc_pivot_changed();
-	if (page == P_ZAPPS && !zapps_loaded) zapps_start(true, NULL, false);
+	if (page == P_ZAPPS && !zapps_loaded) zapps_start(false, NULL, false);
 	if (page == P_INSTALLED) {
 		read_updates();
 		check_aur_updates();
@@ -1524,5 +1636,6 @@ int main(int argc, char **argv) {
 	jobs_init();
 	inst_init(install_changed, install_finished);
 	start_load();
-	return zmc_run(&app, P_TOP);
+	zapps_start(false, NULL, false);
+	return zmc_run(&app, P_ZAPPS);
 }
