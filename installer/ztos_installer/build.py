@@ -52,7 +52,7 @@ class Settings:
 
 
 # the zrn-sdk an image carries; a change here is a change to what apps run on
-ZRN_SDK_COMMIT = "0fda45c92784ccaa111396c3c787d9e8f83de4e3"
+ZRN_SDK_COMMIT = "6140aa62cfae3e47677f533a274face019bcbc12"
 
 
 def say(*words):
