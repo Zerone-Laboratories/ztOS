@@ -382,10 +382,13 @@ static void apply_load_(void *arg) {
 static void load_done(void *arg) {
 	struct load *l = arg;
 	if (l->sections.n) {
+		zmc_list_lock(true);
+		lrows_forget();
 		rows_forget();
 		vec_free(&sections, section_free);
 		sections = l->sections;
 		memset(&l->sections, 0, sizeof(l->sections));
+		zmc_list_lock(false);
 	}
 	free_load(l);
 	loading = false;
