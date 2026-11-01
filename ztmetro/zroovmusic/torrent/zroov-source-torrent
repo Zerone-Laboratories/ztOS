@@ -1,0 +1,6 @@
+#!/usr/bin/python3 -I
+import os, sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import zroov_torrent
+sys.exit(zroov_torrent.main(sys.argv))
