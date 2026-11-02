@@ -147,3 +147,45 @@ playing. It is deleted when the engine stops.
 Everything goes to PipeWire through libmpv's `ao=pipewire`, as a stream named
 ZroovMusic. libmpv is loaded only while something plays or is paused; 120 s after a
 pause it is freed, and `resume` reopens the track where it was.
+
+## Additions for helpers
+
+A `resolve` run with `ZROOV_PREFETCH=1` in the environment is ahead of time, for
+gapless: answer only if it is cheap, else send an error. The engine drops a
+prefetched answer that has `hold` or `headers`. A stream line may carry `"bits"`
+(say, 24), since the engine can only read FLAC's bit depth from a local path.
+
+`ZROOV_VOLUME` sets the starting volume, for tests.
+
+## Measured on the S9 (1 Nov 2026, real network, stream volume low)
+
+Tap here means the socket or function call, not a finger on a UI; first audio
+means the first non-silent sample on the ztos-speaker monitor. Same search, same
+track, runs alternated, a fresh process each run.
+
+| arm                                        | median  | worst   |
+|--------------------------------------------|---------|---------|
+| old `apps/music` as shipped                | no audio in 5 of 5 (45 s limit) | |
+| old, test copy changed to play format 18   | 4.06 s  | 5.24 s  |
+| zroovd, fast path                          | 1.64 s  | 2.04 s  |
+| zroovd, offline copy (engine's own figure) | 0.16 s  | one run |
+| zroovd, yt-dlp fallback (engine's own figure) | 9.9 s | one run |
+
+| state                       | CPU, % of one core | context switches/s |
+|-----------------------------|--------|-------|
+| stopped, client connected   | 0.03   | 0.0   |
+| paused, libmpv loaded       | 0.00   | 0.1   |
+| playing a stream            | 8.4    | 257   |
+| playing local FLAC 24/48    | 6.2    | 264   |
+| old stack playing, with cava | 22.9  | 625   |
+
+## Known limits
+
+**FLAC above 48 kHz reaches the speaker resampled.** The engine hands PipeWire the
+file's own format (24/96 measured as S32LE 96000 on the stream), but the phone's
+graph has `clock.allowed-rates = [ 48000 ]`, so PipeWire converts to 48 kHz after
+that, as it does for 44.1 kHz. 24/48 is not rate converted. Changing this is a
+system audio decision, outside the engine.
+
+**yt-dlp's `bestaudio` is dead on this phone.** With no JS runtime, its links answer
+403 past the first megabyte. The fallback asks for format 18, about 96 kb/s AAC.
