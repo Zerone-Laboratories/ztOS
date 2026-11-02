@@ -28,6 +28,7 @@
  */
 #define _GNU_SOURCE
 #include "core/zrnboard.h"
+#include "core/ztos-hw.h"
 #ifdef HAVE_ZTOS_IAL
 #include <ztos-ial.h>
 #endif
@@ -5101,42 +5102,16 @@ static void set_scroll(struct zt_server *server, double scroll) {
 /* ---- status bar ---------------------------------------------------------- */
 
 static int read_battery(void) {
-#ifdef HAVE_ZTOS_IAL
-	/* the battery ztOSIAL's Power1 names, asked once */
-	static char node[192];
-	static bool asked;
-	if (!asked) {
-		asked = true;
-		if (ztos_ial_get_string(NULL, "Power1", "CapacityNode", node, sizeof(node)) < 0)
-			node[0] = 0;
+	/* the battery ztOSIAL's Power1 names, else the one its generic backend
+	 * would pick (core/ztos-hw.h), asked once */
+	int capacity = -1;
+	FILE *f = fopen(hw_file(hw_battery(), "capacity"), "r");
+	if (f) {
+		if (fscanf(f, "%d", &capacity) != 1)
+			capacity = -1;
+		fclose(f);
 	}
-	if (node[0]) {
-		FILE *f = fopen(node, "r");
-		int capacity = -1;
-		if (f) {
-			if (fscanf(f, "%d", &capacity) != 1) capacity = -1;
-			fclose(f);
-		}
-		if (capacity >= 0) return capacity;
-	}
-#endif
-	static const char *names[] = { "battery", "max77705-battery", "max170xx_battery", NULL };
-	for (int i = 0; names[i]; i++) {
-		char path[128];
-		int capacity = -1;
-		snprintf(path, sizeof(path), "/sys/class/power_supply/%s/capacity", names[i]);
-		FILE *f = fopen(path, "r");
-		if (f) {
-			if (fscanf(f, "%d", &capacity) != 1) {
-				capacity = -1;
-			}
-			fclose(f);
-		}
-		if (capacity >= 0) {
-			return capacity;
-		}
-	}
-	return -1;
+	return capacity;
 }
 
 static bool wifi_up(void) {
