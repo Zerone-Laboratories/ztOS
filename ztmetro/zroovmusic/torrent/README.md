@@ -48,6 +48,7 @@ Stored in `~/.config/zroovmusic/torrent.json` (0600, indexer links can hold keys
 | `seed_after_s` | `0` | how long to keep sharing after the track is left |
 | `cache_mib` | `1024` | oldest entries go first |
 | `buffer_seconds` | `5` | audio held before the player starts |
+| `ahead_low_s`, `ahead_high_s` | `20`, `50` | seconds fetched beyond what the player has read: refill below low, up to high |
 | `idle_stop_s` | `30` | pauses the torrent when nothing has been read for this long |
 | `dht_for_magnets` | `false` | a magnet with no tracker finds no peers without it |
 

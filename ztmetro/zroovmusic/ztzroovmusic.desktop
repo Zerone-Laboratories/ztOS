@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=ZroovMusic
+Comment=Music: library, playlists, search, offline
+Exec=ztzroovmusic
+Terminal=false
+Type=Application
+Icon=ztzroovmusic
+Categories=AudioVideo;Audio;Player;

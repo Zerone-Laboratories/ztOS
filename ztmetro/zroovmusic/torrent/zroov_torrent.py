@@ -40,6 +40,8 @@ DEFAULTS = {
     "cache_mib": 1024,
     "buffer_seconds": 5,
     "idle_stop_s": 30,
+    "ahead_low_s": 20,  # fetched audio beyond what the player has read: refill below this
+    "ahead_high_s": 50,  # and up to this
     "dht_for_magnets": False,
 }
 UA = "ZroovMusic/1 (ztOS)"
@@ -327,6 +329,13 @@ def ia_search(q, settings, get=http_get, max_items=6):
     return out
 
 
+def tl(what):
+    path = os.environ.get("ZROOV_TIMELINE")
+    if path:
+        with open(path, "a") as f:
+            f.write(f"{int(time.time() * 1000)} py {what}\n")
+
+
 # --- the source ---------------------------------------------------------------
 def split_query(text):
     """The engine passes one string: JSON fields, or "Artist - Title", or a title."""
@@ -606,18 +615,22 @@ class Source:
         if not self.consented():
             self.emit("error", reason="consent_required: " + DISCLOSURE)
             return 0
+        tl("resolve")
         o = self.offers.get(ref)
         if not o:
             self.emit("error", reason="unknown offer, search again")
             return 0
         try:
             args = self._helper_args(o, "play")
+            tl("torrent file ready")
         except Exception as e:
             self.emit("error", reason=redact(e))
             return 0
         known = (o.get("verified") or {}).get("duration") or o.get("claimed_duration")
         rate = o["size"] / known if known and o["size"] else 200_000
-        args += ["--buffer-bytes", str(int(rate * float(self.settings["buffer_seconds"])))]
+        args += ["--buffer-bytes", str(int(rate * float(self.settings["buffer_seconds"]))),
+                 "--bytes-per-s", str(int(rate)),
+                 "--ahead-low-s", str(self.settings["ahead_low_s"]), "--ahead-high-s", str(self.settings["ahead_high_s"])]
         p = self.child = self._spawn(args)
 
         def on_term(*_):
@@ -640,7 +653,9 @@ class Source:
                     answered = True
                     on_term()
             elif k == "ready" and not answered:
+                tl("helper ready")
                 why = self._read_own_header(o, ev["url"])
+                tl("own header read")
                 self._save_offers()
                 answered = True
                 if why:
@@ -648,6 +663,9 @@ class Source:
                     on_term()
                     continue
                 v = o["verified"]
+                if v["duration"] and o["size"]:  # the real rate, also when no length was known
+                    p.stdin.write(f"rate {int(o['size'] / v['duration'])}\n")
+                    p.stdin.flush()
                 self.emit("stream", url=ev["url"], via="torrent", hold=True, title="", artist="",
                           duration=v["duration"] or 0, bits=v["bit_depth"], offer=self.public(o), ready_ms=ev["ms"])
             elif k == "stats":

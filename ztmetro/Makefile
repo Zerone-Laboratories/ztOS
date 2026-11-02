@@ -300,3 +300,7 @@ check-demoloop-stop:
 # The native agent uses polkit's async callback API directly.
 auth/ztos-polkit-agent: auth/ztos-polkit-agent.c
 	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags polkit-agent-1 gio-unix-2.0) -o $@ $< $(shell pkg-config --libs polkit-agent-1 gio-unix-2.0)
+
+# ZroovMusic UI; playback is zroovd (zroovmusic/engine).
+zroovmusic/ztzroovmusic: zroovmusic/ztzroovmusic.c zroovmusic/zv-icons.h $(CORE_DEPS)
+	$(APP_BUILD) -o $@ zroovmusic/ztzroovmusic.c store/json.c $(CORE) $(APP_LIBS) -lpthread -lm -lz

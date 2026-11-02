@@ -48,6 +48,8 @@ struct Opts {
     int idle_stop_s = 30, seed_after_s = 0;
     long long buffer_bytes = 1 << 20;
     long long head_bytes = 64 * 1024;
+    long long bytes_per_s = 200000;
+    int ahead_low_s = 20, ahead_high_s = 50;
 };
 static Opts O;
 
@@ -73,6 +75,17 @@ static std::string hexs(const std::string &in) {
 }
 static void err(const std::string &what) {
     emit("{\"ev\":\"error\",\"what\":\"" + esc(what) + "\"}");
+}
+
+// ZROOV_TIMELINE=path appends "realtime-ms what" lines, for measuring start-up.
+static FILE *g_tl = nullptr;
+static void tl(const std::string &what) {
+    if (!g_tl) return;
+    timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    std::lock_guard<std::mutex> l(out_mu);
+    fprintf(g_tl, "%lld bt %s\n", (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000, what.c_str());
+    fflush(g_tl);
 }
 
 static clk::time_point T0;
@@ -307,7 +320,7 @@ static void pick_file(lt::torrent_handle &h, int idx) {
             h.set_piece_deadline(lt::piece_index_t(p), 200);
         }
     } else {
-        h.file_priority(fi, lt::default_priority);
+        // Pieces are opened by the read-ahead window in main(), never the whole file.
         h.set_flags(lt::torrent_flags::sequential_download);
     }
     S.selected = true;
@@ -334,6 +347,9 @@ int main(int argc, char **argv) {
         else if (k == "--idle-stop-s") O.idle_stop_s = atoi(v.c_str());
         else if (k == "--seed-after-s") O.seed_after_s = atoi(v.c_str());
         else if (k == "--buffer-bytes") O.buffer_bytes = atoll(v.c_str());
+        else if (k == "--bytes-per-s") O.bytes_per_s = atoll(v.c_str());
+        else if (k == "--ahead-low-s") O.ahead_low_s = atoi(v.c_str());
+        else if (k == "--ahead-high-s") O.ahead_high_s = atoi(v.c_str());
         else { err("unknown option " + k); return 2; }
     }
     if (O.dir.empty() || (O.torrent.empty() && O.magnet.empty())) { err("need --dir and --torrent or --magnet"); return 2; }
@@ -354,10 +370,13 @@ int main(int argc, char **argv) {
     }
 
     g_debug = getenv("ZROOV_BT_DEBUG") != nullptr;
+    if (const char *t = getenv("ZROOV_TIMELINE")) g_tl = fopen(t, "a");
+    tl("start");
     lt::settings_pack sp;
     sp.set_int(lt::settings_pack::alert_mask,
                lt::alert_category::status | lt::alert_category::error | lt::alert_category::storage |
                    lt::alert_category::tracker | lt::alert_category::piece_progress |
+                   (g_tl ? lt::alert_category::connect | lt::alert_category::peer | lt::alert_category::block_progress : lt::alert_category_t{}) |
                    (g_debug ? lt::alert_category::connect | lt::alert_category::peer | lt::alert_category::peer_log : lt::alert_category_t{}));
     // Nothing that opens router ports or announces beyond what the torrent asks for.
     sp.set_bool(lt::settings_pack::enable_upnp, false);
@@ -368,6 +387,9 @@ int main(int argc, char **argv) {
     sp.set_int(lt::settings_pack::upload_rate_limit, std::max(O.upload_kib, 1) * 1024);
     sp.set_int(lt::settings_pack::download_rate_limit, O.download_kib * 1024);
     sp.set_int(lt::settings_pack::connections_limit, 30);
+    // The default merges up to 16 MiB into one web seed request. Such a range is
+    // committed to the server: it keeps pulling past any window and cannot be reordered.
+    sp.set_int(lt::settings_pack::urlseed_max_request_bytes, 1 << 20);
     sp.set_int(lt::settings_pack::aio_threads, 2);
     sp.set_int(lt::settings_pack::hashing_threads, 1);
     if (!iface.empty()) {
@@ -402,6 +424,7 @@ int main(int argc, char **argv) {
     }
     if (O.mode == "play" && start_http()) { err("http bind"); return 5; }
 
+    int win_from = 0, win_to = -1;
     bool meta_sent = false, ready_sent = false, head_sent = false, scrape_got = false;
     bool user_paused = false, idle_paused = false, net_paused = false, stopping = false;
     long long first_data_ms = -1;
@@ -441,6 +464,19 @@ int main(int argc, char **argv) {
         bool state_changed = false;
         for (lt::alert *a : alerts) {
             if (g_debug) fprintf(stderr, "%s: %s\n", a->what(), a->message().c_str());
+            if (g_tl) {
+                if (auto *bf = lt::alert_cast<lt::block_finished_alert>(a)) {
+                    int i = static_cast<int>(bf->piece_index);
+                    if (S.selected && i - S.first_piece < 3 && i >= S.first_piece) tl("block p+" + std::to_string(i - S.first_piece) + " b" + std::to_string(bf->block_index));
+                } else if (auto *pf = lt::alert_cast<lt::piece_finished_alert>(a)) {
+                    int i = static_cast<int>(pf->piece_index);
+                    if (S.selected && i - S.first_piece < 60) tl("piece p+" + std::to_string(i - S.first_piece));
+                } else if (lt::alert_cast<lt::hash_failed_alert>(a) || lt::alert_cast<lt::peer_disconnected_alert>(a) ||
+                           lt::alert_cast<lt::peer_connect_alert>(a) || lt::alert_cast<lt::url_seed_alert>(a) ||
+                           lt::alert_cast<lt::block_timeout_alert>(a) || lt::alert_cast<lt::torrent_checked_alert>(a)) {
+                    tl(std::string(a->what()) + " " + a->message());
+                }
+            }
             if (auto *m = lt::alert_cast<lt::metadata_received_alert>(a)) { (void)m; if (!meta_sent) send_meta(); }
             else if (auto *c = lt::alert_cast<lt::torrent_checked_alert>(a)) {
                 (void)c;
@@ -493,11 +529,14 @@ int main(int argc, char **argv) {
                 std::string line = in_buf.substr(0, nl);
                 in_buf.erase(0, nl + 1);
                 if (line.rfind("select ", 0) == 0 && meta_sent) {
+                    tl("select");
                     pick_file(h, atoi(line.c_str() + 7));
                     h.scrape_tracker();
+                    if (O.mode == "play") { win_from = S.first_piece; win_to = S.first_piece - 2; }
                     apply_pause();
                 } else if (line == "pause") { user_paused = true; apply_pause(); }
                 else if (line == "resume") { user_paused = false; apply_pause(); }
+                else if (line.rfind("rate ", 0) == 0) { long long r = atoll(line.c_str() + 5); if (r > 0) O.bytes_per_s = r; }
                 else if (line == "stop") {
                     stopping = true;
                     seed_until = clk::now() + std::chrono::seconds(O.seed_after_s);
@@ -553,10 +592,28 @@ int main(int argc, char **argv) {
             std::lock_guard<std::mutex> l(S.mu);
             if (S.playhead_moved) {
                 S.playhead_moved = false;
-                h.clear_piece_deadlines();
-                int window = std::max(4, int((4 << 20) / std::max(1, S.piece_len)));
-                for (int i = 0; i < window && S.playhead + i <= S.last_piece; i++)
-                    h.set_piece_deadline(lt::piece_index_t(S.playhead + i), 300 + i * 500);
+                // The player only reads ahead by its own bounded cache, so its read
+                // position limits what is fetched. Refill in bursts, between a low and
+                // a high mark, so the radio can rest between them.
+                long long low = O.bytes_per_s * O.ahead_low_s, high = O.bytes_per_s * O.ahead_high_s;
+                bool jumped = S.playhead < win_from || S.playhead > win_to + 1;
+                if (jumped) {
+                    for (int p = win_from; p <= win_to; p++)
+                        h.piece_priority(lt::piece_index_t(p), lt::dont_download);
+                    win_from = S.playhead;
+                    win_to = S.playhead - 1;
+                    h.clear_piece_deadlines();
+                    int urgent = std::max(2, int(O.buffer_bytes / std::max(1, S.piece_len)) + 1);
+                    for (int i = 0; i < urgent && S.playhead + i <= S.last_piece; i++)
+                        h.set_piece_deadline(lt::piece_index_t(S.playhead + i), 200 + i * 200);
+                }
+                if ((long long)(win_to - S.playhead + 1) * S.piece_len < low) {
+                    int to = std::min<long long>(S.last_piece, S.playhead + std::max<long long>(4, high / S.piece_len));
+                    for (int p = win_to + 1; p <= to; p++)
+                        h.piece_priority(lt::piece_index_t(p), lt::default_priority);
+                    if (to > win_to) tl("window to p+" + std::to_string(to - S.first_piece) + " at p+" + std::to_string(S.playhead - S.first_piece));
+                    win_to = std::max(win_to, to);
+                }
             }
             if (!ready_sent) {
                 long long contig = 0;
@@ -566,6 +623,7 @@ int main(int argc, char **argv) {
                     contig += std::min(end, S.file_offset + S.file_size) - std::max(start, S.file_offset);
                 }
                 if (contig >= std::min(O.buffer_bytes, S.file_size)) {
+                    tl("ready contig=" + std::to_string(contig));
                     emit("{\"ev\":\"ready\",\"url\":\"http://127.0.0.1:" + std::to_string(g_port) + "/" + g_token +
                          "/stream.flac\",\"ms\":" + std::to_string(ms_since_start()) + ",\"buffered\":" + std::to_string(contig) +
                          ",\"file_size\":" + std::to_string(S.file_size) + "}");
