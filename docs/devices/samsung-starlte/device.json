@@ -191,14 +191,14 @@
     {
       "category": "Camera",
       "feature": "Cameras",
-      "status": "broken",
-      "notes": "No driver yet"
+      "status": "working",
+      "notes": "Rear and front, through zrn-cam; front image the right way up, Samsung tuning for quality"
     },
     {
       "category": "Location",
       "feature": "GPS",
-      "status": "broken",
-      "notes": "No driver yet"
+      "status": "partial",
+      "notes": "Location reaches Android apps; Google Maps works, Uber cannot locate yet"
     },
     {
       "category": "Other",
@@ -223,6 +223,12 @@
       "feature": "ztOSIAL",
       "status": "working",
       "notes": "All 13 interfaces pass `ztos-ial test`"
+    },
+    {
+      "category": "Software",
+      "feature": "App store (ztOS apps)",
+      "status": "working",
+      "notes": "Signed ztOS apps from the store; needs ztOS BETA-1.1"
     }
   ],
   "notes": [
