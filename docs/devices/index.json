@@ -2,6 +2,7 @@
   "devices": [
     "samsung-starlte",
     "xiaomi-klee",
-    "samsung-j5"
+    "samsung-j5",
+    "oneplus-fajita-fajita"
   ]
 }
