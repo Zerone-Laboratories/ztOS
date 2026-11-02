@@ -27,6 +27,9 @@ module_param(init_verified, uint, 0444);
 static unsigned int mif_gate_before, mif_requests_before;
 module_param(mif_gate_before, uint, 0444);
 module_param(mif_requests_before, uint, 0444);
+static uint cp_settle_ms = 300, cp_settle_waited_us;
+module_param(cp_settle_ms, uint, 0644);
+module_param(cp_settle_waited_us, uint, 0444);
 module_param(prepare_only, bool, 0600);
 MODULE_PARM_DESC(prepare_only, "prepare and restore inside saved CPU context without SMC");
 static unsigned long suspend_enter, resume;
@@ -542,6 +545,16 @@ static int sleep_finisher(unsigned long state)
 	wmb();
 	for (i = 0; i < 16; i++)
 		pending_before[i] = readl_relaxed(mapped_base(0x10100000) + 0x1200 + i * 4) & readl_relaxed(mapped_base(0x10100000) + 0x1100 + i * 4);
+	/* modem_suspend's pda_active:0 interrupt makes the CP raise its MIF
+	 * request (bit 0) while it handles it; it drops it about 100 ms later.
+	 * Stock's slower suspend path leaves that time; ours must wait, or
+	 * ACPM finds a live CP request and keeps MIF up. */
+	cp_settle_waited_us = 0;
+	while (((readl_relaxed(mapped_base(0x02040000) + 0xf8ac) >> 16) & 0x01) &&
+	       cp_settle_waited_us < cp_settle_ms * 1000) {
+		udelay(500);
+		cp_settle_waited_us += 500;
+	}
 	mif_requests_before = (readl_relaxed(mapped_base(0x02040000) + 0xf8ac) >> 16) & 0xff;
 	grp4_before = readl_relaxed(grp4);
 	chub_status_before = readl_relaxed(mapped_base(0x14060000) + 0x4084);
@@ -561,10 +574,10 @@ static int sleep_finisher(unsigned long state)
 	grp4_now = readl_relaxed(grp4);
 	/* Keep this before enabling the MIF gate: retained console records must
 	 * distinguish a missing AP request from corruption of earlier log text. */
-	pr_info("zrn-system-sleep: handoff mif_sleep=%u requests=%02x gate=%u grp4=%08x->%08x chub=%08x eint_eff=%08x hub_line=%d grp4_at_smc=%08x\n",
+	pr_info("zrn-system-sleep: handoff mif_sleep=%u requests=%02x gate=%u grp4=%08x->%08x chub=%08x eint_eff=%08x hub_line=%d grp4_at_smc=%08x cp_wait=%uus\n",
 		mif_sleep, mif_requests_before,
 		readl_relaxed(mapped_base(0x02040000) + 0xf95c), grp4_before, grp4_cleared,
-		chub_status_before, eint_effective, hub_line, grp4_now);
+		chub_status_before, eint_effective, hub_line, grp4_now, cp_settle_waited_us);
 	/* again, after the console: what ACPM will find (zrn-sleepd's fw-abort) */
 	grp4_at_smc = readl_relaxed(grp4);
 	/* Keep the enable/SMC/abort-disable instructions in one cache line.
