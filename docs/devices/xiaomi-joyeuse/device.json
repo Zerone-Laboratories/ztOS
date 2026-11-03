@@ -1,0 +1,225 @@
+{
+  "id": "xiaomi-joyeuse",
+  "name": "Xiaomi Note 9 Pro",
+  "maker": "Xiaomi",
+  "model": "M2003J6B2G",
+  "codename": "joyeuse",
+  "maintainer": "Gregory Brzezinski",
+  "contact": "https://github.com/cyber-dream",
+  "added": "2026-11-03",
+  "summary": "UI works smooth, has a \"classic\" problem with an audio like other distros on this SOC",
+  "photo": "photo.jpg",
+  "photo_caption": "",
+  "specs": [
+    [
+      "SoC",
+      "Snapdragon 720G (SM7125)"
+    ],
+    [
+      "CPU",
+      "2× Kryo 465 Gold at 2.3 GHz, 6× Kryo 465 Silver at 1.8 GHz"
+    ],
+    [
+      "GPU",
+      "Adreno 618"
+    ],
+    [
+      "RAM",
+      "4/6/8 Gb"
+    ],
+    [
+      "Storage",
+      "64 or 128 GB"
+    ],
+    [
+      "Display",
+      "6.67 in, 1080×2400 IPS LCD"
+    ],
+    [
+      "Battery",
+      "5020 mAh"
+    ],
+    [
+      "Kernel",
+      "Mainline Linux 6.14.7 (sm7125-mainline)"
+    ],
+    [
+      "Released",
+      "2020"
+    ]
+  ],
+  "install": {
+    "markdown": "> **This erases the phone.** ztOS writes USERDATA, CACHE, DTBO and BOOT. It\n> never touches the IMEI, the modem's partitions or persist.\n\nFor the Redmi Note 9 Pro (`joyeuse`) and 9S (`curtana`), not the 5G.\n\n## What you need\n\n- A Linux computer with 30 GB free\n- A USB-C data cable, and the phone charged above 50%\n\n## 1. Install the tools on your computer\n\n```sh\nsudo pacman -S --needed git python clang lld llvm bc ccache flex bison pahole \\\n  dtc dosfstools mtools cpio e2fsprogs libarchive android-tools qemu-user-static qemu-user-static-binfmt\n```\n\n## 2. Get ztOS\n\n```sh\ngit clone https://github.com/cyber-dream/ztOS-miatoll.git\ncd ztOS-miatoll\ninstaller/ztos doctor\n```\n\n## 3. Unlock the bootloader\n\n1. In MIUI: Developer options > **Mi Unlock status**, bind your Mi account.\n2. In fastboot (Volume Down + Power), unlock with Xiaomi's **Mi Unlock** tool. It may ask you to wait some days.\n\n## 4. Install ztOS\n\n```sh\nmkdir -p build && echo joyeuse-huaxing > build/miatoll-variant   # or curtana-, -tianma\ndevices/xiaomi-miatoll/kernel/build-kernel.sh\ninstaller/ztos build --target miatoll --user YOURNAME --password YOURPASSWORD\ndevices/xiaomi-miatoll/scripts/flash.sh    # phone in fastboot\n```\n\nThe build takes about 1–1½ hours the first time.\n\n## 5. Start ztOS\n\nThe first start takes about a minute. Then log in with your user name and\npassword. Over USB: `ssh YOURNAME@172.16.42.1`.\n\nSave the phone's own partitions once with\n`devices/xiaomi-miatoll/scripts/backup.sh YOURNAME@172.16.42.1`.\n\n## If something goes wrong\n\n| What you see | What to do |\n|---|---|\n| A black screen, but `ssh` works | Your phone has the other panel: write `joyeuse-tianma` to `build/miatoll-variant`, run `devices/xiaomi-miatoll/boot/build-boot.sh` and `flash.sh --boot-only` |\n| `the battery is too low for the bootloader` | Charge it switched off for half an hour |\n| `pacman` times out | Put `Server = http://de.mirror.archlinuxarm.org/$arch/$repo` first in `/etc/pacman.d/mirrorlist` |\n| Back to Android | Flash Xiaomi's fastboot ROM with its `flash_all.sh` |"
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "Panel",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "CPU, frequency scaling",
+      "status": "partial",
+      "notes": "It needs to calibrate zrnperfd for this SOC"
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charging",
+      "status": "partial",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "Sleep (suspend)",
+      "status": "partial",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "broken",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Mobile data",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "SIM and signal",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphone",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Headphones",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient light",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, gyroscope",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Proximity",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Camera",
+      "feature": "Cameras",
+      "status": "broken",
+      "notes": ""
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "ztMETRO",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "Android apps (Waydroid)",
+      "status": "broken",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "ztOSIAL (ztos-ial test)",
+      "status": "untested",
+      "notes": ""
+    }
+  ],
+  "notes": []
+}
