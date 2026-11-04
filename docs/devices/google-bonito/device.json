@@ -1,0 +1,254 @@
+{
+  "id": "google-bonito",
+  "name": "Google Pixel 3a XL",
+  "maker": "Google",
+  "model": "G020C",
+  "codename": "bonito",
+  "maintainer": "Vachagan Grigoryan",
+  "contact": "https://github.com/VachaganGrigoryan",
+  "added": "2026-11-04",
+  "summary": "Experimental cross port built with ztConflo (GSI 0.2.1 + postmarketOS fallback) on the mainline linux-postmarketos-qcom-sdm670 7.2.3 kernel. It boots through the postmarketOS initramfs with the root on userdata, and ztMETRO runs on the Adreno 615 (freedreno). Wi-Fi, Bluetooth, touch, speaker and USB networking work after fixes that ztConflo doesn't do yet: kernel/DTB variant, Qualcomm firmware, rmtfs/tqftpserv, fstab, qbootctl. All are in the guide and in https://github.com/VachaganGrigoryan/ztos-ports/tree/main/ports/google-bonito. Tested on one unit with the Samsung panel.",
+  "photo": "photo.jpg",
+  "photo_caption": "",
+  "specs": [
+    [
+      "SoC",
+      "Qualcomm Snapdragon 670 (SDM670)"
+    ],
+    [
+      "CPU",
+      "8 cores: 2× Kryo 360 Gold 2.0 GHz + 6× Kryo 360 Silver 1.7 GHz"
+    ],
+    [
+      "GPU",
+      "Adreno 615 (freedreno, OpenGL ES 3.2)"
+    ],
+    [
+      "RAM",
+      "4 GB LPDDR4X"
+    ],
+    [
+      "Storage",
+      "64 GB eMMC"
+    ],
+    [
+      "Display",
+      "6.0″ OLED 1080×2160; Samsung SOFEF00 (sdc) or Tianma panel"
+    ],
+    [
+      "Battery",
+      "3700 mAh"
+    ],
+    [
+      "Kernel",
+      "linux-postmarketos-qcom-sdm670 7.2.3 (mainline)"
+    ],
+    [
+      "Released",
+      "2019"
+    ]
+  ],
+  "install": {
+    "markdown": "> **This erases the phone.** The current slot's `boot` partition and all of `userdata` are overwritten, so every app, photo and file is lost. The bootloader, the modem, the radio partitions and the other A/B slot are not touched. To go back to Android, flash a [Google factory image](https://developers.google.com/android/images) or use [flash.android.com](https://flash.android.com/).\n\nThis is an **experimental cross port** built with [ztConflo](https://github.com/Zerone-Laboratories/ztconflo) from postmarketOS's mainline port. It was tested on a Pixel 3a XL (`bonito`) with the Samsung panel. The Pixel 3a (`sargo`) uses the same SoC and kernel but was **not** tried. Every fix in this guide is explained in [FIXES.md](https://github.com/VachaganGrigoryan/ztos-ports/blob/main/ports/google-bonito/FIXES.md). The files it installs are in [`files/`](https://github.com/VachaganGrigoryan/ztos-ports/tree/main/ports/google-bonito/files).\n\n## What you need\n\n- A Pixel 3a XL whose bootloader can be unlocked (carrier-locked units, such as Verizon, cannot). Tested on the final Android 12 bootloader `b4s4-0.4-8048689`.\n- An **x86-64 Arch-based Linux** computer, or a privileged `archlinux` container, with about 30 GB free and Python 3.12 or newer. ztConflo requires Arch.\n- `android-tools` (`adb`, `fastboot`) on the computer the phone is plugged into. A USB data cable. The phone charged above 50%.\n- About 1.5 hours. The two builds take about 25 minutes and 5 minutes.\n\n## 1. Unlock the bootloader\n\n1. On Android: **Settings → About phone →** tap **Build number** 7 times. Then in **Developer options**, turn on **OEM unlocking** and **USB debugging**.\n2. Run the commands below, then confirm on the phone with the volume and power keys. **This wipes the phone.**\n\n```sh\nadb reboot bootloader\nfastboot flashing unlock\n```\n\nGoogle's docs: [Locking/unlocking the bootloader](https://source.android.com/docs/core/architecture/bootloader/locking_unlocking).\n\n## 2. Prepare the build computer\n\n```sh\nsudo pacman -S --needed git python python-pip base-devel util-linux libarchive dosfstools mtools \\\n  e2fsprogs zstd rsync arch-install-scripts qemu-user-static qemu-user-static-binfmt \\\n  qt6-base pyside6 multipath-tools android-tools\n# pmbootstrap from source: PyPI had no installable build for Python 3.14\npip install --user --break-system-packages git+https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git\nexport PATH=$HOME/.local/bin:$PATH\n```\n\n- **Why the extra packages:**\n  - `qt6-base`/`pyside6` provide `uic` for the SDK apps.\n  - `multipath-tools` provides `kpartx` for pmbootstrap.\n  - `android-tools` provides `img2simg`.\n- **In a container:**\n  - Build as a normal user with a `/etc/subuid` and `/etc/subgid` range.\n  - Make sure `/proc/sys/fs/binfmt_misc/qemu-aarch64` exists. If it doesn't, mount `binfmt_misc` and register `/usr/bin/qemu-aarch64-static`.\n  - If a later `pacman` run reinstalls `shadow`, restore the caps: `setcap cap_setuid=ep /usr/bin/newuidmap; setcap cap_setgid=ep /usr/bin/newgidmap`.\n\n## 3. Build the ztOS system image (GSI)\n\n`ztconflo --gsi 0.2.1` cannot download the GSI: the release has no files (HTTP 404). Build it yourself. It takes about 25 minutes.\n\n```sh\ngit clone https://github.com/Zerone-Laboratories/ztOS.git\ncd ztOS\ninstaller/ztos doctor\ninstaller/ztos build --target gsi --password x\ncd ..\n# result: ztOS/build/ztos/gsi/ztos-gsi-0.2.1-aarch64.tar.zst\n```\n\n## 4. Build the phone image with ztConflo\n\nThe Pixel 3a XL shipped with one of **two panels**, and each needs its own kernel package and device tree:\n- `sdc`: Samsung SOFEF00\n- `tianma`\n\nStart with `sdc`. Step 5 tells you whether it is right. ztConflo picks neither, so two workarounds are needed: a one-line patch, and one line in the device entry.\n\n```sh\ngit clone https://github.com/Zerone-Laboratories/ztconflo.git\ngit clone https://github.com/VachaganGrigoryan/ztos-ports.git\ncd ztconflo\ngit apply ../ztos-ports/ports/google-bonito/patches/ztconflo-kernel-variant.diff   # reads the kernel variant from $ZT_KERNEL\npython -m ztconflo lookup bonito                                     # expect: eligible: yes\nexport ZT_KERNEL=sdc\npython -m ztconflo build google-bonito --gsi ../ztOS/build/ztos/gsi/ztos-gsi-0.2.1-aarch64.tar.zst --out ./out\n```\n\nThe build prints `draft registry entry: …/devices/google-bonito/device.toml`, usually under `~/Documents/Projects/ztos-devices/`. In that file, set the device tree, then **run the same build command again**:\n\n```toml\ndtb = \"qcom/sdm670-google-bonito-sdc\"     # or qcom/sdm670-google-bonito-tianma\n```\n\nCheck that `out/google-bonito/build.json` now shows that `dtb`. Without it the bootloader rejects the image with `Error verifying the received boot.img: Invalid Parameter`.\n\n## 5. Test the kernel without writing anything\n\nPut the phone in fastboot mode: hold **Power + Volume Down** until it shows FASTBOOT MODE.\n\n```sh\nfastboot boot out/google-bonito/boot.img\n```\n\nWithin about 15 seconds the screen should show white text from the postmarketOS initramfs, ending in a **debug shell**. The error `failed to mount subpartitions` is expected at this point. That means the panel choice is right.\n\nIf the screen stays black, rebuild with `ZT_KERNEL=tianma` and the `tianma` dtb.\n\n## 6. Clear old partition tables from `userdata`\n\nIf the phone ever ran Droidian, postmarketOS or another Linux, `userdata` can hold an old GPT. Its backup copy at the end survives a sparse flash and gets restored over the new root filesystem. Clearing it is harmless, so do it anyway.\n\nThe debug shell from step 5 is reachable over USB networking, with the phone at `172.16.42.1`. Connect with `telnet 172.16.42.1`, or `nc 172.16.42.1 23`, and run:\n\n```sh\nblkid /dev/mmcblk0p72          # must say PARTLABEL=\"userdata\"\nN=$(blockdev --getsz /dev/mmcblk0p72)\ndd if=/dev/zero of=/dev/mmcblk0p72 bs=512 count=34 conv=fsync\ndd if=/dev/zero of=/dev/mmcblk0p72 bs=512 seek=$((N-64)) count=64 conv=fsync\n```\n\nThen hold **Power + Volume Down** to go back to fastboot.\n\n## 7. Flash\n\n```sh\ncd out/google-bonito\nfastboot getvar current-slot        # e.g. \"a\"\nfastboot flash boot boot.img\nfastboot flash userdata rootfs.img  # about 2 minutes\nfastboot --set-active=a             # the slot printed above; resets its boot-retry counter\nfastboot reboot\n```\n\n## 8. First boot: fix fstab and add your SSH key\n\nThe first boot stops in the debug shell again. ztOS's `/etc/fstab` contains only comments, so the pmOS initramfs goes looking for a `pmOS_boot` partition that doesn't exist.\n\nThe root filesystem is already mounted at `/sysroot`. Over `telnet 172.16.42.1`, run:\n\n```sh\nprintf 'LABEL=pmOS_root\\t/\\text4\\trw,relatime\\t0 0\\n' >> /sysroot/etc/fstab\nmkdir -p /sysroot/root/.ssh && chmod 700 /sysroot/root/.ssh\necho \"ssh-ed25519 AAAA… you@pc\" >> /sysroot/root/.ssh/authorized_keys   # your public key\nchmod 600 /sysroot/root/.ssh/authorized_keys\nsync; umount /sysroot; reboot -f\n```\n\nztOS now boots, but the screen stays **black with one white pixel**. The GPU firmware is missing, which you fix next. SSH works anyway: `ssh root@172.16.42.1`.\n\n## 9. GPU, Wi-Fi and Bluetooth firmware\n\nztConflo leaves out `linux-firmware-qcom` and friends. Copy them from the pmbootstrap rootfs that the build left on your computer:\n\n```sh\nP=~/.cache/ztconflo/pmbootstrap/chroot_rootfs_google-bonito\nsudo tar -C $P/lib/firmware -cf - qcom ath10k qca a300_pfp.fw.zst a300_pm4.fw.zst \\\n  | ssh root@172.16.42.1 'tar -C /usr/lib/firmware --skip-old-files -xf -'\nssh root@172.16.42.1 'systemctl reset-failed greetd; systemctl restart greetd'\n```\n\nThe ztMETRO lock screen appears. Swipe up, and touch works.\n\n## 10. Packages for the modem, Wi-Fi and Bluetooth\n\nOn the Pixel, the Wi-Fi firmware runs on the **modem DSP**. `rmtfs` starts the modem, and `tqftpserv` serves it the Wi-Fi firmware. ztConflo enables both but ships neither.\n\nThe phone has no internet yet, so let its `pacman` list the packages, and download them on the computer:\n\n```sh\nssh root@172.16.42.1 'pacman -Sp --needed rmtfs-git qrtr-git bluez bluez-utils meson ninja' > urls.txt\nmkdir pkgs && cd pkgs\nfor u in $(grep ^http ../urls.txt); do curl -fLO \"$u\" && curl -fLO \"$u.sig\"; done\nscp * root@172.16.42.1:/var/cache/pacman/pkg/\nssh root@172.16.42.1 'pacman -S --needed --noconfirm rmtfs-git qrtr-git bluez bluez-utils meson ninja'\ncd ..\n```\n\nThese are signed [Arch Linux ARM](https://archlinuxarm.org/) packages. `rmtfs-git` and `qrtr-git` come from its `[aur]` repository.\n\n## 11. Build tqftpserv, qbootctl and hexagonrpc on the phone\n\nNone of these is packaged for Arch Linux ARM. Build the pinned upstream releases with the GSI's own `gcc`:\n\n```sh\ngit clone --depth 1 -b v1.3   https://github.com/linux-msm/tqftpserv.git\ngit clone --depth 1 -b 0.2.2  https://github.com/linux-msm/qbootctl.git\ngit clone --depth 1 -b v0.4.0 https://github.com/linux-msm/hexagonrpc.git\ntar --exclude .git -cf - tqftpserv qbootctl hexagonrpc | ssh root@172.16.42.1 '\n  mkdir -p /usr/local/src && tar -C /usr/local/src -xf - && cd /usr/local/src &&\n  for p in tqftpserv qbootctl hexagonrpc; do\n    (cd $p && meson setup build --prefix=/usr/local --buildtype=release && ninja -C build install) || exit 1\n  done'\n```\n\n## 12. Install this repo's files and turn everything on\n\n```sh\ncd ztos-ports/ports/google-bonito\nCOPYFILE_DISABLE=1 tar -C files -cf - . | ssh root@172.16.42.1 'tar -C / --no-same-owner -xf -'\nP=~/.cache/ztconflo/pmbootstrap/chroot_rootfs_google-bonito\nsudo tar -C $P/usr/share -cf - qcom alsa/ucm2/Google/sargo alsa/ucm2/conf.d/sdm660 \\\n  | ssh root@172.16.42.1 'tar -C /usr/share --skip-old-files -xf -'\nssh root@172.16.42.1 '\n  ldconfig\n  getent passwd fastrpc >/dev/null || useradd -r -U -M -d / -s /usr/bin/nologin fastrpc\n  udevadm control --reload && udevadm trigger --subsystem-match=misc\n  qbootctl -m\n  systemctl daemon-reload\n  systemctl enable --now qbootctl tqftpserv rmtfs ztos-bt-addr bluetooth \\\n    hexagonrpcd-adsp-rootpd hexagonrpcd-adsp-sensorspd\n  nmcli general reload conf'\n```\n\nAbout 10 seconds later `wlan0` appears. Connect to Wi-Fi from ztOS **Settings**. The files do the following:\n\n| File | What it does |\n|---|---|\n| `qbootctl` + unit | Marks the boot slot successful at every boot, so the bootloader doesn't fall back to the other slot |\n| `ztos-bt-addr` | Gives Bluetooth a stable address, since the WCN3990 has none on mainline |\n| `10-stable-wifi-mac.conf` | Stable Wi-Fi MAC per network |\n| `hexagonrpcd-*` + udev rules | Serves the sensor DSP |\n| UCM files | Speaker and microphone routing |\n\n## 13. Check it\n\n```sh\nssh root@172.16.42.1 'qbootctl | head -5; for r in /sys/class/remoteproc/*; do echo \"$(cat $r/name) $(cat $r/state)\"; done; ip -br link | grep wlan0; bluetoothctl show | grep Powered'\n```\n\nYou should see the slot `Successful : 1`, three `running` remote processors, `wlan0`, and `Powered: yes`. Reboot once to confirm everything comes back on its own.\n\n## If something goes wrong\n\n| What you see | What to do |\n|---|---|\n| `fastboot boot`: `Error verifying the received boot.img: Invalid Parameter` | The boot image has no device tree. Set `dtb =` in the draft `device.toml` and rebuild (step 4). |\n| `pmbootstrap … Selected kernel () is not valid for device google-bonito` | Apply the patch and `export ZT_KERNEL=sdc` (or `tianma`) (step 4). |\n| `fastboot boot` works but the screen stays black | Wrong panel. Rebuild with `tianma`. |\n| Debug shell, `ERROR: failed to mount subpartitions!` | An old GPT is on `userdata`. Do step 6, then flash `userdata` again. |\n| Debug shell right after `Mount root partition` | The fstab fix (step 8). |\n| Black screen with one white pixel, SSH works | GPU firmware missing (step 9). `~alarm/.local/state/ztmetro.log` says `failed to create the renderer`. |\n| No `wlan0`, Settings shows no Wi-Fi | `rmtfs`/`tqftpserv` not running. `cat /sys/class/remoteproc/*/state` must show `running` for `4080000.remoteproc` (steps 10–12). |\n| The phone boots the old system, or the bootloader says \"no valid slot\" | In fastboot: `fastboot --set-active=a`. Then enable `qbootctl` (step 12). |\n| `pmbootstrap` not found, or `kpartx`/`img2simg`/`uic` missing | Install the packages from step 2. |"
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage",
+      "status": "working",
+      "notes": "pmOS initramfs, root is pmOS_root ext4 on userdata. Needs the fstab line (step 8)."
+    },
+    {
+      "category": "Display",
+      "feature": "Panel",
+      "status": "working",
+      "notes": "Samsung SOFEF00 (sdc), 1080×2160 @ 60 Hz. The Tianma variant is untested."
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": "Backlight 0–1023 present."
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": "Adreno 615, freedreno, OpenGL ES 3.2. Needs the a630 firmware (step 9)."
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": "Synaptics S3706B, used on the on-screen keyboard."
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": "pm8941 pwrkey/resin and gpio-keys present."
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "broken",
+      "notes": "drv2624 haptics present."
+    },
+    {
+      "category": "Power",
+      "feature": "CPU, frequency scaling",
+      "status": "working",
+      "notes": "schedutil, 0.3–1.7 GHz and 0.3–2.0 GHz clusters."
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charging",
+      "status": "working",
+      "notes": "Level and USB charging reported (qcom-battery, pm660-charger)."
+    },
+    {
+      "category": "Power",
+      "feature": "Sleep (suspend)",
+      "status": "untested",
+      "notes": "s2idle available."
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": "WCN3990 (ath10k), 2.4 and 5 GHz. Needs rmtfs + tqftpserv (steps 10–12)."
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "working",
+      "notes": "Scanning works, pairing not tried. Needs bluez and a set address (step 12)."
+    },
+    {
+      "category": "Network",
+      "feature": "Mobile data",
+      "status": "broken",
+      "notes": "The modem DSP and rmnet_ipa0 come up, but ztOS's modem service is Galaxy S9-only."
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking",
+      "status": "working",
+      "notes": "Phone at 172.16.42.1, SSH works."
+    },
+    {
+      "category": "Modem",
+      "feature": "SIM and signal",
+      "status": "broken",
+      "notes": "ztOS modem service doesn't start (S9-specific). ModemManager not tried."
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "broken",
+      "notes": "As above."
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "broken",
+      "notes": "As above."
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "working",
+      "notes": "pmOS sargo UCM (VoiceCall profile), step 12."
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphone",
+      "status": "untested",
+      "notes": "PipeWire shows the built-in microphone."
+    },
+    {
+      "category": "Audio",
+      "feature": "Headphones",
+      "status": "untested",
+      "notes": "Headset jack detected."
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient light",
+      "status": "broken",
+      "notes": "hexagonrpcd serves the ADSP sensors, but ztOS's sensor service (ztoscsf) only supports the S9 sensorhub."
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, gyroscope",
+      "status": "broken",
+      "notes": "As above."
+    },
+    {
+      "category": "Sensors",
+      "feature": "Proximity",
+      "status": "broken",
+      "notes": "As above."
+    },
+    {
+      "category": "Camera",
+      "feature": "Cameras",
+      "status": "broken",
+      "notes": "Only CAMSS nodes. No camera sensor driver on mainline sdm670."
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "ztMETRO",
+      "status": "working",
+      "notes": "Lock screen, Settings (Wi-Fi) and the on-screen keyboard used."
+    },
+    {
+      "category": "Software",
+      "feature": "Android apps (Waydroid)",
+      "status": "working",
+      "notes": "waydroid-container service is active."
+    },
+    {
+      "category": "Software",
+      "feature": "ztOSIAL (ztos-ial test)",
+      "status": "untested",
+      "notes": "ztos-ial status lists 13 generic backends. ztos-ial test not run."
+    }
+  ],
+  "notes": [
+    {
+      "title": "ztConflo picks no kernel variant or DTB",
+      "text": "bonito has two panels (sdc/tianma). pmbootstrap fails with 'Selected kernel () is not valid', and the boot image has no DTB ('Invalid Parameter'). Use the patch + ZT_KERNEL and set dtb = in the draft device.toml (step 4)."
+    },
+    {
+      "title": "'failed to mount subpartitions' after flashing",
+      "text": "An old GPT (e.g. from Droidian) on userdata is restored over the new root. Clear the first 34 and last 64 sectors of userdata from the debug shell, then flash userdata again (step 6)."
+    },
+    {
+      "title": "Debug shell right after 'Mount root partition'",
+      "text": "ztOS's /etc/fstab has only comments, so the pmOS initramfs looks for a pmOS_boot partition. Add 'LABEL=pmOS_root / ext4 rw,relatime 0 0' (step 8)."
+    },
+    {
+      "title": "Black screen with one white pixel",
+      "text": "GPU firmware (qcom/a630_sqe.fw, a630_gmu.bin) is missing and ztMETRO has no renderer. Copy the firmware from the pmbootstrap rootfs (step 9)."
+    },
+    {
+      "title": "No Wi-Fi hardware",
+      "text": "The Wi-Fi firmware runs on the modem DSP. rmtfs and tqftpserv are enabled but not installed by ztConflo. Install them (steps 10–12)."
+    },
+    {
+      "title": "Phone boots the old system after a few reboots",
+      "text": "Nothing marks the A/B slot successful. Run 'fastboot --set-active=a', then install qbootctl (step 12)."
+    },
+    {
+      "title": "Sensors and cellular don't work in ztOS",
+      "text": "ztOS's sensor and modem services target the Galaxy S9. The Qualcomm DSPs are up, but ztOS needs new backends for them."
+    }
+  ]
+}
