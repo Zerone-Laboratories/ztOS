@@ -202,7 +202,7 @@ static int nav_h = NAV_BAR_H;
 #define FOV_DEG		34	/* vertical field of view of the one projection */
 /* the press, as everywhere (ZMC_TILT_* in core/zrnmetrocore.h) */
 #define TILT_DEG	14	/* how far a pressed tile leans toward the finger */
-#define TORCH_PATH	"/sys/class/leds/white:torch/brightness"	/* leds/zrn-flash.ko */
+#define TORCH_S9	"/sys/class/leds/white:torch"	/* leds/zrn-flash.ko */
 #define TORCH_LEVEL	9	/* of 15: the top of Samsung's torch table */
 #define TILT_IN_MS	70
 #define TILT_OUT_MS	200	/* back up on Log(10) (Windows Phone's TiltUp) */
@@ -6290,6 +6290,38 @@ static int shade_hit(struct zt_server *server, double x, double y) {
 	return -1;
 }
 
+/* The rear flash LED's brightness file, at a torch's current: the S9's at
+ * TORCH_LEVEL, else the first mainline "*:torch" or "*:flash" LED at its
+ * max_brightness (the torch mode's highest current). "" while there is none. */
+static const char *torch_path(int *level) {
+	static char path[160];
+	static int max;
+	const char *const leds[] = { TORCH_S9, "/sys/class/leds/*:torch", "/sys/class/leds/*:flash" };
+	for (size_t i = 0; i < sizeof(leds) / sizeof(leds[0]) && !path[0]; i++) {
+		glob_t g;
+		if (glob(leds[i], 0, NULL, &g) != 0) {
+			globfree(&g);
+			continue;
+		}
+		char file[200];
+		snprintf(file, sizeof(file), "%s/max_brightness", g.gl_pathv[0]);
+		FILE *f = i == 0 ? NULL : fopen(file, "r");
+		max = TORCH_LEVEL;
+		if (f) {
+			if (fscanf(f, "%d", &max) != 1 || max <= 0) {
+				max = 1;
+			}
+			fclose(f);
+		}
+		snprintf(path, sizeof(path), "%s/brightness", g.gl_pathv[0]);
+		globfree(&g);
+	}
+	if (level) {
+		*level = max;
+	}
+	return path;
+}
+
 /* One quick action, drawn with its top left corner at the origin. */
 static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double w, double h) {
 	int q = server->quick[i];
@@ -6303,7 +6335,7 @@ static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double
 	 * phone yet (no driver, no service), nor the flashlight while
 	 * zrn-flash is not loaded: shown, faint, and not pretending to switch */
 	bool missing = q == Q_ROTATION || q == Q_LOCATION ||
-		(q == Q_FLASHLIGHT && access(TORCH_PATH, W_OK) != 0) ||
+		(q == Q_FLASHLIGHT && access(torch_path(NULL), W_OK) != 0) ||
 		(q == Q_BLUETOOTH && access("/sys/class/bluetooth/hci0", F_OK) != 0);
 	bool on = q == Q_WIFI ? server->shade_wifi : q == Q_AIRPLANE ? server->shade_airplane :
 		q == Q_DATA ? server->cell_data_on : q == Q_VIBRATE ? server->haptics_enabled :
@@ -7956,13 +7988,14 @@ static void shade_activate(struct zt_server *server, int index) {
 		break;
 	case 100 + Q_FLASHLIGHT: {
 		/* the rear flash LED at a torch's current (leds/zrn-flash.ko) */
-		FILE *f = fopen(TORCH_PATH, "w");
+		int level;
+		FILE *f = fopen(torch_path(&level), "w");
 		if (!f) {
 			break;	/* not loaded: the tile is drawn faint */
 		}
 		hap(server, HAP_TAP, HG_SYSTEM);
 		server->shade_torch = !server->shade_torch;
-		fprintf(f, "%d\n", server->shade_torch ? TORCH_LEVEL : 0);
+		fprintf(f, "%d\n", server->shade_torch ? level : 0);
 		fclose(f);
 		draw_shade(server);
 		damage(server);
