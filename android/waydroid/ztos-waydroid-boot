@@ -24,9 +24,15 @@ if ! systemctl --user start ztos-waydroid-session.service; then
 	exit 0
 fi
 
-if timeout --signal=TERM --kill-after=2 45 \
-	 sudo -n /usr/local/libexec/ztos-waydroid-recover ready; then
-	install -m644 /dev/null "$marker"
+# While Android boots, hold the launcher's mark: ztMETRO asks for "idle" as soon as it
+# shows its own screens, and ztos-waydroid-power would freeze Android before it is ready.
+launching=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ztos-waydroid-launching
+echo $$ > "$launching"
+timeout --signal=TERM --kill-after=2 45 sudo -n /usr/local/libexec/ztos-waydroid-recover ready
+ready=$?
+rm -f "$launching"
+if (( ready == 0 )); then
+	sudo -n /usr/bin/touch "$marker"   # /run is root's; ztOS's sudoers allows touch
 	if ! ztos-waydroid-power idle; then
 		logger -t ztos-waydroid-boot 'Android ready; idle freeze deferred to normal policy'
 	fi
