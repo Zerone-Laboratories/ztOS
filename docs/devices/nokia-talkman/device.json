@@ -1,0 +1,284 @@
+{
+  "id": "nokia-talkman",
+  "name": "Microsoft Nokia Lumia 950",
+  "maker": "Nokia",
+  "model": "RM-1104",
+  "codename": "talkman",
+  "maintainer": "Davitek",
+  "contact": "Discord: @davitek_ Github: @Davitekk",
+  "added": "2026-11-05",
+  "summary": "ztOS on the Snapdragon 808 Lumia 950, booted through BootShim and LK on the phone's own UEFI, on the Android4Lumia950 mainline kernel (Linux 7.3-rc2). The display, touch, charging, USB and vibration work well, ztMETRO scrolls at about 60 fps on the GPU, both cameras give pictures, Wi-Fi works and the speaker plays. There are no microphones or modem yet, and no CPU frequency scaling, so it is an early port and not yet a usable phone. Tried on one RM-1105.",
+  "photo": "photo.jpg",
+  "photo_caption": "",
+  "specs": [
+    [
+      "SoC",
+      "Qualcomm Snapdragon 808 (MSM8992)"
+    ],
+    [
+      "CPU",
+      "2× Cortex-A57 and 4× Cortex-A53 (no frequency scaling yet: about 191 and 785 MHz)"
+    ],
+    [
+      "GPU",
+      "Adreno 418 (freedreno, OpenGL ES 3.0)"
+    ],
+    [
+      "RAM",
+      "3 GB"
+    ],
+    [
+      "Storage",
+      "32 GB eMMC, microSD"
+    ],
+    [
+      "Display",
+      "5.2 in, 1440×2560 AMOLED"
+    ],
+    [
+      "Battery",
+      "3000 mAh"
+    ],
+    [
+      "Kernel",
+      "Linux 7.3-rc2 (Android4Lumia950/linux"
+    ],
+    [
+      "Released",
+      "2015"
+    ],
+    [
+      "Device layer",
+      "devices/microsoft-talkman in github.com/Davitekk/ztOS (branch talkman-port)"
+    ]
+  ],
+  "install": {
+    "markdown": "## Installing ztOS on the Microsoft Lumia 950 (talkman)\n\n> **This erases the phone.** Windows' system and data partitions (MainOS and Data) are\n> replaced. The phone's identity (IMEI, modem calibration, Wi-Fi and Bluetooth addresses)\n> and everything else up to and including EFIESP stay where they are. Only EFIESP gets new\n> files, and it is backed up first with the rest of the phone. Never write the DPP\n> partition: it holds calibration that cannot be had back.\n\nTried on one phone, whose USB reports **RM-1105**. Other Lumia 950 models (RM-1104, RM-1106,\nRM-1116, RM-1118) use the same board and may work, but none has been tried. The 950 XL\n(cityman) is a different phone and this does not support it.\n\nRead the status table in the [README](README.md) first: this port has no microphone or modem yet.\n\n### What you need\n\n- A computer with Windows 10 or 11, 60 GB free for the build and 35 GB more for the backup\n- A USB-C data cable (some only charge)\n- The phone charged above 50 %, with an unlocked bootloader (step 3)\n- About 3 hours the first time, mostly waiting for the build\n\nThe backup and partition steps use PowerShell as administrator, so this guide is for\nWindows. The build itself runs in Docker.\n\n### 1. Install the tools on your computer\n\n1. [Git for Windows](https://git-scm.com/download/win): its Git Bash runs every `sh` command below.\n2. [Docker Desktop](https://www.docker.com/products/docker-desktop/), started once and left running.\n3. Google's [Android platform tools](https://developer.android.com/tools/releases/platform-tools), with the folder holding `fastboot` in your PATH.\n4. [Python 3](https://www.python.org/downloads/windows/), ticking \"Add to PATH\".\n5. [WPInternals](https://github.com/ReneLergner/WPinternals), to unlock the phone and put it in mass storage mode.\n\nOpen **Git Bash** and check:\n\n```sh\ndocker info --format '{{.ServerVersion}}'\nfastboot --version\npython --version\n```\n\n### 2. Get the port\n\n```sh\ngit clone -c core.autocrlf=false --branch talkman-port https://github.com/Davitekk/ztOS.git\ncd ztOS\ngit clone https://github.com/Android4Lumia950/installer ../a4l-installer\ngit -C ../a4l-installer checkout be3ed23\n```\n\nThe second repository holds the bootloader files this port uses (BootShim, LK with fastboot,\nthe developer menu). `install-lk.ps1` checks each file's checksum before using it.\n\n(`core.autocrlf=false` keeps the scripts' Unix line endings on Windows: the build runs them in\nLinux.)\n\n### 3. Unlock the bootloader\n\nUse WPInternals' own guide. The phone this was tried on was already unlocked, so this step is\nthe one part of the guide that was not run for this port.\n\n### 4. Put the phone in mass storage mode\n\nIn WPInternals, switch the phone to **Mass Storage Mode**. Windows then sees the phone's\nstorage as a disk and may show extra drive letters. **If Windows offers to format anything,\nclick Cancel.**\n\n### 5. Back up the whole phone\n\nIn **PowerShell as administrator**, from the `ztOS` folder, with a folder on a drive with 35 GB free:\n\n```sh\npowershell -ExecutionPolicy Bypass -File devices\\microsoft-talkman\\tools\\backup-emmc.ps1 -Out D:\\ztos-talkman-backup\n```\n\nThis reads the entire storage (about 30 minutes) and opens the disk read-only. The copy\nholds the phone's identity, so keep it private. It is your way back to Windows.\n\n### 6. Put the bootloader on the phone\n\nStill in mass storage mode, and still in PowerShell as administrator:\n\n```sh\npowershell -ExecutionPolicy Bypass -File devices\\microsoft-talkman\\tools\\install-lk.ps1 -Data ..\\a4l-installer\\DATA -Ui ..\\a4l-installer\\ui -Backup D:\\ztos-talkman-backup\n```\n\nThis changes only EFIESP. It keeps WPInternals' route back to flash mode working.\n\n### 7. Build ztOS\n\nIn **Git Bash**. Choose the user name and password you will log in with (the password is also\nfor `sudo`), and put them in the second command:\n\n```sh\ndevices/microsoft-talkman/docker/run.sh devices/microsoft-talkman/kernel/build-kernel.sh\ndevices/microsoft-talkman/docker/run.sh python3 installer/ztos build --target talkman --user YOURNAME --password YOURPASSWORD\ndevices/microsoft-talkman/docker/run.sh devices/microsoft-talkman/boot/build-boot.sh --sysroot build/ztos/talkman/root --firmware build/talkman-boot/firmware --name ztos-talkman-rescue --cmdline \"zboot.rescue=1 zboot.noretry=1 loglevel=7\"\ndevices/microsoft-talkman/docker/run.sh --export out/ztos-talkman-boot.img out/ztos-talkman-rescue.img build/ztos/talkman/root.img\n```\n\n| Step | Time the first time, on 12 threads |\n|---|---|\n| The kernel | 5 to 10 minutes |\n| The system | about 15 minutes |\n| The rescue image and the export | a few minutes |\n\nBy default the build uses 6 CPUs and 6 GB of memory, so the computer stays usable; with more\nto spare, set `ZTOS_BUILD_CPUS=12 ZTOS_BUILD_MEM=14g` first and it goes much faster.\nEverything builds in a Docker volume (`ztos-talkman-build`) that is kept between runs. The\nexported files land in `out/` and `build/ztos/talkman/`.\n\n**Building again after changing something:** add `--fresh` to the `installer/ztos build` command.\nWithout it the build reuses the system image it already has, finishes in a minute, and your\nchanges outside the kernel are not in it.\n\n### 8. Install it\n\nRestart the phone: in WPInternals leave mass storage mode, or hold **Power** for about 15\nseconds until it vibrates. With no `boot` partition to start from, LK stays in fastboot, with\nthe screen dark or showing little. Then:\n\n```sh\nfastboot devices\nfastboot boot out/ztos-talkman-rescue.img\n```\n\n`fastboot devices` should list one device. After about 30 seconds the phone is a network\ndevice, 172.16.42.1 (the computer gets 172.16.42.2). Then:\n\n```sh\npython devices/microsoft-talkman/tools/install-talkman.py --root build/ztos/talkman/root.img --boot out/ztos-talkman-boot.img --backup D:/ztos-talkman-backup\n```\n\nIt writes the new partition table (keeping the old one in the backup folder), writes the system\nover USB and reads it back (about 15 minutes), then flashes the boot image and restarts. It\nstops at the first thing that does not match. If the cable comes out, start again from\n`fastboot boot`. Your computer's copy of `root.img` is 10 GB.\n\nIf the script reports that the phone does not respond, the power controller may not have answered\non that start (see step 9). Send `reboot -f` over the phone's shell, or hold Power for 15 seconds,\nthen repeat `fastboot boot`.\n\n### 9. Start ztOS\n\nThe first start usually reaches the shell in about a minute, but the screen may stay black for\nup to 2 minutes:\n\n- On some starts the phone's power controller does not answer. The boot stage notices and\n  restarts by itself, sometimes more than once. Each try vibrates.\n- Every start has a 20 second wait for the battery gauge.\n\nThen the shell appears. Over the USB cable you can also log in: `ssh YOURNAME@172.16.42.1`,\nand a serial console appears as a COM port.\n\nAn earlier build was rebuilt from scratch and installed on the test phone with these steps on\n2026-11-04: it reached the shell, and scrolling Start measured 59.8 fps. Wi-Fi, vibration, the\nmotion sensors and sound came after that, and were put on that same installation by hand, so this\nguide has not yet been run from the start with them.\n\nConnect to Wi-Fi from Settings. On the command line, a password with a `!` in it needs single\nquotes: bash treats `!` in double quotes as a history command.\n\n### If something goes wrong\n\n| What you see | What to do |\n|---|---|\n| `fastboot devices` lists nothing | Windows may need a driver for the Android bootloader interface; try another cable or port. Hold Power for 15 seconds to restart |\n| The phone stays black and off USB, after a test kernel or a bad flash | Hold Power for 15 seconds. If it still does not come up, go to mass storage mode with WPInternals and write a known good boot image to the partition named `boot` |\n| `the disk is not this phone's` | The script only writes to a disk of this phone's exact size. Stop and check which device is connected |\n| `$'\\r': command not found` | The clone has Windows line endings: clone again with `-c core.autocrlf=false` |\n| The build fails at its start | Docker Desktop must be running; check with `docker info` |\n| No `ssh` over USB | Set that USB network adapter to automatic (DHCP): the phone gives it 172.16.42.2 |\n| Pressing both volume keys in LK | Avoid it: that enters emergency download mode |\n\n### Testing your own kernel safely\n\nErase the boot partition, so a kernel that hangs falls back to fastboot rather than leaving the\nphone stuck: `blkdiscard -z /dev/disk/by-partlabel/boot`, restart, then `fastboot boot` your image\nwith `oops=panic` on its command line. Flash it only once it runs.\n\n### Back to Windows\n\nThe full backup from step 5 is an image of the whole storage. With the phone in mass storage mode,\nwrite `gpt-before-ztos-primary.bin` and `gpt-before-ztos-backup.bin` back to restore the partition\ntable, then flash a Windows FFU with WPInternals. This route has not been tried on this phone."
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage",
+      "status": "partial",
+      "notes": "Works, but the power controller does not answer on some starts; the boot stage restarts by itself, so a start takes 80 s and sometimes 3 minutes or more"
+    },
+    {
+      "category": "Display",
+      "feature": "Panel",
+      "status": "working",
+      "notes": "1440x2560 dual-DSI command-mode AMOLED at 60 Hz"
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": "Adreno 418 run as A430, freedreno, GLES 3.0. Scrolling Start measured at 59.8 fps"
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": "Synaptics S3708"
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "working",
+      "notes": "PMI8994 haptics, with a short kick at each start so that short taps can be felt"
+    },
+    {
+      "category": "Power",
+      "feature": "CPU, frequency scaling",
+      "status": "broken",
+      "notes": "No driver. The cores stay at the bootloader's clocks, measured at about 785 MHz (little) and 191 MHz (big), so programs are kept on the little cores"
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charging",
+      "status": "working",
+      "notes": "PMI8994 gauge and charger, USB charging tried. The gauge adds 20 s to every start"
+    },
+    {
+      "category": "Power",
+      "feature": "Sleep (suspend)",
+      "status": "broken",
+      "notes": "Goes to sleep and wakes on a timer, then restarts while resuming. No CPU idle states yet either"
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": "QCA6174 on PCIe with ath10k. Joins a network from Settings and reaches the internet. 2.4 and 5 GHz"
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "working",
+      "notes": "QCA6174. Pairing and audio tried"
+    },
+    {
+      "category": "Network",
+      "feature": "Mobile data",
+      "status": "broken",
+      "notes": "The modem boots by hand and answers AT commands, but stays at SIM busy, so there is no signal"
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking",
+      "status": "working",
+      "notes": "RNDIS: 172.16.42.1 (the computer gets 172.16.42.2), plus a serial console"
+    },
+    {
+      "category": "Modem",
+      "feature": "SIM and signal",
+      "status": "broken",
+      "notes": "The modem boots by hand and the SIM card answers raw commands, but the modem's SIM manager stays busy, so no signal"
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "broken",
+      "notes": "As SIM and signal"
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "broken",
+      "notes": "As SIM and signal"
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "working",
+      "notes": "TAS2553 amp behind the audio DSP, through PipeWire"
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphone",
+      "status": "broken",
+      "notes": "The WCD9330 codec answers and capture runs by hand, but every sample is 0. Off in a normal boot"
+    },
+    {
+      "category": "Audio",
+      "feature": "Headphones",
+      "status": "broken",
+      "notes": "As the microphone"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient light",
+      "status": "working",
+      "notes": "Auto brightness follows the room, with its switch in Settings. The lux scale is an estimate"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, gyroscope",
+      "status": "partial",
+      "notes": "ICM-20x48 family chip. Reads gravity with the phone flat; X and Y directions not checked yet"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Proximity",
+      "status": "untested",
+      "notes": "The chip is found and reads about 45; not tried with anything near it"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Magnetometer",
+      "status": "partial",
+      "notes": "AK8975 reads through ztOSIAL; no calibration or mounting matrix"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Pressure",
+      "status": "untested",
+      "notes": "ZPA2326 reads a value"
+    },
+    {
+      "category": "Camera",
+      "feature": "Rear camera",
+      "status": "working",
+      "notes": "The preview does not look good. Real pictures through camss and ccs; preview about 6 fps and soft, fixed focus (no lens driver), photos about 5 MP as the sensor's cells are not demosaiced"
+    },
+    {
+      "category": "Camera",
+      "feature": "Front camera",
+      "status": "working",
+      "notes": "The preview does not look good. Real pictures, in a dim room too; preview about 8 fps. Photos about 1.3 MP"
+    },
+    {
+      "category": "Camera",
+      "feature": "Iris camera",
+      "status": "broken",
+      "notes": "Found on its bus, with no picture yet"
+    },
+    {
+      "category": "Camera",
+      "feature": "Flash",
+      "status": "broken",
+      "notes": "The driver chip answers, but it is not identified, so nothing is written to it"
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "broken",
+      "notes": "Depends on the modem"
+    },
+    {
+      "category": "Software",
+      "feature": "ztMETRO",
+      "status": "working",
+      "notes": "About 60 fps while scrolling"
+    },
+    {
+      "category": "Software",
+      "feature": "Android apps (Waydroid)",
+      "status": "untested",
+      "notes": "Its first-start download needs Wi-Fi, which now works; not tried yet"
+    },
+    {
+      "category": "Software",
+      "feature": "ztOSIAL (ztos-ial test)",
+      "status": "partial",
+      "notes": "All but one check passed on a fresh install; the one that fails looks for cpufreq clusters"
+    }
+  ],
+  "notes": [
+    {
+      "title": "It is not usable as a phone yet.",
+      "text": "There are no microphones, earpiece or modem."
+    },
+    {
+      "title": "A start can take minutes with a black screen.",
+      "text": "On some starts the power controller does not answer, and the boot stage restarts by itself. The phone vibrates on each try. Every start also waits 20 s for the battery gauge."
+    },
+    {
+      "title": "The phone runs at about half speed.",
+      "text": "With no CPU frequency driver the cores stay at the bootloader's clocks, and heavy apps feel it."
+    },
+    {
+      "title": "The cameras' colour is approximate and focus is fixed.",
+      "text": "There is no ISP: the picture is made on the CPU, with no calibration for these sensors, and no driver for the lens."
+    },
+    {
+      "title": "Do not press both volume keys in LK.",
+      "text": "That enters emergency download mode."
+    },
+    {
+      "title": "Never write the DPP partition.",
+      "text": "It holds calibration that cannot be had back. The install scripts leave it alone."
+    }
+  ]
+}
