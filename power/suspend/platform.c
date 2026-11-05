@@ -30,6 +30,64 @@ module_param(mif_requests_before, uint, 0444);
 static uint cp_settle_ms = 300, cp_settle_waited_us;
 module_param(cp_settle_ms, uint, 0644);
 module_param(cp_settle_waited_us, uint, 0444);
+/* GRP4 trace: start of prepare, after wake masks, after tables; then the
+ * first poll index (0.5 us steps) at which a cleared GRP4 latched again. */
+/* Turn the GIC CPU interface off before the GRP4 clear: its wake request is
+ * WAKEUP_STAT bit 31, which SYS_SLEEP masks; masked and asserted, it latches
+ * GRP4 and ACPM gives the sleep up (upend_wk). */
+static bool gicc_off;
+static uint gicc_saved;
+module_param(gicc_off, bool, 0644);
+module_param(gicc_saved, uint, 0444);
+/* Freeze guard: WDT_APM (0x14030000) still runs from the APM's RC oscillator
+ * in MIF-down. Armed just before the SMC with reset routed (PMU 0x408/0x40c
+ * bit 25, RST_STAT bit 25 seen on its bite), disarmed as soon as the AP runs
+ * again. A hang anywhere in ACPM's sleep then resets the phone after about
+ * wdt_apm_guard_s seconds (prescaler 255, /128: about 793 ticks/s). */
+static void __iomem *mapped_base(u32 physical);
+static uint wdt_apm_guard_s;
+static uint wdt_apm_saved[5], wdt_apm_armed;
+module_param(wdt_apm_guard_s, uint, 0644);
+module_param(wdt_apm_armed, uint, 0444);
+static void wdt_apm_arm(void)
+{
+	void __iomem *w = mapped_base(0x14030000), *p = mapped_base(0x14060000);
+	u32 n;
+	if (!wdt_apm_guard_s || !w)
+		return;
+	n = min_t(u32, wdt_apm_guard_s * 793, 0xffff);
+	wdt_apm_saved[0] = readl_relaxed(w);
+	wdt_apm_saved[1] = readl_relaxed(w + 4);
+	wdt_apm_saved[2] = readl_relaxed(w + 8);
+	wdt_apm_saved[3] = readl_relaxed(p + 0x408);
+	wdt_apm_saved[4] = readl_relaxed(p + 0x40c);
+	writel_relaxed(0, w);
+	writel_relaxed(n, w + 4);
+	writel_relaxed(n, w + 8);
+	writel_relaxed(wdt_apm_saved[3] & ~BIT(25), p + 0x408);
+	writel_relaxed(wdt_apm_saved[4] & ~BIT(25), p + 0x40c);
+	writel_relaxed(0xff39, w);
+	dsb(sy);
+	wdt_apm_armed = 1;
+}
+static void wdt_apm_disarm(void)
+{
+	void __iomem *w = mapped_base(0x14030000), *p = mapped_base(0x14060000);
+	if (!wdt_apm_armed)
+		return;
+	writel_relaxed(0, w);
+	writel_relaxed(wdt_apm_saved[3], p + 0x408);
+	writel_relaxed(wdt_apm_saved[4], p + 0x40c);
+	writel_relaxed(wdt_apm_saved[1], w + 4);
+	writel_relaxed(wdt_apm_saved[2], w + 8);
+	writel_relaxed(wdt_apm_saved[0], w);
+	dsb(sy);
+	wdt_apm_armed = 0;
+}
+static uint g4_trace[4];
+static int g4_relatch = -1;
+module_param_array(g4_trace, uint, NULL, 0444);
+module_param(g4_relatch, int, 0444);
 module_param(prepare_only, bool, 0600);
 MODULE_PARM_DESC(prepare_only, "prepare and restore inside saved CPU context without SMC");
 static unsigned long suspend_enter, resume;
@@ -170,6 +228,8 @@ static unsigned long pdn_applied;
 /* PMU CHUB_STATUS (0x14064084) at the SMC: is the hub's block up */
 static unsigned int chub_status_before;
 
+static void __iomem *mapped_base(u32 base);
+
 static int param_get_hex(char *buffer, const struct kernel_param *parameter)
 {
 	return sysfs_emit(buffer, "%#lx\n", *(unsigned long *)parameter->arg);
@@ -232,6 +292,69 @@ module_param(grp4_stale_clear, bool, 0644);
 static unsigned int grp4_at_smc;	/* GRP4 read last, just before the SMC */
 module_param_cb(grp4_at_smc, &hex32_ops, &grp4_at_smc, 0444);
 
+/* EINT filters of the ALIVE wake-up banks gpa0-4: FLTCON at 0x14050800 +
+ * the bank's fltcon offset (vendor exynos9810_pin_banks0: gpa0 0x00, gpa1
+ * 0x08, gpa2 0x10, gpa3 0x18, gpa4 0x20), one byte a pin: bit 7 enable,
+ * bit 6 digital (0: analog delay), bits 5:0 width. FLTCON1 (+4) holds pins
+ * 4-7; gpa4 has two pins and only FLTCON0. Stock's exynos_pinctrl_suspend
+ * (vendor pinctrl-exynos.c:722) sets every pin of every wake-up bank to
+ * enable+analog (0x80) for sleep and back to enable+digital on resume; the
+ * digital filter counts a clock that SYS_SLEEP stops. Mainline's 9810 banks
+ * have no fltcon offset and never touch these. eint_filter_analog: save the
+ * nine words in prepare_platform, write 0x80 to each pin as stock does, put
+ * the saved words back in restore_platform. Off by default. */
+static const u16 fltcon_offset[] = { 0x800, 0x804, 0x808, 0x80c, 0x810, 0x814, 0x818, 0x81c, 0x820 };
+static bool eint_filter_analog;
+module_param(eint_filter_analog, bool, 0644);
+MODULE_PARM_DESC(eint_filter_analog, "set the gpa0-4 EINT filters to enable+analog for the sleep, as stock suspend does (default off)");
+static u32 fltcon_before[ARRAY_SIZE(fltcon_offset)], fltcon_after[ARRAY_SIZE(fltcon_offset)];
+static unsigned int fltcon_count = ARRAY_SIZE(fltcon_offset);
+module_param_array(fltcon_before, uint, &fltcon_count, 0444);
+module_param_array(fltcon_after, uint, &fltcon_count, 0444);
+static bool fltcon_saved;
+/* pd_log: a second handoff line with the PMU power-domain STATUS words
+ * (0x14064004 + 8 n up to 0x14064094; AUD 0x4004 ... CHUB 0x4084 in the
+ * vendor flexpmu_cal_local_exynos9810.h) and the FLTCON words. Off by default. */
+static bool pd_log;
+module_param(pd_log, bool, 0644);
+MODULE_PARM_DESC(pd_log, "log PMU power-domain status and EINT FLTCON words at the handoff (default off)");
+#define PD_STATUS_COUNT ((0x4094 - 0x4004) / 8 + 1)
+static u32 pd_status[PD_STATUS_COUNT];
+static unsigned int pd_status_count = PD_STATUS_COUNT;
+module_param_array(pd_status, uint, &pd_status_count, 0444);
+
+static void fltcon_read(u32 *out)
+{
+	for (int i = 0; i < ARRAY_SIZE(fltcon_offset); i++)
+		out[i] = readl_relaxed(mapped_base(0x14050000) + fltcon_offset[i]);
+}
+
+static void fltcon_analog(void)
+{
+	fltcon_read(fltcon_before);
+	for (int i = 0; i < ARRAY_SIZE(fltcon_offset); i++)
+		/* 0x820 is gpa4: two pins, bytes 0 and 1 */
+		writel_relaxed(fltcon_offset[i] == 0x820 ? 0x8080 : 0x80808080,
+			       mapped_base(0x14050000) + fltcon_offset[i]);
+	wmb();
+	fltcon_saved = true;
+	fltcon_read(fltcon_after);
+	pr_info("zrn-system-sleep: fltcon %08x %08x %08x %08x %08x %08x %08x %08x %08x -> %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		fltcon_before[0], fltcon_before[1], fltcon_before[2], fltcon_before[3], fltcon_before[4],
+		fltcon_before[5], fltcon_before[6], fltcon_before[7], fltcon_before[8],
+		fltcon_after[0], fltcon_after[1], fltcon_after[2], fltcon_after[3], fltcon_after[4],
+		fltcon_after[5], fltcon_after[6], fltcon_after[7], fltcon_after[8]);
+}
+
+static void fltcon_restore(void)
+{
+	if (!fltcon_saved)
+		return;
+	for (int i = 0; i < ARRAY_SIZE(fltcon_offset); i++)
+		writel_relaxed(fltcon_before[i], mapped_base(0x14050000) + fltcon_offset[i]);
+	fltcon_saved = false;
+}
+
 static void follow_resolve(void)
 {
 	for (unsigned int b = 0; b < ARRAY_SIZE(follow_irq); b++) {
@@ -276,8 +399,6 @@ static unsigned int effective_wake(void)
 	}
 	return eff;
 }
-
-static void __iomem *mapped_base(u32 base);
 
 static void gpio_save(void)
 {
@@ -392,6 +513,7 @@ static void restore_platform(void)
 	quieted = 0;
 	for (i = 0; i < ARRAY_SIZE(eint_offset); i++)
 		writel_relaxed(saved_eint_mask[i], mapped_base(0x14050000) + 0x900 + eint_offset[i]);
+	fltcon_restore();
 	/* The unbound cluster-0 watchdog must retain its boot-disabled state. */
 	writel_relaxed(0, mapped_base(0x10050000));
 	writel_relaxed(saved_wdt0[1], mapped_base(0x10050000) + 4);
@@ -415,6 +537,7 @@ static int prepare_platform(void)
 		return 0;
 	if (num_online_cpus() != 1 || raw_smp_processor_id() != 0)
 		return -EBUSY;
+	g4_trace[0] = readl_relaxed(mapped_base(0x14070000) + 0x408);
 	eff = eint_effective = effective_wake();
 	for (i = 0; i < ARRAY_SIZE(usi_base); i++)
 		saved_usi[i] = readl_relaxed(mapped_base(usi_base[i]) + usi_offset[i]);
@@ -425,6 +548,8 @@ static int prepare_platform(void)
 		saved_eint_mask[i] = readl_relaxed(mapped_base(0x14050000) + 0x900 + eint_offset[i]);
 		writel_relaxed(saved_eint_mask[i] | (i == 4 ? 0xff : ((eff >> (i * 8)) & 0xff)), mapped_base(0x14050000) + 0x900 + eint_offset[i]);
 	}
+	if (eint_filter_analog)
+		fltcon_analog();
 	saved_eint = readl_relaxed(pmu + 0x60c);
 	saved_eint2 = readl_relaxed(pmu + 0x61c);
 	saved_hint = readl_relaxed(pmu + 0x860);
@@ -440,6 +565,7 @@ static int prepare_platform(void)
 	writel_relaxed(eff, pmu + 0x60c);
 	writel_relaxed(~0U, pmu + 0x61c);
 	writel_relaxed(usbl2 ? 5 : 4, pmu + 0x860);
+	g4_trace[1] = readl_relaxed(mapped_base(0x14070000) + 0x408);
 	prepared = true;
 	early = true;
 	last_restore_error = 0;
@@ -447,6 +573,7 @@ static int prepare_platform(void)
 	if (!ret)
 		ret = run_table(0, ZRN_HANDLE);
 	wmb();
+	g4_trace[2] = readl_relaxed(mapped_base(0x14070000) + 0x408);
 	if (ret)
 		restore_platform();
 	return ret;
@@ -556,6 +683,12 @@ static int sleep_finisher(unsigned long state)
 		cp_settle_waited_us += 500;
 	}
 	mif_requests_before = (readl_relaxed(mapped_base(0x02040000) + 0xf8ac) >> 16) & 0xff;
+	if (gicc_off) {
+		gicc_saved = readl_relaxed(mapped_base(0x10100000) + 0x2000);
+		writel_relaxed(0, mapped_base(0x10100000) + 0x2000);
+		dsb(sy);
+		udelay(5);
+	}
 	grp4_before = readl_relaxed(grp4);
 	chub_status_before = readl_relaxed(mapped_base(0x14060000) + 0x4084);
 	grp4_cleared = 0;
@@ -571,6 +704,12 @@ static int sleep_finisher(unsigned long state)
 		if (grp4_stale_clear)
 			grp4_stale_clears++;
 	}
+	g4_trace[3] = grp4_cleared;
+	g4_relatch = -1;
+	for (i = 0; i < 4000; i++) {
+		if (readl_relaxed(grp4)) { g4_relatch = i; break; }
+		udelay(1);
+	}
 	grp4_now = readl_relaxed(grp4);
 	/* Keep this before enabling the MIF gate: retained console records must
 	 * distinguish a missing AP request from corruption of earlier log text. */
@@ -578,11 +717,26 @@ static int sleep_finisher(unsigned long state)
 		mif_sleep, mif_requests_before,
 		readl_relaxed(mapped_base(0x02040000) + 0xf95c), grp4_before, grp4_cleared,
 		chub_status_before, eint_effective, hub_line, grp4_now, cp_settle_waited_us);
+	if (pd_log) {
+		u32 f[ARRAY_SIZE(fltcon_offset)];
+
+		for (i = 0; i < PD_STATUS_COUNT; i++)
+			pd_status[i] = readl_relaxed(mapped_base(0x14060000) + 0x4004 + 8 * i);
+		fltcon_read(f);
+		pr_info("zrn-system-sleep: handoff pd 4004.. %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			pd_status[0], pd_status[1], pd_status[2], pd_status[3], pd_status[4],
+			pd_status[5], pd_status[6], pd_status[7], pd_status[8], pd_status[9],
+			pd_status[10], pd_status[11], pd_status[12], pd_status[13], pd_status[14],
+			pd_status[15], pd_status[16], pd_status[17], pd_status[18]);
+		pr_info("zrn-system-sleep: handoff fltcon %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]);
+	}
 	/* again, after the console: what ACPM will find (zrn-sleepd's fw-abort) */
 	grp4_at_smc = readl_relaxed(grp4);
 	/* Keep the enable/SMC/abort-disable instructions in one cache line.
 	 * x19 is preserved by the secure-call ABI. Do not call or delay in
 	 * the interval where ACPM is permitted to remove DRAM power. */
+	wdt_apm_arm();
 	a0 = psci_system ? 0xc400000eUL : 0xc4000001UL;
 	a1 = psci_system ? resume : state;
 	a2 = psci_system ? 0 : resume;
@@ -601,6 +755,9 @@ static int sleep_finisher(unsigned long state)
 		: "x19", "x8", "x9", "x10", "x11", "x12", "x13",
 		  "x14", "x15", "x16", "x17", "memory");
 	last_smc = (int)a0;
+	wdt_apm_disarm();
+	if (gicc_off && gicc_saved)
+		writel_relaxed(gicc_saved, mapped_base(0x10100000) + 0x2000);
 	return last_smc;
 }
 
@@ -638,6 +795,7 @@ static int enter_sleep_state(suspend_state_t state)
 		dbg_mct_regs[2] = readl_relaxed(dbg_mct + 0x244);	/* G_INT_CSTAT */
 	}
 	ret = suspend_fn(0x03000000, sleep_finisher);
+	wdt_apm_disarm();
 	hold_mif();
 	last_error = ret;
 	for (i = 0; i < 16; i++)
@@ -803,6 +961,9 @@ static int __init system_sleep_init(void)
 	if (ret)
 		goto fail;
 	ret = map_base(0x14060000);
+	if (ret)
+		goto fail;
+	ret = map_base(0x14030000);
 	if (ret)
 		goto fail;
 	ret = map_base(0x14050000);
