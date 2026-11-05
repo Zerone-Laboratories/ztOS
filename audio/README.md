@@ -2,9 +2,9 @@
 
 The hardware, from the stock device tree: every sound passes through
 **ABOX**, an audio DSP block in the SoC (a Cortex-A7 running Samsung's
-"calliope" firmware), on its way to a **MAX98512** speaker amplifier (I2C)
-or a **CS47L93** codec (SPI; headphones, earpiece, microphones). Mainline has
-a driver for the codec only.
+"calliope" firmware), on its way to two **MAX98512** amplifiers (I2C: U8003 the speaker, U8002 the
+earpiece) or a **CS47L93** codec (U8004, SPI; headphones and microphones).
+Mainline has a driver for the codec only.
 
 ## How this is being developed
 
@@ -169,8 +169,12 @@ not a physical speaker latency measurement. Evidence:
   volume control stops at -4 dB, the analogue gain is +9 dB (stock +15) and
   the boost output about half way to stock's. It will be quieter than stock.
   Do not raise those without protection.
-- **Earpiece, headphones, microphones**: all on the CS47L93 codec (SPI), whose
-  bus is not in the device tree either. Mainline has the codec driver
+- **Earpiece**: the second MAX98512 (U8002), on the same amplifier I2S and
+  I2C as the speaker's, not on the codec (service manual, troubleshooting p3
+  and p29).
+- **Headphones, microphones**: on the CS47L93 codec (SPI), whose bus is not in
+  the device tree either. Both microphones are digital and take their 1.8 V
+  from the codec (MICBIAS), so they stay silent until the codec drives it. Mainline has the codec driver
   (madera), so this is the next piece.
 - **Idle power**: the DSP core stays running after the first load.
 - Other rates and formats than 48 kHz / 16 bit / stereo (PipeWire converts).
