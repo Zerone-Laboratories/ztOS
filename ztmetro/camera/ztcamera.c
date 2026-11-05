@@ -35,7 +35,11 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <signal.h>
+#include <sys/file.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -56,7 +60,7 @@
 #define N_CONTROLS	5
 #define ROLL_DIR	"ztCamera"	/* ~/Pictures/ztCamera, where captures go */
 
-enum source_kind { SRC_SCENE, SRC_REPLAY, SRC_V4L2, SRC_RAW };
+enum source_kind { SRC_SCENE, SRC_REPLAY, SRC_V4L2, SRC_RAW, SRC_PIPE };
 enum mode { MODE_PHOTO, MODE_VIDEO };
 enum hit { HIT_NONE, HIT_BACK, HIT_MORE, HIT_CONTROL, HIT_SHUTTER, HIT_VIDEO,
 	HIT_FACING, HIT_LENSES, HIT_THUMB, HIT_DIAL, HIT_MENU, HIT_VIEW };
@@ -93,6 +97,17 @@ static struct {
 	int fd;
 	struct { void *start; size_t len; } buf[4];
 	int nbuf;
+	uint32_t fourcc;	/* YUYV, or 24/32-bit RGB (libcamera's software ISP, through libcamerify) */
+	int dev_w, dev_h;	/* the device's frame; w and h are the viewfinder's, turned */
+	int rotate;		/* --rotate: degrees clockwise that make an RGB source upright */
+	bool mirror;		/* a front camera's picture, flipped as a mirror shows it */
+
+	/* a libcamera camera, through a helper process's pipe (--libcamera) */
+	pid_t child;
+	uint8_t *acc;		/* the frame being read */
+	size_t acc_fill, acc_size;
+	uint32_t last_frame_ms;
+	bool stall_noted;
 } src = { .kind = SRC_SCENE, .w = FRAME_W, .h = FRAME_H, .rate = 15, .fd = -1 };
 
 static struct {
@@ -117,7 +132,8 @@ static struct {
 	int fps;
 	char note[130];		/* the last thing worth a line at the bottom */
 	uint32_t note_until;
-} ui = { .mode = MODE_PHOTO, .dial = -1, .timer_left = -1, .ctl = { 0, 0, 0, 0, 6 } };
+	double zoom;		/* digital: 1, 2 or 4 */
+} ui = { .mode = MODE_PHOTO, .dial = -1, .timer_left = -1, .ctl = { 0, 0, 0, 0, 6 }, .zoom = 1 };
 
 static cairo_surface_t *chrome, *dial_sf, *scratch, *prev, *white;
 static unsigned chrome_rev, dial_rev;
@@ -129,6 +145,18 @@ static const char *replay_path;
 static int replay_w = FRAME_W, replay_h = FRAME_H;
 static double replay_rate = 15;
 static const char *device_path;
+
+/* --libcamera NAME:DEGREES[:mirror], back camera first: each is read through
+ * `gst-launch-1.0 libcamerasrc`, in its own process. libcamera's software ISP
+ * makes its GPU debayer there (scaled, the whole sensor), which in this
+ * process would share EGL with the viewfinder and stall. */
+#define MAX_CAMS	4
+static struct { const char *name; int rotate; bool mirror; } cams[MAX_CAMS];
+static int n_cams, cam_i;
+static int pipe_w = 1280, pipe_h = 960;
+/* one libcamera client at a time, across processes: a second one starting
+ * while one streams breaks both until a reboot (CAMSS on mainline SDM670) */
+#define PIPE_LOCK	"/tmp/.ztcamera-libcamera.lock"
 
 static void note(const char *fmt, ...);
 #include "raw-source.h"
@@ -255,6 +283,9 @@ static void frame_alloc(int w, int h) {
 
 static void source_stop(void) {
 	raw_close();
+	if (src.child > 0) {
+		kill(-src.child, SIGTERM);	/* gst-launch, in its own group */
+	}
 	if (src.fd >= 0) {
 		zmc_watch_fd(src.fd, NULL, NULL);
 		if (src.nbuf) {
@@ -272,11 +303,25 @@ static void source_stop(void) {
 		munmap(src.map, src.size);
 		src.map = NULL;
 	}
+	if (src.child > 0) {
+		waitpid(src.child, NULL, 0);
+		src.child = 0;
+	}
 	src.frame_bytes = 0;
+	src.acc_fill = 0;
 }
 
 /* The V4L2 path, written the ordinary way: the one part of the app this phone
  * cannot exercise, so it stays dull and standard. */
+/* bytes per pixel of the RGB orders rgb_frame reads, 0 for any other format */
+static int rgb_bytes(uint32_t f) {
+	if (f == V4L2_PIX_FMT_RGB24 || f == V4L2_PIX_FMT_BGR24) return 3;
+	return f == V4L2_PIX_FMT_RGBA32 || f == V4L2_PIX_FMT_RGBX32 ||
+		f == V4L2_PIX_FMT_ABGR32 || f == V4L2_PIX_FMT_XBGR32 ||
+		f == V4L2_PIX_FMT_ARGB32 || f == V4L2_PIX_FMT_XRGB32 ||
+		f == V4L2_PIX_FMT_BGRA32 || f == V4L2_PIX_FMT_BGRX32 ? 4 : 0;
+}
+
 static bool v4l2_open(const char *dev) {
 	int fd = open(dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0) {
@@ -295,15 +340,22 @@ static bool v4l2_open(const char *dev) {
 	fmt.fmt.pix.height = FRAME_H;
 	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	fmt.fmt.pix.field = V4L2_FIELD_NONE;
+	/* YUYV is asked for; a device that has none (libcamera's software ISP gives
+	 * only RGB) answers with what it has, which is taken too */
+	bool yuyv = false;
 	if (ioctl(fd, VIDIOC_S_FMT, &fmt) != 0 ||
-			fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV ||
+			!((yuyv = fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV) ||
+				rgb_bytes(fmt.fmt.pix.pixelformat)) ||
 			fmt.fmt.pix.width < 16 || fmt.fmt.pix.width > 4096 ||
 			fmt.fmt.pix.height < 16 || fmt.fmt.pix.height > 4096 ||
-			(fmt.fmt.pix.width & 1) ||
-			fmt.fmt.pix.bytesperline < fmt.fmt.pix.width * 2) {
+			(yuyv && (fmt.fmt.pix.width & 1)) ||
+			fmt.fmt.pix.bytesperline < fmt.fmt.pix.width * (yuyv ? 2 : rgb_bytes(fmt.fmt.pix.pixelformat))) {
 		close(fd);
 		return false;
 	}
+	src.fourcc = fmt.fmt.pix.pixelformat;
+	src.dev_w = fmt.fmt.pix.width;
+	src.dev_h = fmt.fmt.pix.height;
 	struct v4l2_requestbuffers req;
 	memset(&req, 0, sizeof(req));
 	req.count = 4;
@@ -340,7 +392,8 @@ static bool v4l2_open(const char *dev) {
 		source_stop();	/* what was mapped, if anything */
 		return false;
 	}
-	frame_alloc(fmt.fmt.pix.width, fmt.fmt.pix.height);
+	bool turned = !yuyv && (src.rotate == 90 || src.rotate == 270);	/* --rotate is for RGB only */
+	frame_alloc(turned ? src.dev_h : src.dev_w, turned ? src.dev_w : src.dev_h);
 	snprintf(src.name, sizeof(src.name), "%s %dx%d", dev,
 		fmt.fmt.pix.width, fmt.fmt.pix.height);
 	return true;
@@ -373,6 +426,68 @@ static bool replay_open(const char *path, int w, int h, double rate) {
 }
 
 static void v4l2_ready(int fd, void *data);
+static void pipe_ready(int fd, void *data);
+static void focus_apply(void);
+static void af_start(void);
+static cairo_surface_t *zoom_shot(cairo_surface_t *f, double z);
+static bool af_pending;		/* focus once the picture has settled */
+
+/* a --libcamera camera: `gst-launch-1.0 -q libcamerasrc camera-name=NAME ! queue !
+ * video/x-raw,format=BGRx,width=W,height=H ! fdsink fd=1`, holding PIPE_LOCK and in
+ * a process group of its own, its frames read from its stdout. It dies with this
+ * process, however this one ends: a helper left behind would keep the camera. */
+static bool pipe_open(int i) {
+	int fds[2];
+	if (i < 0 || i >= n_cams || pipe2(fds, O_CLOEXEC) != 0) {
+		return false;
+	}
+	char name[320], caps[96];
+	snprintf(name, sizeof(name), "camera-name=%s", cams[i].name);
+	snprintf(caps, sizeof(caps), "video/x-raw,format=BGRx,width=%d,height=%d", pipe_w, pipe_h);
+	pid_t pid = fork();
+	if (pid == 0) {
+		pid_t parent = getppid();
+		prctl(PR_SET_PDEATHSIG, SIGKILL);	/* kept across exec */
+		if (getppid() != parent) {
+			_exit(1);
+		}
+		setpgid(0, 0);
+		int lock = open(PIPE_LOCK, O_RDWR | O_CREAT, 0666);	/* inherited: held until gst-launch ends */
+		alarm(10);	/* the camera another helper holds, waited for this long */
+		if (lock < 0 || flock(lock, LOCK_EX) != 0) {
+			_exit(1);
+		}
+		alarm(0);
+		dup2(fds[1], STDOUT_FILENO);
+		execlp("gst-launch-1.0", "gst-launch-1.0", "-q", "libcamerasrc", name, "!", "queue", "!",
+			caps, "!", "fdsink", "fd=1", (char *)NULL);
+		_exit(127);
+	}
+	close(fds[1]);
+	if (pid < 0) {
+		close(fds[0]);
+		return false;
+	}
+	setpgid(pid, pid);	/* as the child does: source_stop signals the group either way */
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	src.fd = fds[0];
+	src.child = pid;
+	src.fourcc = V4L2_PIX_FMT_XBGR32;	/* BGRx: bytes B, G, R, x */
+	src.dev_w = pipe_w;
+	src.dev_h = pipe_h;
+	src.stride = (size_t)pipe_w * 4;
+	src.rotate = cams[i].rotate;
+	src.mirror = cams[i].mirror;
+	ui.front = cams[i].mirror;	/* a mirrored camera is the one facing you */
+	src.acc_fill = 0;
+	src.last_frame_ms = zmc_now_ms();
+	src.stall_noted = false;
+	bool turned = src.rotate == 90 || src.rotate == 270;
+	frame_alloc(turned ? pipe_h : pipe_w, turned ? pipe_w : pipe_h);
+	snprintf(src.name, sizeof(src.name), "%dx%d", pipe_w, pipe_h);
+	af_pending = !src.mirror;
+	return true;
+}
 
 static void source_start(enum source_kind want) {
 	source_stop();
@@ -407,6 +522,17 @@ static void source_start(enum source_kind want) {
 			break;
 		}
 		note("no replay file");
+		src.kind = SRC_SCENE;
+		snprintf(src.name, sizeof(src.name), "test scene 640x480");
+		frame_alloc(FRAME_W, FRAME_H);
+		break;
+	case SRC_PIPE:
+		if (pipe_open(cam_i)) {
+			src.kind = SRC_PIPE;
+			zmc_watch_fd(src.fd, pipe_ready, NULL);
+			break;
+		}
+		note("could not start the camera helper");
 		src.kind = SRC_SCENE;
 		snprintf(src.name, sizeof(src.name), "test scene 640x480");
 		frame_alloc(FRAME_W, FRAME_H);
@@ -672,6 +798,53 @@ static void yuyv_frame(const uint8_t *in) {
 	src.rev++;
 }
 
+/* 24- or 32-bit RGB to the frame (libcamera's software ISP, through libcamerify), with
+ * the same gains as yuyv_frame, turned src.rotate degrees clockwise: a phone's
+ * sensor sits sideways, and libcamera's V4L2 layer does not say so. */
+static void rgb_frame(const uint8_t *in) {
+	int ro, go, bo;		/* the bytes red, green and blue are in */
+	switch (src.fourcc) {
+	case V4L2_PIX_FMT_RGBA32: case V4L2_PIX_FMT_RGBX32: ro = 0; go = 1; bo = 2; break;
+	case V4L2_PIX_FMT_ABGR32: case V4L2_PIX_FMT_XBGR32: ro = 2; go = 1; bo = 0; break;
+	case V4L2_PIX_FMT_ARGB32: case V4L2_PIX_FMT_XRGB32: ro = 1; go = 2; bo = 3; break;
+	case V4L2_PIX_FMT_RGB24: ro = 0; go = 1; bo = 2; break;
+	case V4L2_PIX_FMT_BGR24: ro = 2; go = 1; bo = 0; break;
+	default: ro = 3; go = 2; bo = 1; break;	/* BGRA32, BGRX32 */
+	}
+	int n = rgb_bytes(src.fourcc);
+	double ev = pow(2.0, (ui.ctl[4] - 6) * 0.5);
+	static const double wb[5][3] = { { 1, 1, 1 }, { 1.10, 1.0, 0.86 },
+		{ 1.0, 1.0, 1.05 }, { 0.9, 1.06, 1.0 }, { 1.15, 1.02, 0.80 } };
+	const double *k = wb[ui.ctl[0]];
+	uint32_t rl[256], gl[256], bl[256];
+	for (int i = 0; i < 256; i++) {
+		int r = (int)(i * ev * k[0]), g = (int)(i * ev * k[1]), b = (int)(i * ev * k[2]);
+		rl[i] = (uint32_t)(r > 255 ? 255 : r) << 16;
+		gl[i] = (uint32_t)(g > 255 ? 255 : g) << 8;
+		bl[i] = (uint32_t)(b > 255 ? 255 : b);
+	}
+	uint8_t *out = (uint8_t *)cairo_image_surface_get_data(src.frame);
+	int stride = cairo_image_surface_get_stride(src.frame);
+	int w = src.dev_w, h = src.dev_h;
+	int fw = src.rotate == 90 || src.rotate == 270 ? h : w;	/* the picture's width, turned */
+	for (int y = 0; y < h; y++) {
+		const uint8_t *p = in + (size_t)y * src.stride;
+		for (int x = 0; x < w; x++, p += n) {
+			int ox = x, oy = y;
+			switch (src.rotate) {
+			case 90: ox = h - 1 - y; oy = x; break;
+			case 180: ox = w - 1 - x; oy = h - 1 - y; break;
+			case 270: ox = y; oy = w - 1 - x; break;
+			}
+			if (src.mirror) ox = fw - 1 - ox;
+			((uint32_t *)(out + (size_t)oy * stride))[ox] =
+				0xff000000u | rl[p[ro]] | gl[p[go]] | bl[p[bo]];
+		}
+	}
+	cairo_surface_mark_dirty(src.frame);
+	src.rev++;
+}
+
 /* ---- captures ------------------------------------------------------------- */
 
 static struct {
@@ -705,7 +878,7 @@ static void capture_photo(void) {
 			return;
 		}
 	} else {
-		shot = cairo_surface_reference(src.frame);
+		shot = zoom_shot(src.frame, ui.zoom);
 	}
 	time_t now = time(NULL);
 	struct tm tm;
@@ -1202,7 +1375,13 @@ static void chrome_draw(cairo_t *cr) {
 	chrome_button(cr, 146, zmc.height - 59, 20, false);
 	cairo_save(cr);
 	cairo_translate(cr, 146, zmc.height - 59);
-	glyph(cr, "lenses");
+	if (src.kind == SRC_PIPE) {	/* the zoom it is at */
+		char zl[8];
+		snprintf(zl, sizeof(zl), "%gx", ui.zoom);
+		zmc_text_centred(cr, zl, FONT_SEMIBOLD, 11, 0, -7);
+	} else {
+		glyph(cr, "lenses");
+	}
 	cairo_restore(cr);
 
 	/* the status line, and anything that just happened */
@@ -1212,6 +1391,9 @@ static void chrome_draw(cairo_t *cr) {
 		src.kind == SRC_REPLAY ? "file replay" : "camera";
 	snprintf(line, sizeof(line), "%s%s · %s · %d fps", ui.front ? "front " : "",
 		what, src.name, ui.fps);
+	if (ui.zoom > 1) {
+		snprintf(line + strlen(line), sizeof(line) - strlen(line), " · %gx", ui.zoom);
+	}
 	zmc_text(cr, line, FONT_REGULAR, 9.5, 16, thumb_y() - 18, zmc.width - 32);
 	if (ui.note_until > zmc_now_ms()) {
 		cairo_set_source_rgba(cr, 0, 0, 0, 0.72);
@@ -1399,7 +1581,7 @@ static void overlay(int page) {
 	} else if (src.frame) {
 		int fw = cairo_image_surface_get_width(src.frame), fh = cairo_image_surface_get_height(src.frame);
 		double k = fmax((double)zmc.width / fw, (double)zmc.height / fh);
-		double cw = zmc.width / k, chh = zmc.height / k;
+		double cw = zmc.width / k / ui.zoom, chh = zmc.height / k / ui.zoom;
 		zmg_surface(src.frame, src.rev, (fw - cw) / 2, (fh - chh) / 2,
 			(fw + cw) / 2, (fh + chh) / 2,
 			(const struct zmg_vertex[4]){ { 0, 0, 0 }, { zmc.width, 0, 0 },
@@ -1501,7 +1683,9 @@ static void source_cycle(void) {
 		raw.cam = RAW_REAR;
 		source_start(SRC_RAW);
 	} else if (src.kind == SRC_SCENE) {
-		if (replay_path) {
+		if (n_cams) {
+			source_start(SRC_PIPE);
+		} else if (replay_path) {
 			source_start(SRC_REPLAY);
 		} else if (device_path) {
 			source_start(SRC_V4L2);
@@ -1543,6 +1727,17 @@ static void facing_toggle(void) {
 		ui.front = raw.cam == RAW_FRONT;
 		ir_parked = raw.cam == RAW_IR;
 		source_start(SRC_RAW);
+		return;
+	}
+	if (src.kind == SRC_PIPE) {
+		if (n_cams < 2) {
+			note("this phone has one camera");
+			return;
+		}
+		cam_i = (cam_i + 1) % n_cams;
+		ui.zoom = 1;
+		source_start(SRC_PIPE);
+		note("%s camera", ui.front ? "front" : "rear");
 		return;
 	}
 	if (src.kind != SRC_SCENE) {
@@ -1651,6 +1846,7 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 			if (v != ui.ctl[c]) {
 				ui.ctl[c] = v;
 				zmc_haptic("tick");
+				if (c == 1) focus_apply();
 			}
 		} else if (down == HIT_SHUTTER && ui.mode == MODE_PHOTO) {
 			ui.shutter_at = time;
@@ -1672,6 +1868,7 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 		if (v != ui.ctl[c]) {
 			ui.ctl[c] = v;
 			zmc_haptic("tick");
+			if (c == 1) focus_apply();
 		}
 		return true;
 	}
@@ -1741,6 +1938,10 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 		if (!off) {
 			if (src.kind == SRC_RAW) {
 				aperture_toggle();
+			} else if (src.kind == SRC_PIPE) {	/* digital zoom: 1x, 2x, 4x */
+				ui.zoom = ui.zoom >= 4 ? 1 : ui.zoom * 2;
+				note("zoom %gx", ui.zoom);
+				chrome_redraw_mark();
 			} else {
 				source_cycle();
 			}
@@ -1781,6 +1982,8 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 		} else if (ui.timer_left > 0) {
 			ui.timer_left = -1;	/* a tap cancels the self-timer */
 			chrome_redraw_mark();
+		} else if (src.kind == SRC_PIPE && ui.ctl[1] == 0) {
+			af_start();	/* a tap focuses again */
 		}
 		break;
 	default:
@@ -1795,6 +1998,10 @@ static void v4l2_ready(int fd, void *data);
 
 static void tick(void) {
 	uint32_t now = zmc_now_ms();
+	if (src.kind == SRC_PIPE && !src.stall_noted && now - src.last_frame_ms > 8000) {
+		src.stall_noted = true;	/* the CAMSS wedge: only a restart brings it back */
+		note("no picture from the camera: restart the phone if it stays dark");
+	}
 	static uint32_t last_scene;
 	if (ui.dial >= 0 && !ui.dial_closing) {
 		ui.dial_anim = fmin(1, ui.dial_anim + 0.16);
@@ -1855,6 +2062,203 @@ static void tick(void) {
 	}
 }
 
+/* ---- a libcamera camera through its helper's pipe ------------------------ */
+
+/* how sharp the frame's middle is, for autofocus: green steps between pixels
+ * two apart, over the centre half */
+static double sharpness(cairo_surface_t *f) {
+	int w = cairo_image_surface_get_width(f), h = cairo_image_surface_get_height(f);
+	int stride = cairo_image_surface_get_stride(f);
+	const uint8_t *d = cairo_image_surface_get_data(f);
+	double s = 0;
+	for (int y = h / 4; y < 3 * h / 4; y += 2) {
+		const uint32_t *row = (const uint32_t *)(d + (size_t)y * stride);
+		for (int x = w / 4; x + 2 < 3 * w / 4; x += 2) {
+			s += abs((int)((row[x] >> 8) & 0xff) - (int)((row[x + 2] >> 8) & 0xff));
+		}
+	}
+	return s;
+}
+
+/* the rear camera's focus motor: the first V4L2 subdevice with an absolute
+ * focus control (a voice-coil driver such as lc898219xi) */
+static int lens = -2, lens_min, lens_max;
+static int focus_at[4] = { -1, -1, -1, -1 };	/* by the focus dial: auto, macro, normal, infinity */
+static bool lens_open(void) {
+	if (lens == -2) {
+		lens = -1;
+		for (int i = 0; i < 64 && lens < 0; i++) {
+			char path[32];
+			snprintf(path, sizeof(path), "/dev/v4l-subdev%d", i);
+			int fd = open(path, O_RDWR | O_CLOEXEC);
+			if (fd < 0) {
+				continue;
+			}
+			struct v4l2_queryctrl q = { .id = V4L2_CID_FOCUS_ABSOLUTE };
+			if (ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 && !(q.flags & V4L2_CTRL_FLAG_DISABLED) &&
+					q.maximum > q.minimum) {
+				lens = fd;
+				lens_min = q.minimum;
+				lens_max = q.maximum;
+			} else {
+				close(fd);
+			}
+		}
+		/* --focus gives this phone's three; otherwise guess the usual direction */
+		if (lens >= 0 && focus_at[1] < 0) {
+			focus_at[3] = lens_min;
+			focus_at[2] = lens_min + (lens_max - lens_min) / 4;
+			focus_at[1] = lens_max;
+		}
+	}
+	return lens >= 0;
+}
+
+static void lens_move(int pos) {
+	struct v4l2_control c = { .id = V4L2_CID_FOCUS_ABSOLUTE, .value = pos };
+	if (lens >= 0) {
+		ioctl(lens, VIDIOC_S_CTRL, &c);
+	}
+}
+
+/* contrast autofocus: a coarse sweep between infinity and macro, then a fine
+ * one round the best, PIPE_AF_SETTLE frames at each place for the lens to land */
+#define PIPE_AF_STEPS	8
+#define PIPE_AF_SETTLE	2
+static struct { int pass, step, settle, lo, hi, best_pos; double best; } af = { .pass = -1 };
+
+static int af_pos(void) {
+	return af.lo + (af.hi - af.lo) * af.step / (PIPE_AF_STEPS - 1);
+}
+
+static void af_start(void) {
+	if (src.kind != SRC_PIPE || src.mirror || !lens_open()) {
+		return;
+	}
+	af.pass = 0;
+	af.step = 0;
+	af.lo = focus_at[3] < focus_at[1] ? focus_at[3] : focus_at[1];
+	af.hi = focus_at[3] < focus_at[1] ? focus_at[1] : focus_at[3];
+	af.best = -1;
+	af.settle = PIPE_AF_SETTLE;
+	lens_move(af_pos());
+	note("focusing");
+}
+
+static void af_frame(void) {
+	if (af.pass < 0) {
+		return;
+	}
+	if (af.settle > 0) {
+		af.settle--;
+		return;
+	}
+	double s = sharpness(src.frame);
+	if (s > af.best) {
+		af.best = s;
+		af.best_pos = af_pos();
+	}
+	if (++af.step < PIPE_AF_STEPS) {
+		lens_move(af_pos());
+		af.settle = PIPE_AF_SETTLE;
+		return;
+	}
+	if (af.pass == 0) {	/* again, closer, either side of the best */
+		int span = (af.hi - af.lo) / (PIPE_AF_STEPS - 1);
+		af.lo = af.best_pos - span > lens_min ? af.best_pos - span : lens_min;
+		af.hi = af.best_pos + span < lens_max ? af.best_pos + span : lens_max;
+		af.pass = 1;
+		af.step = 0;
+		af.settle = PIPE_AF_SETTLE;
+		lens_move(af_pos());
+		return;
+	}
+	lens_move(af.best_pos);
+	af.pass = -1;
+	note("focused");
+}
+
+/* the focus dial, on a camera with a focus motor */
+static void focus_apply(void) {
+	if (src.kind != SRC_PIPE || src.mirror || !lens_open()) {
+		return;
+	}
+	af.pass = -1;
+	if (ui.ctl[1] == 0) {
+		af_start();
+	} else {
+		lens_move(focus_at[ui.ctl[1]]);
+	}
+}
+
+/* reads what the helper has sent, showing each whole frame: how many, or -1
+ * once the helper has ended */
+static int pipe_drain(int fd) {
+	size_t frame = (size_t)pipe_w * pipe_h * 4;
+	if (src.acc_size < frame) {
+		free(src.acc);
+		src.acc = malloc(frame);
+		src.acc_size = src.acc ? frame : 0;
+		src.acc_fill = 0;
+		if (!src.acc) {
+			return -1;
+		}
+	}
+	int frames = 0;
+	for (;;) {
+		ssize_t n = read(fd, src.acc + src.acc_fill, frame - src.acc_fill);
+		if (n > 0) {
+			src.acc_fill += (size_t)n;
+			if (src.acc_fill == frame) {
+				src.acc_fill = 0;
+				rgb_frame(src.acc);
+				af_frame();
+				frames++;
+			}
+		} else if (n == 0) {
+			return -1;
+		} else if (errno != EINTR) {
+			return frames;	/* EAGAIN: all there is for now */
+		}
+	}
+}
+
+static void pipe_ready(int fd, void *data) {
+	static int since_start;
+	int n = pipe_drain(fd);
+	if (n < 0) {
+		note("the camera stopped");
+		source_start(SRC_SCENE);
+		return;
+	}
+	if (n > 0) {
+		src.last_frame_ms = zmc_now_ms();
+		since_start = af_pending ? since_start + n : 0;
+		if (af_pending && since_start >= 15) {	/* half a second: exposure has settled */
+			af_pending = false;
+			focus_apply();
+		}
+		frame_arrived();
+		zmc_present();
+	}
+}
+
+/* the photo at the digital zoom: the frame's middle 1/z, made full size */
+static cairo_surface_t *zoom_shot(cairo_surface_t *f, double z) {
+	if (z <= 1.0) {
+		return cairo_surface_reference(f);
+	}
+	int w = cairo_image_surface_get_width(f), h = cairo_image_surface_get_height(f);
+	cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+	cairo_t *cr = cairo_create(out);
+	cairo_scale(cr, z, z);
+	cairo_set_source_surface(cr, f, -(w - w / z) / 2, -(h - h / z) / 2);
+	cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+	cairo_paint(cr);
+	cairo_destroy(cr);
+	return out;
+}
+
 static void v4l2_ready(int fd, void *data) {
 	struct v4l2_buffer b;
 	memset(&b, 0, sizeof(b));
@@ -1865,9 +2269,10 @@ static void v4l2_ready(int fd, void *data) {
 	}
 	if (b.index >= (unsigned)src.nbuf) return;
 	if (!(b.flags & V4L2_BUF_FLAG_ERROR) &&
-			b.bytesused >= src.stride * src.h &&
-			src.buf[b.index].len >= src.stride * src.h) {
-		yuyv_frame((const uint8_t *)src.buf[b.index].start);
+			b.bytesused >= src.stride * src.dev_h &&
+			src.buf[b.index].len >= src.stride * src.dev_h) {
+		const uint8_t *in = src.buf[b.index].start;
+		if (src.fourcc == V4L2_PIX_FMT_YUYV) yuyv_frame(in); else rgb_frame(in);
 	}
 	ioctl(fd, VIDIOC_QBUF, &b);
 	frame_arrived();
@@ -1905,7 +2310,7 @@ static void arrived(int page) {
 	white_make();
 	roll_scan();
 	thumb_load();
-	source_start(device_path ? SRC_V4L2 : replay_path ? SRC_REPLAY :
+	source_start(device_path ? SRC_V4L2 : replay_path ? SRC_REPLAY : n_cams ? SRC_PIPE :
 		access(RAW_DEV, F_OK) == 0 ? SRC_RAW : SRC_SCENE);
 	if (src.kind == SRC_SCENE) {
 		snprintf(src.name, sizeof(src.name), "test scene 640x480");
@@ -1974,11 +2379,20 @@ static void usage(void) {
 	fprintf(stderr,
 		"ztcamera: the camera, in the Lumia Camera look\n"
 		"\n"
-		"  ztcamera [--device /dev/videoN] [--replay FILE [--size WxH] [--rate R]]\n"
+		"  ztcamera [--libcamera NAME:DEGREES[:mirror]]... [--size WxH]\n"
+		"           [--focus INFINITY,NORMAL,MACRO]\n"
+		"  ztcamera [--device /dev/videoN] [--rotate 0|90|180|270]\n"
+		"           [--replay FILE [--size WxH] [--rate R]]\n"
 		"  ztcamera --render OUT.png [dial 0-4]\n"
 		"\n"
 		"Without --device or --replay it draws its own test scene, which the\n"
-		"manual controls (exposure, white balance, ISO, shutter, focus) drive.\n");
+		"manual controls (exposure, white balance, ISO, shutter, focus) drive.\n"
+		"--rotate turns an RGB device's picture clockwise, for a sensor\n"
+		"mounted sideways (libcamerify ztcamera --rotate 270).\n"
+		"--libcamera reads a libcamera camera (gst-launch-1.0 libcamerasrc) in a\n"
+		"helper process, turned DEGREES clockwise; the first is the rear camera,\n"
+		"the facing button goes through them. --focus is the focus motor's three\n"
+		"positions for the focus dial; auto is a contrast sweep between them.\n");
 }
 
 int main(int argc, char **argv) {
@@ -1993,10 +2407,42 @@ int main(int argc, char **argv) {
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--device") && i + 1 < argc) {
 			device_path = argv[++i];
+		} else if (!strcmp(argv[i], "--libcamera") && i + 1 < argc && n_cams < MAX_CAMS) {
+			char *spec = argv[++i];	/* NAME:DEGREES[:mirror] */
+			bool mirror = false;
+			char *c = strrchr(spec, ':');
+			if (c && !strcmp(c, ":mirror")) {
+				mirror = true;
+				*c = 0;
+				c = strrchr(spec, ':');
+			}
+			int deg = c ? atoi(c + 1) : -1;
+			if (!c || deg % 90 || deg < 0 || deg > 270) {
+				usage();
+				return 2;
+			}
+			*c = 0;
+			cams[n_cams].name = spec;
+			cams[n_cams].rotate = deg;
+			cams[n_cams].mirror = mirror;
+			n_cams++;
+		} else if (!strcmp(argv[i], "--focus") && i + 1 < argc) {
+			if (sscanf(argv[++i], "%d,%d,%d", &focus_at[3], &focus_at[2], &focus_at[1]) != 3) {
+				usage();
+				return 2;
+			}
+		} else if (!strcmp(argv[i], "--rotate") && i + 1 < argc) {
+			src.rotate = atoi(argv[++i]);
+			if (src.rotate % 90 || src.rotate < 0 || src.rotate > 270) {
+				usage();
+				return 2;
+			}
 		} else if (!strcmp(argv[i], "--replay") && i + 1 < argc) {
 			replay_path = argv[++i];
 		} else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
 			sscanf(argv[++i], "%dx%d", &replay_w, &replay_h);
+			pipe_w = replay_w;	/* --size is the libcamera camera's too */
+			pipe_h = replay_h;
 		} else if (!strcmp(argv[i], "--rate") && i + 1 < argc) {
 			replay_rate = atof(argv[++i]);
 		} else if (!strcmp(argv[i], "--render") && i + 1 < argc) {
@@ -2015,7 +2461,11 @@ int main(int argc, char **argv) {
 		if (dial_arg < -1 || dial_arg >= N_CONTROLS) return 2;
 		return render_png(out_png, dial_arg);
 	}
-	if (!device_path && !replay_path && access("/dev/video0", R_OK | W_OK) == 0) {
+	if (pipe_w < 16 || pipe_h < 16 || pipe_w > 4096 || pipe_h > 4096) {
+		usage();
+		return 2;
+	}
+	if (!device_path && !replay_path && !n_cams && access("/dev/video0", R_OK | W_OK) == 0) {
 		device_path = "/dev/video0";
 	}
 	int status = zmc_run(&camera, 0);
