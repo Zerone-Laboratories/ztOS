@@ -1,6 +1,6 @@
 {
- "generated": "2026-10-28T09:41:36+00:00",
- "pmaports": "1eb4dce28ef2d0ecc8651914bcb4972083eefb0f",
+ "generated": "2026-11-06T10:55:07+00:00",
+ "pmaports": "eb442495cfc5aeaeb5f3de153383cbdec7b0d441",
  "devices": [
   {
    "codename": "fairphone-fp4",
@@ -191,6 +191,22 @@
    "archived": false,
    "flash_method": "fastboot",
    "kernel": "linux-ayaneo-pocket-s2",
+   "screen": "",
+   "warnings": []
+  },
+  {
+   "codename": "ayn-odin",
+   "name": "AYN Odin",
+   "manufacturer": "AYN",
+   "year": "2021",
+   "chassis": "tablet",
+   "category": "testing",
+   "soc": "sdm845",
+   "gpu_driver": "freedreno",
+   "accelerated": true,
+   "archived": false,
+   "flash_method": "fastboot",
+   "kernel": "linux-ayn-odin",
    "screen": "",
    "warnings": []
   },
