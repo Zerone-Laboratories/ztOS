@@ -1,0 +1,298 @@
+{
+  "id": "oneplus-oneplus2",
+  "name": "OnePlus 2",
+  "maker": "OnePlus",
+  "model": "A2003",
+  "codename": "oneplus2",
+  "maintainer": "Matt (luvingiane)",
+  "contact": "https://github.com/luvingiane/oneplus2-mainline",
+  "added": "2026-11-07",
+  "summary": "ztOS on the OnePlus 2 (Snapdragon 810, MSM8994), on mainline Linux 7.3 with its own device tree and patches. The display, touch, hardware GPU (Adreno 430, OpenGL ES 3.0 on freedreno), Wi-Fi, Bluetooth with audio, battery, the modem (LTE, SMS, ringing and answering calls) and the loudspeaker work. There is no mobile data, no earpiece, microphones or call audio, no cameras, and the four A57 cores and CPU frequency scaling are not done, so it is an early port and not yet a usable phone. Tried on one OnePlus 2 (A2003); started from RAM with fastboot.",
+  "photo": "photo.jpg",
+  "photo_caption": "ztMETRO's Start on the OnePlus 2",
+  "specs": [
+    [
+      "SoC",
+      "Qualcomm Snapdragon 810 (MSM8994)"
+    ],
+    [
+      "CPU",
+      "4× Cortex-A57 + 4× Cortex-A53 (A57 not brought up yet; the A53 run at a fixed 1.5 GHz)"
+    ],
+    [
+      "GPU",
+      "Adreno 430 (freedreno, OpenGL ES 3.0)"
+    ],
+    [
+      "RAM",
+      "4 GB"
+    ],
+    [
+      "Storage",
+      "64 GB eMMC"
+    ],
+    [
+      "Display",
+      "5.5 in, 1080×1920 LCD (JD35695, DSI command mode)"
+    ],
+    [
+      "Battery",
+      "3300 mAh"
+    ],
+    [
+      "Kernel",
+      "Linux 7.3 (mainline, with patches)"
+    ],
+    [
+      "Released",
+      "2015"
+    ],
+    [
+      "Device layer",
+      "github.com/luvingiane/oneplus2-mainline (kernel, device tree, patches, tools; a ztOS device layer is not written yet)"
+    ]
+  ],
+  "install": {
+    "markdown": "> **This is not installable as a system yet.** The port boots ztOS from RAM with `fastboot boot` and runs it from the phone's userdata partition; there is no installer and no device layer in ztOS yet. Kernel, device tree, patches, initramfs and the build scripts are in [oneplus2-mainline](https://github.com/luvingiane/oneplus2-mainline) (see its README for the build and the status table).\n>\n> **Tried on one OnePlus 2 (A2003)** with an unlocked bootloader. Never flash the modem or bootloader partitions."
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Mainline kernel boot (7.3), from RAM and from flash",
+      "status": "working",
+      "notes": "`fastboot boot` and the boot partition; cold start reaches the ztMETRO shell"
+    },
+    {
+      "category": "Boot",
+      "feature": "Boot logo",
+      "status": "working",
+      "notes": "Arch Linux logo in the `LOGO` partition (`tools/boot-logo`)"
+    },
+    {
+      "category": "Boot",
+      "feature": "CPU, 4 × A53",
+      "status": "working",
+      "notes": "CAF-style ACC bring-up (patch 0010), fixed clock of about 1.5 GHz"
+    },
+    {
+      "category": "Boot",
+      "feature": "CPU, 4 × A57",
+      "status": "broken",
+      "notes": "they come up with a real clock but the boot becomes intermittent (3 of 4 starts); left off"
+    },
+    {
+      "category": "Boot",
+      "feature": "CPU frequency scaling",
+      "status": "broken",
+      "notes": "no cpufreq: clock driver and OPP table are drafts, a 1 V / 1536 MHz try crashed the boot"
+    },
+    {
+      "category": "Display",
+      "feature": "Panel (JD35695, 1080p, DSI command mode)",
+      "status": "working",
+      "notes": "own panel driver (`kernel/panel`), MDP5 + DSI"
+    },
+    {
+      "category": "Display",
+      "feature": "GPU (Adreno 430)",
+      "status": "working",
+      "notes": "hardware OpenGL ES 3.0 (freedreno) draws the whole UI; needs patches 0130 + 0144 (identity IOVA, TZ refuses the SMMU)"
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen (Synaptics S3320)",
+      "status": "working",
+      "notes": "multi-touch; GPIO 74 must stay on"
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": "screenshot on power + volume up, volume with the screen off"
+    },
+    {
+      "category": "Input",
+      "feature": "Capacitive touch keys",
+      "status": "partial",
+      "notes": "events arrive and the left key acts as Home; the other key is not checked"
+    },
+    {
+      "category": "Input",
+      "feature": "Alert slider",
+      "status": "working",
+      "notes": "`gpio-keys` F13/F15"
+    },
+    {
+      "category": "Audio",
+      "feature": "Loudspeaker",
+      "status": "working",
+      "notes": "ADSP + q6 quaternary MI2S → TFA9890"
+    },
+    {
+      "category": "Audio",
+      "feature": "Earpiece, headphone jack, microphones",
+      "status": "broken",
+      "notes": "WCD9330 codec: the SLIMbus never enumerates (capability exchange times out), no mainline codec driver"
+    },
+    {
+      "category": "Audio",
+      "feature": "Audio of a phone call",
+      "status": "broken",
+      "notes": "needs the modem-to-codec path on SLIMbus"
+    },
+    {
+      "category": "Audio",
+      "feature": "Ringtone",
+      "status": "broken",
+      "notes": "the phone does not ring on an incoming call (the caller does hear ringing); cause not found yet"
+    },
+    {
+      "category": "Modem",
+      "feature": "Modem start and SIM",
+      "status": "working",
+      "notes": "MSS + ADSP remoteproc, `rmtfs`, QMI DPM opens `DATA5_CNTL`, USIM session (`scripts/op2-modem-up.sh`)"
+    },
+    {
+      "category": "Modem",
+      "feature": "Mobile network (LTE) and operator name",
+      "status": "working",
+      "notes": "registers on LTE; signal bars and operator in ztOS"
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "working",
+      "notes": "read from the SIM storage"
+    },
+    {
+      "category": "Modem",
+      "feature": "Phone calls",
+      "status": "partial",
+      "notes": "ringing, answering and hanging up work (a QMI VOICE client is needed so the network alerts the phone); no voice audio yet"
+    },
+    {
+      "category": "Modem",
+      "feature": "Mobile data",
+      "status": "broken",
+      "notes": "no packet path: the MSM8994 IPA v2 has no mainline driver"
+    },
+    {
+      "category": "Modem",
+      "feature": "Airplane mode",
+      "status": "working",
+      "notes": "stops the modem (`AT+CFUN=4` crashes its firmware): `scripts/op2-airplane.sh`"
+    },
+    {
+      "category": "Modem",
+      "feature": "Second SIM",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi (QCA6174 on PCIe1)",
+      "status": "working",
+      "notes": "ath10k scans and associates (patches 0149-0165)"
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "working",
+      "notes": "controller over UART, audio over Bluetooth tried and working; the factory BD address is invalid and must be set"
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking (device mode)",
+      "status": "working",
+      "notes": "NCM + ssh; a watchdog can send the phone back to fastboot when no USB link comes up"
+    },
+    {
+      "category": "Network",
+      "feature": "USB host (OTG)",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "broken",
+      "notes": "not started (lives in the modem: QMI LOC)"
+    },
+    {
+      "category": "Camera",
+      "feature": "Front camera (OV5648)",
+      "status": "broken",
+      "notes": "CSIPHY/CSID/ISPIF/VFE lined up with the vendor driver, the CSID test pattern passes, but no MIPI packets from the sensor (PHY status 0)"
+    },
+    {
+      "category": "Camera",
+      "feature": "Rear camera (OV13860)",
+      "status": "broken",
+      "notes": "draft driver in `kernel/patches-73` (0189, 0190), never run"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient light",
+      "status": "working",
+      "notes": "ADSP sensor manager through `tools/op2-sensord`"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Proximity",
+      "status": "broken",
+      "notes": "returns a constant value even when covered (not understood yet)"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, gyroscope, magnetometer",
+      "status": "untested",
+      "notes": "the ADSP streams them (`op2-sensord watch`), not checked; no auto-rotation"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Hall sensor",
+      "status": "untested",
+      "notes": "`SW_MACHINE_COVER` on GPIO 75"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Fingerprint reader",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charging",
+      "status": "working",
+      "notes": "`kernel/patches/0013` + APSD re-run"
+    },
+    {
+      "category": "Power",
+      "feature": "Temperature and thermal throttling",
+      "status": "working",
+      "notes": "16 TSENS zones from the fuses; `op2-thermal.py` throttles the PLL post-dividers"
+    },
+    {
+      "category": "Power",
+      "feature": "Vibration",
+      "status": "untested",
+      "notes": "PMI8994 haptic as an `FF_RUMBLE` input device, not felt by hand yet"
+    },
+    {
+      "category": "Power",
+      "feature": "Notification LED",
+      "status": "working",
+      "notes": "PMI8994 LPG, red/green/blue"
+    }
+  ],
+  "notes": [
+    {
+      "title": "Why the A57 cores are off",
+      "text": "With the four A57 cores on, the boot becomes intermittent (3 starts out of 4). The four A53 cores run at a fixed clock of about 1.5 GHz; CPU frequency scaling is still a draft."
+    },
+    {
+      "title": "Airplane mode stops the modem",
+      "text": "On this phone AT+CFUN=4 crashes the modem firmware while it is registered, so airplane mode stops and restarts the modem instead."
+    }
+  ]
+}
