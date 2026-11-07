@@ -1,6 +1,6 @@
 {
- "generated": "2026-11-06T10:55:07+00:00",
- "pmaports": "eb442495cfc5aeaeb5f3de153383cbdec7b0d441",
+ "generated": "2026-11-07T10:13:29+00:00",
+ "pmaports": "d58ca1a2fe682277729a43775622fca012711024",
  "devices": [
   {
    "codename": "fairphone-fp4",
@@ -480,22 +480,6 @@
    "flash_method": "fastboot",
    "kernel": "linux-postmarketos-qcom-sm8250",
    "screen": "1080x2400",
-   "warnings": []
-  },
-  {
-   "codename": "samsung-a72q",
-   "name": "Samsung Galaxy A72",
-   "manufacturer": "Samsung",
-   "year": "2021",
-   "chassis": "handset",
-   "category": "testing",
-   "soc": "sm7125",
-   "gpu_driver": "freedreno",
-   "accelerated": true,
-   "archived": false,
-   "flash_method": "heimdall-bootimg",
-   "kernel": "linux-postmarketos-qcom-sm7125",
-   "screen": "",
    "warnings": []
   },
   {
