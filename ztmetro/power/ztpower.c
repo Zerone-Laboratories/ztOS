@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "zrnmetrocore.h"
+#include "ztos-hw.h"
 
 enum page {
 	PAGE_SLEEP = 0,
@@ -36,8 +37,6 @@ enum action {
 	ACT_HISTORY_PAGE,
 };
 
-#define BATTERY_PATH	"/sys/class/power_supply/max170xx_battery"
-#define CHARGER_PATH	"/sys/class/power_supply/max77705-charger"
 #define SLEEP_STATUS	"/run/zrn-sleepd/status"
 #define SLEEP_ENABLED	"/var/lib/zrn-sleep/enabled"
 #ifndef SLEEP_LOG
@@ -182,26 +181,26 @@ static void read_sysfs_str(const char *path, char *out, size_t sz, const char *d
 }
 
 static void load_battery_data(void) {
-	pdata.capacity = (int)read_sysfs_long(BATTERY_PATH "/capacity");
+	pdata.capacity = (int)read_sysfs_long(hw_file(hw_battery(), "capacity"));
 	if (pdata.capacity < 0) pdata.capacity = 0;
 	if (pdata.capacity > 100) pdata.capacity = 100;
 
-	read_sysfs_str(BATTERY_PATH "/status", pdata.status, sizeof(pdata.status), "Unknown");
-	pdata.voltage_v = read_sysfs_long(BATTERY_PATH "/voltage_now") / 1e6;
-	pdata.current_ma = read_sysfs_long(BATTERY_PATH "/current_now") / 1000;
-	pdata.current_avg_ma = read_sysfs_long(BATTERY_PATH "/current_avg") / 1000;
-	pdata.temp_c = read_sysfs_long(BATTERY_PATH "/temp") / 10.0;
-	pdata.cycle_count = read_sysfs_long(BATTERY_PATH "/cycle_count");
-	read_sysfs_str(BATTERY_PATH "/health", pdata.health, sizeof(pdata.health), "Good");
+	read_sysfs_str(hw_file(hw_battery(), "status"), pdata.status, sizeof(pdata.status), "Unknown");
+	pdata.voltage_v = read_sysfs_long(hw_file(hw_battery(), "voltage_now")) / 1e6;
+	pdata.current_ma = read_sysfs_long(hw_file(hw_battery(), "current_now")) / 1000;
+	pdata.current_avg_ma = read_sysfs_long(hw_file(hw_battery(), "current_avg")) / 1000;
+	pdata.temp_c = read_sysfs_long(hw_file(hw_battery(), "temp")) / 10.0;
+	pdata.cycle_count = read_sysfs_long(hw_file(hw_battery(), "cycle_count"));
+	read_sysfs_str(hw_file(hw_battery(), "health"), pdata.health, sizeof(pdata.health), "Good");
 
-	pdata.time_to_empty_s = read_sysfs_long(BATTERY_PATH "/time_to_empty_now");
-	pdata.time_to_full_s = read_sysfs_long(BATTERY_PATH "/time_to_full_now");
+	pdata.time_to_empty_s = read_sysfs_long(hw_file(hw_battery(), "time_to_empty_now"));
+	pdata.time_to_full_s = read_sysfs_long(hw_file(hw_battery(), "time_to_full_now"));
 
 	char chg_stat[32];
-	read_sysfs_str(CHARGER_PATH "/status", chg_stat, sizeof(chg_stat), "Disconnected");
+	read_sysfs_str(hw_file(hw_charger(), "status"), chg_stat, sizeof(chg_stat), "Disconnected");
 	pdata.charger_online = (strcmp(chg_stat, "Charging") == 0 || strcmp(chg_stat, "Full") == 0);
-	read_sysfs_str(CHARGER_PATH "/charge_type", pdata.charge_type, sizeof(pdata.charge_type), "Normal");
-	pdata.input_limit_ma = read_sysfs_long(CHARGER_PATH "/input_current_limit") / 1000;
+	read_sysfs_str(hw_file(hw_charger(), "charge_type"), pdata.charge_type, sizeof(pdata.charge_type), "Normal");
+	pdata.input_limit_ma = read_sysfs_long(hw_file(hw_charger(), "input_current_limit")) / 1000;
 }
 
 /* How long a wake line says the phone slept: "(asleep 7.7s, ...)" now,
