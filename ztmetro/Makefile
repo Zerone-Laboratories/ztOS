@@ -1,5 +1,5 @@
 # Builds on the phone itself (aarch64 Arch Linux ARM, wlroots 0.20).
-PKGS = wlroots-0.20 wayland-server xkbcommon cairo pangocairo librsvg-2.0 gdk-pixbuf-2.0 pixman-1 libdrm egl glesv2 libinput
+PKGS = wlroots-0.20 wayland-server xkbcommon cairo pangocairo librsvg-2.0 gdk-pixbuf-2.0 pixman-1 libdrm egl glesv2
 APP_PKGS = xkbcommon wayland-client wayland-egl egl glesv2 cairo pangocairo gdk-pixbuf-2.0
 WP := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
 XDG := $(WP)/stable/xdg-shell/xdg-shell.xml
@@ -30,6 +30,10 @@ sounds/ztos-sounds: sounds/ztos-sounds.c
 IAL_FLAGS := $(shell pkg-config --exists ztos-ial 2>/dev/null && echo -DHAVE_ZTOS_IAL $$(pkg-config --cflags ztos-ial))
 IAL_LIBS := $(shell pkg-config --exists ztos-ial 2>/dev/null && pkg-config --libs --static ztos-ial)
 
+# libinput (touch pad tapping and disable-while-typing when available)
+LIBINPUT_FLAGS := $(shell pkg-config --exists libinput 2>/dev/null && echo -DHAVE_LIBINPUT $$(pkg-config --cflags libinput))
+LIBINPUT_LIBS := $(shell pkg-config --exists libinput 2>/dev/null && pkg-config --libs libinput)
+
 # ztRetrofit's styles beside Metro: retro/ (DotMatrix: the dot engine and its launcher)
 RETRO = retro/dotmatrix.c retro/dm-launcher.c retro/dm-chrome.c
 RETRO_DEPS = $(RETRO) core/zrnboard.h retro/dotmatrix.h retro/dm-launcher.h retro/dm-chrome.h retro/dm-glyphs.h
@@ -38,8 +42,8 @@ DM_WRAP = retro/dm-wrap.c
 DM_WRAP_LDFLAGS = -Wl,--wrap=cairo_fill,--wrap=cairo_fill_preserve,--wrap=cairo_stroke,--wrap=cairo_stroke_preserve,--wrap=cairo_paint
 
 ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h $(RETRO_DEPS) $(DM_WRAP)
-	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(IAL_FLAGS) \
-		-o $@ ztmetro.c $(RETRO) $(DM_WRAP) $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
+	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(LIBINPUT_FLAGS) $(IAL_FLAGS) \
+		-o $@ ztmetro.c $(RETRO) $(DM_WRAP) $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(PKGS)) $(LIBINPUT_LIBS) $(IAL_LIBS) -lm -lpthread
 
 # the DotMatrix screens rendered offscreen to PNG files, to check them without a phone
 retro/dm-test: retro/dm-test.c $(RETRO_DEPS)
@@ -259,20 +263,20 @@ clean:
 # Uses a private Wayland seat; does not touch the running compositor or display.
 .PHONY: check-arch check-keyboard
 check-keyboard: xdg-shell-protocol.h $(RETRO_DEPS)
-	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
-		-o /tmp/ztmetro-keyboard-test tests/keyboard-trackpad.c $(RETRO) $(WRAP_FLAGS) $(shell pkg-config --libs $(PKGS)) -linput $(BACKEND_LIBS) -lm -lpthread
+	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(LIBINPUT_FLAGS) \
+		-o /tmp/ztmetro-keyboard-test tests/keyboard-trackpad.c $(RETRO) $(WRAP_FLAGS) $(shell pkg-config --libs $(PKGS)) $(LIBINPUT_LIBS) $(BACKEND_LIBS) -lm -lpthread
 	/tmp/ztmetro-keyboard-test
 
 .PHONY: check-launch
 check-launch: xdg-shell-protocol.h $(RETRO_DEPS)
-	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
-		-o /tmp/ztmetro-launch-test tests/launch-state.c $(RETRO) $(WRAP_FLAGS) $(shell pkg-config --libs $(PKGS)) -linput $(BACKEND_LIBS) -lm -lpthread
+	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(LIBINPUT_FLAGS) \
+		-o /tmp/ztmetro-launch-test tests/launch-state.c $(RETRO) $(WRAP_FLAGS) $(shell pkg-config --libs $(PKGS)) $(LIBINPUT_LIBS) $(BACKEND_LIBS) -lm -lpthread
 	/tmp/ztmetro-launch-test
 
 .PHONY: check-auth
 check-auth: xdg-shell-protocol.h $(RETRO_DEPS)
-	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
-		-o /tmp/ztmetro-auth-test tests/auth-prompt.c $(RETRO) $(WRAP_FLAGS) $(shell pkg-config --libs $(PKGS)) -linput $(BACKEND_LIBS) -lm -lpthread
+	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(LIBINPUT_FLAGS) \
+		-o /tmp/ztmetro-auth-test tests/auth-prompt.c $(RETRO) $(WRAP_FLAGS) $(shell pkg-config --libs $(PKGS)) $(LIBINPUT_LIBS) $(BACKEND_LIBS) -lm -lpthread
 	/tmp/ztmetro-auth-test
 
 .PHONY: check-demoloop-stop

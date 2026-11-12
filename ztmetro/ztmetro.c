@@ -113,8 +113,10 @@
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
+#ifdef HAVE_LIBINPUT
 #include <libinput.h>
 #include <wlr/backend/libinput.h>
+#endif
 #include <xkbcommon/xkbcommon.h>
 
 /* A file in the session's runtime directory: $XDG_RUNTIME_DIR, or
@@ -13305,6 +13307,7 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 			wlr_cursor_attach_input_device(server->cursor, device);
 			
 			// we should do this elsewhere and provide config options!!! - tenkuma
+#ifdef HAVE_LIBINPUT
 			if (wlr_input_device_is_libinput(device)) {
 				struct libinput_device *lidevice = wlr_libinput_get_device_handle(device);
 				if (lidevice) {
@@ -13312,6 +13315,7 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 					libinput_device_config_dwt_set_enabled(lidevice, LIBINPUT_CONFIG_DWT_DISABLED);
 				}
 			}
+#endif
 		}
 		struct zt_pointer_device *pointer = calloc(1, sizeof(*pointer));
 		pointer->server = server;

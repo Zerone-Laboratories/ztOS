@@ -70,12 +70,17 @@ def packages(target: str) -> list:
     paths = [OS / "packages" / "common"]
     if target in DEVICES:
         paths.append(ROOT / "devices" / DEVICES[target] / "packages.txt")
+    devsrc = os.environ.get("ZTOS_DEVICE")
+    if devsrc and (Path(devsrc) / "packages.txt").exists():
+        paths.append(Path(devsrc) / "packages.txt")
     for path in paths:
         if path.exists():
             for line in path.read_text().splitlines():
                 line = line.split("#", 1)[0].strip()
                 if line:
                     names.append(line)
+    if "libinput" not in names:
+        names.append("libinput")
     return names
 
 
