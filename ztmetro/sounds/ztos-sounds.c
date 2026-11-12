@@ -21,7 +21,10 @@
 #define IDLE_MS 500
 struct sound { int16_t *pcm; size_t frames; };
 struct voice { int sound; size_t position; double gain; uint64_t age; bool active; };
-#define SOUNDS 10
+#define SOUNDS 22
+#define SOUND_DTMF 10	/* the keypad's twelve, cut short: a press is a blip, one at a time */
+#define DTMF_FRAMES (RATE*150/1000)
+#define DTMF_FADE (RATE*10/1000)
 static struct sound sounds[SOUNDS];
 static struct voice voices[VOICES];
 static uint64_t next_age, last_tap;
@@ -39,6 +42,9 @@ static const char *const files[SOUNDS] = {
  "keyboard/KbdKeyTap.wav", "keyboard/KbdSpacebar.wav", "keyboard/KbdFunction.wav",
  "system/lock.wav", "system/unlock.wav", "system/notify.wav", "system/copy.wav",
  "system/menu.wav", "system/battery-low.wav", "system/pip.wav",
+ "phone/dtmf0.wav", "phone/dtmf1.wav", "phone/dtmf2.wav", "phone/dtmf3.wav", "phone/dtmf4.wav",
+ "phone/dtmf5.wav", "phone/dtmf6.wav", "phone/dtmf7.wav", "phone/dtmf8.wav", "phone/dtmf9.wav",
+ "phone/dtmfast.wav", "phone/dtmfpd.wav",
 };
 
 static uint64_t now_ms(void) {
@@ -89,6 +95,11 @@ static void load_sound(int index) {
      pcm[i*2+c]=(int16_t)(x+(y-x)*fraction);
     }
    }
+   if(index>=SOUND_DTMF && frames>DTMF_FRAMES) {
+    frames=DTMF_FRAMES;
+    for(size_t i=0;i<DTMF_FADE;i++) for(unsigned c=0;c<2;c++)
+     pcm[(frames-1-i)*2+c]=(int16_t)(pcm[(frames-1-i)*2+c]*(double)i/DTMF_FADE);
+   }
    sounds[index]=(struct sound){pcm,frames};
   }
  }
@@ -97,6 +108,8 @@ done:
 }
 static void trigger_voice(int sound, unsigned volume) {
  int pick=-1;
+ // A new key replaces the key before it: tones never pile up.
+ if(sound>=SOUND_DTMF) for(int i=0;i<VOICES;i++) if(voices[i].active && voices[i].sound>=SOUND_DTMF) voices[i].active=false;
  for(int i=0;i<VOICES;i++) if(!voices[i].active) {pick=i;break;}
  if(pick<0) {
   pick=0;

@@ -228,10 +228,29 @@ def inspect_apk(path):
     return metadata, any(value['package'] == metadata['package'] for value in installed().values())
 
 
+# ATL's intents between apps (DBusIntentApi: push messages from zrn-pushd
+# among them) go to the app's D-Bus name, its package; the app owns it once
+# started with that GApplication id, and D-Bus starts it when it is not running.
+GAPPLICATION_ID = re.compile(r'[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z_][A-Za-z0-9_-]*)+')
+
+
+def dbus_service_path(package):
+    return Path(os.environ.get('XDG_DATA_HOME', str(Path.home()/'.local/share')))/'dbus-1/services'/(package+'.service')
+
+
+def write_dbus_service(package):
+    if len(package) > 255 or not GAPPLICATION_ID.fullmatch(package):
+        return
+    atomic_write(dbus_service_path(package), '[D-BUS Service]\nName='+package+
+                 '\nExec=/usr/local/bin/ztos-android launch '+package+' --runtime atl\n')
+
+
 def write_desktops(registry):
     directory = Path(os.environ.get('XDG_DATA_HOME', str(Path.home()/'.local/share')))/'applications'
     for metadata in registry.values():
         package, runtime = metadata['package'], metadata.get('runtime', 'atl')
+        if runtime == 'atl':
+            write_dbus_service(package)
         name = metadata['name'].replace('\n', ' ').replace('\r', ' ').replace('|', '/')
         if runtime == 'waydroid':
             name += ' (Waydroid)'
@@ -569,6 +588,8 @@ def launch(path, arguments):
     os.dup2(fd, 2)
     if fd > 2: os.close(fd)
     extra_args = []
+    if len(metadata['package']) <= 255 and GAPPLICATION_ID.fullmatch(metadata['package']):
+        extra_args.extend(['--gapplication-app-id', metadata['package']])
     width = os.environ.get('ZTOS_APP_WIDTH', '360')
     height = os.environ.get('ZTOS_APP_HEIGHT', '672')
     if not any(arg == '-w' or arg.startswith(('-w=', '--window-width')) for arg in arguments):
@@ -652,6 +673,8 @@ def main():
             launch(Path(metadata['apk']), args.arguments)
     elif args.command == 'sync':
         for change in sync_waydroid(): print(change)
+        for metadata in installed().values():
+            if metadata.get('runtime', 'atl') == 'atl': write_dbus_service(metadata['package'])
     elif args.command == 'list':
         for _, metadata in sorted(installed().items()): print(metadata['package']+'\t'+metadata['name']+'\t'+metadata.get('runtime', 'atl'))
     elif args.command in ('uninstall', 'remove'):
@@ -663,6 +686,8 @@ def main():
         del registry[registry_key(args.package, runtime)]
         (Path(os.environ.get('XDG_DATA_HOME', str(Path.home()/'.local/share')))/'applications'/
          ('ztos-android-'+args.package+'-'+runtime+'.desktop')).unlink(missing_ok=True)
+        if runtime == 'atl':
+            dbus_service_path(args.package).unlink(missing_ok=True)
         if metadata.get('apk') and not any(value.get('apk') == metadata.get('apk') for value in registry.values()):
             Path(metadata['apk']).unlink(missing_ok=True)
         if not any(value['package'] == args.package for value in registry.values()):

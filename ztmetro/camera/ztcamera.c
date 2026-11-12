@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +56,7 @@
 #define N_CONTROLS	5
 #define ROLL_DIR	"ztCamera"	/* ~/Pictures/ztCamera, where captures go */
 
-enum source_kind { SRC_SCENE, SRC_REPLAY, SRC_V4L2 };
+enum source_kind { SRC_SCENE, SRC_REPLAY, SRC_V4L2, SRC_RAW };
 enum mode { MODE_PHOTO, MODE_VIDEO };
 enum hit { HIT_NONE, HIT_BACK, HIT_MORE, HIT_CONTROL, HIT_SHUTTER, HIT_VIDEO,
 	HIT_FACING, HIT_LENSES, HIT_THUMB, HIT_DIAL, HIT_MENU, HIT_VIEW };
@@ -128,6 +129,9 @@ static const char *replay_path;
 static int replay_w = FRAME_W, replay_h = FRAME_H;
 static double replay_rate = 15;
 static const char *device_path;
+
+static void note(const char *fmt, ...);
+#include "raw-source.h"
 
 /* ---- where things sit, in points ----------------------------------------- */
 
@@ -207,6 +211,20 @@ static void roll_scan(void) {
 	closedir(d);
 }
 
+/* A photo can be 12 megapixels: the thumbnail is drawn on every chrome redraw, so keep it small. */
+static cairo_surface_t *thumb_of(cairo_surface_t *s) {
+	int w = cairo_image_surface_get_width(s), h = cairo_image_surface_get_height(s);
+	double k = fmin(1, 200.0 / (w > h ? w : h));
+	cairo_surface_t *t = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, (int)(w * k), (int)(h * k));
+	cairo_t *cr = cairo_create(t);
+	cairo_scale(cr, k, k);
+	cairo_set_source_surface(cr, s, 0, 0);
+	cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+	cairo_paint(cr);
+	cairo_destroy(cr);
+	return t;
+}
+
 static void thumb_load(void) {
 	cairo_surface_destroy(last_shot);
 	last_shot = NULL;
@@ -215,10 +233,9 @@ static void thumb_load(void) {
 	}
 	cairo_surface_t *s = cairo_image_surface_create_from_png(last_path);
 	if (cairo_surface_status(s) == CAIRO_STATUS_SUCCESS) {
-		last_shot = s;
-	} else {
-		cairo_surface_destroy(s);
+		last_shot = thumb_of(s);
 	}
+	cairo_surface_destroy(s);
 	chrome_redraw_mark();
 }
 
@@ -237,6 +254,7 @@ static void frame_alloc(int w, int h) {
 }
 
 static void source_stop(void) {
+	raw_close();
 	if (src.fd >= 0) {
 		zmc_watch_fd(src.fd, NULL, NULL);
 		if (src.nbuf) {
@@ -359,6 +377,17 @@ static void v4l2_ready(int fd, void *data);
 static void source_start(enum source_kind want) {
 	source_stop();
 	switch (want) {
+	case SRC_RAW:
+		if (raw_open(raw.cam)) {
+			src.kind = SRC_RAW;
+			frame_alloc(raw.info.h, raw.info.w);	/* the review's size: the viewfinder is on the GPU */
+			snprintf(src.name, sizeof(src.name), "%s raw, no ISP",
+				raw.cam == RAW_FRONT ? "front" : "rear");
+			break;
+		}
+		note("%s", raw.cam == RAW_IR ? "IR camera: the sensor does not answer yet"
+			: "no camera driver (" RAW_DEV ")");
+		/* fall through */
 	case SRC_V4L2:
 		if (device_path && v4l2_open(device_path)) {
 			src.kind = SRC_V4L2;
@@ -645,9 +674,38 @@ static void yuyv_frame(const uint8_t *in) {
 
 /* ---- captures ------------------------------------------------------------- */
 
+static struct {
+	cairo_surface_t *shot;
+	char path[320];
+	cairo_status_t status;
+	bool busy, done;
+} save;
+
+static void *save_thread(void *unused) {
+	(void)unused;
+	save.status = cairo_surface_write_to_png(save.shot, save.path);
+	__atomic_store_n(&save.done, true, __ATOMIC_RELEASE);
+	return NULL;
+}
+
 static void capture_photo(void) {
+	cairo_surface_t *shot = NULL;
 	if (cairo_surface_status(src.frame) != CAIRO_STATUS_SUCCESS) {
 		return;
+	}
+	if (src.kind == SRC_RAW) {
+		if (!raw.seq) {
+			note("no frame yet");
+			return;
+		}
+		note("taking a photo");
+		shot = raw_capture();
+		if (!shot) {
+			note("could not take a photo");
+			return;
+		}
+	} else {
+		shot = cairo_surface_reference(src.frame);
 	}
 	time_t now = time(NULL);
 	struct tm tm;
@@ -662,23 +720,50 @@ static void capture_photo(void) {
 	} while (access(path, F_OK) == 0 && n < 10000);
 	if (access(path, F_OK) == 0) {
 		note("too many captures this second");
+		cairo_surface_destroy(shot);
 		return;
 	}
-	cairo_status_t st = cairo_surface_write_to_png(src.frame, path);
-	if (st != CAIRO_STATUS_SUCCESS) {
-		note("could not save (%s)", cairo_status_to_string(st));
+	/* a full-size PNG takes seconds: on a thread, so the viewfinder keeps going */
+	if (save.busy) {
+		note("still saving the last photo");
+		cairo_surface_destroy(shot);
+		return;
+	}
+	save.shot = shot;
+	snprintf(save.path, sizeof(save.path), "%s", path);
+	save.status = CAIRO_STATUS_SUCCESS;
+	save.done = false;
+	save.busy = true;
+	pthread_t t;
+	if (pthread_create(&t, NULL, save_thread, NULL) != 0) {
+		save_thread(NULL);
+	} else {
+		pthread_detach(t);
+	}
+	ui.flash_at = zmc_now_ms();
+	zmc_haptic("click");
+	note("saving");
+}
+
+static void save_finish(void) {
+	if (!save.busy || !__atomic_load_n(&save.done, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	save.busy = false;
+	if (save.status != CAIRO_STATUS_SUCCESS) {
+		note("could not save (%s)", cairo_status_to_string(save.status));
+		cairo_surface_destroy(save.shot);
 		return;
 	}
 	cairo_surface_destroy(last_shot);
-	last_shot = cairo_surface_reference(src.frame);
+	last_shot = thumb_of(save.shot);
+	cairo_surface_destroy(save.shot);
 	cairo_surface_destroy(review_shot);
 	review_shot = NULL;
-	snprintf(last_path, sizeof(last_path), "%s", path);
+	snprintf(last_path, sizeof(last_path), "%s", save.path);
 	roll_scan();
-	thumb_load();
-	ui.flash_at = zmc_now_ms();
-	zmc_haptic("click");
-	note("saved %s", strrchr(path, '/') + 1);
+	chrome_redraw_mark();
+	note("saved %s", strrchr(save.path, '/') + 1);
 }
 
 static void record_start(void) {
@@ -1309,7 +1394,9 @@ static void overlay(int page) {
 		chrome_rev++;
 	}
 	/* the viewfinder: the frame's middle, filling the screen */
-	if (src.frame) {
+	if (src.kind == SRC_RAW) {
+		raw_draw();
+	} else if (src.frame) {
 		int fw = cairo_image_surface_get_width(src.frame), fh = cairo_image_surface_get_height(src.frame);
 		double k = fmax((double)zmc.width / fw, (double)zmc.height / fh);
 		double cw = zmc.width / k, chh = zmc.height / k;
@@ -1410,7 +1497,10 @@ static void source_cycle(void) {
 		note("stop recording before changing source");
 		return;
 	}
-	if (src.kind == SRC_SCENE) {
+	if (src.kind == SRC_SCENE && !replay_path && !device_path && access(RAW_DEV, F_OK) == 0) {
+		raw.cam = RAW_REAR;
+		source_start(SRC_RAW);
+	} else if (src.kind == SRC_SCENE) {
 		if (replay_path) {
 			source_start(SRC_REPLAY);
 		} else if (device_path) {
@@ -1430,7 +1520,31 @@ static void source_cycle(void) {
 	chrome_redraw_mark();
 }
 
+/* Rear only; the driver limits how many moves one load may make. */
+static void aperture_toggle(void) {
+	if (raw.cam != RAW_REAR) {
+		note("only the rear camera has an aperture");
+		return;
+	}
+	bool to24 = !raw.f24;
+	if (raw_say(to24 ? "ap24" : "ap15")) {
+		raw.f24 = to24;
+		note("aperture F%s", to24 ? "2.4" : "1.5");
+	} else {
+		note("the aperture did not move");
+	}
+}
+
 static void facing_toggle(void) {
+	static bool ir_parked;	/* IR has no picture yet: the test scene shows, the next tap is rear */
+	if (src.kind == SRC_RAW || ir_parked) {
+		/* rear, front, IR, each from the one before */
+		raw.cam = ir_parked ? RAW_REAR : raw.cam == RAW_REAR ? RAW_FRONT : RAW_IR;
+		ui.front = raw.cam == RAW_FRONT;
+		ir_parked = raw.cam == RAW_IR;
+		source_start(SRC_RAW);
+		return;
+	}
 	if (src.kind != SRC_SCENE) {
 		note("front/rear selection is available in test scene only");
 		return;
@@ -1625,7 +1739,11 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 		break;
 	case HIT_LENSES:
 		if (!off) {
-			source_cycle();
+			if (src.kind == SRC_RAW) {
+				aperture_toggle();
+			} else {
+				source_cycle();
+			}
 			zmc_haptic("tap");
 		}
 		break;
@@ -1714,7 +1832,17 @@ static void tick(void) {
 	}
 	if (now - last_scene >= FPS_MS) {
 		last_scene = now;
-		if (src.kind == SRC_SCENE) {
+		save_finish();
+		if (src.kind == SRC_RAW) {
+			uint32_t was = raw.seq;
+			const char *why = raw_poll();
+			if (why) {
+				note("camera: %s", why);
+				source_start(SRC_SCENE);
+			} else if (raw.seq != was) {
+				frame_arrived();
+			}
+		} else if (src.kind == SRC_SCENE) {
 			scene_frame(now / 1000.0);
 			frame_arrived();
 		} else if (src.kind == SRC_REPLAY && src.map) {
@@ -1777,7 +1905,8 @@ static void arrived(int page) {
 	white_make();
 	roll_scan();
 	thumb_load();
-	source_start(device_path ? SRC_V4L2 : replay_path ? SRC_REPLAY : SRC_SCENE);
+	source_start(device_path ? SRC_V4L2 : replay_path ? SRC_REPLAY :
+		access(RAW_DEV, F_OK) == 0 ? SRC_RAW : SRC_SCENE);
 	if (src.kind == SRC_SCENE) {
 		snprintf(src.name, sizeof(src.name), "test scene 640x480");
 	}

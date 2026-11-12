@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Power Management: battery fuel gauge, SoC deep sleep diagnostics, and wake history.
+ * Power Management: battery fuel gauge, SoC deep sleep diagnostics, the
+ * battery's drain since it was unplugged, and wake history.
  * Built with ztOS C SDK (ZrnMetroCore).
  */
 #define _GNU_SOURCE
@@ -23,6 +24,7 @@
 enum page {
 	PAGE_SLEEP = 0,
 	PAGE_HISTORY = 1,
+	PAGE_DRAIN = 2,
 };
 
 enum action {
@@ -38,7 +40,14 @@ enum action {
 #define CHARGER_PATH	"/sys/class/power_supply/max77705-charger"
 #define SLEEP_STATUS	"/run/zrn-sleepd/status"
 #define SLEEP_ENABLED	"/var/lib/zrn-sleep/enabled"
+#ifndef SLEEP_LOG
 #define SLEEP_LOG	"/var/lib/zrn-sleep/log"
+#endif
+#ifndef BATTERY_LOG
+#define BATTERY_LOG	"/var/lib/zrn-power/battery.log"	/* zrn-batlog */
+#endif
+#define MAX_SAMPLES	6144
+#define MAX_NAPS	512
 #define MAX_EVENTS	64
 #define EVENTS_PER_PAGE	8
 
@@ -90,6 +99,24 @@ struct power_data {
 };
 
 static struct power_data pdata;
+
+/* Since the charger was pulled out: zrn-batlog's samples, and the sleeps
+ * (from zrn-sleepd's log) inside that time. */
+struct sample {
+	time_t t;
+	int percent;
+	long charge_uah;
+};
+static struct drain {
+	struct sample s[MAX_SAMPLES];
+	int n;
+	bool plugged;		/* on the charger now: s[] is the last time on battery */
+	time_t naps[MAX_NAPS][2];	/* asleep from, to */
+	int n_naps;
+	long asleep_s;
+	off_t log_size;
+	time_t log_mtime, sleep_mtime;
+} drain;
 static int cur_page = PAGE_SLEEP;
 static int history_page;
 
@@ -177,6 +204,16 @@ static void load_battery_data(void) {
 	pdata.input_limit_ma = read_sysfs_long(CHARGER_PATH "/input_current_limit") / 1000;
 }
 
+/* How long a wake line says the phone slept: "(asleep 7.7s, ...)" now,
+ * "after N s" in older logs. */
+static long log_asleep_s(const char *line) {
+	const char *a = strstr(line, "(asleep ");
+	if (a)
+		return lround(atof(a + 8));
+	a = strstr(line, "after ");
+	return a ? atol(a + 6) : 0;
+}
+
 static void parse_log_line(const char *line, struct sleep_event *ev) {
 	memset(ev, 0, sizeof(*ev));
 	if (strlen(line) < 19)
@@ -216,12 +253,7 @@ static void parse_log_line(const char *line, struct sleep_event *ev) {
 			sscanf(stat + 10, "%31s", ev->wake_stat);
 		}
 
-		const char *aft = strstr(line, "after ");
-		if (aft) {
-			ev->duration_s = atol(aft + 6);
-		} else {
-			ev->duration_s = 0;
-		}
+		ev->duration_s = log_asleep_s(line);
 		format_duration(ev->duration_s, ev->duration_str, sizeof(ev->duration_str));
 	} else if (refused) {
 		strncpy(ev->reason, "refused", sizeof(ev->reason) - 1);
@@ -299,9 +331,8 @@ static void load_sleep_data(void) {
 				line[--l] = '\0';
 			}
 			if (strstr(line, "woke: ") || strstr(line, "sleep refused: ") || strstr(line, "backend up")) {
-				const char *aft = strstr(line, "after ");
-				if (aft) {
-					long dur = atol(aft + 6);
+				long dur = log_asleep_s(line);
+				if (dur > 0) {
 					pdata.total_sleep_s += dur;
 					if (dur > pdata.max_sleep_s)
 						pdata.max_sleep_s = dur;
@@ -353,15 +384,94 @@ static void load_sleep_data(void) {
 	}
 }
 
+/* The samples since the charger was last pulled out. On the charger, the
+ * last stretch on battery instead. Read again only when a log changed. */
+static bool load_drain(void) {
+	struct stat bs, ss;
+	bool have_b = stat(BATTERY_LOG, &bs) == 0, have_s = stat(SLEEP_LOG, &ss) == 0;
+	off_t size = have_b ? bs.st_size : -1;
+	time_t mtime = have_b ? bs.st_mtime : 0, smtime = have_s ? ss.st_mtime : 0;
+	if (size == drain.log_size && mtime == drain.log_mtime && smtime == drain.sleep_mtime)
+		return false;
+	drain.log_size = size;
+	drain.log_mtime = mtime;
+	drain.sleep_mtime = smtime;
+	drain.n = 0;
+	drain.n_naps = 0;
+	drain.asleep_s = 0;
+	drain.plugged = false;
+
+	FILE *f = fopen(BATTERY_LOG, "r");
+	if (!f)
+		return true;
+	/* Keep the newest run of unplugged samples: a plugged sample after it
+	 * marks it finished, one before it ends it (an older run). */
+	char line[128];
+	while (fgets(line, sizeof(line), f)) {
+		long long t;
+		int pct, online;
+		long uah;
+		if (sscanf(line, "%lld %d %ld %d", &t, &pct, &uah, &online) != 4)
+			continue;
+		if (online) {
+			drain.plugged = true;
+			continue;
+		}
+		if (drain.plugged) {		/* unplugged again: a new run */
+			drain.n = 0;
+			drain.plugged = false;
+		}
+		if (drain.n == MAX_SAMPLES) {
+			memmove(drain.s, drain.s + 1, sizeof(drain.s[0]) * (MAX_SAMPLES - 1));
+			drain.n--;
+		}
+		drain.s[drain.n++] = (struct sample){ (time_t)t, pct, uah };
+	}
+	fclose(f);
+	if (drain.n < 1)
+		return true;
+
+	/* the sleeps inside the run: each wake line is "DATE TIME ... woke: ...
+	 * (asleep N.Ns, ...)", stamped at the wake */
+	time_t from = drain.s[0].t, to = drain.s[drain.n - 1].t;
+	f = fopen(SLEEP_LOG, "r");
+	if (!f)
+		return true;
+	char l[512];
+	while (fgets(l, sizeof(l), f)) {
+		if (!strstr(l, "woke: "))
+			continue;
+		long dur = log_asleep_s(l);
+		struct tm tm = {0};
+		if (dur <= 0 || !strptime(l, "%Y-%m-%d %H:%M:%S", &tm))
+			continue;
+		tm.tm_isdst = -1;
+		time_t woke = mktime(&tm);
+		if (woke < from || woke - dur > to + 60)
+			continue;
+		drain.asleep_s += dur;
+		if (drain.n_naps < MAX_NAPS) {
+			drain.naps[drain.n_naps][0] = woke - dur;
+			drain.naps[drain.n_naps][1] = woke;
+			drain.n_naps++;
+		}
+	}
+	fclose(f);
+	return true;
+}
+
+static bool drain_changed;
+
 static void refresh_all(void) {
 	load_battery_data();
 	load_sleep_data();
+	drain_changed = load_drain();
 }
 
 /* -------------------------------------------------------- Page 0: Sleep */
 
 static double draw_page_sleep(cairo_t *cr) {
-	double y = zmc_pivot_next(cr, "sleep", "history", ACT_TAB, PAGE_HISTORY);
+	double y = zmc_pivot_next(cr, "sleep", "drain", ACT_TAB, PAGE_DRAIN);
 
 	bool charging = (strcmp(pdata.status, "Charging") == 0 || pdata.charger_online);
 
@@ -494,6 +604,146 @@ static double draw_page_sleep(cairo_t *cr) {
 	return y;
 }
 
+/* -------------------------------------------------------- Page 2: Drain */
+
+static void clock_label(time_t t, char *out, size_t sz) {
+	struct tm tm;
+	localtime_r(&t, &tm);
+	strftime(out, sz, "%H:%M", &tm);
+}
+
+static double draw_page_drain(cairo_t *cr) {
+	double y = zmc_pivot_next(cr, "drain", "history", ACT_TAB, PAGE_HISTORY);
+	double w = zmc.width - 2 * ZMC_MARGIN;
+
+	if (drain.n < 2) {
+		cairo_set_source_rgb(cr, 0.65, 0.65, 0.65);
+		zmc_text(cr, drain.plugged || pdata.charger_online ?
+			"On the charger. The graph starts when the phone is unplugged." :
+			"Collecting samples: one a minute since the charger came out.",
+			FONT_REGULAR, 14, ZMC_MARGIN, y + 10, w);
+		return y + 80;
+	}
+
+	const struct sample *a = &drain.s[0], *b = &drain.s[drain.n - 1];
+	long span = b->t - a->t;
+	double hours = span / 3600.0;
+	int used_pct = a->percent - b->percent;
+	double used_mah = (a->charge_uah - b->charge_uah) / 1000.0;
+
+	/* the headline: how much has gone, and how fast */
+	char big[32];
+	snprintf(big, sizeof(big), "%d%%", used_pct);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text(cr, big, FONT_LIGHT, 56, ZMC_MARGIN, y, 0);
+	y += 62;
+
+	char since[24], dur[32], sub[128];
+	clock_label(a->t, since, sizeof(since));
+	format_duration(span, dur, sizeof(dur));
+	snprintf(sub, sizeof(sub), "%s since %s, %s", drain.plugged ? "used on battery" : "used",
+		 since, dur);
+	cairo_set_source_rgb(cr, 0.65, 0.65, 0.65);
+	zmc_text(cr, sub, FONT_REGULAR, 13.5, ZMC_MARGIN, y, 0);
+	y += 30;
+
+	/* the graph: percent over time, the sleeps shaded under it */
+	double gx = ZMC_MARGIN + 30, gw = w - 30, gy = y, gh = 190;
+	int hi = a->percent, lo = a->percent;
+	for (int i = 0; i < drain.n; i++) {
+		if (drain.s[i].percent > hi) hi = drain.s[i].percent;
+		if (drain.s[i].percent < lo) lo = drain.s[i].percent;
+	}
+	hi = (hi + 4) / 5 * 5;
+	lo = lo / 5 * 5;
+	if (hi - lo < 10)
+		lo = hi - 10 < 0 ? 0 : hi - 10;
+	if (hi - lo < 10)
+		hi = lo + 10;
+	double tspan = span > 0 ? span : 1;
+#define GX(when) (gx + gw * (double)((when) - a->t) / tspan)
+#define GY(p) (gy + gh * (double)(hi - (p)) / (hi - lo))
+
+	cairo_set_source_rgb(cr, 0.16, 0.16, 0.16);
+	for (int i = 0; i < drain.n_naps; i++) {
+		double x0 = GX(drain.naps[i][0] < a->t ? a->t : drain.naps[i][0]);
+		double x1 = GX(drain.naps[i][1] > b->t ? b->t : drain.naps[i][1]);
+		cairo_rectangle(cr, x0, gy, fmax(x1 - x0, 1), gh);
+	}
+	cairo_fill(cr);
+
+	cairo_set_line_width(cr, 1);
+	for (int k = 0; k <= 2; k++) {
+		int p = lo + (hi - lo) * k / 2;
+		double ly = round(GY(p)) + 0.5;
+		cairo_set_source_rgb(cr, 0.28, 0.28, 0.28);
+		cairo_move_to(cr, gx, ly);
+		cairo_line_to(cr, gx + gw, ly);
+		cairo_stroke(cr);
+		char lab[8];
+		snprintf(lab, sizeof(lab), "%d", p);
+		cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);
+		zmc_text(cr, lab, FONT_REGULAR, 11, ZMC_MARGIN, ly - 8, 0);
+	}
+
+	cairo_move_to(cr, GX(a->t), GY(a->percent));
+	for (int i = 1; i < drain.n; i++)
+		cairo_line_to(cr, GX(drain.s[i].t), GY(drain.s[i].percent));
+	cairo_line_to(cr, GX(b->t), gy + gh);
+	cairo_line_to(cr, GX(a->t), gy + gh);
+	cairo_close_path(cr);
+	cairo_set_source_rgba(cr, (zmc.accent >> 16 & 0xff) / 255.0, (zmc.accent >> 8 & 0xff) / 255.0,
+			      (zmc.accent & 0xff) / 255.0, 0.18);
+	cairo_fill(cr);
+	zmc_accent(cr);
+	cairo_move_to(cr, GX(a->t), GY(a->percent));
+	for (int i = 1; i < drain.n; i++)
+		cairo_line_to(cr, GX(drain.s[i].t), GY(drain.s[i].percent));
+	cairo_set_line_width(cr, 2);
+	cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+	cairo_stroke(cr);
+#undef GX
+#undef GY
+
+	char t0[16], t1[16];
+	clock_label(a->t, t0, sizeof(t0));
+	clock_label(b->t, t1, sizeof(t1));
+	cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);
+	zmc_text(cr, t0, FONT_REGULAR, 11, gx, gy + gh + 4, 0);
+	const char *end = drain.plugged ? t1 : "now";
+	zmc_text(cr, end, FONT_REGULAR, 11, gx + gw - zmc_text_width(end, FONT_REGULAR, 11),
+		 gy + gh + 4, 0);
+	y = gy + gh + 22;
+	cairo_set_source_rgb(cr, 0.16, 0.16, 0.16);
+	cairo_rectangle(cr, ZMC_MARGIN, y + 3, 10, 10);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);
+	zmc_text(cr, "SoC asleep", FONT_REGULAR, 11, ZMC_MARGIN + 16, y, 0);
+	y += 30;
+
+	/* the numbers behind it */
+	char buf[96];
+	if (hours > 0.01) {
+		snprintf(buf, sizeof(buf), "%.1f %%/h • %.0f mA average", used_pct / hours,
+			 used_mah / hours);
+		y = zmc_field(cr, y, "Drain rate", buf);
+	}
+	snprintf(buf, sizeof(buf), "%.0f mAh (%ld → %ld mAh)", used_mah,
+		 a->charge_uah / 1000, b->charge_uah / 1000);
+	y = zmc_field(cr, y, "Charge used", buf);
+	char slept[32];
+	format_duration(drain.asleep_s, slept, sizeof(slept));
+	snprintf(buf, sizeof(buf), "%s (%.0f%% of the time, %d sleeps)", slept,
+		 span > 0 ? fmin(100, drain.asleep_s * 100.0 / span) : 0, drain.n_naps);
+	y = zmc_field(cr, y, "Asleep", buf);
+	if (!drain.plugged && used_pct > 0 && hours > 0.25) {
+		format_duration(lround(b->percent / (used_pct / hours) * 3600), dur, sizeof(dur));
+		snprintf(buf, sizeof(buf), "%s at this rate", dur);
+		y = zmc_field(cr, y, "Left", buf);
+	}
+	return y + 16;
+}
+
 /* ------------------------------------------------------ Page 1: History */
 
 static double draw_page_history(cairo_t *cr) {
@@ -562,6 +812,8 @@ static double render(cairo_t *cr, int page) {
 		return draw_page_sleep(cr);
 	case PAGE_HISTORY:
 		return draw_page_history(cr);
+	case PAGE_DRAIN:
+		return draw_page_drain(cr);
 	default:
 		return draw_page_sleep(cr);
 	}
@@ -633,7 +885,7 @@ static void tick(void) {
 	double new_ratio = pdata.uptime_s > 0 ?
 		fmin(100, pdata.total_sleep_s * 100.0 / pdata.uptime_s) : 0;
 	previous.uptime_s = pdata.uptime_s;
-	if (memcmp(&previous, &pdata, sizeof(pdata)) ||
+	if (drain_changed || memcmp(&previous, &pdata, sizeof(pdata)) ||
 			lround(old_ratio * 10) != lround(new_ratio * 10))
 		zmc_redraw();
 }

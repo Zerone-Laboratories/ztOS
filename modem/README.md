@@ -118,8 +118,9 @@ Talking to it:
   SMS centre `+9477000003`. Text-mode `AT+CMGS` fails (`+CME ERROR:
   unknown`); PDU mode works: `ril/send-sms.py NUMBER TEXT` → `+CMGS: 21`.
 
-The modem's RFS requests (its NV, which stock saves to EFS) are not answered:
-nothing is written to EFS.
+The modem's RFS requests (its NV, which stock saves to EFS) are answered
+since 30 Oct, without storing anything: see "The CP's IPC going silent"
+below. Nothing is written to EFS.
 
 ## The shell's side (2026-10-12)
 
@@ -200,3 +201,96 @@ interface), the APN from the SIM, roaming rules, data counters.
 
 Next: the IPC layouts for packet data (and SMS, SIM access) from how the
 vendor library builds them; receiving SMS; calls and audio; an SMS app.
+
+## The CP's IPC going silent, and the file requests (2026-10-30)
+
+**Answer the CP's file requests and its IPC stays alive.** In every boot
+until now the CP stopped sending IPC about 100 s after its start (the last
+message `0f36`, SAR control, which wants no answer): later 0501 probes went
+unanswered and the screen-state message 0a0f did nothing, while AT kept
+working. ztoscorenetworkingd now answers RFS (`umts_rfs0`) the way stock's
+libsec-ril does, and the CP keeps answering.
+
+What the CP asks at its start (observed, journal): `2601` (OesDrkCpInfo
+indication), `0407` (SMS device ready), and on `umts_rfs0` an OpenFile of
+`CP_OMC_AUDIO_SLSI.bin`, a CloseFile, an OpenFile of `CP_AUDIO_SLSI.bin`,
+NvWrites (offset 0; 97 626 and about 20 300 bytes, arriving as 2040-byte
+reads with the link header already gone), `FLL.bin`,
+`err/csdiag_rf_Mipi.dat`, `err/csdiag_nosvc_Info.dat`; then more NvWrites
+every minute or two.
+
+The answers, read from libsec-ril.so (sha256 4fa6207a...ccdf, REA/Ghidra
+12.1.2; Ghidra addresses are objdump's + 0x100000):
+
+| request | stock handler | answer here |
+|---|---|---|
+| RFS 0x02 NvWrite: offset u32 @6, size u32 @10, data @14 | `Nv::ProcessNvWrite` 0x2d9590 (ev_f221632b...): writes nv_data.bin, then 15 bytes `u32 0x0f, 0x02, id, ok (1 on success), u32 offset, u32 written` | the same 15 bytes, ok 1, written = size; nothing stored (cbd loads the real nv_data.bin at the next start) |
+| RFS 0x11 OpenFile: flags @6, path length @10, path @14 | `Nv::ProcessOpenFile` (ev_a2d9d7f4...): 14 bytes `u32 0x0e, 0x11, id, i32 fd, u32 errno` | fd -1, errno 2 (ENOENT) |
+| RFS 0x06 CloseFile: handle i32 @6 | `Nv::ProcessCloseFile` 0x2da2e0 (ev_e1bb80fd...): 14 bytes `u32 0x0e, 0x06, id, i32 result, u32 errno` | -1, errno 9 (EBADF): nothing was opened |
+| other RFS commands | `Nv::ProcessRfsMessage` 0x2d9218: 0x01-0x17, each its own layout | logged, not answered |
+| IPC 2601 type 1 | `IpcTxCfrmOesDrkCpInfo` 0x4503c8 (ev_b13e084e...): `07 00 00 00 26 01 04` | 2601 type 4, the indication's sequence number as aseq |
+| IPC 0407 type 3 | `IpcTxSetDeviceReady` 0x447648 (ev_b13e084e...): `07 00 00 00 04 07 03` | 0407 set, **once a modem start** |
+| IPC 0402 (an SMS) | `IpcRxIncomingMsg` 0x4480e8 (ev_1b941abc...): data[0] network (2 GSM), data[5] length, data+6 SMS centre + SMS-DELIVER | decoded and logged as one read by AT; no delivery report (0406, layout not read) |
+
+How each was tested (30 Oct, phone on the charger, screen off, the debug
+file present so that a 0501 probe goes out with every poll). Isolation
+runs restart only the modem (`systemctl restart
+ztoscorenetworking-modem.service`, about 8 s to the CP's 0101): restarting
+the daemon leaves the modem deaf to requests (above).
+
+| run | answers on | how | the CP's IPC after t0+100 s |
+|---|---|---|---|
+| control | none | reboot | silent: last `ipc <- 0f36` at t0+100 s; probes at t0+175, 295, 415 s unanswered |
+| R0 | none | modem restart | silent: last message at t0+55 s; probe at t0+112 s unanswered |
+| RA | rfs, cfrm, smsready | modem restart | not a result: answering each 0407 made a loop (the CP answers our 0407 with 8001, 040c and a new 0407): 70 386 sets in 4 min, about 330 a second, stopped by the next modem restart. Fixed: once a start |
+| RA' | rfs, cfrm | modem restart | alive: probes at t0+40, 160, 280, 400, 520 s answered |
+| RB | cfrm | modem restart | silent from t0+45 s: probe at t0+114 s unanswered, `ipc: CP silent since 1807s` |
+| RC | rfs | modem restart | alive: probes at t0+65 ... 545 s answered, frames to t0+630 s |
+| T3 | rfs (the CloseFile answer added) | reboot | alive for 30 min: all 14 probes from boot+196 s to 1756 s answered; no restart, no replies-off; `umts_rfs0` flat from boot+174 s to the end |
+| after a reset | rfs, set again with `replies` | modem restart, in a boot where the CP had already gone silent | alive again: probes at t0+111 and t0+231 s answered |
+
+So the RFS answers are what keeps it alive (observed, 3 runs with them,
+3 without). Why (inferred, not read in the CP's code): the CP's IPC task
+waits on its NV writes being acknowledged. 0f36 is not the cause; it is
+only the last message before the stall.
+
+The CP's NvWrites go on after its start, every minute or two while the AP
+is awake (they are real NV saves, not retries: each is a fresh size, and
+stock writes each one to EFS). With the debug probe on, many come within
+60 ms of a 0501 probe's answer (inferred: the probe makes the CP save).
+
+Flags and recovery:
+
+- `/etc/ztoscorenetworking/reply-rfs`, `reply-cfrm`, `reply-smsready`: an
+  answer is given while its file exists. Read at the daemon's start, at
+  every modem start (0101), and on `replies` on `/run/ztoscorenetworking.ctl`.
+  The CP's first OpenFile comes just before its 0101: after changing the
+  files, send `replies` before restarting the modem.
+- `/var/lib/ztoscorenetworking/replies-off`: no answers at all. Written by
+  the crash guard when the modem starts again within 300 s of our first
+  answer without the daemon having asked for it (an answer within 5 s
+  before the 0101 belongs to that start), or when the driver refuses two
+  answers in a row (EPERM, ENODEV); the shell gets a notification.
+- The phone runs with `reply-rfs` only (the smallest set that passed).
+- Every request is logged on one line (`rfs: request 0x02 id 0, 20310
+  bytes -> replied`), command, id, length and an opened file's name only,
+  at most 40 a modem start. No SMS payload (main 04) is hex-logged any more,
+  and EFS is never opened: nv_data.bin's md5 was the same before the
+  runs, after the first reset and at the end.
+- `ipc=alive|silent` and `ipc_last_rx=` in /run/ztoscorenetworking/status
+  (the probe goes only while the debug file exists; 3 unanswered in a row
+  log `ipc: CP silent since <t>s`).
+
+In SoC sleep, with the IPC alive (30 Oct, `once 300` on the charger): three
+full sleeps of 297 s ended by the RTC, with no modem wake and no RFS wake
+(one `umts_ipc0` frame arrived in one sleep's window without waking it).
+Awake, the screen-state message does not hold back the CP's signal
+indications: with the screen off (T3, 26 min) the CP sent 151 messages, all
+0706 (signal), 5.8 a minute; with the screen on (5 min) 9, 1.7 a minute.
+While the AP sleeps they did not come (inferred: modem_suspend tells the
+CP, pda_active 0, and it holds them).
+
+Not known yet: whether an SMS left without a delivery report (0406) is
+sent again (a PDU seen in the last day is ignored either way,
+`/var/lib/ztoscorenetworking/sms/seen-*`); a real call and SMS from SoC
+sleep (J6, needs the user and a second phone); the unplugged night (J5).

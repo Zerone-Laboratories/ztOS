@@ -1,0 +1,11 @@
+[Unit]
+Description=ztOS: GNSS for Android apps in Waydroid ("gps" and "network" providers fed by ztos-gnss-gate)
+After=ztos-gnss-gate.service waydroid-container.service
+
+[Service]
+ExecStart=/usr/local/sbin/ztos-waydroid-location
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

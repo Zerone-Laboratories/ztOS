@@ -5,8 +5,8 @@
 # and the gamma for each level comes from calibration burnt into the panel
 # (MTP, register C8). kernel/s9p-bl-table.py makes the table from it the way
 # Samsung's driver does; the kernel's bl_table file takes it, and from then
-# on /sys/class/backlight/s9p-panel sends a level's whole set (smooth, from
-# 2 to 400 nits). The shell sees /run/ztos-panel-bl and uses every level.
+# on /sys/class/backlight/s9p-panel sends a level's packets (AOR only, in even
+# steps of L*). The shell sees /run/ztos-panel-bl and uses every level.
 #
 # The panel is read once, the first time, and the table kept in
 # /var/lib/ztos: a DCS read disturbs this panel, and its calibration never
@@ -56,7 +56,7 @@ if [ ! -s "$CACHE" ] || [ "$GEN" -nt "$CACHE" ]; then
 	python3 "$GEN" -i "$REGS" -o "$CACHE.new" && mv "$CACHE.new" "$CACHE" ||
 		{ echo "ztos-panel-bl: could not make the table" >&2; rm -f "$CACHE.new"; exit 0; }
 fi
-# each level's luminance, for the shell's brightness ladder (ztmetro.c)
+# each level's modelled relative light, for reference (nothing reads it)
 NITS=/var/lib/ztos/panel-bl-nits.txt
 if [ -s "$REGS" ] && { [ ! -s "$NITS" ] || [ "$GEN" -nt "$NITS" ]; }; then
 	python3 "$GEN" -i "$REGS" --nits "$NITS.new" -o /dev/null && mv "$NITS.new" "$NITS" ||

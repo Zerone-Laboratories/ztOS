@@ -1,0 +1,10 @@
+[Unit]
+Description=ztOS GNSS: fetch Broadcom's predicted orbits (LTO) for a quick first fix
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ztos-gnss-lto
+Nice=10
+IOSchedulingClass=idle

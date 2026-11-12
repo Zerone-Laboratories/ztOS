@@ -18,7 +18,10 @@ up)
 	# already up (linker64 itself is a link that only resolves inside the
 	# root: testing it from outside failed every time, and each restart of a
 	# service stacked another root on top)
-	mountpoint -q $R && [ -d $R/system/bin ] && exit 0
+	if mountpoint -q $R && [ -d $R/system/bin ]; then
+		umount -l $R/dev/binderfs 2>/dev/null || true
+		exit 0
+	fi
 	# a root left half made (mounted, nothing in it): take it down first
 	while mountpoint -q $R; do umount -R $R 2>/dev/null || umount -l $R; done
 	mkdir -p /mnt/system /mnt/vendor /var/lib/zrn-android/data/vendor/gps /var/lib/zrn-android/data/system/gps
@@ -37,6 +40,9 @@ up)
 	# Waydroid's) alone.
 	mount --make-rslave $R/dev
 	umount -l $R/dev/binderfs 2>/dev/null || true
+	# Private as well: Waydroid's container can mount binderfs after this
+	# (a slave would receive it), and lhd hung again at every boot (30 Oct).
+	mount --make-rprivate $R/dev
 	mount -t proc proc $R/proc
 	mount --rbind /sys $R/sys
 	mount --bind /var/lib/zrn-android/data $R/data

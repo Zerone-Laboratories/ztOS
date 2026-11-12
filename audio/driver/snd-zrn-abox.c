@@ -130,6 +130,12 @@
 #define CP_VSS_PA		0xf7900000UL
 #define CP_VSS_SIZE		0x700000
 #define CP_VSS_MAGIC		0x600000
+/* The voice firmware's parameters, in the same shared memory. The modem's
+ * driver says where at boot ("VSS PARAM: 0x09000000: 0x00200000"), and
+ * Samsung's abox.c maps shm_get_vparam_base() at IOVA_VSS_PARAMETER: empty
+ * memory there was no parameters at all for the voice firmware. */
+#define CP_VPARAM_PA		0xf9000000UL
+#define CP_VPARAM_SIZE		0x200000
 #define LV2_TABLES		64
 
 /* messages, as in Samsung's abox_ipc.h */
@@ -289,6 +295,8 @@ static u32 dsm_rx[8];	/* the DSP's last DSM answer, first words */
 static int n_dsm_rx = 8;
 module_param_array(dsm_rx, uint, &n_dsm_rx, 0444);
 static bool vss_started;
+static bool call_mic_on;	/* the microphones are feeding the voice firmware */
+static bool dsm_before_call;	/* DSM was on: back on when the call ends */
 static int pointer_stalls, pointer_backsteps;
 module_param(pointer_stalls, int, 0444);
 module_param(pointer_backsteps, int, 0444);
@@ -1247,6 +1255,21 @@ static int call_msg(u32 type, u32 param)
 	return ipc_send(m, 6);
 }
 
+static int call_mic(bool on);
+static int dsm_set(bool on);
+#define ABOX_ROUTE_CTRL1_NSRC1	4
+static void sfr_field(u32 reg, int shift, u32 mask, u32 val);
+
+/*
+ * The path of a call, as Samsung's incall_* mixer paths (stock mixer_paths.xml):
+ *   down: RDMA4 -> SIFS0 -> UAIF1 -> amplifier, with SIFS0 -> RSRC0 -> RECP as
+ *         the echo reference (route-sifs0-to-rsrc0, route-rsrc0-to-wdma0);
+ *   up:   microphones -> codec AIF1 -> UAIF0 -> NSRC1 -> SIFM1 -> WDMA2
+ *         (route-cp-tx), which only ever ran with a capture stream open, so a
+ *         call had no microphone at all before 2026-10-30.
+ * Speaker management is taken off for the call: its route ends at SIFS1, and
+ * the voice comes on SIFS0.
+ */
 static int call_set(int route)
 {
 	int ret = 0;
@@ -1255,13 +1278,39 @@ static int call_set(int route)
 		return 0;
 	if (route) {
 		if (!vss_started && cp_vss) {
+			/* The voice firmware marks this word once it has come up. A SoC
+			 * sleep reboots the DSP, so VSS must start afresh, and a stale
+			 * mark from the last call left RDMA4 idle: wdma2 ran, the
+			 * earpiece was silent (the first call after a sleep that followed
+			 * another call, 30 Oct). Samsung clears it only at probe; its
+			 * DSP does not reboot here. */
+			void __iomem *magic = ioremap(CP_VSS_PA + CP_VSS_MAGIC, 4);
+
+			if (magic) {
+				pr_info("snd-zrn-abox: VSS mark was %08x: cleared\n", readl(magic));
+				writel(0, magic);
+				iounmap(magic);
+			}
 			ret = call_msg(ABOX_START_VSS, 0);
 			vss_started = !ret;
 			msleep(50);
 		}
+		if (!call_route && dsm_on) {
+			dsm_before_call = true;
+			dsm_set(false);
+		}
 		call_msg(ABOX_SET_TYPE, route == 2 ? SOUND_TYPE_SPEAKER : SOUND_TYPE_VOICE);
 		ret = call_msg(ABOX_SET_MODE, MODE_IN_CALL);
 		if (!call_route) {
+			if (!any_active()) {
+				mixp_flush();
+				mixp_flushes++;
+			}
+			sfr_field(ABOX_ROUTE_CTRL2, 0, 0xf, 1);		/* RSRC0 <- SIFS0 */
+			sfr_field(ABOX_SPUM_CTRL1, 0, 0x1, 1);		/* RECP PIFS0 */
+			/* no microphone must not cost the caller's voice: logged, on */
+			if (call_mic(true))
+				pr_err("snd-zrn-abox: call: no microphone\n");
 			memset(voice_rx, 0, VOICE_BYTES);
 			memset(voice_tx, 0, VOICE_BYTES);
 			voice_stream(IPC_PCMPLAYBACK, VOICE_RDMA, IOVA_VOICE_RX, true);
@@ -1275,16 +1324,28 @@ static int call_set(int route)
 		voice_stream(IPC_PCMCAPTURE, VOICE_WDMA, IOVA_VOICE_TX, false);
 		voice_stream(IPC_PCMPLAYBACK, VOICE_RDMA, IOVA_VOICE_RX, false);
 		ret = call_msg(ABOX_SET_MODE, MODE_NORMAL);
+		call_mic(false);
+		sfr_field(ABOX_SPUM_CTRL1, 0, 0x1, 0);
+		sfr_field(ABOX_ROUTE_CTRL2, 0, 0xf, 0);
 		amp_set(false);
+		call_route = 0;
+		if (dsm_before_call) {
+			dsm_before_call = false;
+			dsm_set(true);
+		}
 		if (any_active())
 			amp_set(true);	/* playback was running: back to both speakers */
+		if (!any_active()) {
+			mixp_flush();
+			mixp_flushes++;
+		}
 	}
 	pr_info("snd-zrn-abox: call audio %s (%d)\n", route == 1 ? "earpiece" : route == 2 ? "speaker" : "off", ret);
 	call_route = route;
 	return ret;
 }
 
-static void sfr_field(u32 reg, int shift, u32 mask, u32 val)
+static __maybe_unused void sfr_field(u32 reg, int shift, u32 mask, u32 val)
 {
 	writel((readl(sfr + reg) & ~(mask << shift)) | (val << shift), sfr + reg);
 }
@@ -1765,6 +1826,8 @@ static const struct snd_pcm_ops abox_pcm_ops = {
 #define IOVA_WDMA(x)		(0x92000000UL + SZ_1M * (x))	/* Samsung's IOVA_WDMA_BUFFER */
 #define SET_INMUX0_SAMPLE_RATE	5
 #define SET_INMUX0_FORMAT	0x14
+#define SET_INMUX1_SAMPLE_RATE	6
+#define SET_INMUX1_FORMAT	0x15
 
 /*
  * Codec side: Cirrus Logic CS47L93 (madera family, silicon ID 0x6371, as
@@ -1979,8 +2042,24 @@ static int codec_power_up(void)
 	u16 id, rev, raw = 0;
 	int i, ret;
 
-	if (cap.codec_up)
-		return 0;
+	if (cap.codec_up) {
+		/* The codec's core rail goes down over a SoC sleep, and it comes back
+		 * at its reset defaults while this flag stays set. codec_start()
+		 * writes nearly everything again, FLL1 still locks and SPI still
+		 * reads the ID, but AIF1's pins stay GPIOs (GP6 0xa001): nothing on
+		 * the data line, digital silence from every recording and every call
+		 * after the first sleep (seen 2026-10-30). The pins tell. */
+		u16 fn;
+
+		mutex_lock(&codec_lock);
+		fn = codec_read(CODEC_GPIO5_CTRL_1) & 0x03ff;
+		mutex_unlock(&codec_lock);
+		if (!fn)
+			return 0;
+		pr_info("snd-zrn-abox: the codec was reset (GP5 fn %03x): setting it up again\n", fn);
+		cap.codec_up = false;
+		cap.path_on = false;
+	}
 	ret = codec_get_gpios();
 	if (ret)
 		return ret;
@@ -2171,7 +2250,7 @@ static int cap_path_on(void)
 
 static void cap_path_off(void)
 {
-	if (!cap.path_on)
+	if (!cap.path_on || call_mic_on)	/* a call still needs it */
 		return;
 	if (cap.codec_up)
 		codec_stop();
@@ -2180,6 +2259,115 @@ static void cap_path_off(void)
 	sfr_field(ABOX_ROUTE_CTRL1, 0, 0xf, 0);		/* NSRC0 RESERVED, stock default */
 	cap.path_on = false;
 }
+
+/*
+ * The microphones for a call, whether or not anybody is recording: Samsung's
+ * route-cp-tx, NSRC1 <- UAIF0, SIFM1 -> WDMA. The codec and UAIF0 are shared
+ * with the capture stream (which uses NSRC0); whichever stops last turns them
+ * off.
+ */
+static int call_mic(bool on)
+{
+	u32 m[6] = { IPC_ABOX_CONFIG, 0, SET_INMUX1_SAMPLE_RATE, RATE, 0, 0 };
+	int ret = 0;
+
+	if (!capture)
+		return on ? -ENODEV : 0;
+	mutex_lock(&stream_lock);
+	if (on && !call_mic_on) {
+		ret = codec_power_up();
+		if (!ret)
+			ret = ipc_send(m, 6);
+		if (!ret) {
+			m[2] = SET_INMUX1_FORMAT; m[3] = 16; m[4] = 2;
+			ret = ipc_send(m, 6);
+		}
+		if (!ret)
+			ret = cap_path_on();
+		if (!ret) {
+			sfr_field(ABOX_ROUTE_CTRL1, ABOX_ROUTE_CTRL1_NSRC1, 0xf, 8);
+			sfr_field(ABOX_SPUM_CTRL0, 11, 0x1, 0);	/* SIFM1 -> WDMA */
+			sfr_field(ABOX_SPUM_CTRL0, 8, 0x1, 1);	/* NSRC1 rate converter on */
+			writel(readl(sfr + ABOX_UAIF0_CTRL0) | BIT(1), sfr + ABOX_UAIF0_CTRL0);
+			call_mic_on = true;
+		}
+	} else if (!on && call_mic_on) {
+		sfr_field(ABOX_ROUTE_CTRL1, ABOX_ROUTE_CTRL1_NSRC1, 0xf, 0);
+		call_mic_on = false;
+		if (!READ_ONCE(cap.running))
+			writel(readl(sfr + ABOX_UAIF0_CTRL0) & ~BIT(1), sfr + ABOX_UAIF0_CTRL0);
+		if (!cap.opened)
+			cap_path_off();
+	}
+	mutex_unlock(&stream_lock);
+	return ret;
+}
+
+/* The loudest sample in a DMA's buffer, when that is in the voice firmware's
+ * memory (mapped for a moment: this is read every few seconds). -1 elsewhere. */
+static int vss_buf_peak(u32 start, u32 end)
+{
+	void __iomem *map;
+	int i, n, peak = 0;
+
+	if (start < IOVA_VSS || start >= IOVA_VSS + CP_VSS_SIZE || end <= start)
+		return -1;
+	n = min_t(u32, end - start, SZ_8K) & ~1;
+	if (!n || start + n > IOVA_VSS + CP_VSS_SIZE)
+		return -1;
+	map = ioremap(CP_VSS_PA + ((start - IOVA_VSS) & ~1U), n);
+	if (!map)
+		return -1;
+	for (i = 0; i < n; i += 2)
+		peak = max(peak, abs((int)(s16)readw(map + i)));
+	iounmap(map);
+	return peak;
+}
+
+/* How the path of a call stands, for the bench and for the first seconds of a
+ * real call in the journal: the loudest sample lately in each direction (no
+ * sound itself), the two DMAs' status, the routes. */
+static int call_diag_get(char *buf, const struct kernel_param *kp)
+{
+	s16 *rx = voice_rx, *tx = voice_tx;
+	int i, rx_peak = 0, tx_peak = 0;
+	u16 gp5 = 0, gp6 = 0, inputs = 0;
+	int tx_vss = -1, rx_vss = -1;
+
+	if (!booted || suspending)
+		return sysfs_emit(buf, "off\n");
+	for (i = 0; i < VOICE_BYTES / 2; i++) {
+		rx_peak = max(rx_peak, abs((int)rx[i]));
+		tx_peak = max(tx_peak, abs((int)tx[i]));
+	}
+	if (cap.codec_up && codec_rst) {
+		mutex_lock(&codec_lock);
+		gp5 = codec_read(CODEC_GPIO5_CTRL_1);
+		gp6 = codec_read(CODEC_GPIO5_CTRL_1 + 2);
+		inputs = codec_read(CODEC_INPUT_ENABLES);
+		mutex_unlock(&codec_lock);
+	}
+	/* tx_buf: where WDMA2 really writes, 0x922... being voice_tx above; the
+	 * peaks stayed 0 through a call whose voice was heard, so the voice
+	 * firmware has its own buffers. tx_vss, rx_vss: the peaks in those */
+	if (call_route) {
+		u32 w = ABOX_WDMA0 + 0x100 * VOICE_WDMA, r = ABOX_RDMA0 + 0x100 * VOICE_RDMA;
+
+		tx_vss = vss_buf_peak(readl(sfr + w + 0x08), readl(sfr + w + 0x0c));
+		rx_vss = vss_buf_peak(readl(sfr + r + 0x08), readl(sfr + r + 0x0c));
+	}
+	return sysfs_emit(buf, "route=%d mic=%d vss=%d rx_peak=%d tx_peak=%d rdma4=%08x wdma2=%08x route1=%08x spum0=%08x uaif0=%08x uaif1=%08x tx_buf=%08x tx_off=%08x tx_vss=%d rx_vss=%d gp5=%04x gp6=%04x inputs=%04x\n",
+		call_route, call_mic_on, vss_started, rx_peak, tx_peak,
+		readl(sfr + ABOX_RDMA0 + 0x100 * VOICE_RDMA + RDMA_STATUS),
+		readl(sfr + ABOX_WDMA0 + 0x100 * VOICE_WDMA + WDMA_STATUS),
+		readl(sfr + ABOX_ROUTE_CTRL1), readl(sfr + ABOX_SPUM_CTRL0),
+		readl(sfr + ABOX_UAIF0_CTRL0), readl(sfr + ABOX_UAIF1_CTRL0),
+		readl(sfr + ABOX_WDMA0 + 0x100 * VOICE_WDMA + 0x08),
+		readl(sfr + ABOX_WDMA0 + 0x100 * VOICE_WDMA + 0x10),
+		tx_vss, rx_vss, gp5, gp6, inputs);
+}
+static const struct kernel_param_ops call_diag_ops = { .get = call_diag_get };
+module_param_cb(call_diag, &call_diag_ops, NULL, 0444);
 
 static int cap_msg(u32 type, u32 a, u32 b, u32 c)
 {
@@ -2337,7 +2525,8 @@ static int cap_trigger(struct snd_pcm_substream *s, int cmd)
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		WRITE_ONCE(cap.running, false);
 		ret = cap_msg(PCM_PLTDAI_TRIGGER, 0, 0, 0);
-		writel(readl(sfr + ABOX_UAIF0_CTRL0) & ~BIT(1), sfr + ABOX_UAIF0_CTRL0);
+		if (!call_mic_on)
+			writel(readl(sfr + ABOX_UAIF0_CTRL0) & ~BIT(1), sfr + ABOX_UAIF0_CTRL0);
 		return ret;
 	}
 	return -EINVAL;
@@ -3123,7 +3312,11 @@ static int __init abox_init(void)
 			ret = mmu_map(IOVA_VSS + CP_VSS_SIZE, vss_pa, VSS_SIZE - CP_VSS_SIZE);
 	} else if (!ret)
 		ret = mmu_map(IOVA_VSS, vss_pa, VSS_SIZE);
-	if (!ret)
+	if (!ret && cp_vss) {
+		ret = mmu_map(IOVA_VPARAM, CP_VPARAM_PA, CP_VPARAM_SIZE);
+		if (!ret)
+			ret = mmu_map(IOVA_VPARAM + CP_VPARAM_SIZE, vparam_pa, VPARAM_SIZE - CP_VPARAM_SIZE);
+	} else if (!ret)
 		ret = mmu_map(IOVA_VPARAM, vparam_pa, VPARAM_SIZE);
 	if (!ret)
 		ret = mmu_map(IOVA_RDMA0, streams[0].buf_pa, BUFFER_BYTES);

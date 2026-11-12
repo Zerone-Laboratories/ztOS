@@ -416,7 +416,7 @@
   // ---- one cross port: what ztConflo knows, and how to build it ----
   function crossDevice(x) {
     meta('ztOS on the ' + x.name + ' (' + x.codename + '): experimental cross port', 'How to build ztOS for the ' + x.name + ' (' + x.codename + ', ' + x.soc + ') with ztConflo, from postmarketOS\'s port. Experimental.');
-    var gsi = 'build/ztos/gsi/ztos-gsi-0.2.0-aarch64.tar.zst';
+    var gsi = 'build/ztos/gsi/ztos-gsi-0.2.1-aarch64.tar.zst';
     var guide = [
       '> **Experimental.** ztConflo builds this from postmarketOS\'s port of the ' + x.name + '. Nobody may have tried ztOS on it yet, and flashing erases the phone.' +
         (x.accelerated ? '' : ' **This phone has no GPU driver: ztOS installs, but its shell (ztMETRO) will not start.**') +

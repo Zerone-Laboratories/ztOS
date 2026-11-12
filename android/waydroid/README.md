@@ -160,6 +160,43 @@ standby bucket and a boot-time force-stop. Packages listed in `keep_awake` are
 excluded; foreground launches remain available. The cached-process and AppOps
 settings persist in Android user data, so rollback must restore them explicitly.
 
+## Android alarms wake the phone (30 Oct)
+
+**Android init dropped CAP_WAKE_ALARM; lxc did not.** Right after "init
+second stage started!", SecondStageMain calls prctl(PR_CAPBSET_DROP, 35) on
+both its paths, so everything init starts lacked the capability:
+system_server had CapEff 0x1002887420 and its timerfds were clockids 0, 1
+and 7 only, never CLOCK_*_ALARM (8, 9). An Android alarm then rang only at
+the phone's next wake (up to 5 or 30 min late). The container's own
+bounding set (lxc.cap.keep) keeps bit 35: container init's CapEff was
+0x1c4bac75ff while its bounding set was 0x144bac75ff, after the drop.
+
+`patch-init-wake-alarm.py PATH` replaces that one call with a NOP (4 bytes
+at file offset 0xf4b88), in place, on the known init only (sha256
+9f2795ad...0921 to d01768fd...1e08); anything else exits 3 untouched. The
+REA evidence is in its docstring. strip-image.sh runs it on new images.
+Test: `tests/test-patch-init-wake-alarm.py INIT` on a copy.
+
+The live S9 image was swapped without stopping the container (30 Oct), as
+one root script: copy system.img to system.img.before-r2 and to a work
+copy, mount the work copy rw, patch its init, unmount, `e2fsck -fy` (rc <= 1),
+check init's hash read-only, then `mv -T` over system.img. The running loop
+device keeps the old inode until the reboot, so a hard reset at any step
+leaves a good system.img. Peak space: three copies, about 7.5 GB.
+
+After the reboot: container init CapBnd 0x1c4bac75ff, system_server CapEff
+0x1802887420, clockids 8 and 9 in system_server; an Android wakeup alarm woke
+the SoC from a 30 min `once` about 1.5 s after its due time
+(power/suspend/README.md, "Android alarms wake the SoC"). Waydroid's
+LocationManagerService crash at boot (system_server restarts once) and the
+Launcher3 inflate crash are in this boot's dropbox as in the four boots
+before it: not from the patch.
+
+Rollback: `mv /usr/share/waydroid-extra/images/system.img.before-r2
+/usr/share/waydroid-extra/images/system.img`, then reboot. Keep the backup
+until an unplugged night (J5) has measured how often Android's *_WAKEUP
+alarms wake the phone.
+
 ## Measurements
 
 Memory is `lxc.payload.waydroid/memory.current`, **not** the small systemd manager
@@ -337,6 +374,23 @@ Only registered Waydroid packages in that list prevent freezing. Frozen apps can
 run background notifications, sync, or calls. A launch-in-progress marker prevents
 the event-driven policy and Phase 1's zero-window fallback from freezing Android
 while its first session or APK installation is starting.
+
+Android's display is asleep whenever none of its windows is in front (Home, another
+app, the lock screen, screen off), kept-awake packages included, so a hidden app is
+stopped rather than left resumed: a chat left open no longer marks messages read.
+`ztos-waydroid-recover display on|off` does it (`input keyevent WAKEUP|SLEEP`);
+`unfreeze` leaves it asleep, so zrn-pushd's thaw for a push message does not bring
+an app back to the front. Waking makes Waydroid's composer drop the window in front
+and map a new one; ztMETRO waits for it behind "Loading..." and launches the app if
+none comes within 2 s.
+
+Android plays no notification sound of its own: ztOS chimes for each notification
+at the ztOS ringer. `ztos-waydroid-recover settings` keeps Android's notification
+stream at 0 and its ring stream (calls) at the ztOS ringer's level (0 at vibrate),
+switches off Android's touch, lock and charging sounds, and gives Waydroid's
+keyboard a layout (without one Android posts "Configure physical keyboard" each time its
+display sleeps). It runs when Android is ready, at every thaw (only if the ringer
+changed or Android restarted since) and when the ringer changes in ztMETRO.
 
 Opening an APK in ztMETRO Files offers ATL, Waydroid, and both remember-as-default
 choices. Updating the default preserves the other `android.conf` entries.

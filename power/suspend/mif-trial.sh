@@ -47,6 +47,20 @@ rm -f /var/lib/zrn-cpuidle/loading
 	ZRN_CPUIDLE_S2IDLE_SICD=0 /usr/local/sbin/zrn-cpuidle try
 # ACPM's TMU plugin, which Samsung's kernel attaches at boot and ours did not
 python3 "$D/load-acpm-tmu.py" "$D/exynos9810_acpm_tmu.fw" $LIB/s9p-acpm
+# ...and the messages it sends the plugin: TMU_IPC_INIT once at boot,
+# AP_SUSPEND before the sleep (rsvd = cp net connected) and AP_RESUME after
+# (exynos_acpm_tmu.c). Ours sent none, so the plugin was never told the AP
+# sleeps. TMU_IPC=0 leaves them out, as every trial before 2026-10-29.
+# Word 1 of a request: type | rsvd << 8 | tzid << 16.
+TMU_IPC=${TMU_IPC:-1}
+tmu() { [ "$TMU_IPC" = 1 ] && python3 $LIB/s9p-acpm ipc 12 0 "$1" 0 0 || true; }
+tmu 0x01
+# ACPM's sleep-sequence log into DRAM that survives a reset (0xafffe000 is
+# ACPM 0x8fffe000): after a hang read it with acpmlogptr.py dump 0xafffe000
+if [ -f "$D/acpm-log/acpmlogptr.py" ]; then
+	python3 "$D/acpm-log/acpmlogptr.py" clear 0xafffe000
+	python3 "$D/acpm-log/acpmlogptr.py" set 0x8fffe000
+fi
 # Buck ramp rates as Samsung's regulator driver leaves them: every buck has
 # regulator-ramp-delay = <6000> in the stock tree, code 0 (6 mV/us) in
 # BUCKRAMP (0x3f) and BUCKRAMP2 (0x40). Mainline has no S2MPS18 driver and
@@ -60,6 +74,7 @@ echo "init: changes $(cat $P/init_changes), verified $(cat $P/init_verified)"
 UDC=$(find /sys/kernel/config/usb_gadget -name UDC | head -1)
 CONTROLLER=$(cat "$UDC")
 finish() {
+	[ "${TMU_SUSPENDED:-0}" = 1 ] && tmu 0x10
 	echo 1 > $P/dry_run
 	echo 0 > $P/mif_sleep
 	echo 0 > /sys/power/pm_debug_messages
@@ -96,6 +111,8 @@ echo 1 > /sys/power/pm_debug_messages
 echo 8 > /proc/sys/kernel/printk
 sync
 printf '\n' > "$UDC"
+if [ "$MODE" = mif-cp ]; then tmu 0x0104; else tmu 0x04; fi
+TMU_SUSPENDED=1
 ZRN_SYSTEM_SLEEP_MODULE=$SLEEP python3 -u $LIB/suspend-test.py --mem-sleep deep \
 	--wake-source rtc --seconds ${TRIAL_SECONDS:-10} --connected-diagnostic --ignore-host-req-wake \
 	--acpm-fvp-tool $LIB/s9p-acpm --mif-suspend-khz ${MIF_SUSPEND_KHZ:-421000} --mif-restore-khz 1794000 \

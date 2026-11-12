@@ -1,0 +1,234 @@
+{
+  "id": "xiaomi-daisy",
+  "name": "Mi A2 Lite",
+  "maker": "Xiaomi",
+  "model": "M1805D1SG",
+  "codename": "daisy",
+  "maintainer": "Eri",
+  "contact": "@Noxyntious  (GitHub)",
+  "added": "2026-11-07",
+  "summary": "Runs well, boots using lk2nd and Nura kernel. No camera.",
+  "photo": "photo.jpg",
+  "photo_caption": "",
+  "specs": [
+    [
+      "SoC",
+      "Qualcomm Snapdragon 625 (MSM8953)"
+    ],
+    [
+      "CPU",
+      "8x Cortex-A53"
+    ],
+    [
+      "GPU",
+      "Adreno 506 (freedreno, OpenGL ES 3.1)"
+    ],
+    [
+      "RAM",
+      "3 or 4GB"
+    ],
+    [
+      "Storage",
+      "32 or 64 GB eMMC"
+    ],
+    [
+      "Display",
+      "5.84″ IPS LCD 1080×2280"
+    ],
+    [
+      "Battery",
+      "4000 mAh"
+    ],
+    [
+      "Kernel",
+      "linux-postmarketos-qcom-msm8953 7.1.3 (mainline)"
+    ],
+    [
+      "Released",
+      "2018"
+    ]
+  ],
+  "install": {
+    "markdown": "> This wipes the phone. You'll lose everything that isn't backed up. \n\n\n## Step 0: Building the OS\n\nClone each of these repos into the same folder, next to each other, and set their respective branches (git switch <branch>).\n\n| Repository | Branch |\n|---|---|\n| [Noxyntious/ztconflo](https://github.com/Noxyntious/ztconflo/tree/port/xiaomi-daisy) | `port/xiaomi-daisy` |\n| [Noxyntious/ztos-devices](https://github.com/Noxyntious/ztos-devices/tree/port/xiaomi-daisy) | `port/xiaomi-daisy` |\n| [Noxyntious/ztOS](https://github.com/Noxyntious/ztOS/tree/port/xiaomi-daisy) | `port/xiaomi-daisy` |\n| [postmarketOS/pmaports](https://gitlab.postmarketos.org/postmarketOS/pmaports) | (the kernel, firmware and lk2nd) |\n\nztConflo (essentially pmbootstrap but for ztOS) runs on Arch Linux and derivatives (Cachy, Endeavour, Omarchy, Manjaro, Nyarch etc.) ONLY, to use any other distro you need to use distrobox. \n\nMake sure you are using a rootful distrobox!!! (--root)\n\nONLY building is done in distrobox, flashing is done outside.\n\n```\ndistrobox create --root -n ztos-arch-root -i docker.io/library/archlinux:latest -Y\ndistrobox enter --root ztos-arch-root\nsudo pacman -Syu python git\n```\n\nNow, in the ztConflo folder:\n\n```\npython -m ztconflo build xiaomi-daisy \\\n    --registry ../ztos-devices --pmaports ../pmaports --ztos-src ../ztOS --jobs 16\n```\n> If build fails here, try less jobs, depending on how many CPU threads you have.\n\nIf everything goes well, you should hopefully have your images in `out/xiaomi-daisy/`.\n\nIf you run into \"No such file or directory\" errors, QEMU might have lost its F flag. `grep flags /proc/sys/fs/binfmt_misc/qemu-aarch64`\n\nTo reset (outside distrobox):\n```\nsudo sh -c 'echo -1 > /proc/sys/fs/binfmt_misc/qemu-aarch64'\nsudo systemctl restart systemd-binfmt\n```\n\n\n## Step 1: BL unlock\n1. In Android, enable Developer Options, check OEM unlocking.\n2. Reboot to fastboot (turn the phone off, Vol Down+Power), run `fastboot flashing unlock` (if this fails, use `fastboot oem unlock`. I forgot which one it was)\n\n***This WILL wipe the phone!!! Make sure you have everything saved.***\n\n## Step 2: Flash lk2nd\n\nMake sure you are in the xiaomi-daisy folder:\n\n```\ncd out/xiaomi-daisy\n```\n\nNow, flash lk2nd from fastboot.\n\n```\nfastboot flash boot lk2nd.img\n```\n\n## Step 3: Flash ztOS\n\nBack in fastboot, flash the rootfs to the `userdata` partition:\n\n```\nsh flash.sh\n```\n\nOr manually:\n\n```\nfastboot -S 256M flash userdata rootfs.img\nfastboot reboot\n```\n\nThe image is pretty big, so give it some time. If one stage gets stuck for more than 5 minutes, use CTRL+C to break out of the flash, reboot your phone back into fastboot, and try again. Perhaps use a different cable or port.\n\nIf you see:\n```\nWarning: skip copying userdata image avb footer due to sparse image.\n```\nignore it. It's normal.\n\nAfter this finished, the phone should boot straight into ztOS."
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "Panel",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": "Goodix panel"
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "CPU, frequency scaling",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charging",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "Sleep (suspend)",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Mobile data",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking",
+      "status": "working",
+      "notes": "ssh alarm@172.16.42.1"
+    },
+    {
+      "category": "Modem",
+      "feature": "SIM and signal",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphone",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Headphones",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient light",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, gyroscope",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Proximity",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Camera",
+      "feature": "Cameras",
+      "status": "broken",
+      "notes": "ov5675 sensor fails to probe"
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "broken",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "ztMETRO",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "Android apps (Waydroid)",
+      "status": "broken",
+      "notes": "kernel lacks binderfs support"
+    },
+    {
+      "category": "Software",
+      "feature": "ztOSIAL (ztos-ial test)",
+      "status": "working",
+      "notes": "Everything passes"
+    }
+  ],
+  "notes": [
+    {
+      "title": "No SIM pin prompt",
+      "text": "Unlock with sudo mmcli -i any --pin=XXXX"
+    },
+    {
+      "title": "Clock is wrong until the phone goes online",
+      "text": "Connect to WiFi or data, after a boot, wait a while and it should sync."
+    }
+  ]
+}

@@ -25,13 +25,17 @@
  *    /sys/class/sec/gps/GPS_PWR_EN/value (gpg0-2, the chip's enable pin);
  *  - somewhere for sensor packets to go. On the stock kernel Samsung's SSP
  *    driver takes them. Here they are queued on /dev/zrn_ssp for a user-space
- *    client, and what is written there is sent to the hub.
+ *    client, and what is written there is sent to the hub;
+ *  - Samsung's ssp_suspend / ssp_resume: the AP_SLEEP pulse at each suspend
+ *    (ap_sleep_pulse) and a resume counter (resume_seq) that tells the
+ *    user-space client to send the hub MSG2SSP_AP_STATUS_RESUME (0xd3).
  *
  * The chip does nothing until lhd, run from the phone's own vendor partition,
  * has loaded its patch through /dev/bbd_patch and /dev/ttyBCM.
  */
 #include <linux/delay.h>
 #include <linux/gpio/machine.h>
+#include <linux/irq.h>
 #include <linux/kfifo.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -611,6 +615,78 @@ static ssize_t ready_show(struct device *dev, struct device_attribute *attr, cha
 }
 static DEVICE_ATTR_RO(ready);
 
+/* ---- what Samsung's ssp_suspend / ssp_resume do ----------------------------- */
+
+/*
+ * Stock (ssp_dev.c, and ssp_suspend at 0xa83560 in stock's Image): at each
+ * suspend AP_SLEEP (gpa0-5) goes low and straight back high (set 0, a read
+ * and a printk, set 1), and no command is sent; at resume AP_SLEEP is set
+ * high and MSG2SSP_AP_STATUS_RESUME (0xd3) is sent with ssp_send_cmd
+ * (ssp_resume, 0xa839a4). Here the command comes from ztoscsf-sensord, the
+ * only writer on the link, when resume_seq moves.
+ *
+ * Off by default (ap_sleep_pulse): it pulses only while host_req is a wake
+ * IRQ, since a hub told the AP sleeps asks to be woken (SSP_suspend_*
+ * strings in its firmware) and with host_req masked nobody would answer.
+ */
+static bool ap_sleep_pulse;
+module_param(ap_sleep_pulse, bool, 0644);
+MODULE_PARM_DESC(ap_sleep_pulse, "pulse AP_SLEEP low at each suspend and count the resumes for 0xd3 (as stock)");
+static unsigned int ap_sleep_pulse_us = 100;
+module_param(ap_sleep_pulse_us, uint, 0644);
+MODULE_PARM_DESC(ap_sleep_pulse_us, "how long AP_SLEEP is held low");
+static bool pulsed;
+static unsigned long resume_seq, ap_suspends;
+
+void zrn_ssp_suspend(void)
+{
+	struct irq_data *d = hub_spi && hub_spi->irq > 0 ? irq_get_irq_data(hub_spi->irq) : NULL;
+	unsigned int us = ap_sleep_pulse_us;
+	const char *why = NULL;
+	int level;
+
+	if (!ap_sleep_pulse)
+		why = "off";
+	else if (!hub_ready)
+		why = "hub not ready";
+	else if (!d || !irqd_is_wakeup_set(d))
+		why = "host_req is not a wake IRQ";
+	if (why) {
+		pr_info("zrn-bbd: no AP_SLEEP pulse (%s)\n", why);
+		return;
+	}
+	gpiod_set_value(zrn_gpios[ZRN_GPIO_AP_SLEEP], 0);
+	usleep_range(us, us + 50);
+	level = gpiod_get_value(zrn_gpios[ZRN_GPIO_AP_SLEEP]);
+	gpiod_set_value(zrn_gpios[ZRN_GPIO_AP_SLEEP], 1);
+	pr_info("zrn-bbd: AP_SLEEP pulse, read %d\n", level);
+	pulsed = true;
+	ap_suspends++;
+}
+
+void zrn_ssp_resume(void)
+{
+	gpiod_set_value(zrn_gpios[ZRN_GPIO_AP_SLEEP], 1);
+	if (!pulsed)
+		return;
+	pulsed = false;
+	resume_seq++;
+	if (!IS_ERR_OR_NULL(sec_hub))
+		sysfs_notify(&sec_hub->kobj, NULL, "resume_seq");
+}
+
+static ssize_t resume_seq_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", resume_seq);
+}
+static DEVICE_ATTR_RO(resume_seq);
+
+static ssize_t ap_suspends_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", ap_suspends);
+}
+static DEVICE_ATTR_RO(ap_suspends);
+
 /* ---- putting it together ---------------------------------------------------- */
 
 static void board_exit(void)
@@ -700,6 +776,10 @@ static int __init board_init(void)
 	ret = device_create_file(sec_hub, &dev_attr_mcu_power);
 	if (!ret)
 		ret = device_create_file(sec_hub, &dev_attr_ready);
+	if (!ret)
+		ret = device_create_file(sec_hub, &dev_attr_resume_seq);
+	if (!ret)
+		ret = device_create_file(sec_hub, &dev_attr_ap_suspends);
 	if (!ret)
 		ret = device_create_file(sec_hub, &dev_attr_reset);
 	if (!ret)

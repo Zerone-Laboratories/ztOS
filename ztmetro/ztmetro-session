@@ -9,4 +9,11 @@ if systemctl --user -q is-active ztos-waydroid-session.service 2>/dev/null; then
 	(i=0; while [ ! -S "$XDG_RUNTIME_DIR/wayland-0" ] && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
 	 sleep 2; systemctl --user try-restart ztos-waydroid-session.service) >/dev/null 2>&1 &
 fi
+# ztRetrofit's style for the whole session, from the config: the shell and
+# every app started in it read ZTRF_SHELL_STYLE, so the two never meet.
+style=$(sed -n 's/^[[:space:]]*style[[:space:]]*=[[:space:]]*\([A-Za-z0-9]*\).*/\1/p' \
+	"${XDG_CONFIG_HOME:-$HOME/.config}/ztmetro/config" 2>/dev/null | tail -n 1)
+case "$style" in dotmatrix|1) style=dotmatrix ;; *) style=metro ;; esac
+export ZTRF_SHELL_STYLE=$style
+systemctl --user set-environment ZTRF_SHELL_STYLE=$style >/dev/null 2>&1 || true
 exec /usr/local/bin/ztmetro >"$log" 2>&1

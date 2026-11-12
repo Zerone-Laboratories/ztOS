@@ -8,6 +8,7 @@ directly that its own daemon did not.
 """
 import os
 import subprocess
+import time
 
 from ztos_ial.backends import Backend, NotSupported, exists, read, read_int
 from ztos_ial.backends import generic
@@ -53,11 +54,23 @@ class Display(generic.Display):
 SLEEP_STATE = '/var/lib/zrn-sleep/enabled'
 SLEEP_STATUS = '/run/zrn-sleepd/status'
 SLEEP_INHIBIT = '/run/zrn-sleepd/inhibit'
+INHIBIT_S = 300         # an inhibitor's file lasts this long unless renewed
+RENEW_S = 60
 
 
 class Sleep(Backend):
+    """An inhibitor is a timed-ial-N file in zrn-sleepd's inhibit directory
+    that lasts INHIBIT_S and is renewed every RENEW_S while its caller is on
+    the bus: a client that crashes, or ztos-iald itself, no longer holds the
+    phone awake until a reboot. It goes at once when the caller's name does
+    (NameOwnerChanged)."""
     interface = 'Sleep1'
     poll_s = 10
+
+    def __init__(self, config, manifest):
+        super().__init__(config, manifest)
+        self.held = {}          # cookie: (sender or None, its subscription id)
+        self.renewing = False
 
     def props(self):
         status = key_values(SLEEP_STATUS)
@@ -69,20 +82,92 @@ class Sleep(Backend):
         subprocess.run(['/usr/local/sbin/zrn-sleepd', 'enable' if enabled else 'disable'],
                        check=True, timeout=20)
 
-    def m_Inhibit(self, who, why):
+    @staticmethod
+    def _path(cookie):
+        return os.path.join(SLEEP_INHIBIT, f'timed-ial-{cookie}')
+
+    @staticmethod
+    def _stamp(cookie, text=None):
+        """Write (or renew) the file atomically: its mtime is when it lapses,
+        set before it appears, so zrn-sleepd never sees it expired."""
         os.makedirs(SLEEP_INHIBIT, exist_ok=True)
+        tmp = os.path.join(os.path.dirname(SLEEP_INHIBIT), f'.ial-{cookie}.tmp')
+        if text is None:
+            try:
+                with open(Sleep._path(cookie)) as stream:
+                    text = stream.read()
+            except OSError:
+                text = ''
+        with open(tmp, 'w') as stream:
+            stream.write(text)
+        expiry = time.time() + INHIBIT_S
+        os.utime(tmp, (expiry, expiry))
+        os.replace(tmp, Sleep._path(cookie))
+
+    def m_Inhibit(self, who, why):
         cookie = 1
-        while exists(os.path.join(SLEEP_INHIBIT, f'ial-{cookie}')):
+        while cookie in self.held or exists(self._path(cookie)) or \
+                exists(os.path.join(SLEEP_INHIBIT, f'ial-{cookie}')):
             cookie += 1
-        with open(os.path.join(SLEEP_INHIBIT, f'ial-{cookie}'), 'w') as stream:
-            stream.write(f'{who}: {why}\n')
+        sender = self.sender
+        self._stamp(cookie, f'{who}: {why} ({sender or "unknown caller"})\n')
+        watch = None
+        if sender and self.connection is not None:
+            from gi.repository import Gio
+            watch = self.connection.signal_subscribe(
+                'org.freedesktop.DBus', 'org.freedesktop.DBus', 'NameOwnerChanged',
+                '/org/freedesktop/DBus', sender, Gio.DBusSignalFlags.NONE,
+                lambda *args: self._gone(args[5].unpack()), None)
+        self.held[cookie] = (sender, watch)
+        if not self.renewing:
+            from gi.repository import GLib
+            self.renewing = True
+            GLib.timeout_add_seconds(RENEW_S, self._renew)
         return cookie
 
-    def m_Uninhibit(self, cookie):
+    def _gone(self, args):
+        name, _old, new = args
+        if new:
+            return
+        for cookie, (sender, _watch) in list(self.held.items()):
+            if sender == name:
+                self.m_Uninhibit(cookie)
+
+    def _owned(self, sender):
+        if not sender or self.connection is None:
+            return True
+        from gi.repository import Gio, GLib
         try:
-            os.unlink(os.path.join(SLEEP_INHIBIT, f'ial-{int(cookie)}'))
-        except FileNotFoundError:
-            pass
+            reply = self.connection.call_sync(
+                'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                'NameHasOwner', GLib.Variant('(s)', (sender,)), GLib.VariantType('(b)'),
+                Gio.DBusCallFlags.NONE, 1000, None)
+            return reply.unpack()[0]
+        except Exception:
+            return True     # the bus did not answer: keep it, it lapses anyway
+
+    def _renew(self):
+        for cookie, (sender, _watch) in list(self.held.items()):
+            if not self._owned(sender):
+                self.m_Uninhibit(cookie)    # gone without a signal reaching us
+                continue
+            try:
+                self._stamp(cookie)
+            except OSError:
+                pass
+        self.renewing = bool(self.held)
+        return self.renewing
+
+    def m_Uninhibit(self, cookie):
+        cookie = int(cookie)
+        _sender, watch = self.held.pop(cookie, (None, None))
+        if watch is not None and self.connection is not None:
+            self.connection.signal_unsubscribe(watch)
+        for path in (self._path(cookie), os.path.join(SLEEP_INHIBIT, f'ial-{cookie}')):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
 
 # ---- Sensors1: the sensor hub, through ztoscsf-sensord ----------------------

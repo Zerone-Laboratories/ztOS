@@ -35,6 +35,7 @@
 #define ZMC_TILT_IN_MS	90
 #define ZMC_TILT_OUT_MS	200
 #define ZMC_MARGIN	16	/* left edge of everything: 20 px on a 450 px wide reference */
+enum { ZMC_STYLE_METRO, ZMC_STYLE_DOTMATRIX };
 #define ZMC_HEADER_H	104	/* the title stays; the list moves under it */
 #define ZMC_ACT_BACK	(-1)	/* the title: up a page */
 #define ZMC_ACT_PIVOT	(-2)	/* the next tab's title: slide to it (arg: its page) */
@@ -121,6 +122,11 @@ struct zmc_state {
 	bool configured, running, dirty;
 	bool active;		/* the shell has this app in front (XDG activated) */
 	uint32_t accent;	/* 0xRRGGBB */
+	/* the shell's style (ztRetrofit): the same widgets with another face.
+	 * ZMC_STYLE_DOTMATRIX draws switches, sliders, buttons, the loading dots
+	 * and page titles as dots, in the palette chosen on its home screen */
+	int style;
+	uint32_t dm_main, dm_accent;
 
 	int page;
 	double scroll, content_h;
@@ -163,10 +169,12 @@ struct zmc_state {
 	double last_y;
 	bool sliding;
 	struct zmc_hit slider;
+	int slider_permille;	/* where the finger is, in tenths of a percent */
 
 	/* a pivot: its tabs slide sideways, under the finger or on their own */
 	bool pivot_set;		/* the page in front is one tab of a pivot */
 	int pivot_page;		/* and the other tab */
+	const char *pivot_after;	/* more than two tabs: the title after the next one */
 	double pivot_next_dx;	/* where the next tab's title is, from this one's */
 	int axis;		/* a moving finger: 0 undecided, 1 across, 2 along the list */
 	bool swiping, spring, slide_active;
@@ -213,6 +221,7 @@ void zmc_every(int ms, void (*tick)(void));
 /* ---- drawing a page ---- */
 double zmc_header(cairo_t *cr, const char *title);	/* returns where the content starts */
 double zmc_pivot(cairo_t *cr, const char *title, const char *next);
+void zmc_pivot_changed(void);	/* from arrived(), with more than two tabs */
 /* the same, with the next tab's title a thing to tap: it gives (action, arg) */
 double zmc_pivot_next(cairo_t *cr, const char *title, const char *next, int action, int arg);
 double zmc_entry(cairo_t *cr, double y, const char *title, const char *detail, int action, int arg);
@@ -274,6 +283,37 @@ void zmc_present(void);
 bool zmc_transition(const char *name, double t, double x, double y, double w, double h,
 	cairo_surface_t *source, unsigned revision);
 double zmc_transition_ms(const char *name);
+
+/* The board: rows of cells, each swivelling in by itself, staggered, over the
+ * same interface with no page change, and out the same way (zrnboard.h). They are drawn once when
+ * it opens, so a frame costs only GPU quads. While it is up
+ * it takes every touch; back closes it; a page change drops it at once. */
+struct zmc_board {
+	int count, cols;
+	double x0, top, cell_w, cell_h, gap;
+	/* one cell, its top left at the origin */
+	void (*draw_cell)(cairo_t *cr, int i, double w, double h);
+	bool (*live)(int i);	/* NULL: all of them answer a tap */
+	int action;		/* a tap on a live cell gives (action, i) */
+	const char *label;	/* a line above the rows, which does not move */
+	/* a picker: the box lit in place, the old page gone behind black, then the
+	 * rows. Otherwise the page stays faintly visible under the rows. */
+	bool picker;
+	void (*draw_box)(cairo_t *cr, double w, double h);
+	double box_x, box_y, box_w, box_h;	/* on screen */
+	void (*closed)(void);	/* it has finished going */
+};
+void zmc_board_open(const struct zmc_board *board);
+void zmc_board_close(void);		/* from the top, as it came */
+/* Close for a choice: apply() runs once the rows have gone, when the page's
+ * redraw is hidden, so the rows do not wait for it. Only for a picker. It runs
+ * inside a frame: it changes state and must not redraw. */
+void zmc_board_choose(void (*apply)(void));
+bool zmc_board_up(void);
+void zmc_board_redraw(void);		/* the rows again: a cell has changed */
+/* People's and the phone's letters: # a..z and the globe. has(i) says whether a
+ * cell (see zb_letter) has anything under it; a tap gives (action, i). */
+void zmc_letter_board(bool (*has)(int i), int action);
 double zmc_button(cairo_t *cr, double x, double y, double w, const char *label, int action, int arg);
 void zmc_round_button(cairo_t *cr, double cx, double y, const char *glyph, const char *label,
 	int action, int arg);
@@ -291,7 +331,48 @@ double zmc_text(cairo_t *cr, const char *s, const char *font, double size, doubl
 void zmc_text_line(cairo_t *cr, const char *s, const char *font, double size, double x, double y, double width);
 void zmc_add_hit(double x, double y, double w, double h, int action, int arg);
 void zmc_set_rgb(cairo_t *cr, uint32_t color);
+/* A picture (a person's photo) cut to a square at x, y, `size` points across.
+ * Under DotMatrix it is dots on the page's lattice, each as bright as what is
+ * under it, in the palette's main colour: never a photograph among the dots. */
+void zmc_picture(cairo_t *cr, cairo_surface_t *picture, double x, double y, double size);
 void zmc_accent(cairo_t *cr);
+
+/* A long list, of up to thousands of rows of one height, with no page of that
+ * size anywhere and no tap target per row: call zmc_list from .render at the
+ * height it starts at, and go on from what it returns. Rows are drawn one at a
+ * time as they come near the screen, each onto a GPU texture of its own that
+ * is then only moved, and a tap finds its row by arithmetic. Only a page's
+ * rows that fit on the first screen are ever in its cached page.
+ *
+ * Its heads are the rows that start a section: the part of a head from pin_x,
+ * pin_y over pin_w, pin_h stays at the top of the list, opaque, so nothing shows
+ * behind it (take the row's whole width), while its section passes
+ * below it, until the next head arrives and pushes it off, as Windows Phone's
+ * letters do. It comes from the head's row texture, so it costs nothing a frame. */
+struct zmc_list {
+	int count;
+	double row_h;
+	uint64_t revision;	/* changes when any row would be drawn differently */
+	/* one row, its top left at the origin, zmc.width across */
+	void (*draw_row)(cairo_t *cr, int row);
+	/* what a touch at x, y in the row gives: action, arg and the box it presses
+	 * (x, y, w, h in the row; w 0: no tilt). false: nothing there */
+	bool (*row_hit)(int row, double x, double y, struct zmc_hit *hit);
+	bool (*is_head)(int row);	/* NULL: no heads */
+	double pin_x, pin_y, pin_w, pin_h;
+};
+/* returns where the list ends */
+double zmc_list(cairo_t *cr, double y, const struct zmc_list *list);
+/* when `page` next arrives (going back, or as the next zmc_go to it), show
+ * `row` at the top of the list: its place is otherwise kept while away */
+void zmc_list_show(int page, int row);
+/* something drawn over a list at where it is now, such as zmc_menu: from here
+ * until zmc_list_freeze(false) the page is one picture of this moment, which
+ * does not scroll, and what .render draws at page heights lands right */
+void zmc_list_freeze(bool freeze);
+/* Rows are also drawn ahead on a thread: hold this while changing what
+ * draw_row reads, outside .render (which already holds it). */
+void zmc_list_lock(bool lock);
 
 /* ---- odds and ends ---- */
 /* A touch to be felt: "tick", "tap", "click" or "heavy", from the lightest.
@@ -301,6 +382,7 @@ void zmc_accent(cairo_t *cr);
 void zmc_haptic(const char *kind);
 uint32_t zmc_now_ms(void);
 void zmc_read_file(const char *path, char *out, size_t size);	/* first line, or "" */
-uint32_t zmc_config_accent(void);	/* the accent in ~/.config/ztmetro/config */
+uint32_t zmc_config_accent(void);
+void zmc_config_style(void);	/* style and palette from the same file; DotMatrix also sets the accent */	/* the accent in ~/.config/ztmetro/config */
 
 #endif

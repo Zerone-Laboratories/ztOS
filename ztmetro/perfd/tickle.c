@@ -27,8 +27,9 @@
  *     its cgroup, so the whole app is exempt; and the exemption lasts 10 s
  *     past the end of playback, so the gap between two tracks does not
  *     pause the player.
- *   - ztMETRO and everything of its own (app ids zt*, zrn*) are never
- *     touched, nor is anything that is not an app ztMETRO has shown.
+ *   - Only the core shell (ztMETRO and its ztos-* helpers, such as the
+ *     polkit agent) and the Phone are never touched, nor is anything that
+ *     is not an app ztMETRO has shown. ztOS's other apps are tickled.
  *   - With the screen off, no app is in front: the grace period starts then.
  */
 #define _GNU_SOURCE
@@ -118,7 +119,7 @@ static void freeze(struct app *a, bool on) {
 
 static bool own(const char *id) {
 	if (bg_contains(id)) return false;
-	return strncmp(id, "zt", 2) == 0 || strncmp(id, "zrn", 3) == 0;
+	return strcmp(id, "ztmetro") == 0 || strcmp(id, "ztphone") == 0 || strncmp(id, "ztos-", 5) == 0;
 }
 
 /* /proc/PID/cgroup's path, "" if gone */
@@ -484,6 +485,16 @@ static bool background_run(long now) {
          * IN_CLOSE_WRITE in the runtime directory we watch, and this loop
          * would wake itself for ever (flock needs no write access) */
         int lock = open(path, O_CREAT | O_RDONLY | O_CLOEXEC, 0600);
+        /* made here first (perfd is root, at boot): the session's own
+         * ztos-waydroid-power opens it for writing, so it must be the user's,
+         * or every policy change fails at its flock */
+        struct stat rt;
+        if (lock >= 0 && stat(background_runtime, &rt) == 0) {
+            struct stat ls;
+            if (fstat(lock, &ls) == 0 && ls.st_uid != rt.st_uid && fchown(lock, rt.st_uid, rt.st_gid) != 0) {
+                fprintf(stderr, "zrnperfd: tickle: %s: chown: %s\n", path, strerror(errno));
+            }
+        }
         if (lock >= 0 && flock(lock, LOCK_EX | LOCK_NB) == 0) {
             snprintf(path, sizeof(path), "%s/ztos-waydroid-power-state", background_runtime);
             FILE *f = fopen(path, "r");

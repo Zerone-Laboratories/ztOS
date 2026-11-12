@@ -5,6 +5,8 @@ After=zrn-cpuidle.service zrnperfd.service ztoscorenetworking.service zrn-blueto
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/zrn-sleepd
+# a clean stop is not a sleep that never came back
+ExecStopPost=/bin/rm -f /var/lib/zrn-sleep/sleeping
 Restart=on-failure
 RestartSec=10
 

@@ -1,0 +1,209 @@
+{
+  "id": "oneplus-fajita-fajita",
+  "name": "OnePlus 6T",
+  "maker": "Oneplus-fajita",
+  "model": "",
+  "codename": "fajita",
+  "maintainer": "flaher",
+  "contact": "dc:flaher gh:flaherxd",
+  "added": "2026-11-02",
+  "summary": "The OnePlus 6T (fajita) runs mainline Linux 7.1.0-rc1-sdm845 with a patched device tree for Qualcomm Snapdragon 845 hardware\n  support. It boots via the standard fastboot Android boot.img flow directly into systemd, synchronizing Qualcomm remote\n  processors (QRTR/RMTFS) before launching the ztmetro compositor via greetd. The port runs smoothly at a fluid 60 FPS on the\n  AMOLED display with full hardware acceleration, responsive haptics and wireless connectivity, and accurate battery monitoring\n  verified across all core hardware interfaces. Fixed Wi-Fi and Bluetooth initialization,battery telemetry and charging\n  detection, flashlight control, haptics feedback and framework error popups",
+  "photo": "photo.jpg",
+  "photo_caption": "",
+  "specs": [
+    [
+      "SoC",
+      "Snapdragon 845"
+    ],
+    [
+      "GPU",
+      "Adreno 630"
+    ],
+    [
+      "RAM",
+      "8GB"
+    ],
+    [
+      "Storage",
+      "128GB"
+    ],
+    [
+      "Kernel",
+      "mainline Linux 7.1.0-rc1"
+    ]
+  ],
+  "install": {
+    "markdown": "# OnePlus 6T (fajita) ztOS Installation Guide\n\n## Stage 1: Host Preparation\n\n1. Install build and flash utilities on Arch Linux or Manjaro:\n\n```sh\nsudo pacman -S --needed android-tools python util-linux e2fsprogs libarchive mkbootimg git\n```\n\n2. Install build and flash utilities on Ubuntu or Debian:\n\n```sh\nsudo apt update && sudo apt install -y android-tools-adb android-tools-fastboot python3 util-linux e2fsprogs libarchive-tools mkbootimg git\n```\n\n## Stage 2: Getting the Repositories\n\n1. Clone the ztConflo builder repository:\n\n```sh\ngit clone https://github.com/flaherxd/ztconflo.git -b port/oneplus-fajita\n```\n\n2. Clone the ztOS mobile shell repository:\n\n```sh\ngit clone https://github.com/flaherxd/ztOS.git -b port/oneplus-fajita\n```\n\n3. Enter the builder directory:\n\n```sh\ncd ztconflo\n```\n\n## Stage 3: Building the Images\n\n1. Run the builder script:\n\n```sh\npython3 build_fajita.py\n```\n\n## Stage 4: Entering Fastboot Mode\n\n1. Reboot the phone into bootloader over ADB:\n\n```sh\nadb reboot bootloader\n```\n\n2. Verify that fastboot detects the device:\n\n```sh\nfastboot devices\n```\n\n## Stage 5: Flashing the Device\n\n1. Navigate to the output directory:\n\n```sh\ncd out/oneplus-fajita\n```\n\n2. Flash the boot partition:\n\n```sh\nfastboot flash boot boot.img\n```\n\n3. Flash the root filesystem partition:\n\n```sh\nfastboot flash userdata rootfs.img\n```\n\n4. Reboot the phone into ztOS:\n\n```sh\nfastboot reboot\n```\n\n## Stage 6: First Boot and Access\n\n1. Connect the phone to your computer with a USB cable.\n\n2. Connect to the device via SSH:\n\n```sh\nssh alarm@172.16.42.1\n```\n\nPassword: `alarm` (root password: `root`).\n\n## Problems\n\n| Problem | Cause | Solution |\n| --- | --- | --- |\n| Fastboot device not detected | Faulty USB cable or missing permissions | Use a USB data cable, plug into a rear motherboard port, or run sudo fastboot devices. |\n| Speaker volume is quiet | Safe gain limit without upstream DSP curve | Expected behavior. Volume is capped to protect hardware. |\n| SSH connection times out | USB network interface not configured by host | Assign an IP to the host interface: sudo ip addr add 172.16.42.2/24 dev <interface>. |\n| Device boots into stock OS or recovery | Fastboot flashed the inactive slot | Run fastboot getvar current-slot, then flash directly to that slot: fastboot flash boot_a boot.img (or _b). |"
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "Panel",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "CPU, frequency scaling",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charging",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "Sleep (suspend)",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "Mobile data",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "SIM and signal",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "partial",
+      "notes": "really quiet"
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphone",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Headphones",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient light",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, gyroscope",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Sensors",
+      "feature": "Proximity",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Camera",
+      "feature": "Cameras",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "ztMETRO",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "Android apps (Waydroid)",
+      "status": "partial",
+      "notes": "android boots, 3rd party apps untested"
+    },
+    {
+      "category": "Software",
+      "feature": "ztOSIAL (ztos-ial test)",
+      "status": "untested",
+      "notes": ""
+    }
+  ],
+  "notes": []
+}

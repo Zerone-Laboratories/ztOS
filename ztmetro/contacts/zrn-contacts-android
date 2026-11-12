@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""zrn-contacts-android: Android's contacts (Waydroid) into the ztOS store, one way.
+
+    zrn-contacts-android              as root: read Android, import as the user
+    zrn-contacts-android --import     read `content query` rows on stdin, as the user
+
+Android's own Google account syncs them, so ztOS needs no OAuth client. Does
+nothing while Android is frozen or stopped: it never wakes it.
+"""
+import fcntl, os, re, subprocess, sys
+
+COLUMNS = ("name", "mobile", "other", "email", "note", "uid")
+MAX_CONTACTS = 2000
+ROW = re.compile(r"^Row: \d+ contact_id=(\d+), display_name=(.*), data1=(.*), data2=(\S*)$")
+PAYLOAD = "/sys/fs/cgroup/lxc.payload.waydroid/cgroup.freeze"
+
+
+def parse(lines):
+    people = {}
+    for line in lines:
+        m = ROW.match(line.rstrip("\n"))
+        if not m or m[2] == "NULL" or m[3] == "NULL":
+            continue
+        name, number = m[2].replace("\t", " ")[:63], m[3].replace("\t", "")[:31]
+        p = people.setdefault("a:" + m[1], {"name": name, "numbers": []})
+        # data2 2 is TYPE_MOBILE: it goes first
+        p["numbers"].insert(0, number) if m[4] == "2" else p["numbers"].append(number)
+    return people
+
+
+def merge(rows, people):
+    """Android's people replace their earlier copies. An empty read changes nothing."""
+    if not people:
+        return rows
+    kept = [r for r in rows if not r["uid"].startswith("a:")]
+    have = {(r["name"].lower(), r["mobile"][-9:]) for r in kept}
+    for uid, p in people.items():
+        mobile = p["numbers"][0]
+        if (p["name"].lower(), mobile[-9:]) in have or len(kept) >= MAX_CONTACTS:
+            continue
+        other = p["numbers"][1] if len(p["numbers"]) > 1 else ""
+        kept.append(dict(zip(COLUMNS, (p["name"], mobile, other, "", "", uid))))
+    return kept
+
+
+def import_stdin(path=None):
+    path = path or os.path.expanduser("~/.local/share/ztmetro/contacts")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    people = parse(sys.stdin)
+    lock = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    rows = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                cells = line.rstrip("\r\n").split("\t")
+                cells += [""] * (len(COLUMNS) - len(cells))
+                if cells[0]:
+                    rows.append(dict(zip(COLUMNS, cells)))
+    except FileNotFoundError:
+        pass
+    rows = merge(rows, people)
+    rows.sort(key=lambda r: r["name"].lower())
+    new = path + ".new"
+    fd = os.open(new, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("".join("\t".join(r[c] for c in COLUMNS) + "\n" for r in rows))
+    os.replace(new, path)
+    print(f"zrn-contacts-android: {len(people)} from Android, {len(rows)} in the store")
+
+
+def from_android():
+    try:
+        with open(PAYLOAD) as f:
+            if f.read().strip() != "0":
+                return
+    except OSError:
+        return
+    user = subprocess.run(["sh", "-c", ". /usr/lib/ztos/user.sh; echo $ZTOS_USER"],
+                          capture_output=True, text=True).stdout.strip()
+    q = subprocess.run(["waydroid", "shell", "--", "content", "query", "--uri",
+                        "content://com.android.contacts/data/phones", "--projection",
+                        "contact_id:display_name:data1:data2"],
+                       capture_output=True, text=True, timeout=30)
+    subprocess.run(["runuser", "-u", user, "--", os.path.abspath(__file__), "--import"],
+                   input=q.stdout, text=True, check=True)
+
+
+if __name__ == "__main__":
+    import_stdin() if sys.argv[1:] == ["--import"] else from_android()

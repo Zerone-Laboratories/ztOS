@@ -34,7 +34,7 @@ static struct {
 	struct wl_egl_window *window;
 	struct wl_surface *wl_surface;
 	GLuint program, white;
-	GLint size, eye, alpha, opaque, solid, color, native;
+	GLint size, eye, alpha, opaque, solid, color, native, reveal, dpitch;
 	int w, h, scale, tile_h, max_size;
 	bool ready, failed;
 	unsigned clock;
@@ -43,6 +43,8 @@ static struct {
 	unsigned frames, uploads;
 	size_t bytes;
 } gpu;
+
+float zmg_reveal = 1.0f, zmg_dot_pitch = 4.6f;
 
 static double clock_ms(void) {
 	struct timespec ts;
@@ -106,11 +108,19 @@ bool zmg_init(struct wl_display *display, struct wl_surface *surface, int w, int
 		"void main(){ uv=texcoord; gl_Position=vec4(2.0*position.x/size.x-1.0,"
 		"1.0-2.0*position.y/size.y,0.0,1.0-position.z/eye); }";
 	static const char fragment[] =
-		"precision mediump float; varying vec2 uv; uniform sampler2D image;"
+		"precision mediump float; varying vec2 uv; uniform sampler2D image;\n"
+		"#ifdef GL_FRAGMENT_PRECISION_HIGH\n#define HP highp\n#else\n#define HP mediump\n#endif\n"
 		"uniform float alpha; uniform bool opaque; uniform bool solid; uniform vec4 color;"
 		"uniform bool native;"	/* an EGLImage samples in order; Cairo's BGRA is swapped */
+		/* the DotMatrix style's arrival (zmg_reveal): through a lattice of dots */
+		"uniform float reveal; uniform float dpitch;"
 		"void main(){ if(solid){gl_FragColor=color;return;} vec4 c=texture2D(image,uv);"
-		"gl_FragColor=vec4(native?c.rgb:c.bgr,opaque?1.0:c.a)*alpha; }";
+		"c=vec4(native?c.rgb:c.bgr,opaque?1.0:c.a)*alpha;"
+		"if(reveal<0.999){ HP vec2 q=gl_FragCoord.xy/dpitch; HP vec2 cell=floor(q);"
+		"HP float h=fract(sin(dot(cell,vec2(12.9898,78.233)))*43758.5453);"
+		"float r=0.36+max(0.0,reveal-0.7)*1.5;"
+		"c*=step(h,reveal/0.7)*(1.0-smoothstep(r-0.08,r,length(fract(q)-0.5))); }"
+		"gl_FragColor=c; }";
 	GLuint vs = zmr_shader(GL_VERTEX_SHADER, vertex), fs = zmr_shader(GL_FRAGMENT_SHADER, fragment);
 	if (!vs || !fs) {
 		if (vs) glDeleteShader(vs);
@@ -135,6 +145,8 @@ bool zmg_init(struct wl_display *display, struct wl_surface *surface, int w, int
 	gpu.solid = glGetUniformLocation(gpu.program, "solid");
 	gpu.color = glGetUniformLocation(gpu.program, "color");
 	gpu.native = glGetUniformLocation(gpu.program, "native");
+	gpu.reveal = glGetUniformLocation(gpu.program, "reveal");
+	gpu.dpitch = glGetUniformLocation(gpu.program, "dpitch");
 	static const unsigned char white[] = {255,255,255,255};
 	glGenTextures(1, &gpu.white);
 	glBindTexture(GL_TEXTURE_2D, gpu.white);
@@ -338,6 +350,8 @@ void zmg_surface(cairo_surface_t *source, unsigned revision, double x0, double y
 	if (left >= right || top >= bottom) return;
 	glUniform1i(gpu.solid, 0);
 	glUniform1i(gpu.native, 0);
+	glUniform1f(gpu.reveal, zmg_reveal);
+	glUniform1f(gpu.dpitch, zmg_dot_pitch * gpu.scale);
 	glUniform1i(gpu.opaque, cairo_image_surface_get_format(source) == CAIRO_FORMAT_RGB24);
 	glUniform1f(gpu.alpha, alpha);
 	int first = (int)top / gpu.tile_h, last = (int)ceil(bottom / gpu.tile_h);
@@ -355,6 +369,53 @@ void zmg_surface(cairo_surface_t *source, unsigned revision, double x0, double y
 		glBindTexture(GL_TEXTURE_2D, p->tiles[i]);
 		vertices(v);
 	}
+}
+
+/* ---- a list's rows: one small texture each ---------------------------------- */
+
+unsigned zmg_row_new(int w, int h) {
+	GLuint t = 0;
+	glGenTextures(1, &t);
+	glBindTexture(GL_TEXTURE_2D, t);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	return t;
+}
+
+void zmg_row_upload(unsigned texture, cairo_surface_t *source) {
+	cairo_surface_flush(source);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cairo_image_surface_get_width(source),
+		cairo_image_surface_get_height(source), GL_RGBA, GL_UNSIGNED_BYTE,
+		cairo_image_surface_get_data(source));
+	gpu.uploads++;
+	gpu.bytes += (size_t)cairo_image_surface_get_stride(source) * cairo_image_surface_get_height(source);
+}
+
+void zmg_row_draw(unsigned texture, double u0, double v0, double u1, double v1,
+		const struct zmg_vertex c[4], float alpha) {
+	float v[20];
+	for (int j = 0; j < 4; j++) {
+		v[j*5] = c[j].x; v[j*5+1] = c[j].y; v[j*5+2] = c[j].z;
+		v[j*5+3] = (j & 1) ? u1 : u0; v[j*5+4] = (j & 2) ? v1 : v0;
+	}
+	glUniform1i(gpu.solid, 0);
+	glUniform1i(gpu.native, 0);
+	glUniform1f(gpu.reveal, zmg_reveal);
+	glUniform1f(gpu.dpitch, zmg_dot_pitch * gpu.scale);
+	glUniform1i(gpu.opaque, 1);
+	glUniform1f(gpu.alpha, alpha);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	vertices(v);
+}
+
+void zmg_row_free(unsigned texture) {
+	GLuint t = texture;
+	if (gpu.ready && t) glDeleteTextures(1, &t);
 }
 
 /* ---- external buffers (DMA-BUF), no copy ---------------------------------- */
@@ -451,6 +512,8 @@ void zmg_dmabuf_draw(void *image, const struct zmg_vertex c[4], float alpha) {
 	}
 	glUniform1i(gpu.solid, 0);
 	glUniform1i(gpu.native, 1);
+	glUniform1f(gpu.reveal, zmg_reveal);
+	glUniform1f(gpu.dpitch, zmg_dot_pitch * gpu.scale);
 	glUniform1i(gpu.opaque, 1);
 	glUniform1f(gpu.alpha, alpha);
 	glBindTexture(GL_TEXTURE_2D, e->tex);

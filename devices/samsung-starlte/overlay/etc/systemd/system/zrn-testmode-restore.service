@@ -1,0 +1,7 @@
+[Unit]
+Description=Bring back what a test switched off, once its time is up
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zrn-testmode restore --expired

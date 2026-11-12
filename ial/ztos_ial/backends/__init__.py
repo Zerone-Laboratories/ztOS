@@ -17,6 +17,8 @@ class Backend:
     interface = ''      # 'Power1'
     version = 1         # the minor version served (the Version property)
     poll_s = 0          # how often properties are compared for change signals (0: never)
+    sender = None       # the D-Bus caller of the method running now (set by ztos-iald)
+    connection = None   # the bus it came in on
 
     def __init__(self, config, manifest):
         self.config = config        # this interface's [ial.X] table

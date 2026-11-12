@@ -805,6 +805,38 @@ static int app_cmp(const void *a, const void *b) {
 	return c ? c : strcmp(x->id, y->id);
 }
 
+/* Waydroid's launchers stay out of the list (desktop_read), but any Android app
+ * may notify: their glyphs are made all the same, for the shell's notifications. */
+static void waydroid_glyphs(void) {
+	for (int i = 0; i < n_app_dirs; i++) {
+		DIR *dir = opendir(app_dirs[i]);
+		struct dirent *entry;
+		while (dir && (entry = readdir(dir))) {
+			size_t len = strlen(entry->d_name);
+			if (strncmp(entry->d_name, "waydroid.", 9) != 0 || len <= 8 ||
+					strcmp(entry->d_name + len - 8, ".desktop") != 0) {
+				continue;
+			}
+			char path[768], line[1024], key[128];
+			snprintf(path, sizeof(path), "%s/%s", app_dirs[i], entry->d_name);
+			FILE *f = fopen(path, "r");
+			while (f && fgets(line, sizeof(line), f)) {
+				if (strncmp(line, "Icon=/", 6) == 0) {	/* the entry's own comes first */
+					line[strcspn(line, "\r\n")] = 0;
+					glyph_ensure(line + 5, key, sizeof(key));
+					break;
+				}
+			}
+			if (f) {
+				fclose(f);
+			}
+		}
+		if (dir) {
+			closedir(dir);
+		}
+	}
+}
+
 static bool scan(bool print) {
 	n_apps = 0;
 	for (int i = 0; i < n_app_dirs; i++) {
@@ -870,6 +902,7 @@ static bool scan(bool print) {
 			printf("%s|%s|%s|%s\n", app->name, app->key, app->command, app->path);
 		}
 	}
+	waydroid_glyphs();
 	bool ok = fclose(f) == 0;
 	return ok && rename(tmp, path) == 0;
 }

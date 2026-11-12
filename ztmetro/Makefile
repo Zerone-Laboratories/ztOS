@@ -30,9 +30,21 @@ sounds/ztos-sounds: sounds/ztos-sounds.c
 IAL_FLAGS := $(shell pkg-config --exists ztos-ial 2>/dev/null && echo -DHAVE_ZTOS_IAL $$(pkg-config --cflags ztos-ial))
 IAL_LIBS := $(shell pkg-config --exists ztos-ial 2>/dev/null && pkg-config --libs --static ztos-ial)
 
-ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h
+# ztRetrofit's styles beside Metro: retro/ (DotMatrix: the dot engine and its launcher)
+RETRO = retro/dotmatrix.c retro/dm-launcher.c retro/dm-chrome.c
+RETRO_DEPS = $(RETRO) core/zrnboard.h retro/dotmatrix.h retro/dm-launcher.h retro/dm-chrome.h retro/dm-glyphs.h
+# every cairo fill and stroke through retro/dm-wrap.c: the style's dots
+DM_WRAP = retro/dm-wrap.c
+DM_WRAP_LDFLAGS = -Wl,--wrap=cairo_fill,--wrap=cairo_fill_preserve,--wrap=cairo_stroke,--wrap=cairo_stroke_preserve,--wrap=cairo_paint
+
+ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h $(RETRO_DEPS) $(DM_WRAP)
 	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(IAL_FLAGS) \
-		-o $@ ztmetro.c $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
+		-o $@ ztmetro.c $(RETRO) $(DM_WRAP) $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
+
+# the DotMatrix screens rendered offscreen to PNG files, to check them without a phone
+retro/dm-test: retro/dm-test.c $(RETRO_DEPS)
+	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags egl glesv2 cairo) -o $@ retro/dm-test.c $(RETRO) \
+		$(shell pkg-config --libs egl glesv2 cairo) -lm
 
 xdg-shell-protocol.h:
 	wayland-scanner server-header $(XDG) $@
@@ -44,10 +56,11 @@ apps/ztapps: apps/ztapps.c
 
 # ZrnMetroCore: the window, motion and widgets our own apps share
 VIEWPORTER := $(WP)/stable/viewporter/viewporter.xml
-CORE = core/zrnmetrocore.c core/zrnmetrogpu.c core/xdg-shell-protocol.c core/viewporter-protocol.c
-CORE_DEPS = $(CORE) core/zrnmetrocore.h core/zrnmetrogpu.h core/zrnmetrorender.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
+CORE = core/zrnmetrocore.c core/zrnmetrogpu.c core/xdg-shell-protocol.c core/viewporter-protocol.c \
+	retro/dotmatrix.c retro/dm-chrome.c $(DM_WRAP)
+CORE_DEPS = $(CORE) core/zrnboard.h retro/dotmatrix.h retro/dm-chrome.h retro/dm-glyphs.h core/zrnmetrocore.h core/zrnmetrogpu.h core/zrnmetrorender.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
 APP_BUILD = $(CC) $(CFLAGS) $(WARN) -Icore $(shell pkg-config --cflags $(APP_PKGS)) $(IAL_FLAGS)
-APP_LIBS = $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS) -lm
+APP_LIBS = $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS) -lm
 
 # ztCamera: the camera, in the Lumia Camera look (see camera/CAMERA-DRIVERS.md
 # for why its viewfinder runs against a source that is not a sensor)
@@ -105,7 +118,7 @@ phone/ztphone: phone/ztphone.c comm/comm.h $(CORE_DEPS)
 messages/ztmessages: messages/ztmessages.c comm/comm.h $(CORE_DEPS)
 	$(APP_BUILD) -Icomm -o $@ messages/ztmessages.c $(CORE) $(APP_LIBS)
 
-contacts/ztcontacts: contacts/ztcontacts.c comm/comm.h $(CORE_DEPS)
+contacts/ztcontacts: contacts/ztcontacts.c comm/comm.h comm/contact-store.h $(CORE_DEPS)
 	$(APP_BUILD) -Icomm -o $@ contacts/ztcontacts.c $(CORE) $(APP_LIBS)
 
 # the App Store: the repos in pacman.conf and the AUR (see store/README.md)
@@ -228,6 +241,11 @@ install: check-arch
 	install -Dm755 phone/ztphone /usr/local/bin/ztphone
 	install -Dm755 messages/ztmessages /usr/local/bin/ztmessages
 	install -Dm755 contacts/ztcontacts /usr/local/bin/ztcontacts
+	install -Dm755 contacts/zrn_contacts_sync.py /usr/local/bin/zrn-contacts-sync
+	install -Dm755 contacts/zrn-contacts-android /usr/local/bin/zrn-contacts-android
+	install -Dm644 -t /etc/systemd/system contacts/zrn-contacts-android.service contacts/zrn-contacts-android.timer
+	install -Dm644 -t /usr/lib/systemd/user contacts/zrn-contacts-sync.service contacts/zrn-contacts-sync.timer
+	install -Dm644 contacts/google-client.json.template /usr/local/share/ztos/google-client.json.template
 	install -Dm644 -t /usr/local/share/applications comm/ztphone.desktop comm/ztmessages.desktop comm/ztcontacts.desktop
 	install -Dm644 -t /usr/local/share/icons/hicolor/scalable/apps comm/ztphone.svg comm/ztmessages.svg comm/ztcontacts.svg
 	install -Dm644 csf/components /etc/ztoscoresensorframework/components
@@ -240,21 +258,21 @@ clean:
 
 # Uses a private Wayland seat; does not touch the running compositor or display.
 .PHONY: check-arch check-keyboard
-check-keyboard: xdg-shell-protocol.h
+check-keyboard: xdg-shell-protocol.h $(RETRO_DEPS)
 	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
-		-o /tmp/ztmetro-keyboard-test tests/keyboard-trackpad.c $(shell pkg-config --libs $(PKGS)) -lm
+		-o /tmp/ztmetro-keyboard-test tests/keyboard-trackpad.c $(RETRO) $(WRAP_FLAGS) $(shell pkg-config --libs $(PKGS)) -linput $(BACKEND_LIBS) -lm -lpthread
 	/tmp/ztmetro-keyboard-test
 
 .PHONY: check-launch
-check-launch: xdg-shell-protocol.h
+check-launch: xdg-shell-protocol.h $(RETRO_DEPS)
 	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
-		-o /tmp/ztmetro-launch-test tests/launch-state.c $(shell pkg-config --libs $(PKGS)) -lm
+		-o /tmp/ztmetro-launch-test tests/launch-state.c $(RETRO) $(WRAP_FLAGS) $(shell pkg-config --libs $(PKGS)) -linput $(BACKEND_LIBS) -lm -lpthread
 	/tmp/ztmetro-launch-test
 
 .PHONY: check-auth
-check-auth: xdg-shell-protocol.h
+check-auth: xdg-shell-protocol.h $(RETRO_DEPS)
 	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
-		-o /tmp/ztmetro-auth-test tests/auth-prompt.c $(shell pkg-config --libs $(PKGS)) -lm
+		-o /tmp/ztmetro-auth-test tests/auth-prompt.c $(RETRO) $(WRAP_FLAGS) $(shell pkg-config --libs $(PKGS)) -linput $(BACKEND_LIBS) -lm -lpthread
 	/tmp/ztmetro-auth-test
 
 .PHONY: check-demoloop-stop

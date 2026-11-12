@@ -1,6 +1,6 @@
 # ztOS
 
-**BETA-1** — the ztOS GSI (0.2.0) with ztOSIAL, and the Galaxy S9 (SM-G960N / starlte) device layer.
+**BETA-1.1** — the ztOS GSI (0.2.1) with ztOSIAL, and the Galaxy S9 (SM-G960N / starlte) device layer.
 
 ztOS is a phone operating system: the **ztMETRO** shell (Windows Phone 8.1's
 look and motion) on Arch Linux ARM and mainline Linux, with its own apps, an

@@ -139,6 +139,9 @@ class Service:
     def _method(self, name):
         def call(connection, sender, path, interface, method, params, invocation):
             backend = self.backends[name]
+            # who is calling, for a backend that ties what it holds to the
+            # caller's lifetime (Sleep1's inhibitors on the S9)
+            backend.sender, backend.connection = sender, connection
             try:
                 result = backend.call(method, params.unpack())
                 out = self.info[name].lookup_method(method).out_args

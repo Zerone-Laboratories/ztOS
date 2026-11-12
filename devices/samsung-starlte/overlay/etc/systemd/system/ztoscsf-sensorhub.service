@@ -9,6 +9,8 @@ ExecStart=/usr/local/sbin/ztoscsf-sensorhub --run
 Restart=no
 KillMode=control-group
 TimeoutStopSec=5
+# the sleep hold of a start that was killed (see ztoscsf-sensorhub)
+ExecStopPost=-/bin/rm -f /run/zrn-sleepd/inhibit/timed-hub
 
 [Install]
 WantedBy=graphical.target

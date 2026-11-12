@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include "../retro/dm-chrome.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,7 @@
 #include <wayland-client.h>
 
 #include "zrnmetrocore.h"
+#include "zrnboard.h"
 #include "../background-apps.h"
 
 /* A file in the session's runtime directory: $XDG_RUNTIME_DIR, or
@@ -89,6 +91,8 @@ enum action {
 	ACT_OPEN_PAGE,
 	ACT_BACK,
 	ACT_ACCENT,
+	ACT_ACCENT_OPEN,	/* the theme page's box: the picker swivels in over it */
+	ACT_PALETTE,	/* the DotMatrix style's palette, as the accent is Metro's */
 	ACT_WALL,		/* arg: 0 none, else the photo walls[arg - 1] */
 	ACT_WALL_TARGET,	/* arg: 0 start and lock, 1 start, 2 lock */
 	ACT_WALL_CAT,		/* arg: the category to open (a folder of photos) */
@@ -99,6 +103,7 @@ enum action {
 	ACT_BT_MENU,		/* an item of a held device's menu */
 	ACT_BT_MENU_CLOSE,
 	ACT_COLUMNS,
+	ACT_STYLE,		/* arg: the shell's style, 0 Metro, 1 DotMatrix */
 	ACT_HAPTICS,
 	ACT_WIFI_RADIO,
 	ACT_WIFI_SUSPEND,
@@ -206,9 +211,11 @@ static const struct { const char *name; unsigned color; } ACCENTS[] = {
 static struct {
 	/* Settings state */
 	int accent;
+	int palette;		/* dotmatrix_palette */
 	char start_wall[256], lock_wall[256];	/* the photos, or "" */
 	int wall_target;			/* 0 both, 1 Start, 2 lock screen */
 	int columns;
+	int style;				/* ztRetrofit's look: 0 Metro, 1 DotMatrix */
 	bool haptics;
 	char scale_text[16];
 
@@ -345,6 +352,9 @@ static void config_load(void) {
 			snprintf(app.lock_wall, sizeof(app.lock_wall), "%s", val);
 		} else if (strcmp(key, "nav_center_icon") == 0) {
 			int n = atoi(val); app.nav_icon_idx = n < 0 ? 0 : n > 4 ? 4 : n;
+		} else if (strcmp(key, "dotmatrix_palette") == 0) {
+			int n = isdigit((unsigned char)val[0]) ? atoi(val) : dm_palette_index(val);
+			app.palette = n < 0 || n >= DM_PALETTES ? 0 : n;
 		} else if (strcmp(key, "accent") == 0) {
 			for (int i = 0; i < N_ACCENTS; i++) {
 				if (strcmp(ACCENTS[i].name, val) == 0) {
@@ -363,6 +373,8 @@ static void config_load(void) {
             app.media_vol = atoi(val) < 0 ? 0 : atoi(val) > 100 ? 100 : atoi(val);
         } else if (strcmp(key, "columns") == 0) {
 			app.columns = atoi(val);
+		} else if (strcmp(key, "style") == 0) {
+			app.style = strcmp(val, "dotmatrix") == 0 || strcmp(val, "1") == 0;
 		} else if (strcmp(key, "haptics") == 0) {
 			app.haptics = strcmp(val, "off") != 0 && strcmp(val, "0") != 0;
 		} else if (strcmp(key, "haptic_strength") == 0) {
@@ -540,7 +552,7 @@ static void auto_load(void) {
 
 static void config_save(void) {
 	static const int timeouts[] = { 30, 60, 180, 300, 0 };
-	enum { N_KEYS = 21 + N_HAPTIC_GROUPS };
+	enum { N_KEYS = 23 + N_HAPTIC_GROUPS };
 	struct { const char *key; char value[300]; bool written; } keys[N_KEYS] = {
 		{ .key = "accent" }, { .key = "columns" }, { .key = "haptics" },
 		{ .key = "brightness" }, { .key = "timeout" }, { .key = "demo_tiles" },
@@ -573,6 +585,10 @@ static void config_save(void) {
 	static const char *const sizes[] = { "compact", "standard", "large" };
 	keys[20 + N_HAPTIC_GROUPS].key = "display_size";
 	snprintf(keys[20 + N_HAPTIC_GROUPS].value, 32, "%s", sizes[app.scale_idx]);
+	keys[21 + N_HAPTIC_GROUPS].key = "style";
+	snprintf(keys[21 + N_HAPTIC_GROUPS].value, 32, "%s", app.style ? "dotmatrix" : "metro");
+	keys[22 + N_HAPTIC_GROUPS].key = "dotmatrix_palette";
+	snprintf(keys[22 + N_HAPTIC_GROUPS].value, 32, "%s", dm_palette_names[app.palette]);
 	snprintf(keys[0].value, 32, "%s", ACCENTS[app.accent].name);
 	snprintf(keys[1].value, 32, "%d", app.columns);
 	snprintf(keys[2].value, 32, "%s", app.haptics ? "on" : "off");
@@ -848,6 +864,8 @@ static void cell_load(void) {
 	app.mobile_data = cell.data_on;
 }
 
+static int brightness_now(void);
+
 static double draw_main(cairo_t *cr) {
 	double y = zmc_pivot_next(cr, "system", "applications", ACT_OPEN_PAGE, PAGE_APPS);
 	char detail[128], wifi[96];
@@ -857,8 +875,11 @@ static double draw_main(cairo_t *cr) {
 	y = zmc_entry(cr, y, "theme", detail, ACT_OPEN_PAGE, PAGE_THEME);
 	y = zmc_entry(cr, y, "navigation bar", "choose the centre icon", ACT_OPEN_PAGE, PAGE_NAVIGATION);
 
+	/* the screen's real level: the config's is only where it last started,
+	 * and auto brightness moves on from it */
+	int bright_now = brightness_now();
 	snprintf(detail, sizeof(detail), "%d%% brightness, %s timeout",
-		app.brightness, app.timeout_idx == 4 ? "Never" : "1 min");
+		bright_now > 0 ? bright_now : app.brightness, app.timeout_idx == 4 ? "Never" : "1 min");
 	y = zmc_entry(cr, y, "display", detail, ACT_OPEN_PAGE, PAGE_DISPLAY);
 
 	wifi_summary(wifi, sizeof(wifi));
@@ -1223,10 +1244,11 @@ static void walls_scan(void) {
 #define WALL_PH			384
 #define WALL_FRAME_MS		16
 #define WALL_PER_TICK		2
-#define WALL_SWIVEL_IN_MS	300	/* "swivel in": -60 to 0 about X, Log 200 */
-#define WALL_SWIVEL_OUT_MS	199	/* "swivel out": 0 to 60 about X, Exp 60 */
+#define WALL_SWIVEL_IN_MS	((uint32_t)ZB_SWIVEL_IN_MS)	/* see zrnboard.h */
+#define WALL_SWIVEL_OUT_MS	((uint32_t)ZB_SWIVEL_OUT_MS)
+#define WALL_PHOTO_IN_MS	120.0	/* a photo made late, over its cell */
 #define WALL_TURN_MS		480	/* the page's rows turning in, before the photos */
-#define WALL_LEAVE_MS		220	/* a category leaving: its photos swivel out, then the page turns */
+#define WALL_LEAVE_MS		400	/* a category leaving: its cells swivel out, then the page turns */
 static unsigned char wall_state[MAX_WALLS];	/* 0 not made, 1 queued, 2 made, 3 failed */
 static uint32_t wall_arrive[MAX_WALLS];		/* when a made photo swivels in */
 static int wall_queue[MAX_WALLS], wall_q_n, wall_q_head;
@@ -1370,22 +1392,13 @@ static void wall_prefetch(int k) {
 }
 
 /* the curves of DevTest's animations (Iris's Exp and Log, weights as there) */
-static double wall_ease(double t, bool out) {
-	double a = out ? 2.0 : 200.0 / 30.0;
-	t = fmin(1, fmax(0, t));
-	if (out) return (exp(a * t) - 1) / (exp(a) - 1);
-	return 1 - (exp(a * (1 - t)) - 1) / (exp(a) - 1);
-}
-
-/* a photo turned `deg` about its horizontal middle line, drawn on the GPU */
 static void wall_card(cairo_surface_t *img, unsigned rev, double x, double y, double w, double h,
 		double deg, double alpha, int cell) {
 	double a = deg * M_PI / 180, c[4][3];
 	for (int i = 0; i < 4; i++) {
-		double lx = (i & 1) ? w : 0, ly = (i & 2) ? h : 0;
-		double u = ly - h / 2;
+		double lx = (i & 1) ? w : 0, u = ((i & 2) ? h : 0) - h / 2;
 		c[i][0] = x + lx;
-		c[i][1] = y + h / 2 + u * cos(a);
+		c[i][1] = y + h / 2 + u * cos(a);	/* about its own middle */
 		c[i][2] = u * sin(a);
 	}
 	if (cell < 0) zmc_gpu_quad(img, rev, c, alpha);
@@ -1393,10 +1406,10 @@ static void wall_card(cairo_surface_t *img, unsigned rev, double x, double y, do
 		WALL_PW, WALL_PH, c, alpha);
 }
 
-/* the grid's cells and photos, on the GPU over the page. A cell is a grey
- * quad that swivels in when the category opens (in order, from the first);
- * its photo swivels in over it when made. Leaving, the photos and the cells
- * swivel out together, then the page turns back. */
+/* the grid's cells and photos, on the GPU over the page: each swivels in by
+ * itself, staggered, when the category opens and out when it leaves, then the
+ * page turns back. A cell is a grey quad; its photo fades in over it when made.
+ * DotMatrix has no turn: each cell fades, as dots do not take perspective. */
 static cairo_surface_t *wall_grey;
 
 static void wall_overlay(int page) {
@@ -1412,34 +1425,29 @@ static void wall_overlay(int page) {
 	const char *current = app.wall_target == 2 ? app.lock_wall : app.start_wall;
 	unsigned col = ACCENTS[app.accent].color;
 	double ar = ((col >> 16) & 255) / 255.0, ag = ((col >> 8) & 255) / 255.0, ab = (col & 255) / 255.0;
+	bool leaving = wall_leave_at != 0, dots = zmc.style == ZMC_STYLE_DOTMATRIX;
+	uint32_t t0 = leaving ? wall_leave_at : wall_open_at;
+	if ((int32_t)(now - t0) < 0) return;	/* the page is still turning */
 	for (int i = 1; i <= cat_count[c]; i++) {
 		int k = cat_first[c] + i - 1;
 		double x = MARGIN + (i % 3) * (tw + gap), y = wall_grid_top + (i / 3) * (th + gap) - zmc.scroll;
 		if (y + th < ZMC_HEADER_H || y > zmc.height) continue;
-		double stagger = ((i - 1) % 3) * 60 + fmin((i - 1) / 3, 4) * 60;	/* the rows, a few at most */
-		bool leaving = wall_leave_at != 0;
-		uint32_t t0 = leaving ? wall_leave_at : wall_open_at + (uint32_t)stagger;
-		double dur = leaving ? WALL_SWIVEL_OUT_MS : WALL_SWIVEL_IN_MS;
-		if ((int32_t)(now - t0) < 0) continue;	/* its turn has not come */
-		double e = wall_ease((double)(now - t0) / dur, leaving);
-		/* the cell: out (0 to 60) or in (-60 to 0) about X, grey */
-		double deg = leaving ? 60 * e : -60 * (1 - e);
-		double alpha = leaving ? 1 - e : e;
-		if (alpha > 0) wall_card(wall_grey, 1, x, y, tw, th, deg, alpha, -1);
-		/* the photo, over its cell: its own swivel, from when it arrived */
-		if (wall_state[k] != 2) continue;
-		if (leaving) {
-			deg = 60 * e;
-			alpha = 1 - e;
-		} else {
-			if ((int32_t)(now - wall_arrive[k]) < 0) continue;
-			e = wall_ease((double)(now - wall_arrive[k]) / WALL_SWIVEL_IN_MS, false);
-			deg = -60 * (1 - e);
-			alpha = e;
+		double own = (int32_t)(now - t0) - zb_delay(i), run = leaving ? ZB_SWIVEL_OUT_MS : ZB_SWIVEL_IN_MS;
+		if (own < 0 && !leaving) continue;	/* its turn has not come */
+		if (own >= run && leaving) continue;	/* gone */
+		double e = zb_swivel_ease(own / run, !leaving);
+		double deg = leaving ? ZB_SWIVEL_OUT_DEG * e : ZB_SWIVEL_IN_DEG * (1 - e), alpha = 1;
+		if (dots) {
+			alpha = leaving ? 1 - e : e;
+			deg = 0;
 		}
-		if (alpha <= 0) continue;
-		wall_card(wall_atlas[c], wall_atlas_revision[c], x, y, tw, th, deg, alpha, k - cat_first[c]);
-		if (!leaving && current[0] && strcmp(current, walls[k]) == 0) {
+		if (alpha > 0) wall_card(wall_grey, 1, x, y, tw, th, deg, alpha, -1);
+		/* the photo, over its cell, from when it arrived */
+		if (wall_state[k] != 2 || (int32_t)(now - wall_arrive[k]) < 0) continue;
+		double photo = leaving ? alpha : alpha * fmin(1, (now - wall_arrive[k]) / WALL_PHOTO_IN_MS);
+		if (photo <= 0) continue;
+		wall_card(wall_atlas[c], wall_atlas_revision[c], x, y, tw, th, deg, photo, k - cat_first[c]);
+		if (!leaving && own >= run && current[0] && strcmp(current, walls[k]) == 0) {
 			zmc_gpu_rect(x, y, tw, 4, ar, ag, ab);
 			zmc_gpu_rect(x, y + th - 4, tw, 4, ar, ag, ab);
 			zmc_gpu_rect(x, y, 4, th, ar, ag, ab);
@@ -1465,8 +1473,11 @@ static void draw_wall_tile(cairo_t *cr, cairo_surface_t *img, double x, double y
 	cairo_save(cr);
 	cairo_rectangle(cr, x, y, w, h);
 	cairo_clip(cr);
-	cairo_translate(cr, x, y);
-	cairo_scale(cr, w / cairo_image_surface_get_width(img), h / cairo_image_surface_get_height(img));
+	/* cover the tile, cropped about the middle: a photo keeps its shape */
+	double iw = cairo_image_surface_get_width(img), ih = cairo_image_surface_get_height(img);
+	double k = fmax(w / iw, h / ih);
+	cairo_translate(cr, x + (w - iw * k) / 2, y + (h - ih * k) / 2);
+	cairo_scale(cr, k, k);
 	cairo_set_source_surface(cr, img, 0, 0);
 	cairo_paint(cr);
 	cairo_restore(cr);
@@ -1577,7 +1588,36 @@ static double draw_wall_row(cairo_t *cr, double y) {
 /* The accent picker, as the phone's: four swatches a row, each row a strip
  * that the page change turns in on its own, 33 ms after the one above
  * (TurnstileFeatherList in UIXMobile; the core's ROW_STAGGER_MS). */
+/* The DotMatrix style's palettes in the accent picker's place: each its two
+ * colours as dots, its name under them. */
+static double draw_palettes(cairo_t *cr) {
+	double y = zmc_header(cr, "palettes");
+	double gap = 10, side = (zmc.width - 2 * MARGIN - 2 * gap) / 3;
+	for (int i = 0; i < DM_PALETTES; i++) {
+		double x = MARGIN + (i % 3) * (side + gap), sy = y + (i / 3) * (side + 34 + gap);
+		dm_map_raw++;	/* its own colours, not the palette in use */
+		zmc_set_rgb(cr, dm_palettes[i][0]);
+		cairo_rectangle(cr, x, sy, side, side * 0.66);
+		cairo_fill(cr);
+		zmc_set_rgb(cr, dm_palettes[i][1]);
+		cairo_rectangle(cr, x, sy + side * 0.72, side, side * 0.28);
+		cairo_fill(cr);
+		dm_map_raw--;
+		cairo_set_source_rgb(cr, i == app.palette ? 1 : 0.6, i == app.palette ? 1 : 0.6, i == app.palette ? 1 : 0.6);
+		zmc_text(cr, dm_palette_names[i], FONT_REGULAR, 14, x, sy + side + 6, 0);
+		if (i == app.palette) {
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			cairo_set_line_width(cr, 3);
+			cairo_rectangle(cr, x - 4, sy - 4, side + 8, side + 30);
+			cairo_stroke(cr);
+		}
+		zmc_add_hit(x, sy, side, side + 30, ACT_PALETTE, i);
+	}
+	return y + 2 * (side + 34 + gap) + 20;
+}
+
 static double draw_accents(cairo_t *cr) {
+	if (zmc.style == ZMC_STYLE_DOTMATRIX) return draw_palettes(cr);
 	double y = zmc_header(cr, "accents");
 	double gap = 10, side = (zmc.width - 2 * MARGIN - 3 * gap) / 4;
 	int rows = (N_ACCENTS + 3) / 4;
@@ -1603,23 +1643,90 @@ static double draw_accents(cairo_t *cr) {
 	return y + rows * (side + gap) + 20;
 }
 
+/* ---- the accent picker: Swivel over the page, not a page ---------------------
+ * As the phone's (a Lumia 1020's, on video): the box lights up, the old page
+ * goes, the label is there and the colours swivel in, each by itself;
+ * chosen, they swivel out and the old page is back with it. */
+
+static double accent_box_y;	/* on the theme page */
+static bool board_unsaved;
+
+static void accent_closed(void) {
+	if (board_unsaved) {
+		board_unsaved = false;
+		config_save();
+	}
+}
+
+static void accent_cell(cairo_t *cr, int i, double w, double h) {
+	zmc_set_rgb(cr, ACCENTS[i].color);
+	cairo_rectangle(cr, 0, 0, w, h);
+	cairo_fill(cr);
+	if (i == app.accent) {
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		cairo_set_line_width(cr, 3);
+		cairo_rectangle(cr, 1.5, 1.5, w - 3, h - 3);
+		cairo_stroke(cr);
+	}
+}
+
+static void palette_cell(cairo_t *cr, int i, double w, double h) {
+	dm_map_raw++;	/* its own colours, not the palette in use */
+	zmc_set_rgb(cr, dm_palettes[i][0]);
+	cairo_rectangle(cr, 4, 4, w - 8, w * 0.62);
+	cairo_fill(cr);
+	zmc_set_rgb(cr, dm_palettes[i][1]);
+	cairo_rectangle(cr, 4, 4 + w * 0.68, w - 8, w * 0.26);
+	cairo_fill(cr);
+	dm_map_raw--;
+	double k = i == app.palette ? 1 : 0.6;
+	cairo_set_source_rgb(cr, k, k, k);
+	zmc_text(cr, dm_palette_names[i], FONT_REGULAR, 14, 4, w + 4, 0);
+}
+
+/* the box, lit: the accent behind what it says */
+static void accent_box(cairo_t *cr, double w, double h) {
+	bool dots = zmc.style == ZMC_STYLE_DOTMATRIX;
+	zmc_accent(cr);
+	cairo_rectangle(cr, 0, 0, w, h);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text(cr, dots ? dm_palette_names[app.palette] : ACCENTS[app.accent].name, FONT_REGULAR, 16, 42, 10, 0);
+}
+
+static void accent_board_open(void) {
+	bool dots = zmc.style == ZMC_STYLE_DOTMATRIX;
+	double gap = dots ? 10 : 9, cols = dots ? 3 : 4;
+	double side = (zmc.width - 2 * MARGIN - (cols - 1) * gap) / cols;
+	struct zmc_board b = { .count = dots ? DM_PALETTES : N_ACCENTS, .cols = (int)cols,
+		.x0 = MARGIN, .top = 46, .cell_w = side, .cell_h = dots ? side + 30 : side, .gap = gap,
+		.draw_cell = dots ? palette_cell : accent_cell, .action = dots ? ACT_PALETTE : ACT_ACCENT,
+		.label = dots ? "PALETTES" : "ACCENTS", .picker = true, .draw_box = accent_box,
+		.box_x = MARGIN, .box_y = accent_box_y - zmc.scroll, .box_w = zmc.width - 2 * MARGIN, .box_h = 42,
+		.closed = accent_closed };
+	zmc_board_open(&b);
+}
+
 static double draw_theme(cairo_t *cr) {
 	double y = zmc_header(cr, "theme");
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "Accent colour", FONT_REGULAR, 13.5, MARGIN, y, 0);
+	zmc_text(cr, zmc.style == ZMC_STYLE_DOTMATRIX ? "Palette" : "Accent colour", FONT_REGULAR, 13.5, MARGIN, y, 0);
 	/* Windows Phone's list picker, collapsed: the box shows the choice and
 	 * opens the full-screen picker (UIXMobile!ListPicker in full mode) */
 	y += 20;
+	accent_box_y = y;
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	cairo_set_line_width(cr, 2);
 	cairo_rectangle(cr, MARGIN + 1, y + 1, zmc.width - 2 * MARGIN - 2, 40);
 	cairo_stroke(cr);
-	zmc_set_rgb(cr, ACCENTS[app.accent].color);
+	if (zmc.style == ZMC_STYLE_DOTMATRIX) dm_map_raw++;
+	zmc_set_rgb(cr, zmc.style == ZMC_STYLE_DOTMATRIX ? dm_palettes[app.palette][0] : ACCENTS[app.accent].color);
 	cairo_rectangle(cr, MARGIN + 10, y + 10, 22, 22);
 	cairo_fill(cr);
+	if (zmc.style == ZMC_STYLE_DOTMATRIX) dm_map_raw--;
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, ACCENTS[app.accent].name, FONT_REGULAR, 16, MARGIN + 42, y + 10, 0);
-	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_OPEN_PAGE, PAGE_ACCENTS);
+	zmc_text(cr, zmc.style == ZMC_STYLE_DOTMATRIX ? dm_palette_names[app.palette] : ACCENTS[app.accent].name, FONT_REGULAR, 16, MARGIN + 42, y + 10, 0);
+	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_ACCENT_OPEN, 0);
 	y += 62;
 	double gap = 8;
 
@@ -1650,7 +1757,32 @@ static double draw_theme(cairo_t *cr) {
 		zmc_text(cr, label, FONT_REGULAR, 13, bx + 10, by + 9, 0);
 		zmc_add_hit(bx, by, btn_w, 36, ACT_COLUMNS, c);
 	}
- 	return draw_wall_row(cr, last_by + 36 + 24);	/* under the columns row (36 high, 24 below) */
+	y = last_by + 36 + 24;
+
+	/* ztRetrofit's styles: the same shell, the same apps, another look */
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, "Shell style", FONT_REGULAR, 13.5, MARGIN, y, 0);
+	y += 24;
+	static const char *const styles[] = { "Metro", "DotMatrix" };
+	for (int k = 0; k < 2; k++) {
+		double btn_w = (zmc.width - 2 * MARGIN - gap) / 2.0;
+		double bx = MARGIN + k * (btn_w + gap);
+		if (app.style == k) {
+			zmc_set_rgb(cr, ACCENTS[app.accent].color);
+		} else {
+			cairo_set_source_rgb(cr, 0.18, 0.18, 0.18);
+		}
+		cairo_rectangle(cr, bx, y, btn_w, 36);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, styles[k], FONT_REGULAR, 13, bx + 10, y + 9, 0);
+		zmc_add_hit(bx, y, btn_w, 36, ACT_STYLE, k);
+	}
+	/* the two never share a screen: the whole session starts again */
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, "Changing it restarts the shell and closes open apps", FONT_REGULAR, 12, MARGIN, y + 42, zmc.width - 2 * MARGIN);
+	y += 20;
+	return draw_wall_row(cr, y + 60);	/* under the style row (36 high, 24 below) */
 }
 
 /* The brightness as it is now, in percent (the shell or sensord may have
@@ -2881,6 +3013,24 @@ static bool is_picker(int action) {
 	return action >= ACT_QUICK_SLOT && action <= ACT_QUICK_LAST;
 }
 
+static int board_choice;
+
+/* The page first, with the new one; the shell is told when it is back (.closed),
+ * because the shell's own redraw of everything then takes the cores. */
+static void accent_apply(void) {
+	app.accent = board_choice;
+	zmc.accent = ACCENTS[app.accent].color;
+	board_unsaved = true;
+}
+
+static void palette_apply(void) {
+	app.palette = board_choice;
+	board_unsaved = true;
+	config_save();
+	zmc_config_style();
+	board_unsaved = false;
+}
+
 static void activate(int action, int arg) {
 	/* a picker's box opens or closes it; one of its options is the choice */
 	if (is_picker(action) && arg < 0) {
@@ -2992,11 +3142,34 @@ static void activate(int action, int arg) {
 		}
 		zmc_go(arg, 1);
 		break;
+	case ACT_PALETTE:
+		if (zmc_board_up()) {
+			board_choice = arg;
+			zmc_board_choose(palette_apply);
+			break;
+		}
+		app.palette = arg;
+		config_save();
+		zmc_config_style();	/* this app's dots in it at once */
+		if (zmc.page == PAGE_ACCENTS) {
+			zmc_go(PAGE_THEME, -1);
+		} else {
+			zmc_redraw();
+		}
+		break;
+	case ACT_ACCENT_OPEN:
+		accent_board_open();
+		break;
 	case ACT_ACCENT:
+		if (zmc_board_up()) {
+			board_choice = arg;
+			zmc_board_choose(accent_apply);
+			break;
+		}
 		app.accent = arg;
 		config_save();
 		if (zmc.page == PAGE_ACCENTS) {
-			zmc_go(PAGE_THEME, -1);	/* chosen: the picker turns away */
+			zmc_go(PAGE_THEME, -1);	/* (opened directly, by name) */
 		}
 		break;
 	case ACT_WALL_TARGET:
@@ -3011,9 +3184,9 @@ static void activate(int action, int arg) {
 			for (int i = 0; i < n && i < 6; i++) wall_prefetch(cat_first[arg] + i);
 			wall_open_at = now + WALL_TURN_MS;	/* the cells, once the rows are in */
 			for (int i = 0; i < n && i < 6; i++) {	/* their photos come in with them */
-				wall_arrive[cat_first[arg] + i] = wall_open_at + (i % 3) * 60 + (i / 3) * 60;
+				wall_arrive[cat_first[arg] + i] = wall_open_at - (uint32_t)WALL_PHOTO_IN_MS;
 			}
-			wall_busy_until = now + WALL_TURN_MS + 360 + WALL_SWIVEL_IN_MS;	/* the cells' last swivel */
+			wall_busy_until = now + WALL_TURN_MS + (uint32_t)(zb_delay(n) + ZB_SWIVEL_IN_MS) + 50;	/* the last cell's swivel */
 			wall_kick();
 			zmc_turn(1);
 			wall_cat_open = arg;
@@ -3029,6 +3202,10 @@ static void activate(int action, int arg) {
 	case ACT_COLUMNS:
 		app.columns = arg;
 		config_save();
+		break;
+	case ACT_STYLE:
+		app.style = arg;
+		config_save();	/* the shell reads it on SIGHUP and starts the session again in it */
 		break;
 	case ACT_HAPTICS:
 		app.haptics = !app.haptics;
@@ -3419,6 +3596,27 @@ static void activate(int action, int arg) {
 /* Where a point on the screen is on the page: the title does not scroll. */
 
 /* A slider is being dragged, or has just been let go. */
+/* The shell's control pipe stays open for a drag's sixty lines a second, and
+ * is opened again if the shell has gone. */
+static void brightness_tell(int permille) {
+	static int fd = -1;
+	char line[40];
+	int n = snprintf(line, sizeof(line), "brightness-fine %d\n", permille);
+	signal(SIGPIPE, SIG_IGN);
+	for (int attempt = 0; attempt < 2; attempt++) {
+		if (fd < 0) {
+			const char *runtime = getenv("XDG_RUNTIME_DIR");
+			char path[256];
+			snprintf(path, sizeof(path), "%s/ztmetro.ctl", runtime ? runtime : "/tmp");
+			fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+			if (fd < 0) return;
+		}
+		if (write(fd, line, n) == n || errno != EPIPE) return;
+		close(fd);
+		fd = -1;
+	}
+}
+
 static void slide(int action, int value, bool done) {
 	static uint32_t saved;
 	char cmd[160];
@@ -3436,21 +3634,17 @@ static void slide(int action, int value, bool done) {
 	}
 	switch (action) {
 	case ACT_BRIGHTNESS_STEP:
-		app.brightness = value < 1 ? 1 : value;
+		app.brightness = value < 2 ? 2 : value;
 		if (app.autobrightness) {
 			/* a hand on the slider takes over from the light sensor */
 			app.autobrightness = false;
 			pipe_tell("/run/ztoscsf-sensord.ctl", "auto off\n");
 		}
-		/* send live brightness to the shell without reloading config/textures */
-		if (done || zmc_now_ms() - saved > 40) {
+		/* live to the shell, which eases between these: a step every frame,
+		 * finer than a percent. The lifted position always goes */
+		if (done || zmc_now_ms() - saved >= 16) {
 			saved = zmc_now_ms();
-			char ctl_cmd[32];
-			snprintf(ctl_cmd, sizeof(ctl_cmd), "brightness %d\n", app.brightness);
-			const char *runtime = getenv("XDG_RUNTIME_DIR");
-			char ctl_path[256];
-			snprintf(ctl_path, sizeof(ctl_path), "%s/ztmetro.ctl", runtime ? runtime : "/tmp");
-			pipe_tell(ctl_path, ctl_cmd);
+			brightness_tell(zmc.slider_permille < 20 ? 20 : zmc.slider_permille);
 		}
 		if (done) {
 			config_save();

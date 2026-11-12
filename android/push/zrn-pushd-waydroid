@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# zrn-pushd's way into Waydroid: one push message for PACKAGE, its extras on
+# stdin (recover.sh's push records), handed to the app inside Android.
+# Android is thawed (or, if its session is down, started) first; zrn-pushd
+# holds off the freeze meanwhile and lets the shell's policy refreeze after.
+# Exit 0: the app's receiver took it; 4: the package has no push receiver.
+set -uo pipefail
+package=${1:-}
+[[ $# == 1 && $package =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$ ]] || exit 2
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+recover=/usr/local/libexec/ztos-waydroid-recover
+# the extras may be needed twice (Android not up the first time)
+extras=$(mktemp "$XDG_RUNTIME_DIR/zrn-pushd-extras.XXXXXX") || exit 12
+trap 'rm -f "$extras"' EXIT
+cat > "$extras"
+
+# Thaw a frozen container (starting it if it is down), then hand it over.
+if ! sudo -n "$recover" unfreeze < /dev/null; then
+	echo "zrn-pushd-waydroid: the container did not start" >&2
+	exit 10
+fi
+sudo -n "$recover" push "$package" < "$extras"
+rc=$?
+[[ $rc == 3 ]] || exit $rc
+# Android is not up: its session is down (a crash, or a shell restart took it).
+if ! systemctl --user -q is-active ztos-waydroid-session.service; then
+	echo "zrn-pushd-waydroid: Android's session is down; starting it for $package" >&2
+	systemctl --user reset-failed ztos-waydroid-session.service 2>/dev/null || true
+	systemctl --user start ztos-waydroid-session.service < /dev/null || exit 11
+fi
+timeout 100 sudo -n "$recover" ready < /dev/null > /dev/null || exit 11
+sudo -n "$recover" push "$package" < "$extras"

@@ -169,19 +169,36 @@ def _live_path() -> str:
     return os.path.join(runtime, "ztos-live", manifest().get("id", "ztos.app"))
 
 
-def tile_update(title: str = "", lines=(), count: int = 0) -> None:
+def tile_update(title: str = "", lines=(), count: int = 0, *, value: str = "", image: str = "",
+                progress: Optional[int] = None, badge: str = "") -> None:
     """Make this app's Start tile live, as a Windows Phone Flip tile: now and
     then it turns over to a back with up to three `lines` at the top and
     `title` along the bottom; `count` (if not 0) sits on the front's corner.
-    Small tiles keep still. Kept until tile_clear() or the session ends."""
+    Small tiles keep still (they have no back) but show the front's count,
+    `badge` ("play", "pause", "bolt", or a few characters) and `progress`.
+    More for the back: `value` is one large figure above the lines, `image` a
+    picture file (kept by the app), and `progress` (0..100) a thin bar along
+    the bottom of both faces. Kept until tile_clear() or the session ends.
+    The format is the shell's tile signal (ztmetro/TILE-SIGNALS.md)."""
     clean = lambda s: str(s).replace("\n", " ").strip()
     path = _live_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     body = f"title={clean(title)}\n" + "".join(f"line={clean(l)}\n" for l in list(lines)[:3])
     body += f"count={int(count)}\n"
+    if value:
+        body += f"value={clean(value)}\n"
+    if image:
+        body += f"image={clean(image)}\n"
+    if badge:
+        body += f"badge={clean(badge)}\n"
+    if progress is not None:
+        body += f"progress={max(0, min(100, int(progress)))}\n"
     with open(path + ".new", "w") as f:
         f.write(body)
     os.replace(path + ".new", path)
+
+
+tile_signal = tile_update
 
 
 def tile_clear() -> None:

@@ -1,0 +1,34 @@
+#!/bin/sh
+# zrn-cam-probe STEP...: run zrn-cam steps with a mark, as the other risky
+# loads do. A step leaves a mark before it starts and clears it when it has
+# returned. A later run that finds a mark refuses: the step before it froze or
+# restarted the phone, so it is not tried again by itself. A reboot does not
+# clear it; remove /var/lib/zrn-cam/doing by hand after reading what happened.
+# Never autoloaded: nothing starts this at boot.
+D=/var/lib/zrn-cam
+KO=$D/zrn-cam.ko
+RUN=/sys/kernel/debug/zrn-cam/run
+RES=/sys/kernel/debug/zrn-cam/result
+mkdir -p $D
+if [ -e $D/doing ]; then
+	echo "zrn-cam-probe: last step did not finish: $(cat $D/doing). Not running."
+	exit 3
+fi
+mark() { printf '%s\n' "$*" > $D/doing; sync; }
+mark insmod
+if [ ! -d /sys/module/zrn_cam ]; then
+	modprobe i2c-gpio 2>/dev/null
+	insmod "$KO" ${IRIS:+iris_allowed=1} || { rm -f $D/doing; sync; echo "zrn-cam-probe: insmod failed"; exit 1; }
+fi
+rm -f $D/doing; sync
+rc=0
+for s in "$@"; do
+	mark "$s"
+	echo "== $s $(date +%T)"
+	echo "$s" > $RUN; r=$?
+	cat $RES
+	cat /sys/class/power_supply/max170xx_battery/current_now 2>/dev/null
+	rm -f $D/doing; sync
+	[ $r = 0 ] || rc=$r
+done
+exit $rc

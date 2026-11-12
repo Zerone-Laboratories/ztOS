@@ -1,0 +1,1 @@
+KERNEL=="zrn-cam", GROUP="video", MODE="0660"

@@ -465,6 +465,35 @@ static void battery_look(void)
 	}
 }
 
+/* zrn-sleepd's inhibit for a hub reset (see ztoscsf-sensorhub): written
+ * outside inhibit/, dated (its mtime is its expiry), then renamed in, so it
+ * never shows up already expired. The hub's own start lets it go at "hub
+ * ready"; it expires by itself if nobody does. */
+#define HUB_HOLD_DIR	"/run/zrn-sleepd/inhibit"
+#define HUB_HOLD	HUB_HOLD_DIR "/timed-hub"
+#define HUB_HOLD_TMP	"/run/zrn-sleepd/.hub-csf.tmp"
+
+static void hub_hold(int seconds)
+{
+	mkdir("/run/zrn-sleepd", 0755);
+	mkdir(HUB_HOLD_DIR, 0755);
+	int fd = open(HUB_HOLD_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return;
+	struct timespec t[2];
+	clock_gettime(CLOCK_REALTIME, &t[0]);
+	t[0].tv_sec += seconds;
+	t[1] = t[0];
+	if (futimens(fd, t) != 0 || rename(HUB_HOLD_TMP, HUB_HOLD) != 0)
+		unlink(HUB_HOLD_TMP);
+	close(fd);
+}
+
+static void hub_release(void)
+{
+	unlink(HUB_HOLD);
+}
+
 static void sensorhub_look(void)
 {
 	static bool dialog_shown = false;
@@ -510,6 +539,8 @@ static void sensorhub_look(void)
 
 		for (attempt = 1; attempt <= 2; attempt++) {
 			say("Sensor hub initialization failed; power retry %d/2", attempt);
+			/* no SoC sleep in the middle of a reset and patch download */
+			hub_hold(45);
 			run("systemctl stop ztoscsf-sensord.service");
 			/* No daemon may talk to the hub while its power is reset. */
 			run("systemctl stop ztoscsf-sensorhub.service");
@@ -533,6 +564,7 @@ static void sensorhub_look(void)
 		}
 		/* A dialog must never leave the failed vendor daemon spinning. */
 		run("systemctl stop ztoscsf-sensord.service ztoscsf-sensorhub.service");
+		hub_release();
 		say("Sensor hub failed to initialize; stopped sensor services: showing Lumia Metro dialog");
 		dialog_shown = true;
 		char cmd[512];

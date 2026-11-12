@@ -13,8 +13,7 @@
  *
  * Calls are the modem daemon's (comm.h: "call", "answer", "hangup" on its
  * control pipe; its report says how the call stands, its log what calls there
- * were). The sound of a call is not routed on this phone yet: a call connects
- * and is silent, and the page says so.
+ * were). The sound of a call is the daemon's too.
  *
  *	ztphone				history
  *	ztphone NUMBER			the keypad with that number on it
@@ -22,6 +21,7 @@
  *	ztphone --render PAGE FILE	draw a page into a PNG (history, keypad, call, entry)
  */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -30,16 +30,20 @@
 #include <cairo.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "zrnvibe.h"
 
 #include "zrnmetrocore.h"
+#include "zrnboard.h"
 #include "comm.h"
+#include "contact-photo.h"
 
 #define MARGIN ZMC_MARGIN
 
-enum page { P_HISTORY, P_SPEED, P_KEYPAD, P_CALL, P_ENTRY };
+enum page { P_HISTORY, P_SPEED, P_KEYPAD, P_CALL, P_ENTRY, P_CONTACTS };
 
 enum action {
 	ACT_KEY = 1,	/* arg: the character */
@@ -56,13 +60,17 @@ enum action {
 	ACT_ANSWER,
 	ACT_MENU,
 	ACT_MENU_CLOSE,
-	ACT_KEYPAD,	/* the keypad, from the history */
+	ACT_SUGGEST,	/* arg: a contact the digits match: its number */
+	ACT_PERSON,	/* arg: a row of the contacts tab */
+	ACT_GOOGLE,
 	ACT_SPEED_TILE,	/* arg: which speed dial entry (n_speed: the plus) */
 	ACT_SPEED_MENU,	/* arg: 0 remove, 1 move up, 2 move down */
 	ACT_ENTRY_SPEED,	/* add the number on the entry page to speed dial */
 	ACT_PIVOT_PLUS,	/* the plus on speed dial: pick a number from the history */
 	ACT_MUTE, ACT_SPEAKER, ACT_CALL_KEYS, ACT_REPLY,
 	ACT_CANCEL,	/* the keypad's cancel: back to the history */
+	ACT_LETTERS,	/* a letter's square on the contacts tab */
+	ACT_LETTER,	/* arg: a cell of the letters (zb_letter) */
 };
 
 #define MAX_SPEED	30	/* what the phone allows in speed dial */
@@ -78,15 +86,29 @@ static struct call_item calls[MAX_CALLS];
 static int n_calls;
 static char state[16] = "idle", number[40];	/* the call there is, if any */
 static time_t answered_at;
-static int came_from = P_HISTORY;	/* where to go back to when a call ends */
+static int entry_from = P_HISTORY;	/* the tab the entry page opened from */
+static int came_from = P_KEYPAD;	/* where to go back to when a call ends */
 static char entry[40];			/* the number the entry page is of */
 static int menu_for = -1;
 static bool sample;
 static bool call_screen_only, call_keys, muted, speaker, ending, reply_hint;
-static uint32_t ended_at, swivel_at;
-static cairo_surface_t *swivel_surface;
-static unsigned swivel_revision;
-static bool swivel_leaving;
+/* The call as this page holds it. state[] above is what is on screen, and only
+ * tick() and the taps change it: the daemon's report is read through call_seen().
+ *
+ *   dialled	this app placed the call: it can never be one to answer
+ *   connected	it has been in progress: it stays so until it ends
+ *   answering	"answer" went down the pipe, the report has not caught up
+ *   daemon_said	the report has shown this call at all (a dial's first ticks)
+ *   daemon_idle	since the call ended here, the report has said so too
+ *   page_wanted	where the call wants the page to be, until it gets there
+ */
+static bool dialled, connected, answering, daemon_said, daemon_idle, redraw_wanted;
+static uint32_t ended_at, dialled_at, answered_tap_at;
+static int page_wanted = -1;
+static long clock_shown = -1;
+#define ENDED_MS	1000	/* "call ended" stays this long */
+#define DIAL_GRACE_MS	3000	/* a dial not yet in the report is not a call that ended */
+#define ANSWER_GRACE_MS	6000	/* after this an answer that did nothing rings again */
 static pid_t loop_pid;
 static char loop_sound[64];
 #define PHONE_SOUNDS "/usr/local/share/sounds/ztos/phone/"
@@ -151,6 +173,22 @@ static void sound_play(const char *file, bool loop) {
 	}
 }
 
+/* A key's tone: through ztos-sounds, whose stream is already open and which cuts
+ * them short and one at a time; a pw-play for each key took a process start per
+ * press and left a second of tone under the next. Its protocol: sound, volume. */
+static void key_tone(int key) {
+	if (sample) return;
+	static int fd = -1;
+	int index = 10 + (key == '*' ? 10 : key == '#' ? 11 : key - '0');
+	int volume = ring_volume() * 60 / 100;
+	if (volume < 1) return;
+	if (fd < 0) fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	struct sockaddr_un to = { .sun_family = AF_UNIX };
+	snprintf(to.sun_path, sizeof(to.sun_path), "%s/ztos-sounds.sock", getenv("XDG_RUNTIME_DIR") ?: "/run/user/1000");
+	unsigned char packet[2] = { (unsigned char)index, (unsigned char)volume };
+	if (fd >= 0) sendto(fd, packet, sizeof(packet), MSG_DONTWAIT, (struct sockaddr *)&to, sizeof(to));
+}
+
 static void ringtone(char *out, size_t size) {
 	char path[512], line[80];
 	snprintf(out, size, "Nokia-Tune.wav");
@@ -191,9 +229,13 @@ static void call_sound(void) {
 			vibe_stop(&vibe_pid);
 			vibe_playing[0] = 0;
 		}
-	} else if (!strcmp(state, "dialing") || !strcmp(state, "ringing")) {
-		sound_play("ringback.wav", true);
-	} else sound_stop();
+	} else {
+		/* Dialling and ringing sound nothing here: the call's path is open from
+		 * dialling and the network's own ringback comes through it. A local tone
+		 * went out on another DSP stream in the middle of the call's route change
+		 * (RDMA0 then ran at 180542 frames a second) and doubled the real one. */
+		sound_stop();
+	}
 }
 
 
@@ -296,24 +338,11 @@ static void describe(const struct call_item *c, char *out, size_t size) {
 }
 
 static double draw_history(cairo_t *cr) {
+	zmc.pivot_after = "keypad";
 	double y = zmc_pivot_next(cr, "history", "speed dial", ZMC_ACT_PIVOT, P_SPEED);
 	if (!sample) {
 		n_calls = calls_load(calls, MAX_CALLS);
 	}
-	/* the keypad: a row at the top, as the phone's keypad button */
-	cairo_set_source_rgb(cr, 0.13, 0.13, 0.13);
-	cairo_rectangle(cr, MARGIN, y, zmc.width - 2 * MARGIN, 44);
-	cairo_fill(cr);
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	for (int r = 0; r < 3; r++) {
-		for (int c = 0; c < 3; c++) {
-			cairo_arc(cr, MARGIN + 22 + (c - 1) * 6, y + 22 + (r - 1) * 6, 1.6, 0, 2 * M_PI);
-			cairo_fill(cr);
-		}
-	}
-	zmc_text(cr, "keypad", FONT_REGULAR, 15, MARGIN + 46, y + 12, 0);
-	zmc_add_hit(MARGIN, y, zmc.width - 2 * MARGIN, 44, ACT_KEYPAD, 0);
-	y += 60;
 	if (n_calls == 0) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		y += zmc_text(cr, "Calls you make or receive will appear here. Tap the keypad icon to call someone.",
@@ -361,7 +390,8 @@ static double draw_history(cairo_t *cr) {
 /* The speed dial: two across, a tile to each entry, in the accent colour, and
  * a plus at the end. Tap a tile to call it; hold for the menu. */
 static double draw_speed(cairo_t *cr) {
-	double y = zmc_pivot_next(cr, "speed dial", "history", ZMC_ACT_PIVOT, P_HISTORY);
+	zmc.pivot_after = "contacts";
+	double y = zmc_pivot_next(cr, "speed dial", "keypad", ZMC_ACT_PIVOT, P_KEYPAD);
 	if (n_speed == 0) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		y += zmc_text(cr, "Looking for quicker calling? Tap the plus sign to add someone to speed dial.",
@@ -408,12 +438,146 @@ static double draw_speed(cairo_t *cr) {
 
 /* ---- keypad --------------------------------------------------------------- */
 
+/* Does a contact fit what is typed: the digits in one of their numbers, or the
+ * keys of their name (2 for ABC ...) from the start of a word. */
+static bool t9_word(const char *name, const char *typed) {
+	static const char keys[] = "22233344455566677778889999";
+	for (const char *w = name; *w; w++) {
+		if (w != name && w[-1] != ' ') continue;
+		const char *n = w, *t = typed;
+		while (*t && isalpha((unsigned char)*n) && keys[tolower((unsigned char)*n) - 'a'] == *t) {
+			n++;
+			t++;
+		}
+		if (!*t) return true;
+	}
+	return false;
+}
+
+static bool number_has(const char *number, const char *typed) {
+	char plain[40];
+	size_t o = 0;
+	for (const char *c = number; *c && o + 1 < sizeof(plain); c++) {
+		if (isdigit((unsigned char)*c)) plain[o++] = *c;
+	}
+	plain[o] = 0;
+	return o && strstr(plain, typed);
+}
+
+/* Under the number: whose it could be, as many as fit above the keys. */
+static void draw_suggestions(cairo_t *cr, double y, double bottom) {
+	const double row = 40;
+	if (strlen(digits) < 2 || strspn(digits, "0123456789") != strlen(digits)) return;
+	for (int i = 0; i < n_contacts && y + row <= bottom; i++) {
+		struct contact *c = &contacts[i];
+		const char *num = number_has(c->mobile, digits) ? c->mobile :
+			number_has(c->other, digits) ? c->other : t9_word(c->name, digits) ? c->mobile : NULL;
+		if (!num || !num[0] || !strcmp(num, digits)) continue;
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text_line(cr, c->name, FONT_REGULAR, 16, MARGIN, y + 1, zmc.width * 0.55);
+		zmc_accent(cr);
+		zmc_text_line(cr, num, FONT_REGULAR, 13.5, MARGIN, y + 21, zmc.width - 2 * MARGIN);
+		zmc_add_hit(0, y, zmc.width, row, ACT_SUGGEST, i);
+		y += row;
+	}
+}
+
+/* Everyone: tap for their page. A zmc_list, as in People: all of them, under
+ * their letters, with only the rows near the screen drawn. */
+#define CONTACT_ROW_H 62
+static int contact_rows[MAX_CONTACTS + 27];	/* a person; or -1 - a letter */
+static int n_contact_rows;
+
+static char contact_letter(const struct contact *c) {
+	char first = (char)toupper((unsigned char)c->name[0]);
+	return first >= 'A' && first <= 'Z' ? first : '#';
+}
+
+static void contacts_row_draw(cairo_t *cr, int row) {
+	int v = contact_rows[row];
+	if (v < 0) {
+		char text[2] = { (char)tolower((unsigned char)(-1 - v)), 0 };
+		zmc_accent(cr);
+		cairo_rectangle(cr, MARGIN, 8, 42, 42);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_text(cr, text, FONT_SEMILIGHT, 26, MARGIN + 6, 16, 0);
+		return;
+	}
+	const struct contact *c = &contacts[v];
+	contact_tile(cr, MARGIN, 7, 48, c->name, c->uid);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_text_line(cr, c->name, FONT_SEMILIGHT, 24, MARGIN + 60, 6, zmc.width - 2 * MARGIN - 60);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text_line(cr, c->mobile[0] ? c->mobile : c->other, FONT_REGULAR, 13.5, MARGIN + 60, 37, zmc.width - 2 * MARGIN - 60);
+}
+
+static bool contacts_row_hit(int row, double x, double y, struct zmc_hit *hit) {
+	if (contact_rows[row] < 0) {
+		if (x < MARGIN || x >= MARGIN + 42 || y < 8 || y >= 50) {
+			return false;
+		}
+		*hit = (struct zmc_hit){ .x = MARGIN, .y = 8, .w = 42, .h = 42, .action = ACT_LETTERS };
+		return true;
+	}
+	*hit = (struct zmc_hit){ .x = 0, .y = 4, .w = zmc.width, .h = 58, .action = ACT_PERSON, .arg = contact_rows[row] };
+	return true;
+}
+
+/* the letter's row in the list, or -1. '#' is itself; the rest are upper case */
+static int contact_letter_row(int cell) {
+	char c = zb_letter(cell);
+	int want = -1 - (c == '#' ? '#' : toupper((unsigned char)c));
+	for (int i = 0; i < n_contact_rows; i++) {
+		if (contact_rows[i] == want) return i;
+	}
+	return -1;
+}
+
+static bool contact_letter_has(int cell) {
+	return contact_letter_row(cell) >= 0;
+}
+
+static bool contacts_row_head(int row) {
+	return contact_rows[row] < 0;
+}
+
+static double draw_contacts(cairo_t *cr) {
+	zmc.pivot_after = "speed dial";
+	double y = zmc_pivot_next(cr, "contacts", "history", ZMC_ACT_PIVOT, P_HISTORY);
+	if (!sample) contacts_load();
+	if (n_contacts == 0) {
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, "no contacts yet", FONT_REGULAR, 16, MARGIN, y, 0);
+		y = zmc_entry(cr, y + 34, "sign in with Google", "bring your contacts here", ACT_GOOGLE, 0);
+		return y + 40;
+	}
+	char letter = 0;
+	n_contact_rows = 0;
+	for (int i = 0; i < n_contacts; i++) {
+		char first = contact_letter(&contacts[i]);
+		if (first != letter) {
+			letter = first;
+			contact_rows[n_contact_rows++] = -1 - first;
+		}
+		contact_rows[n_contact_rows++] = i;
+	}
+	struct zmc_list list = { .count = n_contact_rows, .row_h = CONTACT_ROW_H,
+		.revision = contact_list_revision(), .draw_row = contacts_row_draw,
+		.row_hit = contacts_row_hit, .is_head = contacts_row_head,
+		.pin_x = 0, .pin_y = 0, .pin_w = zmc.width, .pin_h = CONTACT_ROW_H };
+	return zmc_list(cr, y - 6, &list) + 40;
+}
+
+static double suggest_y;
+
 static double draw_keypad(cairo_t *cr) {
 	static const struct { char key; const char *letters; } KEYS[12] = {
 		{ '1', "" }, { '2', "ABC" }, { '3', "DEF" }, { '4', "GHI" }, { '5', "JKL" }, { '6', "MNO" },
 		{ '7', "PQRS" }, { '8', "TUV" }, { '9', "WXYZ" }, { '*', "" }, { '0', "+" }, { '#', "" },
 	};
-	double y = zmc_header(cr, "keypad") - 14;
+	zmc.pivot_after = "history";
+	double y = zmc_pivot_next(cr, "keypad", "contacts", ZMC_ACT_PIVOT, P_CONTACTS) - 14;
 	/* the number so far, and under it whose it is */
 	double size = strlen(digits) > 13 ? 26 : 34;
 	cairo_set_source_rgb(cr, 1, 1, 1);
@@ -441,7 +605,7 @@ static double draw_keypad(cairo_t *cr) {
 		}
 	}
 	y += 64;
-	/* three across, four down, as the phone's */
+	suggest_y = y;
 	/* the keys, as the phone's: a 3 by 4 grid of dark tiles that run to the
 	 * buttons at the foot, the digit with its letters beside it */
 	const double gap = 2, kw = (zmc.width - 2 * gap) / 3, kh = 84;
@@ -450,6 +614,7 @@ static double draw_keypad(cairo_t *cr) {
 	if (keys_top < y) {
 		keys_top = y;
 	}
+	draw_suggestions(cr, suggest_y, keys_top);
 	for (int i = 0; i < 12; i++) {
 		double x = (i % 3) * (kw + gap), ky = keys_top + (i / 3) * (kh + gap);
 		char label[2] = { KEYS[i].key, 0 };
@@ -508,6 +673,14 @@ static double draw_call(cairo_t *cr) {
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		zmc_text(cr, timer, FONT_LIGHT, 30, MARGIN, y, 0);
 	}
+	if (!call_keys && !ending) {
+		/* their photo, if we know them and have one: no initials here */
+		const struct contact *known = contact_of_number(who);
+		cairo_surface_t *photo = known ? contact_photo_get(known->uid) : NULL;
+		if (photo) {
+			zmc_picture(cr, photo, MARGIN, y + (active ? 48 : 0), 150);
+		}
+	}
 	if (ending) return zmc.height;
 	if (call_keys && active) {
 		const char *keys = "123456789*0#";
@@ -543,14 +716,16 @@ static double draw_call(cairo_t *cr) {
 			const char *labels[] = { "mute", "speaker", call_keys ? "hide keypad" : "keypad" };
 			int actions[] = { ACT_MUTE, ACT_SPEAKER, ACT_CALL_KEYS };
 			double side = (w - 16) / 3;
+			/* square tiles, as the reference; low ones under the keypad */
+			double tile = call_keys ? 64 : side, top = bottom + 22 - tile;
 			for (int i = 0; i < 3; i++) {
 				double x = MARGIN + i * (side + 8);
 				if ((i == 0 && muted) || (i == 1 && speaker) || (i == 2 && call_keys)) zmc_accent(cr);
 				else cairo_set_source_rgb(cr, .25, .25, .25);
-				cairo_rectangle(cr, x, bottom - 44, side, 64); cairo_fill(cr);
+				cairo_rectangle(cr, x, top, side, tile); cairo_fill(cr);
 				cairo_set_source_rgb(cr, 1, 1, 1);
-				zmc_text_centred(cr, labels[i], FONT_REGULAR, 15, x + side / 2, bottom - 23);
-				zmc_add_hit(x, bottom - 44, side, 64, actions[i], 0);
+				zmc_text_centred(cr, labels[i], FONT_REGULAR, 15, x + side / 2, top + tile / 2 - 10);
+				zmc_add_hit(x, top, side, tile, actions[i], 0);
 			}
 		}
 		cairo_set_source_rgb(cr, .25, .25, .25);
@@ -558,8 +733,6 @@ static double draw_call(cairo_t *cr) {
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		zmc_text_centred(cr, "end call", FONT_SEMILIGHT, 22, zmc.width / 2, bottom + 42);
 		zmc_add_hit(MARGIN, bottom + 30, w, 54, ACT_HANGUP, 0);
-		cairo_set_source_rgb(cr, .65, .65, .65);
-		zmc_text(cr, "Call audio is not routed yet. Neither side can hear.", FONT_REGULAR, 12, MARGIN, bottom + 94, w);
 	}
 	return zmc.height;
 }
@@ -606,48 +779,58 @@ static double render(cairo_t *cr, int page) {
 	case P_HISTORY: return draw_history(cr);
 	case P_SPEED: return draw_speed(cr);
 	case P_KEYPAD: return draw_keypad(cr);
+	case P_CONTACTS: return draw_contacts(cr);
 	case P_CALL: return draw_call(cr);
 	case P_ENTRY: return draw_entry(cr);
 	}
 	return 0;
 }
 
-/* Keep the named Lumia swivel on the GPU; cache its face once per arrival. */
-static void arrived(int page) {
-	if (page != P_KEYPAD && page != P_CALL) return;
-	if (swivel_surface) cairo_surface_destroy(swivel_surface);
-	swivel_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, zmc.width * zmc.scale, zmc.height * zmc.scale);
-	cairo_surface_set_device_scale(swivel_surface, zmc.scale, zmc.scale);
-	cairo_t *cr = cairo_create(swivel_surface);
-	cairo_set_source_rgb(cr, 0, 0, 0); cairo_paint(cr);
-	int hits = zmc.n_hits;
-	render(cr, page);
-	zmc.n_hits = hits;
-	cairo_destroy(cr);
-	swivel_at = zmc_now_ms();
-	swivel_leaving = false;
-	swivel_revision++;
-	zmc_present();
-}
-
-static void overlay(int page) {
-	if (!swivel_surface || (page != P_CALL && page != P_KEYPAD)) return;
-	const char *transition = swivel_leaving ? "swivel-out" : "swivel-in";
-	double t = (zmc_now_ms() - swivel_at) / zmc_transition_ms(transition);
-	if (t >= 1) {
-		cairo_surface_destroy(swivel_surface);
-		swivel_surface = NULL;
-		return;
-	}
-	zmc_gpu_rect(0, 0, zmc.width, zmc.height, 0, 0, 0);
-	zmc_transition(transition, t, 0, 0, zmc.width, zmc.height, swivel_surface, swivel_revision);
-	zmc.dirty = true;	/* request the next callback without entering the renderer again */
-}
-
 /* ---- what taps do --------------------------------------------------------- */
 
+/* The one way the page moves for a call. The core ignores a turn asked for
+ * while another runs, and a turn over a moving pivot tears it: so this only
+ * notes where to be, and settle() goes there when nothing else is moving. */
+static void want_page(int page) {
+	page_wanted = page;
+}
+
+static void want_redraw(void) {
+	redraw_wanted = true;
+}
+
+static bool page_moving(void) {
+	return zmc.anim_active || zmc.slide_active || zmc.swiping || zmc.spring;
+}
+
+static void settle(void) {
+	if (page_moving()) return;
+	if (page_wanted >= 0) {
+		int page = page_wanted;
+		page_wanted = -1;
+		if (zmc.page != page) {
+			redraw_wanted = false;	/* the turn draws the page afresh */
+			zmc_go(page, page == P_CALL ? 1 : -1);
+			return;
+		}
+	}
+	if (redraw_wanted) {
+		redraw_wanted = false;
+		zmc_redraw();
+	}
+}
+
+static void call_begun(void) {
+	answered_at = 0;
+	clock_shown = -1;
+	connected = answering = false;
+	if (zmc.page != P_CALL) came_from = zmc.page == P_ENTRY ? entry_from : zmc.page;
+	want_page(P_CALL);
+	want_redraw();
+}
+
 static void dial(const char *who) {
-	if (!who[0] || on_call()) {
+	if (!who[0] || on_call() || ending) {
 		return;
 	}
 	if (!modem_tell("call %s", who)) {
@@ -655,12 +838,30 @@ static void dial(const char *who) {
 	}
 	snprintf(number, sizeof(number), "%s", who);
 	snprintf(state, sizeof(state), "dialing");
-	answered_at = 0;
+	dialled = true;
+	daemon_said = false;
+	dialled_at = zmc_now_ms();
 	zmc_haptic("click");
-	if (zmc.page != P_CALL) {
-		came_from = zmc.page == P_ENTRY ? P_HISTORY : zmc.page;
-		zmc_go(P_CALL, 1);
-	}
+	call_begun();
+	settle();
+}
+
+/* The call is over on this page, now: its sound, "call ended", and away. */
+static void call_over(const char *result) {
+	answered_at = 0;
+	sound_stop();
+	sound_play(!strcmp(result, "busy") ? "Disconnct.wav" : !strcmp(result, "drop") ? "Calldrop.wav" : "Busy.wav", false);
+	ending = true;
+	ended_at = zmc_now_ms();
+	/* the modem keeps its mute: the next call must not start with it on */
+	if (muted) modem_tell("mute off");
+	call_keys = muted = speaker = false;
+	dialled = connected = answering = daemon_said = false;
+	daemon_idle = false;
+	reply_hint = false;
+	snprintf(state, sizeof(state), "idle");
+	want_redraw();
+	settle();
 }
 
 static void other_app(const char *app, const char *arg) {
@@ -677,14 +878,15 @@ static void other_app(const char *app, const char *arg) {
 }
 
 static void activate(int action, int arg) {
-	if (ending || (swivel_surface && zmc_now_ms() - swivel_at < 300)) return;
+	if (ending) return;
 	size_t len = strlen(digits);
 	switch (action) {
 	case ACT_KEY: {
-		char file[32];
-		snprintf(file, sizeof(file), "dtmf%s.wav", arg == '*' ? "ast" : arg == '#' ? "pd" : (char[2]){arg, 0});
-		sound_play(file, false);
-		if (on_call()) break;
+		if (arg != '+') key_tone(arg);
+		if (on_call()) {
+			modem_tell("dtmf %c", arg);
+			break;
+		}
 		if (len + 1 < sizeof(digits) - 1) {
 			digits[len] = (char)arg;
 			digits[len + 1] = 0;
@@ -717,6 +919,7 @@ static void activate(int action, int arg) {
 	case ACT_OPEN:
 		if (arg >= 0 && arg < n_calls) {
 			snprintf(entry, sizeof(entry), "%s", calls[arg].number);
+			entry_from = P_HISTORY;
 			zmc_go(P_ENTRY, 1);
 		}
 		break;
@@ -731,6 +934,7 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_MUTE:
 		muted = !muted;
+		modem_tell(muted ? "mute on" : "mute off");
 		break;
 	case ACT_SPEAKER:
 		speaker = !speaker;
@@ -756,12 +960,16 @@ static void activate(int action, int arg) {
 		break;
 	}
 	case ACT_HANGUP:
-		sound_stop();
 		modem_tell("hangup");
 		zmc_haptic("click");
-		break;		/* the page goes when the modem says the call is over */
+		call_over("ended");	/* at once: the daemon sees the modem through it */
+		break;
 	case ACT_ANSWER:
 		sound_stop();
+		answering = true;
+		answered_tap_at = zmc_now_ms();
+		snprintf(state, sizeof(state), "active");	/* on the page at once; the ring must not resume */
+		if (!answered_at) answered_at = time(NULL);
 		modem_tell("answer");
 		zmc_haptic("click");
 		break;
@@ -784,9 +992,31 @@ static void activate(int action, int arg) {
 		menu_for = -1;
 		speed_menu_for = -1;
 		break;
-	case ACT_KEYPAD:
-		came_from = P_HISTORY;
-		zmc_go(P_KEYPAD, 1);
+	case ACT_SUGGEST:
+		if (arg >= 0 && arg < n_contacts) {
+			struct contact *c = &contacts[arg];
+			snprintf(digits, sizeof(digits), "%s", number_has(c->other, digits) ? c->other : c->mobile);
+			zmc_redraw();
+		}
+		break;
+	case ACT_LETTERS:
+		zmc_letter_board(contact_letter_has, ACT_LETTER);
+		break;
+	case ACT_LETTER: {
+		/* the list moves at once, under the rows going */
+		zmc_list_show(P_CONTACTS, contact_letter_row(arg));
+		zmc_board_close();
+		break;
+	}
+	case ACT_PERSON:
+		if (arg >= 0 && arg < n_contacts) {
+			snprintf(entry, sizeof(entry), "%s", contacts[arg].mobile[0] ? contacts[arg].mobile : contacts[arg].other);
+			entry_from = P_CONTACTS;
+			zmc_go(P_ENTRY, 1);
+		}
+		break;
+	case ACT_GOOGLE:
+		run_app("ztcontacts --google");
 		break;
 	case ACT_SPEED_TILE:
 		if (arg >= 0 && arg < n_speed) {
@@ -813,7 +1043,7 @@ static void activate(int action, int arg) {
 		zmc_go(P_HISTORY, -1);
 		break;
 	case ACT_CANCEL:
-		zmc_go(P_HISTORY, -1);
+		zmc_go(P_KEYPAD, -1);
 		break;
 	case ACT_ENTRY_SPEED:
 		if (speed_index(entry) >= 0) {
@@ -876,8 +1106,8 @@ static bool back(void) {
 		zmc_redraw();
 		return true;
 	}
-	if (zmc.page == P_ENTRY || zmc.page == P_KEYPAD) {
-		zmc_go(P_HISTORY, -1);
+	if (zmc.page == P_ENTRY) {
+		zmc_go(entry_from, -1);
 		return true;
 	}
 	if (zmc.page == P_CALL) {
@@ -888,66 +1118,107 @@ static bool back(void) {
 	return false;
 }
 
-/* How the call stands, from the modem daemon's report: once a second. */
+/* What the report's state means for the call on this page. Every flip the
+ * report can make that is not news to the person holding the phone stops here:
+ * a call you placed or are already in is never one to answer, so it can neither
+ * ring nor put answer and ignore on the screen. */
+static const char *call_seen(const char *now) {
+	if (!strcmp(now, "incoming")) {
+		if (dialled || connected) return "active";
+		if (answering && zmc_now_ms() - answered_tap_at < ANSWER_GRACE_MS) return "active";
+		answering = false;
+	}
+	return now;
+}
+
+/* How the call stands, from the modem daemon's report: four times a second.
+ * This is the only place the report reaches the page. */
 static void tick(void) {
 	while (waitpid(-1, NULL, WNOHANG) > 0) {}
-	if (ending) {
-		if (!swivel_leaving && zmc_now_ms() - ended_at >= 600) {
-			arrived(P_CALL);
-			swivel_leaving = true;
-		}
-		if (zmc_now_ms() - ended_at >= 1000) {
-			ending = false;
-			number[0] = 0;
-			if (call_screen_only) zmc_quit();
-			else zmc_go(came_from, -1);
-		}
-		return;
-	}
-
 	char now[16], who[40];
-	bool was = on_call();
 	modem_value("call", now, sizeof(now));
 	modem_value("call_number", who, sizeof(who));
 	if (!now[0]) {
 		snprintf(now, sizeof(now), "idle");
 	}
-	bool changed = strcmp(now, state) != 0;
-	/* (just dialled: the daemon may not have said so yet) */
-	if (!strcmp(state, "dialing") && !strcmp(now, "idle") && !changed) {
+	bool daemon_on = strcmp(now, "idle") != 0;
+
+	if (ending) {
+		if (!daemon_on) daemon_idle = true;
+		if (daemon_idle && daemon_on) {
+			/* a new call, in the moment of the last one's "call ended" */
+			ending = false;
+			number[0] = 0;
+		} else if (zmc_now_ms() - ended_at < ENDED_MS) {
+			settle();
+			return;
+		} else if (daemon_idle) {
+			ending = false;
+			number[0] = 0;
+			if (call_screen_only) {
+				zmc_quit();
+				return;
+			}
+			want_page(came_from);
+			want_redraw();
+			settle();
+			return;
+		} else {
+			/* hung up here, and the report still has it: the daemon has not
+			 * let go, so the call is not over: show it again */
+			ending = false;
+		}
+	}
+
+	if (daemon_on) daemon_said = true;
+	/* just dialled: the daemon may not have said so yet */
+	if (dialled && !daemon_said && zmc_now_ms() - dialled_at < DIAL_GRACE_MS) {
+		settle();
 		return;
 	}
-	snprintf(state, sizeof(state), "%s", now);
+	bool was = on_call();
+	const char *seen = call_seen(now);
+	bool changed = strcmp(seen, state) != 0;
+	if (changed) snprintf(state, sizeof(state), "%s", seen);
 	if (who[0]) {
+		if (strcmp(number, who)) changed = true;
 		snprintf(number, sizeof(number), "%s", who);
 	}
-	if (!strcmp(state, "active") && !answered_at) {
-		answered_at = time(NULL);
-	}
-	if (on_call() && !was && zmc.page != P_CALL) {
-		came_from = zmc.page == P_ENTRY ? P_HISTORY : zmc.page;
-		zmc_go(P_CALL, 1);
-	} else if (!on_call() && was) {
-		answered_at = 0;
-		sound_stop();
+	if (!was && on_call()) {
+		call_begun();
+	} else if (was && !on_call()) {
 		char result[16];
 		modem_value("call_result", result, sizeof(result));
-		sound_play(!strcmp(result, "busy") ? "Busy.wav" : !strcmp(result, "drop") ? "Calldrop.wav" : "Disconnct.wav", false);
-		ending = true;
-		ended_at = zmc_now_ms();
-		call_keys = muted = speaker = false;
-		zmc_redraw();
+		call_over(result);
 		return;
-	} else if (changed || (zmc.page == P_CALL && !strcmp(state, "active"))) {
-		zmc_redraw();	/* the state, or the clock of the call */
+	}
+	/* (the report's word, not the page's: an answer that did nothing is not a call) */
+	if (!strcmp(now, "active")) connected = true;
+	if (!strcmp(state, "active") && !answered_at) answered_at = time(NULL);
+	if (!strcmp(state, "incoming")) answered_at = 0;
+	if (changed) want_redraw();
+	if (zmc.page == P_CALL && !strcmp(state, "active") && answered_at) {
+		long seconds = time(NULL) - answered_at;	/* the clock: a page's drawing once a second */
+		if (seconds != clock_shown) {
+			clock_shown = seconds;
+			want_redraw();
+		}
+	}
+	if (on_call() && page_wanted < 0 && zmc.page != P_CALL && !page_moving()) {
+		want_page(P_CALL);	/* whatever turned away from a call in progress */
 	}
 	call_sound();
+	settle();
+}
+
+/* four tabs going round: the one just left is not the next */
+static void tab_arrived(int page) {
+	zmc_pivot_changed();
 }
 
 static const struct zmc_app phone = {
 	.app_id = "ztphone", .title = "Phone", .caps = "PHONE",
-	.render = render, .activate = activate, .back = back, .text = typed, .hold = hold,
-	.arrived = arrived, .overlay = overlay, .overlay_above_header = true,
+	.render = render, .activate = activate, .back = back, .text = typed, .hold = hold, .arrived = tab_arrived,
 };
 
 int main(int argc, char **argv) {
@@ -964,7 +1235,9 @@ int main(int argc, char **argv) {
 		sample = true;
 		snprintf(contacts[0].name, sizeof(contacts[0].name), "Amara Perera");
 		snprintf(contacts[0].mobile, sizeof(contacts[0].mobile), "0771234567");
-		n_contacts = 1;
+		snprintf(contacts[1].name, sizeof(contacts[1].name), "Dilan Silva");
+		snprintf(contacts[1].mobile, sizeof(contacts[1].mobile), "0771239999");
+		n_contacts = 2;
 		for (size_t i = 0; i < 4; i++) {
 			snprintf(calls[i].type, sizeof(calls[i].type), "%s", made[i].type);
 			calls[i].at = time(NULL) - made[i].ago;
@@ -972,10 +1245,10 @@ int main(int argc, char **argv) {
 			calls[i].duration = made[i].lasted;
 		}
 		n_calls = 4;
-		snprintf(digits, sizeof(digits), "0771234567");
+		snprintf(digits, sizeof(digits), "0771");
 		snprintf(entry, sizeof(entry), "0771234567");
 		int page = !strcmp(argv[2], "keypad") ? P_KEYPAD : !strcmp(argv[2], "call") ? P_CALL :
-			!strcmp(argv[2], "entry") ? P_ENTRY : !strcmp(argv[2], "speed") ? P_SPEED : P_HISTORY;
+			!strcmp(argv[2], "entry") ? P_ENTRY : !strcmp(argv[2], "speed") ? P_SPEED : !strcmp(argv[2], "contacts") ? P_CONTACTS : P_HISTORY;
 		if (page == P_CALL) {
 			snprintf(state, sizeof(state), "active");
 			snprintf(number, sizeof(number), "0771234567");
@@ -983,7 +1256,7 @@ int main(int argc, char **argv) {
 		}
 		return zmc_render_png(&phone, page, 664, argv[3]);
 	}
-	int first = P_HISTORY;
+	int first = P_KEYPAD;
 	const char *call_now = NULL;
 	if (argc == 3 && !strcmp(argv[1], "--call")) {
 		call_now = argv[2];
@@ -1001,7 +1274,10 @@ int main(int argc, char **argv) {
 	if (call_now && !on_call() && modem_tell("call %s", call_now)) {
 		snprintf(number, sizeof(number), "%.38s", call_now);
 		snprintf(state, sizeof(state), "dialing");
+		dialled = true;
+		dialled_at = zmc_now_ms();
 	}
+	if (!strcmp(state, "active")) connected = true;
 	if (call_screen_only && !on_call()) return 0;
 	if (on_call()) {
 		first = P_CALL;

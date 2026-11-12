@@ -161,6 +161,36 @@ older revision of the same Samsung source we use; nothing to take from it.
 The patch alone did not stop the asserts. They came within a second of `ztoscsf-sensord`
 sending the AP-state commands 0xd2 (SLEEP, at every screen-off) and 0xd1 (WAKEUP, at its start).
 Samsung's ssp driver on this phone never sends either: they belong to early suspend, which its
-kernel does not build; it only sends 0xd4/0xd3 (SUSPEND/RESUME) around system suspend.
+kernel does not build. Around system suspend it sends only 0xd3 (RESUME, from ssp_resume); at
+suspend it pulses AP_SLEEP and sends nothing (REA on stock's Image, 30 Oct: ssp_suspend 0xa83560
+stores 0xd4 as its last state but never calls ssp_send_cmd; ssp_resume 0xa83928 calls
+`ssp_send_cmd(data, 0xd3, 0)`; evidence ev_16bab461, ev_a47f6062).
 `ztoscsf-sensord` no longer sends them and only takes its sensors off while the screen is off.
 After that: no assert at start and none in four screen off/on cycles (2026-10-25).
+
+## One transaction at a time; the hub through SoC sleep (2026-10-30)
+
+The screen-off assert (`Assert=MCU_BCM477X_transport_layer.c line=0165 Arg2=00000005`, then
+`ESW:CRASHED`) came back whenever a second sensor was on: 8 of 8 screen-offs with `watch accel`,
+`watch prox` or both. `ztoscsf-sensord` then sent two REMOVEs back to back (light, then the
+watched one), the second header before the hub had echoed the first. Samsung's driver never does
+that: `bbd_do_transfer` holds `comm_mutex` from the header until the echo's payload is out.
+One REMOVE alone, with the screen on (`unwatch accel`), gave no assert (P1, 30 Oct).
+
+Now `ztoscsf-sensord` keeps one transaction in flight: headers wait in a queue (16; when full
+the oldest queued one is dropped and logged, never the open one), a bare command (length 0) is
+not echoed and does not hold the link, an unanswered header is dropped after 1 s (400 ms within
+5 s of a resume, as `ssp_spi_async`), and the time message goes out only on an idle link. After
+a hub restart (INIT_DONE) the queue is emptied: a REMOVE of a sensor the new hub never added
+asserts it too.
+
+Sleep: zrn-bbd pulses AP_SLEEP at each suspend as `ssp_suspend` does (`ap_sleep_pulse`, off by
+default, only while host_req is a wake IRQ) and counts the resumes after a pulse in
+`/sys/class/sec/sensorhub/resume_seq` (sysfs-notified; `ap_suspends` counts the pulses).
+`ztoscsf-sensord` follows that file and sends the bare 0xd3 (`D3 00 00 01 00 00 00 00 00`)
+after each change, behind any open transaction. zrn-sleep-init makes host_req (gpa1-7) a wake
+source while its IRQ is wake-enabled, as stock's EINT wake mask does, and refuses a sleep while
+host_req is high (power/suspend/README.md, round 2). GNSS still holds sleep off with
+`timed-gnss`: it does not live through a sleep.
+
+Host test: `ztmetro/sensord/test-sensord-queue.py` (the hub on a pty; no hardware).

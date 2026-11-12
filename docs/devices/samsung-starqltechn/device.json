@@ -1,0 +1,238 @@
+{
+  "id": "samsung-starqltechn",
+  "name": "Samsung Galaxy S9 (Snapdragon)",
+  "maker": "Samsung",
+  "model": "SCV38, SM-G9600",
+  "codename": "starqltechn",
+  "maintainer": "Davitek",
+  "contact": "Discord: @davitek_ GitHub: @Davitekk",
+  "added": "2026-11-02",
+  "summary": "ztOS on the Snapdragon Galaxy S9 (SCV38, SM-G9600). Mainline Linux 7.1 (sdm845-mainline, the tree postmarketOS ships for this phone) with patches for the BCM4361 Wi-Fi and Bluetooth, the panel's backlight, the WCD9340 codec and the MAX98512 amps. Samsung's bootloader starts U-Boot from BOOT, which boots the kernel and ztOS's boot stage; the system lives in USERDATA, and the phone's own firmware is loaded read-only from its Android partitions (EFS and the modem's partitions are never written). Calls with voice both ways, SMS, 4G data, Wi-Fi, Bluetooth, sensors and both mics work; it is built in Docker, so it can be built and installed from Windows too.",
+  "photo": "photo.jpg",
+  "photo_caption": "",
+  "specs": [
+    [
+      "SoC",
+      "Qualcomm Snapdragon 845"
+    ],
+    [
+      "CPU",
+      "4× Kryo 385 Gold at 2.8 GHz, 4× Kryo 385 Silver at 1.77 GHz"
+    ],
+    [
+      "GPU",
+      "Adreno 630 (freedreno, OpenGL ES 3.2)"
+    ],
+    [
+      "RAM",
+      "4 GB"
+    ],
+    [
+      "Storage",
+      "64 GB UFS 2.1, microSD"
+    ],
+    [
+      "Display",
+      "5.8 in, 1440×2960 Super AMOLED"
+    ],
+    [
+      "Battery",
+      "3000 mAh"
+    ],
+    [
+      "Kernel",
+      "Mainline Linux 7.1 (sdm845-mainline)"
+    ],
+    [
+      "Released",
+      "2018"
+    ],
+    [
+      "Device layer",
+      "devices/samsung-starqltechn in github.com/Davitekk/ztOS (branch starqltechn-port)"
+    ]
+  ],
+  "install": {
+    "markdown": "## Installing ztOS on the Galaxy S9, Snapdragon (starqltechn)\n\n> **This erases the phone.** Android's data and everything in the phone's\n> storage are replaced. The phone's identity (IMEI, modem calibration, Wi-Fi\n> and Bluetooth addresses) and its sensor calibration are never written, and\n> are backed up to your computer first anyway. Only BOOT and USERDATA are\n> written: Android's other partitions stay, because ztOS loads the phone's own\n> firmware from them.\n\nOnly the Snapdragon Galaxy S9 with an unlockable bootloader works: **SCV38**\n(au, Japan) and **SM-G9600** (China, Hong Kong, Taiwan). The US and Canadian\nSM-G960U, U1 and W cannot be unlocked. The Exynos S9 (SM-G960F, N) is\n`starlte`, the main ztOS port, with its own guide.\n\n### What you need\n\n- A computer with Windows 10 or 11 (tested), or Linux, with 60 GB free and an internet connection\n- A USB-C data cable (some only charge)\n- The phone charged above 50 %\n- About 3 hours the first time, mostly waiting for the build\n\n### 1. Install the tools on your computer\n\nOn **Windows**:\n\n1. [Git for Windows](https://git-scm.com/download/win): its Git Bash runs every command below.\n2. [Docker Desktop](https://www.docker.com/products/docker-desktop/), started once and left running.\n3. Google's [Android platform tools](https://developer.android.com/tools/releases/platform-tools), with the folder holding `adb.exe` added to your `PATH`.\n4. Samsung's [USB driver for Windows](https://developer.samsung.com/android-usb-driver) and Odin, Samsung's flashing tool (3.14 or later; Samsung has no official download page, so take it from a well-known source).\n\nOpen **Git Bash** and check:\n\n```sh\ndocker info --format '{{.ServerVersion}}'\nadb version\n```\n\nOn **Linux**, install Docker and `adb` (Arch: `sudo pacman -S docker android-tools`; Debian and Ubuntu: `sudo apt install docker.io adb`), and Heimdall instead of Odin (`heimdall`, `heimdall-flash`).\n\n### 2. Get the port\n\n```sh\ngit clone -c core.autocrlf=false --branch starqltechn-port https://github.com/Davitekk/ztOS.git\ncd ztOS\n```\n\n(`core.autocrlf=false` keeps the scripts' Unix line endings on Windows: the\nbuild runs them in Linux.)\n\n### 3. Unlock the bootloader\n\n1. Back up the phone. Unlocking erases it.\n2. In Android: Settings > About phone > Software information, tap **Build number** seven times.\n3. Settings > Developer options > **OEM unlocking**: on. No such switch? Connect to Wi-Fi and wait: Samsung can take up to 7 days after setup to show it.\n4. Turn the phone off. Hold **Volume Down + Bixby** and plug in the USB cable.\n5. On the warning screen, long-press **Volume Up** to unlock. The phone erases itself and restarts.\n6. Go through Android's setup quickly, and check that OEM unlocking is still on.\n\n### 4. Put TWRP in RECOVERY\n\n1. Download the official TWRP for the Galaxy S9 (Qualcomm), [twrp.me/samsung/samsunggalaxys9qcom.html](https://twrp.me/samsung/samsunggalaxys9qcom.html): the latest `.img.tar` (3.7.0_9-0 is the one tested).\n2. Turn the phone off. Hold **Volume Down + Bixby** and plug in the cable, then press **Volume Up**: download mode.\n3. In Odin, put the TWRP `.img.tar` in **AP**, untick **Auto Reboot** in Options, and press Start. (Linux: `heimdall flash --RECOVERY recovery.img --no-reboot`, with `recovery.img` taken out of the `.tar`.)\n4. When Odin says PASS, hold **Volume Down + Power** until the screen goes black, then at once **Volume Up + Bixby + Power** until TWRP appears. If Android starts instead, it puts its own recovery back: repeat this step.\n5. In TWRP, *Cancel* the password question and choose *Keep Read Only*.\n\nFrom now on, TWRP is always one button combination away: power off, then hold **Volume Up + Bixby + Power**.\n\n### 5. Back up the phone's identity\n\nWith the phone in TWRP and plugged in:\n\n```sh\nadb devices\ndevices/samsung-starqltechn/scripts/backup.sh\n```\n\n`adb devices` should list one device, as `recovery`. The backup saves EFS\n(IMEI, Wi-Fi and Bluetooth addresses), the modem's partitions, persist, BOOT\nand the rest that cannot be had back to `stock/starqltechn/`, each read twice\nand checked. Keep a copy of that folder somewhere safe. It stays out of git.\n\n### 6. Build ztOS\n\nChoose the user name and password you will log in with (the password is also\nfor `sudo`), and put them in the second command:\n\n```sh\ndevices/samsung-starqltechn/docker/run.sh devices/samsung-starqltechn/kernel/build-kernel.sh\ndevices/samsung-starqltechn/docker/run.sh python3 installer/ztos build --target starqltechn --user YOURNAME --password YOURPASSWORD\ndevices/samsung-starqltechn/docker/run.sh sh devices/samsung-starqltechn/scripts/root-chunks.sh build/ztos/starqltechn/root.img build/ztos/starqltechn/root-chunks\ndevices/samsung-starqltechn/docker/run.sh --export build/ztos/starqltechn/root-chunks build/ztos/starqltechn/stage/boot/ztos-starqltechn-boot.img\n```\n\n| Step | Time the first time |\n|---|---|\n| The kernel | 30 to 60 minutes |\n| The system | 30 to 60 minutes |\n| The pieces and the export | about 10 minutes |\n\nEverything builds in a Docker volume (`ztos-starqltechn-build`) that is kept\nbetween runs, so later builds are much quicker. The system image is 10 GB,\nmostly empty; it comes out as about 2.5 GB of checked pieces in\n`build/ztos/starqltechn/root-chunks`.\n\n### 7. Install it\n\nWith the phone in TWRP and plugged in:\n\n```sh\ndevices/samsung-starqltechn/scripts/flash-root.sh build/ztos/starqltechn/root-chunks\ndevices/samsung-starqltechn/scripts/flash.sh BOOT build/ztos/starqltechn/stage/boot/ztos-starqltechn-boot.img\nadb reboot\n```\n\n`flash-root.sh` writes the system to USERDATA in 256 MiB pieces, each read\nback and checked: 10 to 20 minutes. If the cable comes out, run it again and\nit carries on. `flash.sh` writes ztOS's boot image to BOOT and reads it back.\n\n### 8. Start ztOS\n\nThe first start takes about a minute while the system grows to fill the\nstorage. Then log in with your user and password, and the Welcome app shows\nhow ztOS works. With internet, Android apps set themselves up in the\nbackground on the first start (Waydroid downloads about 1 GB once).\n\nOver the USB cable the phone is also a network: `ssh YOURNAME@172.16.42.1`\n(the computer gets 172.16.42.2), and a serial console (a COM port on\nWindows, `/dev/ttyACM0` on Linux).\n\n### Upgrading to a new version, keeping your data\n\nA new ztOS version is a new system image, and writing it replaces USERDATA.\n`upgrade.sh` keeps your data across it: your home (settings, files, Android's\napps), Wi-Fi networks, Bluetooth pairings, calls and messages, the access\npoint and your password. Build the new version as in step 6, with the same\nuser name, then:\n\n1. With the old ztOS running and the cable in:\n\n   ```sh\n   devices/samsung-starqltechn/scripts/upgrade.sh save\n   ```\n\n2. In TWRP, step 7.\n3. When the new ztOS shows its lock screen:\n\n   ```sh\n   devices/samsung-starqltechn/scripts/upgrade.sh restore backups/starqltechn/ztos-data-DATE.tar.gz\n   ```\n\n   The phone restarts with your data. The saved file holds Wi-Fi passwords and\n   messages: it stays in `backups/`, out of git.\n\n### If something goes wrong\n\n| What you see | What to do |\n|---|---|\n| `the phone is not in TWRP` | Start TWRP (Volume Up + Bixby + Power), try another cable or USB port, then `adb devices` |\n| `stock/starqltechn/... missing: run backup.sh first` | Step 5: `flash.sh` will not write BOOT without the backup |\n| `USERDATA is still mounted in TWRP` | In TWRP, Mount, untick Data, then run `flash-root.sh` again |\n| The build fails at its start on Windows | Docker Desktop must be running; check with `docker info` |\n| `$'\\r': command not found` | The clone has Windows line endings: clone again with `-c core.autocrlf=false` (step 2) |\n| The phone shows ztOS's rescue screen | The system was not found: run step 7 again from TWRP |\n| No `ssh` over USB | The phone gives the computer 172.16.42.2: set that USB network adapter to automatic (DHCP) |\n\n### Back to Android\n\nFrom TWRP, put Samsung's kernel back, then flash Samsung's firmware for your\nmodel with Odin from download mode:\n\n```sh\ndevices/samsung-starqltechn/scripts/flash.sh BOOT stock/starqltechn/boot.img\n```"
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage (UFS)",
+      "status": "working",
+      "notes": "Samsung's bootloader, U-Boot, the kernel; if the root is not found, a rescue shell on USB"
+    },
+    {
+      "category": "Display",
+      "feature": "Panel, 1440x2960",
+      "status": "working",
+      "notes": "S6E3HA8 (DSI, MSM DPU)"
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": "Samsung's AOR table, 573 steps"
+    },
+    {
+      "category": "3D",
+      "feature": "GPU",
+      "status": "working",
+      "notes": "Adreno 630 through freedreno"
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": "S6SY761, multi-touch"
+    },
+    {
+      "category": "Input",
+      "feature": "Power, volume and Bixby keys",
+      "status": "working",
+      "notes": "Bixby is KEY_ASSISTANT"
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "working",
+      "notes": "ztOSIAL's generic Haptics1"
+    },
+    {
+      "category": "Input",
+      "feature": "Notification light",
+      "status": "working",
+      "notes": "MAX77705 RGB: red while charging, green when full, a red blink at 15 % and below; colour and blink through ztOSIAL Lights1"
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charger",
+      "status": "working",
+      "notes": "MAX17042 gauge, MAX77705 charger"
+    },
+    {
+      "category": "Power",
+      "feature": "Clock across reboots",
+      "status": "working",
+      "notes": "The PMIC's RTC with a saved offset (ztos-starq-rtc); the AP may not set it"
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": "BCM4361 B2 on PCIe (brcmfmac), the phone's own MAC address"
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "working",
+      "notes": "BCM4361 on UART6 at 3 Mbaud, the phone's own address; scanning, pairing and headphone audio tried"
+    },
+    {
+      "category": "Network",
+      "feature": "Mobile data (4G)",
+      "status": "working",
+      "notes": "ModemManager over QRTR (1.24.2 with a use-after-free fixed: it crashed on data reconnects), NetworkManager; the access point from the SIM's operator"
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking to a computer",
+      "status": "working",
+      "notes": "RNDIS: 172.16.42.1 (the computer gets 172.16.42.2), plus a serial console"
+    },
+    {
+      "category": "Modem",
+      "feature": "SIM, registration, signal",
+      "status": "working",
+      "notes": "4G; EFS (IMEI, calibration) is never written"
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "working",
+      "notes": "Sending and receiving tried"
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "working",
+      "notes": "Placing and receiving calls with voice both ways, earpiece and speakerphone, mute, keypad tones; over 2G/3G (CSFB), as VoLTE needs Android's IMS stack. The mics reach the call through ztos-starq-call-uplink (q6voiced only prepares the voice PCM, and the codec's SLIMbus mic channels start with a star"
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "partial",
+      "notes": "WCD9340 and the MAX98512 pair, both speakers; media through PipeWire. Still a little quieter than stock: stock drives the speakers harder under Samsung's speaker management (Maxim DSM) on the DSP, which ztOS does not have. The amp is at its most (analog 18 dB, boost 10 V), and a filter on the speake"
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphones",
+      "status": "working",
+      "notes": "Both digital mics record (bottom: DMIC0, top: DMIC2). What made them work: the codec's DMIC1 pins in the driven mode Samsung's audio HAL sets at boot (\"DMIC1_CLK/DATA_PIN_MODE 0\", patch-wcd934x.py). Raw level, as stock's unprocessed path; stock adds +7 dB (DEC7/DEC8 Volume 91) for recordings"
+    },
+    {
+      "category": "Audio",
+      "feature": "Wired Headphones",
+      "status": "working",
+      "notes": "Media plays, a little quietly; the WCD9340's headphone output (UCM's Headphones)"
+    },
+    {
+      "category": "Audio",
+      "feature": "Headset Microphone",
+      "status": "broken",
+      "notes": "Its DSP port (SLIMBUS_1_TX) does not start; left out of the profile (did not test thoroughly)"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, light, proximity",
+      "status": "working",
+      "notes": "On the sensor DSP (SLPI), through hexagonrpcd, libssc and iio-sensor-proxy"
+    },
+    {
+      "category": "Storage",
+      "feature": "microSD",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "untested",
+      "notes": "No fix in one try indoors; not tried outside yet"
+    },
+    {
+      "category": "Camera",
+      "feature": "Cameras",
+      "status": "broken",
+      "notes": "Not started. No mainline drivers for the sensors"
+    },
+    {
+      "category": "Other",
+      "feature": "Fingerprint, NFC/FeliCa, iris, heart rate",
+      "status": "broken",
+      "notes": "Not started."
+    }
+  ],
+  "notes": [
+    {
+      "title": "Media is a little quieter than on stock Android.",
+      "text": "Stock drives the speakers harder under Samsung's speaker management on the DSP, which ztOS does not have; ztOS runs the amp at its most and a compressor and limiter on the speakers."
+    },
+    {
+      "title": "Calls go over 2G/3G, not VoLTE.",
+      "text": "VoLTE needs Android's IMS stack. ztOS sets the modem to CS calls at each start, so incoming calls arrive too."
+    },
+    {
+      "title": "The headset's microphone does not work.",
+      "text": "Wired headphones play, but calls and recordings use the phone's own mics."
+    },
+    {
+      "title": "When TWRP is flashed, Android must not start before TWRP has once...",
+      "text": "...or it puts Samsung's recovery back: go from Odin's PASS straight to Volume Up + Bixby + Power."
+    },
+    {
+      "title": "A new ztOS version means writing the system again...",
+      "text": "...which replaces USERDATA; scripts/upgrade.sh saves your data before and puts it back after."
+    }
+  ]
+}

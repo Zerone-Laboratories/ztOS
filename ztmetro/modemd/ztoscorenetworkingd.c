@@ -21,9 +21,14 @@
  *	sms NUMBER TEXT		one message, in PDU mode (text mode is refused
  *				by this modem)
  *
- * Nothing is written to EFS: the modem's file channel is drained, unanswered.
+ * Nothing is written to EFS. The modem's file channel is read, and its
+ * requests may be answered without storing anything (see "what the modem
+ * asks of us at its start" below), each answer behind its own flag file.
  */
 #define _GNU_SOURCE
+#include <ctype.h>
+#include <dirent.h>
+#include <pwd.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -61,6 +66,7 @@ struct state {
 	int wifi_bars;		/* -1 no link, 0..3 */
 	char call[12];		/* "", dialing, ringing (theirs), incoming, active */
 	char call_number[32];
+	char ipc[8];		/* "", alive, silent: does the CP answer IPC probes (debug only) */
 };
 static struct state now = { "?", "", -1, 0, 0, 0, -1, -1, -1, false, false, false, "", -1 };
 static struct state written;
@@ -108,9 +114,17 @@ static void tell_shell(const char *line)
 	}
 }
 
+static long ms(void);
+static double ipc_last_rx;	/* boot time (s) of the last frame from the CP on umts_ipc0 */
+
+/* Written when something the shell shows changes; and, at most once a
+ * minute and without poking the shell, when only ipc_last_rx moved. */
 static void publish(void)
 {
-	if (written_once && memcmp(&now, &written, sizeof(now)) == 0)
+	static double written_ipc_rx;
+	static long written_at;
+	bool same = written_once && memcmp(&now, &written, sizeof(now)) == 0;
+	if (same && (ipc_last_rx == written_ipc_rx || ms() - written_at < 60000))
 		return;
 	mkdir(STATUS_DIR, 0755);
 	FILE *f = fopen(STATUS ".new", "w");
@@ -130,12 +144,16 @@ static void publish(void)
 		 * registered: a registered radio is not in airplane mode) */
 		now.airplane && reg != 1 && reg != 5, now.data, now.data_on,
 		now.ip, now.wifi_bars);
+	fprintf(f, "ipc=%s\nipc_last_rx=%.0f\n", now.ipc[0] ? now.ipc : "?", ipc_last_rx);
 	fclose(f);
 	chmod(STATUS ".new", 0644);
 	rename(STATUS ".new", STATUS);
 	written = now;
 	written_once = true;
-	tell_shell("modem\n");
+	written_ipc_rx = ipc_last_rx;
+	written_at = ms();
+	if (!same)
+		tell_shell("modem\n");
 }
 
 /* ---- the AT port: one command at a time, a queue behind it --------------- */
@@ -281,7 +299,7 @@ static int sms_job_head, sms_job_count;
 static void send_sms(const char *number, const char *text);
 static void sms_next(void);
 static void sms_finish(bool ok);
-static unsigned concat_ref, concat_total, concat_part, concat_dcs;
+static unsigned concat_ref, concat_total, concat_part, concat_dcs, sms_pid;
 static bool sms_test;
 static const char *sms_test_dir;
 
@@ -304,6 +322,9 @@ static void log_line(const char *path, const char *fmt, ...)
 	va_start(ap, fmt);
 	vfprintf(f, fmt, ap);
 	va_end(ap);
+	/* it may be the only copy of a message: the phone can reset in a sleep */
+	if (!fflush(f))
+		fsync(fileno(f));
 	fclose(f);
 	chmod(path, 0644);
 }
@@ -378,6 +399,7 @@ static bool sms_decode(const char *hex, char *number, size_t number_size, char *
 	}
 	number[o] = 0;
 	at += bytes;
+	sms_pid = b[at];
 	unsigned dcs = b[at + 1];
 	at += 2 + 7;				/* protocol, coding, the centre's time stamp */
 	size_t udl = b[at++], skip = 0;
@@ -466,8 +488,9 @@ static bool sms_decode(const char *hex, char *number, size_t number_size, char *
 	return true;
 }
 
-/* Parts stay on disk across daemon restarts. A completed set is kept for a
- * day to ignore SIM redelivery; a reused reference then starts a fresh set. */
+/* Parts stay on disk across daemon restarts, until the set is whole or a day
+ * has passed. Redelivery is sms_seen's to catch, by the whole PDU: a reference
+ * is only one byte, and some senders use the same one for every message. */
 static bool sms_join(const char *number, char *text, size_t size)
 {
 	if (!concat_total) return true;
@@ -477,9 +500,7 @@ static bool sms_join(const char *number, char *text, size_t size)
 	const char *dir = sms_test_dir ? sms_test_dir : SMS_DIR;
 	mkdir(dir, 0755);
 	snprintf(base, sizeof(base), "%s/parts-%08x-%u-%u-%u", dir, hash, concat_ref, concat_total, concat_dcs);
-	snprintf(path, sizeof(path), "%s.done", base);
 	struct stat st;
-	if (stat(path, &st) == 0 && time(NULL) - st.st_mtime < 86400) return false;
 	snprintf(path, sizeof(path), "%s.%u", base, concat_part);
 	FILE *f = fopen(path, "w");
 	if (!f) return false;
@@ -500,14 +521,79 @@ static bool sms_join(const char *number, char *text, size_t size)
 	}
 	joined[used] = 0;
 	memcpy(text, joined, used + 1);
+	for (unsigned i = 1; i <= concat_total; i++) {
+		snprintf(path, sizeof(path), "%s.%u", base, i);
+		unlink(path);
+	}
 	return true;
+}
+
+/* Who to say it is from: their name in the session user's People, as the
+ * apps match it (the last nine digits), or what the network gave. */
+static void sms_who(const char *number, char *who, size_t size)
+{
+	snprintf(who, size, "%s", number);
+	char want[12] = "", path[300], line[1024];
+	size_t n = 0;
+	for (const char *c = number; *c; c++) {
+		if (!isdigit((unsigned char)*c)) {
+			if (!strchr("+ ", *c))
+				return;		/* a name already */
+			continue;
+		}
+		if (n < 9)
+			want[n++] = *c;
+		else {
+			memmove(want, want + 1, 8);
+			want[8] = *c;
+		}
+	}
+	want[n] = 0;
+	if (n < 7)
+		return;
+	for (int uid = 1000; uid < 1010; uid++) {
+		struct passwd *pw = getpwuid((uid_t)uid);
+		if (!pw)
+			continue;
+		snprintf(path, sizeof(path), "%s/.local/share/ztmetro/contacts", pw->pw_dir);
+		FILE *f = fopen(path, "r");
+		while (f && fgets(line, sizeof(line), f)) {
+			char *cursor = line, *name = strsep(&cursor, "\t\n");
+			/* name, mobile, other: the fields the apps match on */
+			for (int k = 0; k < 2 && cursor; k++) {
+				char *field = strsep(&cursor, "\t\n");
+				char digits[32];
+				size_t d = 0;
+				for (const char *c = field; *c && d + 1 < sizeof(digits); c++)
+					if (isdigit((unsigned char)*c))
+						digits[d++] = *c;
+				digits[d] = 0;
+				if (d >= n && !strcmp(digits + d - n, want)) {
+					snprintf(who, size, "%s", name);
+					for (char *w = who; *w; w++)
+						if (*w == '|')
+							*w = '/';
+					fclose(f);
+					return;
+				}
+			}
+		}
+		if (f)
+			fclose(f);
+	}
 }
 
 static void sms_arrived(const char *pdu)
 {
-	char number[40], text[8192], escaped[16384], note[330];
+	char number[40], text[8192], escaped[16384], note[400];
 	if (!sms_decode(pdu, number, sizeof(number), text, sizeof(text))) {
 		fprintf(stderr, "ztoscorenetworkingd: a message that could not be read\n");
+		return;
+	}
+	/* 23.040: type 0 is to be acknowledged and thrown away, unseen (a
+	 * network's ping); the person never has one to read */
+	if (sms_pid == 0x40) {
+		fprintf(stderr, "ztoscorenetworkingd: a silent message (ignored)\n");
 		return;
 	}
 	if (!sms_join(number, text, sizeof(text))) return;
@@ -527,30 +613,75 @@ static void sms_arrived(const char *pdu)
 	}
 	escaped[o] = 0;
 	log_line(SMS_LOG, "in\t%ld\t%s\t%s\n", (long)time(NULL), number, escaped);
-	if (concat_total) {
-		unsigned hash = 2166136261u;
-		for (const unsigned char *c = (const unsigned char *)number; *c; c++) hash = (hash ^ *c) * 16777619u;
-		char path[550];
-		snprintf(path, sizeof(path), "%s/parts-%08x-%u-%u-%u.done", sms_test_dir ? sms_test_dir : SMS_DIR,
-			hash, concat_ref, concat_total, concat_dcs);
-		FILE *done = fopen(path, "w");
-		if (done) fclose(done);
-	}
 	fprintf(stderr, "ztoscorenetworkingd: a message came in (%zu characters)\n", strlen(text));
-	for (char *c = escaped; *c; c++)
-		if (*c == '|')
-			*c = '/';
-	snprintf(note, sizeof(note), "notify Messaging|%s|%.240s\n", number, escaped);
+	/* the banner: one line, nothing of the shell's own format, whole characters */
+	char line[241];
+	size_t cut = strlen(text) < sizeof(line) - 1 ? strlen(text) : sizeof(line) - 1;
+	while (cut && ((unsigned char)text[cut] & 0xc0) == 0x80)
+		cut--;
+	memcpy(line, text, cut);
+	line[cut] = 0;
+	for (char *c = line; *c; c++)
+		if (*c == '\n' || *c == '\r' || *c == '\t' || *c == '|')
+			*c = *c == '|' ? '/' : ' ';
+	char who[64];
+	sms_who(number, who, sizeof(who));
+	snprintf(note, sizeof(note), "notify Messaging|%s|%s\n", who, line);
 	if (!sms_test) tell_shell(note);
 	else fprintf(stderr, "test notification: %s", note);
+}
+
+/* A message (its PDU, the SMS centre first) taken in the last day, by
+ * either way it comes (IPC 0402, or AT +CMGR): SMS_DIR/seen-<FNV of the
+ * PDU>. The PDU carries the centre's time stamp, so the same PDU again is
+ * the network or the modem delivering it again (no delivery report is sent
+ * over IPC yet), not a new message. Marks older than a day go at start. */
+static bool sms_seen(const char *pdu)
+{
+	unsigned hash = 2166136261u;
+	for (const char *c = pdu; *c; c++) {
+		char u = *c >= 'a' && *c <= 'f' ? (char)(*c - 32) : *c;
+		hash = (hash ^ (unsigned char)u) * 16777619u;
+	}
+	const char *dir = sms_test_dir ? sms_test_dir : SMS_DIR;
+	char path[512];
+	mkdir(dir, 0755);
+	snprintf(path, sizeof(path), "%s/seen-%08x", dir, hash);
+	struct stat st;
+	if (stat(path, &st) == 0 && time(NULL) - st.st_mtime < 86400)
+		return true;
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd >= 0) {
+		futimens(fd, NULL);
+		close(fd);
+	}
+	return false;
+}
+
+static void sms_seen_prune(void)
+{
+	const char *dir = sms_test_dir ? sms_test_dir : SMS_DIR;
+	DIR *d = opendir(dir);
+	struct dirent *e;
+	while (d && (e = readdir(d))) {
+		char path[512];
+		struct stat st;
+		/* a part whose other parts never came goes with them */
+		if (strncmp(e->d_name, "seen-", 5) && strncmp(e->d_name, "parts-", 6))
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+		if (stat(path, &st) == 0 && time(NULL) - st.st_mtime >= 86400)
+			unlink(path);
+	}
+	if (d)
+		closedir(d);
 }
 
 /* ---- calls ----------------------------------------------------------------
  *
  * By AT: ATD<number>; dials, ATA answers, AT+CHUP ends. While there is a
  * call the modem is asked for its list (AT+CLCC) every two seconds; RING and
- * +CLIP announce one coming in. The sound of a call is not routed yet (the
- * audio driver has no voice path), so a call connects and is silent.
+ * +CLIP announce one coming in. The sound of a call: call_audio below.
  *
  * CALL_LOG, one line each, tab separated: out|in|missed, <unix time>,
  * <number>, <seconds it lasted>.
@@ -561,8 +692,26 @@ static bool call_incoming, call_seen, fake_call;
  * active (stat 0) while it still rings, so a call coming in is only active
  * once it was answered here. */
 static bool call_answering;
+/* This call was dialled here. The modem's list says nothing useful about one:
+ * a call to 0777717794 came back "+CLCC: 0,1,0,4,0" (direction 1, stat 0, as a
+ * call coming in) while it was still ringing at the far end, and went to the
+ * "incoming" screen with the ringtone on top of the call (2026-10-30). The
+ * modem's own report says when it is answered: call_connected. */
+static bool call_dialled, call_connected;
 static int empty_lists;	/* AT+CLCC answered with no call, in a row */
 static long fake_until;
+/* Hang-up, as the person sees it, is at once: the call is over here and the
+ * modem is told, while the list goes on being asked until it agrees. Until then
+ * what it says about that call changes nothing; if it never agrees, the call
+ * comes back on screen rather than running on unseen. */
+#define RELEASE_GIVE_UP_MS	10000
+static long release_since, release_again_at, release_next_poll;
+/* What was said of the call let go may still be arriving when the next one
+ * starts: its one "over" is not the new call's. */
+static long stale_end_until;
+/* A ring this long after the hang-up is a call, new or not let go. */
+#define RELEASE_RING_MS		4000
+static bool release_saw_call;
 
 
 /*
@@ -570,8 +719,11 @@ static long fake_until;
  * snd-zrn-abox drives: its "Voice Call" control puts the DSP in call mode and
  * the amplifiers on the earpiece or the speaker. The modem is told as
  * Samsung's RIL does (libsec-ril IpcProtocol41): the sound clock on
- * (IpcTxSndSetClockCtrl, 09 09 exec) and the audio path (IpcTxSndSetAudioPath,
- * 09 03 set, [path, 0]; 1 handset, 6 speaker).
+ * (IpcTxSndSetClockCtrl, 09 09 exec), the audio path (IpcTxSndSetAudioPath,
+ * 09 03 set, [path, 0]; 1 handset, 6 speaker) and the volume (IpcTxSndSetVolume,
+ * 09 01 set, [device, level]). The DSP first, so the firmware is up when the
+ * modem starts on it. Sound is on from dialling: the network's own ringback
+ * and announcements are part of the call.
  */
 static int call_audio_route;	/* 0 off, 1 earpiece, 2 speaker */
 static void ipc_send(int main_cmd, int sub, int type, const unsigned char *data, size_t len);
@@ -585,16 +737,26 @@ static void call_audio(int route)
 		return;
 	if (route) {
 		unsigned char on = 1, path[2] = { route == 2 ? 6 : 1, 0 };
-		if (!call_audio_route)
+		unsigned char volume[2] = { route == 2 ? 0x11 : 0x01, 4 };
+		snprintf(cmd, sizeof(cmd), "amixer -q -c0 cset name='Voice Call' %s", names[route]);
+		if (system(cmd))
+			fprintf(stderr, "ztoscorenetworkingd: %s: failed\n", cmd);
+		if (!call_audio_route) {
+			/* every call starts unmuted, as Android's does: the modem keeps
+			 * its mute from call to call, whoever left it on */
+			unsigned char unmuted = 0;
 			ipc_send(0x09, 0x09, 1, &on, 1);
+			ipc_send(0x09, 0x02, 3, &unmuted, 1);
+		}
 		ipc_send(0x09, 0x03, 3, path, 2);
+		ipc_send(0x09, 0x01, 3, volume, 2);
 	} else {
 		unsigned char off = 0;
 		ipc_send(0x09, 0x09, 1, &off, 1);
+		snprintf(cmd, sizeof(cmd), "amixer -q -c0 cset name='Voice Call' %s", names[route]);
+		if (system(cmd))
+			fprintf(stderr, "ztoscorenetworkingd: %s: failed\n", cmd);
 	}
-	snprintf(cmd, sizeof(cmd), "amixer -q -c0 cset name='Voice Call' %s", names[route]);
-	if (system(cmd))
-		fprintf(stderr, "ztoscorenetworkingd: %s: failed\n", cmd);
 	fprintf(stderr, "ztoscorenetworkingd: call audio: %s\n", names[route]);
 	call_audio_route = route;
 }
@@ -606,15 +768,15 @@ static void call_set(const char *state, const char *number)
 		call_since = time(NULL);
 		call_answered_at = 0;
 		call_answering = false;
+		call_connected = false;
 		empty_lists = 0;
 		call_incoming = !strcmp(state, "incoming");
+		call_dialled = !strcmp(state, "dialing");
 	}
 	if (!strcmp(state, "active") && !call_answered_at)
 		call_answered_at = time(NULL);
-	if (!fake_call && !strcmp(state, "active") && !call_audio_route)
+	if (!fake_call && !call_audio_route && (!strcmp(state, "active") || !strcmp(state, "dialing") || !strcmp(state, "ringing")))
 		call_audio(1);
-	if (!state[0] && call_audio_route)
-		call_audio(0);
 	if (!state[0] && now.call[0]) {
 		/* over: into the log */
 		if (!call_result[0]) snprintf(call_result, sizeof(call_result), "ended");
@@ -635,6 +797,17 @@ static void call_set(const char *state, const char *number)
 		snprintf(now.call_number, sizeof(now.call_number), "%s", number);
 	/* Calls must reach the UI even while an unrelated AT command is pending. */
 	publish();
+	/* (after the report: taking the sound down takes a moment) */
+	if (!state[0] && call_audio_route)
+		call_audio(0);
+}
+
+/* the modem has let the call go, one way or another */
+static void release_done(const char *how)
+{
+	if (release_since)
+		fprintf(stderr, "ztoscorenetworkingd: hangup: modem done after %ld ms (%s)\n", ms() - release_since, how);
+	release_since = 0;
 }
 
 static void on_line(char *l)
@@ -651,6 +824,14 @@ static void on_line(char *l)
 			raw_at[0] = 0;
 	}
 	if (!strcmp(l, "NO CARRIER") || !strcmp(l, "BUSY") || !strcmp(l, "NO ANSWER") || !strcmp(l, "NO DIALTONE")) {
+		if (stale_end_until && ms() < stale_end_until && now.call[0] && !release_since) {
+			stale_end_until = 0;
+			fprintf(stderr, "ztoscorenetworkingd: %s: the call before this one\n", l);
+			if (busy && (!strncmp(sent, "ATD", 3) || !strncmp(sent, "ATA", 3)))
+				busy = false;
+			return;
+		}
+		release_done(l);
 		snprintf(call_result, sizeof(call_result), "%s", !strcmp(l, "BUSY") ? "busy" : "drop");
 		call_set("", "");
 		if (busy && (!strncmp(sent, "ATD", 3) || !strncmp(sent, "ATA", 3)))
@@ -665,6 +846,9 @@ static void on_line(char *l)
 		if (!strncmp(sent, "AT+CLCC", 7) && !strcmp(l, "OK")) {
 			/* the list is empty twice running: it is over (once may be a late
 			 * OK, to an ATA, taken for the list's) */
+			if (release_since && !call_seen)
+				release_done("list empty");
+			release_saw_call = call_seen;
 			empty_lists = call_seen ? 0 : empty_lists + 1;
 			if (!fake_call && empty_lists >= 2 && now.call[0])
 				call_set("", "");
@@ -754,10 +938,18 @@ static void on_line(char *l)
 		sms_index = atoi(l + 6);
 	} else if (sms_index != -1 && strlen(l) > 20 && strspn(l, "0123456789ABCDEFabcdef") == strlen(l)) {
 		/* the message itself; then it is taken off the SIM */
-		sms_arrived(l);
+		if (!sms_seen(l))
+			sms_arrived(l);
+		else
+			fprintf(stderr, "ztoscorenetworkingd: a message already taken, again (ignored)\n");
 		if (sms_index >= 0)
 			queue_at("AT+CMGD=%d", sms_index);
 		sms_index = -1;
+	} else if (release_since && ms() - release_since < RELEASE_RING_MS &&
+		   (!strcmp(l, "RING") || !strncmp(l, "+CRING", 6) || !strncmp(l, "+CLIP:", 6))) {
+		/* the call being let go, still ringing */
+	} else if (release_since && !now.call[0] && !strncmp(l, "+CLCC:", 6)) {
+		call_seen = true;
 	} else if (!strcmp(l, "RING") || !strncmp(l, "+CRING", 6)) {
 		if (strcmp(now.call, "incoming"))
 			fprintf(stderr, "ztoscorenetworkingd: modem: %s\n", l);
@@ -785,7 +977,10 @@ static void on_line(char *l)
 			call_seen = true;
 			const char *state = stat == 0 ? "active" : stat == 2 ? "dialing" : stat == 3 ? "ringing" :
 				stat == 4 || stat == 5 ? "incoming" : "active";
-			if (!strcmp(state, "active") && (dir == 1 || call_incoming) && !call_answering)
+			if (call_dialled) {
+				if (strcmp(state, "dialing"))
+					state = call_connected ? "active" : "ringing";
+			} else if (!strcmp(state, "active") && (dir == 1 || call_incoming) && !call_answering)
 				state = "incoming";
 			if (strcmp(state, now.call))
 				fprintf(stderr, "ztoscorenetworkingd: modem: +CLCC:%s -> %s\n", l + 6, state);
@@ -1030,25 +1225,45 @@ static void send_sms(const char *number, const char *text)
 static bool ipc_log;		/* with /var/lib/ztoscorenetworking/debug: every message, and a probe with the poll */
 static unsigned char ipc_seq;
 
-static void ipc_send(int main_cmd, int sub, int type, const unsigned char *data, size_t len)
+/* aseq: the sequence number of the message this one answers (a confirm
+ * carries the indication's), 0xff for none. False, with errno, if the
+ * driver refused it. */
+static bool ipc_write(int main_cmd, int sub, int type, int aseq, const unsigned char *data, size_t len)
 {
 	unsigned char msg[512];
-	if (ipc_fd < 0 || len > sizeof(msg) - 7)
-		return;
+	if (ipc_fd < 0 || len > sizeof(msg) - 7) {
+		errno = ipc_fd < 0 ? EBADF : EMSGSIZE;
+		return false;
+	}
 	ipc_seq = ipc_seq % 254 + 1;
 	msg[0] = (7 + len) & 0xff;
 	msg[1] = (7 + len) >> 8;
 	msg[2] = ipc_seq;
-	msg[3] = 0xff;
+	msg[3] = (unsigned char)aseq;
 	msg[4] = main_cmd;
 	msg[5] = sub;
 	msg[6] = type;
 	if (len)
 		memcpy(msg + 7, data, len);
-	if (write(ipc_fd, msg, 7 + len) < 0)
-		fprintf(stderr, "ztoscorenetworkingd: ipc write: %s\n", strerror(errno));
-	else if (ipc_log)
+	if (write(ipc_fd, msg, 7 + len) < 0) {
+		int e = errno;
+		fprintf(stderr, "ztoscorenetworkingd: ipc write: %s\n", strerror(e));
+		errno = e;
+		return false;
+	}
+	if (ipc_log)
 		fprintf(stderr, "ztoscorenetworkingd: ipc -> %02x%02x t%d, %zu bytes\n", main_cmd, sub, type, len);
+	return true;
+}
+
+static void ipc_send(int main_cmd, int sub, int type, const unsigned char *data, size_t len)
+{
+	ipc_write(main_cmd, sub, type, 0xff, data, len);
+}
+
+static bool ipc_send_ack(int main_cmd, int sub, int type, int aseq, const unsigned char *data, size_t len)
+{
+	return ipc_write(main_cmd, sub, type, aseq, data, len);
 }
 
 /* ---- packet data, through IPC ---------------------------------------------
@@ -1281,13 +1496,334 @@ static void data_keep(void)
 		data_activate();
 }
 
-static void ipc_message(int main_cmd, int sub, int type, const unsigned char *data, size_t len)
+/* The Hutch workaround's 080a (WCDMA/GSM only): at most HUTCH_SENDS each
+ * registration change, then HUTCH_HOLD_MS without; none with the screen off;
+ * none after one the modem did not answer (8001), until the registration
+ * changes or the modem restarts. 29 Oct: 306 sends in 5 h, every 60 s,
+ * unanswered, the phone on LTE all along. */
+#define HUTCH_SENDS	3
+#define HUTCH_HOLD_MS	600000L
+static int hutch_sends;
+static bool hutch_waiting, hutch_dead;
+static long hutch_hold_until;
+
+static void at_setup(void);
+static void poll_state(void);
+
+/* What stock's libsec-ril does when the screen goes off or on (Android's
+ * unsolicited-response filter, MiscManager::DoScreenStateBehavior): a
+ * MISC_SCREEN_STATUS event (0a0f, type 5: 0 off, 1 on), so the CP holds back
+ * its indications (signal, icons, cell changes), each of which wakes the AP
+ * through the mailbox; and cell changes no longer reported (+CREG=1: only
+ * the registration). */
+static void screen_tell_modem(void)
+{
+	unsigned char state = screen_off ? 0 : 1;
+	ipc_send(0x0a, 0x0f, 5, &state, 1);
+	queue_at(screen_off ? "AT+CREG=1" : "AT+CREG=2");
+	queue_at(screen_off ? "AT+CGREG=1" : "AT+CGREG=2");
+	queue_at(screen_off ? "AT+CEREG=1" : "AT+CEREG=2");
+}
+
+/* ---- what the modem asks of us at its start --------------------------------
+ *
+ * At every start the CP asks three things that stock's libsec-ril answers
+ * and this daemon did not. In every boot the CP's IPC then went silent about
+ * 100 s after its start (the last message 0f36, SAR control, which wants no
+ * answer), and its file requests were retried for as long as the boot. The
+ * answers, from libsec-ril's code (REA/Ghidra on libsec-ril.so, sha256
+ * 4fa6207a...ccdf):
+ *
+ *  - RFS, on umts_rfs0, a request arriving in several reads (the link
+ *    header already taken off): u32 total length, u8 command, u8 id, ...
+ *	0x02 NvWrite (Nv::ProcessNvWrite): offset u32 @6, size u32 @10, data
+ *	     @14. Answered with 15 bytes: u32 0x0f, 0x02, id, ok, u32 offset,
+ *	     u32 bytes written. The data is never stored: cbd loads the real
+ *	     nv_data.bin at the next start, and nothing here touches EFS.
+ *	0x11 OpenFile (Nv::ProcessOpenFile): flags u32 @6, path length u32
+ *	     @10, path @14. Answered with 14 bytes: u32 0x0e, 0x11, id, i32 fd
+ *	     (-1: not opened), u32 errno (2, ENOENT).
+ *	0x06 CloseFile (Nv::ProcessCloseFile): handle i32 @6. Answered with
+ *	     14 bytes: u32 0x0e, 0x06, id, i32 -1, u32 errno (9, EBADF). The
+ *	     CP closes the handle -1 it was given, at once (seen 30 Oct).
+ *	Anything else is noted, not answered (each stock handler has its own
+ *	reply layout).
+ *  - 2601 indication (OesDrkCpInfo): confirmed with 2601 type 4, no data
+ *    (IpcTxCfrmOesDrkCpInfo), carrying the indication's sequence number.
+ *  - 0407 (SMS device ready): answered with 0407 set, no data
+ *    (IpcTxSetDeviceReady), once a start. 040c is not sent.
+ *
+ * Each answer only while its flag file is in FLAGS_DIR (reply-rfs,
+ * reply-cfrm, reply-smsready), read at start and at every modem start, and
+ * none while STATE_DIR/replies-off exists. That file is made by the crash
+ * guard: the modem starting again within 300 s of our first answer when
+ * this daemon did not ask for it, or the driver refusing two answers in a
+ * row. "replies" on the control pipe reads the files again at once.
+ * Restart only the modem (ztoscorenetworking-modem) to try a new set:
+ * restarting this daemon has been seen to leave the modem deaf to requests.
+ */
+static const char *flags_dir = "/etc/ztoscorenetworking";
+static const char *state_dir = "/var/lib/ztoscorenetworking";
+static bool reply_rfs, reply_cfrm, reply_smsready, replies_off;
+static double first_reply_at;	/* boot time of the first answer since the modem started; 0 none */
+static int reply_refusals;	/* answers the driver refused (EPERM, ENODEV) in a row */
+static bool cfrm_logged, smsready_logged;
+
+static double boot_s(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_BOOTTIME, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static bool flag_file(const char *dir, const char *name)
+{
+	char path[256];
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	return access(path, F_OK) == 0;
+}
+
+static void replies_load(void)
+{
+	reply_rfs = flag_file(flags_dir, "reply-rfs");
+	reply_cfrm = flag_file(flags_dir, "reply-cfrm");
+	reply_smsready = flag_file(flags_dir, "reply-smsready");
+	replies_off = flag_file(state_dir, "replies-off");
+	if (replies_off)
+		fprintf(stderr, "ztoscorenetworkingd: replies: off (crash guard)\n");
+	else
+		fprintf(stderr, "ztoscorenetworkingd: replies:%s%s%s%s\n", reply_rfs ? " rfs" : "",
+			reply_cfrm ? " cfrm" : "", reply_smsready ? " smsready" : "",
+			reply_rfs || reply_cfrm || reply_smsready ? "" : " (none)");
+}
+
+static bool replying(bool feature)
+{
+	return feature && !replies_off;
+}
+
+static void replies_switch_off(const char *why)
+{
+	char path[256];
+	if (replies_off)
+		return;
+	mkdir(state_dir, 0755);
+	snprintf(path, sizeof(path), "%s/replies-off", state_dir);
+	int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+	if (fd >= 0) {
+		if (dprintf(fd, "%s\n", why) < 0 || fsync(fd))
+			fprintf(stderr, "ztoscorenetworkingd: %s: %s\n", path, strerror(errno));
+		close(fd);
+	}
+	replies_off = true;
+	fprintf(stderr, "ztoscorenetworkingd: replies: %s; replies switched off\n", why);
+	tell_shell("notify Mobile network|Modem|Answers to the modem switched off: it restarted after them.\n");
+}
+
+/* every answer goes through here: the crash guard's bookkeeping */
+static void reply_done(bool ok, int err)
+{
+	if (ok) {
+		reply_refusals = 0;
+		if (!first_reply_at)
+			first_reply_at = boot_s();
+	} else if ((err == EPERM || err == ENODEV) && ++reply_refusals >= 2) {
+		replies_switch_off("the driver refused two answers in a row");
+	}
+}
+
+/* the modem (re)started: anything to blame on our answers? */
+static void replies_modem_started(void)
+{
+	double t = boot_s();
+	/* The CP's first file request comes just before its 0101: an answer
+	 * within the last 5 s belongs to this start. A CP brought down by an
+	 * answer comes back 20 s later at the earliest (cbd, the unit's
+	 * RestartSec). */
+	if (first_reply_at && t - first_reply_at > 5 && t - first_reply_at < 300 &&
+	    !(modem_restarted_at && ms() - modem_restarted_at < 60000)) {
+		char why[96];
+		snprintf(why, sizeof(why), "the modem restarted %.0f s after our first reply", t - first_reply_at);
+		replies_switch_off(why);
+	}
+	if (first_reply_at && t - first_reply_at > 5)
+		first_reply_at = 0;
+	cfrm_logged = smsready_logged = false;
+	replies_load();
+}
+
+/* RFS: requests put together from their reads, and answered */
+#define RFS_MAX		0x80000
+#define RFS_LOG_MAX	40
+static unsigned char rfs_buf[RFS_MAX];
+static size_t rfs_total, rfs_got;
+static long rfs_started;
+static int rfs_logged;
+
+static void rfs_note(const char *fmt, ...)
+{
+	va_list ap;
+	if (rfs_logged > RFS_LOG_MAX)
+		return;
+	if (rfs_logged++ == RFS_LOG_MAX) {
+		fprintf(stderr, "ztoscorenetworkingd: rfs: further requests not logged\n");
+		return;
+	}
+	fprintf(stderr, "ztoscorenetworkingd: ");
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+}
+
+static unsigned le32(const unsigned char *p)
+{
+	return p[0] | p[1] << 8 | p[2] << 16 | (unsigned)p[3] << 24;
+}
+
+static void put_le32(unsigned char *p, unsigned v)
+{
+	p[0] = v & 0xff;
+	p[1] = v >> 8 & 0xff;
+	p[2] = v >> 16 & 0xff;
+	p[3] = v >> 24;
+}
+
+static void rfs_request(void)
+{
+	unsigned cmd = rfs_buf[4], id = rfs_buf[5];
+	unsigned char reply[15];
+	size_t n = 0;
+	char name[68] = "";
+	if (cmd == 0x02 && rfs_total >= 14) {
+		unsigned offset = le32(rfs_buf + 6), size = le32(rfs_buf + 10);
+		if (size > RFS_MAX)
+			size = RFS_MAX;
+		reply[0] = 0x0f; reply[1] = reply[2] = reply[3] = 0;
+		reply[4] = 0x02;
+		reply[5] = (unsigned char)id;
+		reply[6] = 1;
+		put_le32(reply + 7, offset);
+		put_le32(reply + 11, size);
+		n = 15;
+	} else if (cmd == 0x11 && rfs_total >= 14) {
+		/* the file's name, for the log (a name, not a content) */
+		unsigned path_len = le32(rfs_buf + 10);
+		size_t at = 0;
+		for (size_t i = 0; i < path_len && 14 + i < rfs_total && at < sizeof(name) - 2; i++) {
+			unsigned char c = rfs_buf[14 + i];
+			if (!c)
+				break;
+			name[at++] = c >= 0x20 && c < 0x7f ? (char)c : '?';
+		}
+		name[at] = 0;
+		static const unsigned char enoent[14] = { 0x0e, 0, 0, 0, 0x11, 0, 0xff, 0xff, 0xff, 0xff, 2, 0, 0, 0 };
+		memcpy(reply, enoent, sizeof(enoent));
+		reply[5] = (unsigned char)id;
+		n = 14;
+	} else if (cmd == 0x06 && rfs_total >= 10) {
+		/* CloseFile (Nv::ProcessCloseFile): handle i32 @6. Nothing is ever
+		 * opened here, so: i32 -1, errno 9 (EBADF), in its 14 bytes */
+		static const unsigned char ebadf[14] = { 0x0e, 0, 0, 0, 0x06, 0, 0xff, 0xff, 0xff, 0xff, 9, 0, 0, 0 };
+		memcpy(reply, ebadf, sizeof(ebadf));
+		reply[5] = (unsigned char)id;
+		n = 14;
+	}
+	const char *outcome;
+	if (!n) {
+		outcome = "not answered";
+	} else if (!replying(reply_rfs)) {
+		outcome = "not served";
+	} else {
+		ssize_t w = write(rfs_fd, reply, n);
+		int e = errno;
+		reply_done(w == (ssize_t)n, w < 0 ? e : 0);
+		if (w != (ssize_t)n)
+			fprintf(stderr, "ztoscorenetworkingd: rfs: answer: %s\n", w < 0 ? strerror(e) : "short write");
+		outcome = w == (ssize_t)n ? "replied" : "reply failed";
+	}
+	rfs_note("rfs: request 0x%02x id %u, %zu bytes%s%s -> %s\n", cmd, id, rfs_total, name[0] ? " " : "", name,
+		outcome);
+}
+
+static void rfs_readable(void)
+{
+	unsigned char chunk[4096];
+	ssize_t got = read(rfs_fd, chunk, sizeof(chunk));
+	if (got <= 0)
+		return;
+	if (rfs_total && ms() - rfs_started > 2000) {
+		rfs_note("rfs: a partial request (%zu of %zu bytes) dropped after 2 s\n", rfs_got, rfs_total);
+		rfs_total = rfs_got = 0;
+	}
+	if (!rfs_total) {
+		size_t total = got >= 4 ? le32(chunk) : 0;
+		if (got < 6 || total < 6 || total > RFS_MAX) {
+			rfs_note("rfs: refused a read of %zd bytes (length %zu)\n", got, total);
+			return;
+		}
+		rfs_total = total;
+		rfs_got = 0;
+		rfs_started = ms();
+	}
+	if (rfs_got + (size_t)got > rfs_total) {
+		rfs_note("rfs: %zu bytes for a request of %zu; dropped\n", rfs_got + (size_t)got, rfs_total);
+		rfs_total = rfs_got = 0;
+		return;
+	}
+	memcpy(rfs_buf + rfs_got, chunk, (size_t)got);
+	rfs_got += (size_t)got;
+	if (rfs_got == rfs_total) {
+		rfs_request();
+		rfs_total = rfs_got = 0;
+	}
+}
+
+/* An SMS the CP hands over by IPC (0402), not stored on the SIM. Layout
+ * from libsec-ril (IpcProtocol41::IpcRxIncomingMsg): data[0] network type
+ * (2 GSM), data[5] the length of what follows, data+6 the SMS centre's
+ * address and the SMS-DELIVER, as AT+CMGR gives them. No delivery report
+ * (0406) is sent yet: its layout has not been read. */
+static void sms_via_ipc(const unsigned char *data, size_t len)
+{
+	if (len < 7 || data[0] != 2 || !data[5] || (size_t)data[5] > len - 6) {
+		fprintf(stderr, "ztoscorenetworkingd: sms via ipc: not a GSM message (%zu bytes)\n", len);
+		return;
+	}
+	char hex[2 * 255 + 1];
+	for (size_t i = 0; i < data[5]; i++)
+		sprintf(hex + 2 * i, "%02X", data[6 + i]);
+	hex[2 * data[5]] = 0;
+	if (sms_seen(hex)) {
+		fprintf(stderr, "ztoscorenetworkingd: sms via ipc: already taken (ignored)\n");
+		return;
+	}
+	fprintf(stderr, "ztoscorenetworkingd: sms via ipc (not acknowledged)\n");
+	sms_arrived(hex);
+}
+
+/* Is the CP's IPC alive? Asked only while finding out (the debug file): a
+ * 0501 get with the poll, answered by 0501 type 2. */
+static int probes_unanswered;
+static bool probe_out;
+
+static void ipc_probe(void)
+{
+	if (probe_out && ++probes_unanswered >= 3 && strcmp(now.ipc, "silent")) {
+		snprintf(now.ipc, sizeof(now.ipc), "silent");
+		fprintf(stderr, "ztoscorenetworkingd: ipc: CP silent since %.0fs (AT %s)\n", ipc_last_rx,
+			silent_polls ? "silent too" : "still answers");
+	}
+	ipc_send(0x05, 0x01, 2, NULL, 0);
+	probe_out = true;
+}
+
+static void ipc_message(int main_cmd, int sub, int type, int mseq, const unsigned char *data, size_t len)
 {
 	if (ipc_log) {
 		char hex[200] = "";
 		/* what is the phone's or the SIM's own is not written down: its
-		 * presence only */
-		bool private = (main_cmd == 0x0d && sub == 0x09) || main_cmd == 0x0a ||
+		 * presence only; nor any SMS (main 04) */
+		bool private = (main_cmd == 0x0d && sub == 0x09) || main_cmd == 0x0a || main_cmd == 0x04 ||
 			(main_cmd == 0x05 && sub == 0x0c) || (main_cmd == 0x08 && sub == 0x06);
 		for (size_t i = 0; i < len && i < 64 && !private; i++)
 			sprintf(hex + 2 * i, "%02x", data[i]);
@@ -1297,12 +1833,64 @@ static void ipc_message(int main_cmd, int sub, int type, const unsigned char *da
 	if (main_cmd == 0x01 && sub == 0x01) {
 		/* the modem has (re)started: whatever was up is not any more */
 		fprintf(stderr, "ztoscorenetworkingd: the modem started\n");
+		replies_modem_started();
+		rfs_logged = 0;		/* a start's requests are logged again */
+		probe_out = false;
+		probes_unanswered = 0;
+		now.ipc[0] = 0;
 		net_set = net_retried = false;
 		at_setup();
+		screen_tell_modem();	/* it forgot the screen too */
+		hutch_sends = 0;
+		hutch_waiting = hutch_dead = false;
 		ctx_up = false;
 		now.data = false;
 		now.ip[0] = 0;
 		data_tried_at = 0;
+	} else if (main_cmd == 0x02 && sub == 0x05 && type == 3 && len >= 4) {
+		/* A call's state, as seen on real calls: byte 3 is 1 setting up, 3
+		 * connected, 4 released. */
+		if (data[3] == 3) {
+			call_connected = true;
+			if (call_dialled && now.call[0] && strcmp(now.call, "active")) {
+				fprintf(stderr, "ztoscorenetworkingd: the far end answered\n");
+				call_set("active", "");
+			}
+		} else if (data[3] == 4) {
+			release_done("ipc released");
+		}
+	} else if (main_cmd == 0x26 && sub == 0x01 && type == 1) {
+		/* OesDrkCpInfo: confirmed as stock does, if asked to */
+		if (replying(reply_cfrm)) {
+			bool ok = ipc_send_ack(0x26, 0x01, 4, mseq, NULL, 0);
+			reply_done(ok, ok ? 0 : errno);
+			if (ok && !cfrm_logged)
+				fprintf(stderr, "ztoscorenetworkingd: ipc: confirmed 2601\n");
+			cfrm_logged = cfrm_logged || ok;
+		}
+	} else if (main_cmd == 0x04 && sub == 0x07 && type == 3) {
+		/* The CP's SMS side is ready: so is ours, if asked to say so. Once
+		 * a start: the CP answers every 0407 set with 8001, 040c and its
+		 * 0407 again, so answering each 0407 made a loop (30 Oct, RA:
+		 * 70 000 sets in 4 min, about 330 a second). */
+		if (replying(reply_smsready) && !smsready_logged) {
+			bool ok = ipc_write(0x04, 0x07, 3, 0xff, NULL, 0);
+			reply_done(ok, ok ? 0 : errno);
+			if (ok)
+				fprintf(stderr, "ztoscorenetworkingd: ipc: SMS device ready sent\n");
+			smsready_logged = ok;
+		}
+	} else if (main_cmd == 0x04 && sub == 0x02) {
+		sms_via_ipc(data, len);
+	} else if (main_cmd == 0x05 && sub == 0x01 && type == 2) {
+		/* the answer to a probe */
+		probe_out = false;
+		probes_unanswered = 0;
+		if (!strcmp(now.ipc, "silent"))
+			fprintf(stderr, "ztoscorenetworkingd: ipc: the CP answers again\n");
+		snprintf(now.ipc, sizeof(now.ipc), "alive");
+	} else if (main_cmd == 0x80 && sub == 0x01 && len >= 2 && data[0] == 0x08 && data[1] == 0x0a) {
+		hutch_waiting = false;	/* the network mask was taken */
 	} else if (main_cmd == 0x80 && sub == 0x01 && len >= 5 && data[0] == 0x0d) {
 		int result = data[3] | data[4] << 8;
 		if (result != 0x8000) {
@@ -1338,13 +1926,34 @@ static void ipc_message(int main_cmd, int sub, int type, const unsigned char *da
 			now.ip[0] = 0;
 		}
 	} else if ((main_cmd == 0x07 && (sub == 0x01 || sub == 0x06)) ||
-		   (main_cmd == 0x09 && sub == 0x02) ||
 		   (main_cmd == 0x08 && (sub == 0x03 || sub == 0x04))) {
 		if (len >= 1 && data[0] <= 5 && data[0] > 0)
 			now.bars = data[0];
 		else if (len >= 1 && data[0] > 5)
 			now.bars = csq_bars(data[0]);
 	}
+}
+
+static void at_first(const char *command)
+{
+	if (q_len == MAX_QUEUE) {	/* the newest goes, not the hang-up */
+		q_len--;
+	}
+	q_head = (q_head + MAX_QUEUE - 1) % MAX_QUEUE;
+	snprintf(queue[q_head], sizeof(queue[0]), "%s", command);
+	q_len++;
+}
+
+/* every way this modem has of ending a call, at once: an answer may be
+ * outstanding for AT+CLCC or ATD, and is not waited for */
+static void release_send(void)
+{
+	ipc_send(0x02, 0x03, 1, NULL, 0);
+	at_first("AT+CHLD=1");
+	at_first("ATH");
+	if (busy && (!strncmp(sent, "ATD", 3) || !strncmp(sent, "AT+CLCC", 7)))
+		busy = false;
+	next_at();
 }
 
 static void ipc_readable(void)
@@ -1355,7 +1964,8 @@ static void ipc_readable(void)
 		size_t len = buf[off] | buf[off + 1] << 8;
 		if (len < 7 || off + (ssize_t)len > n)
 			break;
-		ipc_message(buf[off + 4], buf[off + 5], buf[off + 6], buf + off + 7, len - 7);
+		ipc_last_rx = boot_s();
+		ipc_message(buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 2], buf + off + 7, len - 7);
 		off += len;
 	}
 }
@@ -1368,10 +1978,15 @@ static void command(char *l)
 		fprintf(stderr, "ztoscorenetworkingd: asked: %.40s\n", l);
 	if (!strcmp(l, "screen off") || !strcmp(l, "screen on")) {
 		/* from zrnperfd: with the screen off nobody is looking at the bars */
+		bool was_off = screen_off;
 		screen_off = !strcmp(l, "screen off");
+		if (screen_off != was_off)
+			screen_tell_modem();
 		if (!screen_off) {
 			silent_polls = 0;	/* someone is looking: back to the normal rate */
 			next_poll = ms();	/* discard the old screen-off deadline */
+			if (was_off)
+				poll_state();	/* what was held back while it was off */
 		}
 		return;
 	}
@@ -1432,6 +2047,11 @@ static void command(char *l)
 	} else if (!strncmp(l, "call ", 5)) {
 		char number[32];
 		if (sscanf(l + 5, "%31[0-9+*#]", number) == 1 && !now.call[0]) {
+			if (release_since) {
+				/* the last one's end is not waited for any more */
+				stale_end_until = ms() + RELEASE_GIVE_UP_MS;
+				release_since = 0;
+			}
 			call_set("dialing", number);
 			queue_at("ATD%s;", number);
 			call_poll_at = ms() + 1500;
@@ -1445,16 +2065,29 @@ static void command(char *l)
 		} else {
 			/* The modem took 02 03 without answering and the call went on:
 			 * ATH (like ATA, not waited for) and AT+CHLD=1 (release the
-			 * active call) after it. */
-			ipc_send(0x02, 0x03, 1, NULL, 0);
-			queue_at("ATH");
-			queue_at("AT+CHLD=1");
+			 * active call) after it, ahead of whatever else is waiting. */
+			if (!now.call[0]) return;
 			fprintf(stderr, "ztoscorenetworkingd: hangup: ipc call release, ATH, AT+CHLD=1\n");
+			release_send();
+			release_since = ms();
+			release_again_at = ms() + 1500;
+			release_next_poll = ms() + 300;
+			release_saw_call = true;
+			call_set("", "");
+			return;
 		}
 		call_poll_at = ms() + 500;
 	} else if (!strcmp(l, "speaker on") || !strcmp(l, "speaker off")) {
 		if (call_audio_route)
 			call_audio(!strcmp(l, "speaker on") ? 2 : 1);
+	} else if (!strcmp(l, "mute on") || !strcmp(l, "mute off")) {
+		/* IpcTxSndSetMute, 09 02 set */
+		unsigned char muted = !strcmp(l, "mute on");
+		ipc_send(0x09, 0x02, 3, &muted, 1);
+	} else if (!strncmp(l, "dtmf ", 5)) {
+		/* a key pressed in a call, to the far end */
+		if (strchr("0123456789*#", l[5]) && l[5] && !strcmp(now.call, "active"))
+			queue_at("AT+VTS=%c", l[5]);
 	} else if (!strcmp(l, "answer")) {
 		call_answering = true;
 		queue_at("ATA");
@@ -1489,6 +2122,10 @@ static void command(char *l)
 		}
 	} else if (!strcmp(l, "refresh")) {
 		written_once = false;
+	} else if (!strcmp(l, "replies")) {
+		/* the flag files again, now: to stop an answer without waiting
+		 * for the modem's next start */
+		replies_load();
 	}
 }
 
@@ -1628,7 +2265,17 @@ int main(int argc, char **argv)
 	if ((argc == 4 || (argc == 5 && !strcmp(argv[4], "--notify"))) && !strcmp(argv[1], "--sms-inject")) {
 		if (argv[2][0] != '/') return 1;
 		sms_test = argc == 4; sms_test_dir = argv[2];
-		sms_arrived(argv[3]);
+		if (!sms_seen(argv[3])) sms_arrived(argv[3]);
+		return 0;
+	}
+	/* The same, as the CP hands it over: a whole 0402 frame's data, in hex. */
+	if ((argc == 4 || (argc == 5 && !strcmp(argv[4], "--notify"))) && !strcmp(argv[1], "--sms-inject-ipc")) {
+		if (argv[2][0] != '/') return 1;
+		sms_test = argc == 4; sms_test_dir = argv[2];
+		unsigned char frame[300];
+		size_t len = 0;
+		for (const char *h = argv[3]; h[0] && h[1] && len < sizeof(frame); h += 2) frame[len++] = (unsigned char)hex_byte(h);
+		ipc_message(0x04, 0x02, 3, 0, frame, len);
 		return 0;
 	}
 	if (argc != 1) return 1;
@@ -1669,6 +2316,8 @@ int main(int argc, char **argv)
 	next_poll = ms() + PERIOD_S * 1000;
 	wifi_read();
 	ipc_log = access("/var/lib/ztoscorenetworking/debug", F_OK) == 0;
+	replies_load();
+	sms_seen_prune();
 	/* the access point is the user's to set (Settings writes the file) */
 	mkdir("/etc/ztoscorenetworking", 0755);
 	int apn_fd = open(APN_FILE, O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
@@ -1704,23 +2353,84 @@ int main(int argc, char **argv)
 		bool hutch = !strncmp(sim_mccmnc, "41303", 5) || !strncmp(sim_mccmnc, "41308", 5);
 		bool lte = now.eps_reg == 1 || now.eps_reg == 5;
 		bool cs = now.cs_reg == 1 || now.cs_reg == 5;
+		static int hutch_reg = -1;
+		int reg = now.cs_reg * 64 + now.eps_reg;
+		if (reg != hutch_reg) {		/* a registration change: tries anew */
+			hutch_reg = reg;
+			hutch_sends = 0;
+			hutch_dead = false;
+		}
 		if (!hutch || cs || airplane_asked || strcmp(now.sim, "ready")) hutch_lte_since = 0;
 		else if (!hutch_lte_since) hutch_lte_since = ms();
 		if (hutch_lte_since && ms() - hutch_lte_since >= 60000) {
-			unsigned char networks = 0x03;
-			ipc_send(0x08, 0x0a, 3, &networks, 1);
 			hutch_lte_since = ms();
-			fprintf(stderr, "ztoscorenetworkingd: Hutch CS absent for 60 s (%s); WCDMA/GSM mask 0x03\n",
-				lte ? "on LTE" : "not registered");
+			if (screen_off || hutch_dead || ms() < hutch_hold_until) {
+				/* not now */
+			} else if (hutch_waiting) {
+				hutch_dead = true;
+				fprintf(stderr, "ztoscorenetworkingd: Hutch: the last WCDMA/GSM mask got no answer; "
+					"not again until the registration changes\n");
+			} else {
+				unsigned char networks = 0x03;
+				ipc_send(0x08, 0x0a, 3, &networks, 1);
+				hutch_waiting = true;
+				fprintf(stderr, "ztoscorenetworkingd: Hutch CS absent for 60 s (%s); WCDMA/GSM mask 0x03\n",
+					lte ? "on LTE" : "not registered");
+				if (++hutch_sends >= HUTCH_SENDS) {
+					hutch_sends = 0;
+					hutch_hold_until = ms() + HUTCH_HOLD_MS;
+					fprintf(stderr, "ztoscorenetworkingd: Hutch: %d masks sent; the next in 10 min\n",
+						HUTCH_SENDS);
+				}
+			}
+		}
+		if (release_since && now.call[0]) {
+			/* a call came in meanwhile: asking again would end that one */
+			fprintf(stderr, "ztoscorenetworkingd: hangup: a new call; no more asking\n");
+			release_since = 0;
+		}
+		if (release_since) {
+			long t = ms();
+			if (t - release_since >= RELEASE_GIVE_UP_MS) {
+				fprintf(stderr, "ztoscorenetworkingd: hangup: the modem still lists the call\n");
+				release_since = 0;
+				if (release_saw_call && !now.call[0])
+					call_set("active", "");
+			} else if (t >= release_again_at) {
+				release_send();
+				release_again_at = t + 3000;
+			}
+			if (release_since && !busy && !q_len && t >= release_next_poll) {
+				queue_at("AT+CLCC");
+				release_next_poll = t + 400;
+			}
 		}
 		next_at();
 		long wait = next_poll - ms();
+		if (release_since && wait > 100)
+			wait = 100;
+		{
+			/* how the path of the call stands: numbers only, for the journal */
+			static long diag_at;
+			if (!fake_call && call_audio_route && ms() >= diag_at) {
+				char diag[320] = "";
+				FILE *f = fopen("/sys/module/snd_zrn_abox/parameters/call_diag", "r");
+				if (f) {
+					if (fgets(diag, sizeof(diag), f))
+						fprintf(stderr, "ztoscorenetworkingd: call path: %s", diag);
+					fclose(f);
+				}
+				diag_at = ms() + 5000;
+			}
+		}
 		if (!fake_call && now.call[0] && !busy && !q_len && ms() >= call_poll_at) {
 			queue_at("AT+CLCC");
 			call_poll_at = ms() + 2000;
 			next_at();
 		}
-		if ((fake_call || hutch_lte_since) && wait > 1000) wait = 1000;
+		if (fake_call && wait > 1000) wait = 1000;
+		if (hutch_lte_since && hutch_lte_since + 60000 - ms() < wait)
+			wait = hutch_lte_since + 60000 - ms();
 		if (now.call[0] && wait > 500)
 			wait = 500;
 		if (busy && AT_TIMEOUT_MS - (ms() - sent_at) < wait)
@@ -1733,30 +2443,13 @@ int main(int argc, char **argv)
 			at_readable();
 		if (fds[1].revents & POLLIN)
 			ctl_readable();
-		char drain[4096];
-		/* the command and file channels: kept open, not answered */
+		/* the command and file channels (the file channel's requests are
+		 * noted, by command, id, length and a file's name, never their
+		 * contents; and answered only behind reply-rfs) */
 		if (ipc_fd >= 0 && (fds[2].revents & POLLIN))
 			ipc_readable();
-		if (rfs_fd >= 0 && (fds[3].revents & POLLIN)) {
-			/* the file channel: what the modem asks for is noted (its
-			 * length and command byte, never its contents), not served */
-			static int noted;
-			ssize_t got = read(rfs_fd, drain, sizeof(drain));
-			if (got >= 6 && noted < 12) {
-				/* and a file's name, when it is asked to be opened */
-				char name[80] = "";
-				size_t at = 0;
-				for (ssize_t i = 6; i < got && i < 200 && at < sizeof(name) - 1 &&
-						(unsigned char)drain[4] == 0x11; i++) {
-					if (drain[i] >= 0x20 && drain[i] < 0x7f)
-						name[at++] = drain[i];
-				}
-				name[at] = 0;
-				noted++;
-				fprintf(stderr, "ztoscorenetworkingd: rfs <- %zd bytes, command 0x%02x, id %d %s\n", got,
-					(unsigned char)drain[4], (unsigned char)drain[5], name);
-			}
-		}
+		if (rfs_fd >= 0 && (fds[3].revents & POLLIN))
+			rfs_readable();
 		if (busy && ms() - sent_at > AT_TIMEOUT_MS) {
 			fprintf(stderr, "ztoscorenetworkingd: %s: no answer\n", sent);
 			if (!strncmp(sent, "AT+CMGS", 7)) sms_finish(false);
@@ -1764,7 +2457,7 @@ int main(int argc, char **argv)
 		}
 		if (ms() >= next_poll) {
 			if (ipc_log)
-				ipc_send(0x05, 0x01, 2, NULL, 0);	/* while finding out: does it still answer? */
+				ipc_probe();	/* while finding out: does it still answer? */
 			/* a modem that stopped answering is asked less and less: each ask
 			 * wakes it and the phone with it, all night, for nothing */
 			silent_polls = answered_since_poll ? 0 : silent_polls + 1;

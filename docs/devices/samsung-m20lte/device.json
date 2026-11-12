@@ -1,0 +1,225 @@
+{
+  "id": "samsung-m20lte",
+  "name": "Samsung Galaxy M20",
+  "maker": "Samsung",
+  "model": "SM-M205F",
+  "codename": "m20lte",
+  "maintainer": "Madesh",
+  "contact": "https://github.com/madesh-ops",
+  "added": "2026-11-02",
+  "summary": "Mainline Linux 7.1 on the Exynos 7904 (the Exynos 7885 die), with a device tree, a few driver patches and the M20's own drivers for backlight, battery gauge, CPU frequency, Wi-Fi/Bluetooth and sound. Samsung's sboot starts uniLoader from BOOT, which boots the kernel with ztOS's initramfs; the Arch Linux ARM root is in USERDATA. In daily use on an SM-M205F (3 GB): ztMETRO draws on the Mali-G71 through Panfrost (with a patched Mesa for the G71's derivatives), with touch, CPU and GPU frequency scaling, 2.4 GHz Wi-Fi, Bluetooth, the speaker, rotation, battery level and USB networking. Android apps run in Waydroid, with video decoded on the MFC. Not yet: the modem, cameras, microphones, charger control and suspend.",
+  "photo": "photo.jpg",
+  "photo_caption": "",
+  "specs": [
+    [
+      "SoC",
+      "Exynos 7904 (Exynos 7885 die)"
+    ],
+    [
+      "CPU",
+      "2x Cortex-A73 at 1.77 GHz + 6x Cortex-A53 at 1.59 GHz"
+    ],
+    [
+      "GPU",
+      "Mali-G71 MP2 (r0p0), Panfrost"
+    ],
+    [
+      "RAM",
+      "3 GB or 4 GB"
+    ],
+    [
+      "Storage",
+      "32 GB or 64 GB eMMC 5.1"
+    ],
+    [
+      "Display",
+      "6.3\" 1080 x 2340 LCD (HX83112A)"
+    ],
+    [
+      "Battery",
+      "5000 mAh"
+    ],
+    [
+      "Kernel",
+      "Linux 7.1, mainline with patches"
+    ],
+    [
+      "Released",
+      "January 2019"
+    ]
+  ],
+  "install": {
+    "markdown": "> **This erases the phone.** ztOS replaces Android: everything in USERDATA is erased, and BOOT gets ztOS's boot image. The phone's identity (EFS and CPEFS: IMEI, modem calibration) is never written, and BOOT, RECOVERY, EFS and CPEFS are saved to `stock/m20lte/` before anything is.\n\n## What you need\n\n- A Linux computer with 15 GB free\n- A USB data cable, and the phone charged above 50%\n- An SM-M205F, M205G or M205FN (3 GB or 4 GB)\n\n## 1. Install the tools on your computer\n\n```sh\nsudo pacman -S --needed git android-tools\n```\n\n## 2. Get ztOS\n\nThe M20 port is on the `m20lte-port` branch:\n\n```sh\ngit clone -b m20lte-port https://github.com/madesh-ops/ztOS.git\ncd ztOS\ninstaller/ztos doctor\ninstaller/ztos guide --target m20lte\n```\n\n## 3. Unlock the bootloader and put TWRP on the phone\n\n1. On Android: Settings > About phone > Software information, tap Build number seven times.\n2. Settings > Developer options > turn on OEM unlocking.\n3. Power off, then hold Volume Up + Volume Down and plug the cable in: download mode. Long-press Volume Up to unlock (this wipes Android).\n4. From download mode, flash TWRP (or OrangeFox) for m20lte to RECOVERY with Odin or Heimdall.\n5. Back up anything you want to keep from the phone now.\n\n## 4. Install ztOS\n\nStart TWRP (power off, then hold Volume Up + Power), plug the phone in, and run:\n\n```sh\ninstaller/ztos install --target m20lte\n```\n\nEverything is written from TWRP over adb, so the install never depends on ztOS's own USB working. The installer asks before each step:\n\n1. It saves BOOT, RECOVERY, EFS and CPEFS to `stock/m20lte/` (once).\n2. It builds the boot image (Linux 7.1 with the M20's device tree) and asks whether the phone has 4 GB (3 GB is the safe answer).\n3. You type `ERASE`, and the system is written to USERDATA in checked 256 MiB pieces. A cut cable only means running it again: it carries on.\n4. The boot image is written to BOOT and read back.\n\n## 5. Start ztOS\n\nLet the installer reboot the phone, or reboot to System from TWRP. The first start takes about a minute (the system grows to fill the storage), then the Welcome app shows how ztOS is used. Over USB the phone is at `172.16.42.1` (NCM network).\n\n## If something goes wrong\n\n| What you see | What to do |\n|---|---|\n| The phone hangs, or stops on the Samsung logo | Hold Volume Down + Power about 7 s: it restarts into TWRP (uniLoader arms recovery first). If not, hold Volume Up as well |\n| No network device on the computer over USB | Try another cable or port: a charge-only cable powers the phone but leaves USB `not attached` |\n| The clock is wrong after a boot | The M20 has no RTC driver yet: it is set by NTP once Wi-Fi connects |\n| You want Android back | In TWRP: `devices/m20lte/scripts/flash.sh BOOT stock/m20lte/BOOT.img`, then flash the stock firmware with Odin |"
+  },
+  "features": [
+    {
+      "category": "Boot",
+      "feature": "Booting from internal storage",
+      "status": "working",
+      "notes": "sboot → uniLoader (BOOT) → Linux 7.1; root in USERDATA"
+    },
+    {
+      "category": "Display",
+      "feature": "Panel",
+      "status": "working",
+      "notes": "the bootloader's framebuffer through simpledrm; no DECON/DSIM driver, so the panel itself is never switched off (the backlight is)"
+    },
+    {
+      "category": "Display",
+      "feature": "Brightness",
+      "status": "working",
+      "notes": "LM3632 backlight driver"
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": "OpenGL ES 3.1 through Panfrost, 343-845 MHz DVFS; patched Mesa for the G71 (r0p0) derivatives"
+    },
+    {
+      "category": "Input",
+      "feature": "Touchscreen",
+      "status": "working",
+      "notes": "Himax HX83112A, multi-touch"
+    },
+    {
+      "category": "Input",
+      "feature": "Power and volume keys",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Input",
+      "feature": "Vibration",
+      "status": "partial",
+      "notes": "gpio-vibrator probes and ztMETRO uses it; strength not tuned"
+    },
+    {
+      "category": "Power",
+      "feature": "CPU, frequency scaling",
+      "status": "working",
+      "notes": "schedutil: A73s 936-1768 MHz, A53s 546-1586 MHz, with thermal throttling"
+    },
+    {
+      "category": "Power",
+      "feature": "Battery and charging",
+      "status": "partial",
+      "notes": "battery level, voltage and current work; no charger driver: it charges on the bootloader's settings, and barely holds its level on a computer's USB port"
+    },
+    {
+      "category": "Power",
+      "feature": "Sleep (suspend)",
+      "status": "broken",
+      "notes": "not started"
+    },
+    {
+      "category": "Network",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": "2.4 GHz (the M20 has no 5 GHz path)"
+    },
+    {
+      "category": "Network",
+      "feature": "Bluetooth",
+      "status": "working",
+      "notes": "BlueZ; no audio offload"
+    },
+    {
+      "category": "Network",
+      "feature": "Mobile data",
+      "status": "broken",
+      "notes": "no modem driver yet"
+    },
+    {
+      "category": "Network",
+      "feature": "USB networking",
+      "status": "working",
+      "notes": "NCM network and ACM serial at 172.16.42.1"
+    },
+    {
+      "category": "Modem",
+      "feature": "SIM and signal",
+      "status": "broken",
+      "notes": "no modem driver yet"
+    },
+    {
+      "category": "Modem",
+      "feature": "SMS",
+      "status": "broken",
+      "notes": "no modem driver yet"
+    },
+    {
+      "category": "Modem",
+      "feature": "Calls",
+      "status": "broken",
+      "notes": "no modem driver yet"
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "working",
+      "notes": "ABOX + TFA9896 (no speaker protection, so kept quieter than stock)"
+    },
+    {
+      "category": "Audio",
+      "feature": "Microphone",
+      "status": "broken",
+      "notes": "not started (COD3035X)"
+    },
+    {
+      "category": "Audio",
+      "feature": "Headphones",
+      "status": "broken",
+      "notes": "not started (COD3035X)"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Ambient light",
+      "status": "broken",
+      "notes": "no driver"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Accelerometer, gyroscope",
+      "status": "partial",
+      "notes": "accelerometer works (apps rotate); gyroscope untested; compass not started"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Proximity",
+      "status": "broken",
+      "notes": "no driver"
+    },
+    {
+      "category": "Camera",
+      "feature": "Cameras",
+      "status": "broken",
+      "notes": "no Exynos camera ISP driver"
+    },
+    {
+      "category": "Location",
+      "feature": "GPS",
+      "status": "broken",
+      "notes": "not started"
+    },
+    {
+      "category": "Software",
+      "feature": "ztMETRO",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Software",
+      "feature": "Android apps (Waydroid)",
+      "status": "working",
+      "notes": "with Android Mesa patched for the G71 and hardware video decoding on the MFC"
+    },
+    {
+      "category": "Software",
+      "feature": "ztOSIAL (ztos-ial test)",
+      "status": "untested",
+      "notes": ""
+    }
+  ],
+  "notes": []
+}

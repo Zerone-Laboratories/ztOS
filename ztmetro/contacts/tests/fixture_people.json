@@ -1,0 +1,10 @@
+{"full_page1":{"connections":[
+ {"resourceName":"people/c1","etag":"e1","names":[{"displayName":"Test Alpha"}],"phoneNumbers":[{"value":"011 555 0100","canonicalForm":"+15550100","type":"home"},{"value":"555 0101","canonicalForm":"+15550101","type":"mobile"}],"emailAddresses":[{"value":"alpha@example.invalid"}],"biographies":[{"value":"line one\nline\ttwo"}]},
+ {"resourceName":"people/c2","etag":"e2","names":[{"displayName":"Test Beta"}]}],"nextPageToken":"p2"},
+"full_page2":{"connections":[
+ {"resourceName":"people/c3","etag":"e3","organizations":[{"name":"Test Company"}],"phoneNumbers":[{"value":"555 0103"}]},
+ {"resourceName":"people/c4","etag":"e4"}],"nextSyncToken":"sync-1"},
+"incremental":{"connections":[
+ {"resourceName":"people/c1","etag":"e1b","names":[{"displayName":"Test Alpha Renamed"}],"phoneNumbers":[{"canonicalForm":"+15550101","type":"mobile"}]},
+ {"resourceName":"people/c2","metadata":{"deleted":true}},
+ {"resourceName":"people/c5","etag":"e5","names":[{"displayName":"Test Gamma"}]}],"nextSyncToken":"sync-2"}}

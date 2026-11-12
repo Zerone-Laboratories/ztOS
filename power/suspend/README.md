@@ -1,3 +1,439 @@
+# End-to-end bench after round 2 — 2026-10-30
+
+**Every check passed on the charger.** The hub, the sensors, GNSS, Wi-Fi, push,
+the modem's IPC, the inhibit race, the GRP4 policy and an Android alarm all
+held through 33 SoC entries and 34 AP_SLEEP pulses in one boot
+(10:29-11:25, uptime 35-91 min; entries 15->48).
+There were 0 hub error lines (MCU_REQ_RESP, Assert, ESW, OnCommunicationError,
+hub reset, power retry, `no echo`), and lhd and sensord kept their PIDs. Sleep
+is enabled again (`zrn-sleepd enable`), so it reads `why=charger`. Nothing
+here ran off the charger: J5 (unplugged night) and J6 (call/SMS) still wait
+for the user. Scripts: power/suspend/hub-bench/e2e/.
+
+| part | result (observed) |
+|---|---|
+| test-sleep-e2e.sh A-F | 0 crash lines in every phase, `Assert=` now counted. A: 35 s sleep ended by an Android alarm; fix 12.0 s after the reader; sensors fresh (`AP resumed (resume_seq 16)`, `sent 0xd3`). B, D: cancelled on timed-gnss (D at `settle`). C: modem wake (`umts_ipc0 +1, umts_rfs0 +10`) after 9.5 s. E: Android alarm after 47.8 s, fix 8.4 s. F: inhibit gone 1.2 s after the gate's kill -9. Wi-Fi 4.6-6.0 s, push 6-8 s after each return |
+| GNSS streaming, timed-gnss not counted | `once 60` and 15 `once 300` in 146 s: 16 `hub` wakes after 0.7-1.4 s (wake_stat 0x80000001), one hub-cause fw-abort; GNSS gapless (227 GGA, longest gap 1.6 s); 17 AP_SLEEP pulses and 17 0xd3; 0 refusals. Accel fresh 0.5 s and prox 0.1 s after screen on |
+| modem, GPS off, 3 x `once 300` | 296.5 s and 296.4 s RTC sleeps (one `modem rx: umts_ipc0 +1`), then an Android alarm; 0 modem wakes in 664 s asleep. The CP answered 0501 probes after the sleeps (11:21:36) and sent 0f36 at 11:26, 91 min into the boot |
+| late-inhibit race, 10 runs, 0-120 ms | **0 FAIL**: 4 cancelled before any handoff (3 EBUSY after the re-check, 1 why_awake), 6 renames after the handoff (helper frozen) |
+| GRP4 | clear_grp4 stayed N. Two fw-aborts, each retried by `once`: `hub` (grp4_at_smc 1, gpa1 0x81, GNSS streaming) and `other` (grp4 cleared 1->0 at the handoff, then latched again before the SMC by gpa1-0 alone). grp4_stale_clears went 1 -> 3, hub_pend_cleared 0 -> 1 |
+| Android alarm | two alarm wakes against `dumpsys alarm`'s next wakeup alarm: PM suspend exit 1.2 s after an `android` alarm's due time, and 0.0 s after a networkstack ELAPSED_WAKEUP; `alarm wake, container running` |
+
+What it showed besides:
+
+- **gpa1-0 latches GRP4 between the stale clear and the SMC.** In Samsung's
+  starlte DT, gpa1-0 is `attn-irq`, the sec_ts touchscreen's interrupt
+  (observed in exynos9810-starlte_eur_open_26.dts). That it is the touch
+  controller on this phone is inferred. Each such sleep is an `other`
+  fw-abort, and three in a row pause sleep for 30 min. J5 will show how often
+  that happens.
+- **zrn-pushd's heartbeat never wakes a sleeping SoC.** Every sleep unbinds
+  Wi-Fi, and the connection drop runs mcs_close(), which stops the heartbeat
+  timer (android/push/zrn-pushd.c). One heartbeat was due at 11:21:05 during
+  a sleep; the SoC woke on the RTC 26.6 s later. Push therefore comes back
+  only at a wake: a doze window, an alarm, the modem or the RTC. So an early
+  RTC wake that zrn-sleepd calls `alarm` comes from Android, not from pushd
+  (inferred).
+- **Android's wakeup alarms:** the queue at 11:25 held 4 for the next hour
+  (android, networkstack x3). That is a snapshot, not a rate.
+- entries 48 against ap_suspends and resume_seq 49: one cycle pulsed
+  AP_SLEEP and then cancelled before the SoC entry. sensord sent its 0xd3
+  for it as well.
+
+# Sleep holes closed in round 2 — 2026-10-30
+
+Four holes the round-1 skeptic found, closed in zrn-sleepd plus a 4-byte
+patch to Android's init. No kernel or module change.
+
+| hole | what was wrong | now |
+|---|---|---|
+| late inhibit | why_awake() ran before the wakeup_count write; an inhibit written after it did not stop the suspend (a file is not a wakeup event; no CONFIG_PM_WAKELOCKS) | the inhibit watch (below): a late inhibit cancels the sleep |
+| GRP4 | the first firmware abort set clear_grp4=1 for the boot; a clear while the hub talks killed the hub (J0c) | clear_grp4 is written 0 at setup and at every cycle; nothing writes 1. A firmware abort is classified `hub` or `other` |
+| the log | a hard reset left 64 NUL bytes in /var/lib/zrn-sleep/log; grep then hid the lines | one write and fdatasync a line, NUL runs repaired, `zrn-sleepd log` |
+| Android alarms | Android's init drops CAP_WAKE_ALARM: no *_ALARM timer in system_server | init patched in system.img; an early RTC wake is `alarm` |
+
+## The inhibit watch
+
+zrn-sleepd watches /run/zrn-sleepd/inhibit with inotify (create, moved-to,
+attrib, close-write; not delete, so its own removal of an expired inhibit
+is no event) inside an epoll with EPOLLWAKEUP. In build/linux-7.1: the
+writer's own rename or utime queues the inotify event and wakes the epoll
+in that syscall; ep_poll_callback activates the item's wakeup source; it
+stays active until zrn-sleepd reads the events and polls the epoll
+(ep_send_events relaxes it). While it is active, pm_save_wakeup_count fails
+(the write gives EINVAL) and pm_wakeup_pending aborts the freezer or the
+device suspend (EBUSY). Both are now `cancelled` (5 s), not failures.
+
+- The kernel strips EPOLLWAKEUP without CAP_BLOCK_SUSPEND
+  (ep_take_care_of_epollwakeup). zrn-sleepd reads the bit back from
+  /proc/self/fdinfo and creates and removes a test file: the journal says
+  `inhibit watch armed`, or why not.
+- /sys/power/wakeup_count blocks while any source is active, our own too,
+  so it is read in a thread while the main thread drains; it gives up
+  (`stalled`) after 15 s and lists the sources that held it.
+- The main loop drains every pass (2 s): a change while awake does not
+  hold sleep off.
+- The contract for a holder: write the inhibit before starting the risky
+  thing. An inhibit that comes after the freezer has stopped its writer
+  arrives after the wake, and that writer's job waits for it (B4 below).
+
+R1, the late race on the phone (charger, `once 60 --ignore-inhibit
+timed-push`, a helper that waits for the `wakeup_count` step, sleeps a
+seeded random delay, renames `timed-r2` into place and writes `r2: renamed`
+to /dev/kmsg): **0 of 29 runs had a rename before the handoff**.
+
+| delays | runs | EBUSY cancel | rename after the wake (helper frozen) | EINVAL / why_awake cancel |
+|---|---|---|---|---|
+| 0-800 ms | 1-20 | 2 (85, 190 ms) | 18 | 0 |
+| 0-120 ms | 21-30 | 7 (14-90 ms) | 3 (78-115 ms) | 0 |
+
+`PM: suspend entry` came 24-250 ms after the step. The helper got its
+rename in before the freezer at delays of 14-90 ms (and once at 190 ms);
+at 78 ms and from 111 ms on it was mostly frozen first, although `Freezing
+user space processes` was logged 0.5-0.6 s after the entry. The EINVAL path is covered by host tests
+only. Wi-Fi was associated 4.9-6.4 s and zrn-pushd logged in 7.0-8.7 s after
+each of the 30 returns.
+
+## Firmware aborts: two causes, a pause that ends
+
+A `fw-abort` (smc 0 and no source, or GRP4 at the SMC) is classified:
+
+- `hub`: host_req (gpa1-7) in eint_before or eint_pending, `timed-gnss` or
+  `timed-hub` held (even when a bench ignores it), or the hub not ready.
+  Harmless (J0b): tried again in 20 s, 300 s from the sixth in a row, never
+  a pause.
+- `other`: three in a row pause sleeping 30 min (`/run/zrn-sleepd/paused`,
+  `until=` in boot time); then it tries again by itself. The shell hears of
+  the first pause of a boot. A masked line alone (gpa1-0, which eint_before
+  keeps) is `other`.
+
+The log line is `the firmware gave the sleep up (cause C, N in a row):
+grp4_before=… grp4_at_smc=… eint_before=… eint_pending=…`; the hourly
+summary counts fw-aborts by cause. Not seen on the phone this round: with
+host_req a wake source (eint_follow), a GNSS-streaming bench sleep was a
+`hub` wake after 0.7 s, not a firmware abort (G1: clear_grp4 N, 0
+MCU_REQ_RESP, lhd and ztoscsf PIDs unchanged; then GPS off, a 57 s RTC sleep).
+Both causes are host-tested.
+
+## The log
+
+`log()` opens with O_APPEND, writes the line once and fdatasyncs it; past
+1 MiB the log moves to log.1. At start (daemon and `once`) NUL runs are
+replaced by `-- N bytes lost: an unclean stop --`, after a copy of the file
+as it was goes to log.nul (once). `zrn-sleepd log [N | all]` prints the last
+N lines (50) of log.1 and log without NULs: use it, or `grep -a`, for J5:
+
+	zrn-sleepd log all | grep summary
+
+## Android alarms wake the SoC
+
+Android's init (SecondStageMain, right after "init second stage started!")
+calls prctl(PR_CAPBSET_DROP, 35) on every path, so system_server had
+CapEff 0x1002887420 and only clockids 0, 1, 7. lxc keeps the capability;
+init drops it. android/waydroid/patch-init-wake-alarm.py NOPs that call
+(REA evidence in the script); android/waydroid/README.md has the swap.
+
+zrn-sleepd notes the boot time of its wakealarm write; an RTC wake more than
+3 s before its own alarm is `alarm` (someone else's alarmtimer): awake 20 s
+(Android's wake locks do not reach the host), a doze window when dozing,
+and `alarm wake, container frozen|running`. Measured from the write, not
+from the suspend: the preparations after it take seconds, and a test on
+time asleep would call our own RTC wakes `alarm`.
+
+On the phone after the swap: container init CapBnd 0x1c4bac75ff,
+system_server CapEff 0x1802887420, clockids 8 and 9 present. A2: an
+`android` ELAPSED_WAKEUP batch due 10:05:57.06 woke the SoC from a
+`once 1800` after 108.5 s asleep (PM: suspend exit 10:05:58.80, about
+1.5 s late); `woke: alarm`, container running, screen off; dumpsys
+`Last trigger` 2.9 s after its due time. No eventpoll or [timerfd] source
+was left active.
+
+**Cost: not measured yet.** How often Android's *_WAKEUP alarms wake the
+phone is for J5. In the first ten minutes after a boot the modem woke every
+2-95 s (umts_ipc0) and ended nine sleeps before the alarm did.
+
+# Modem wakes: which channel carried them — 2026-10-30
+
+A wake by the CP's mailbox (wake_stat bit 24, `modem`) says nothing of what
+the CP sent. zrn-sleepd now names the channel, from the modem's own wakeup
+sources:
+
+- each of zrn-modem's io devices has a wakeup source of its own, and takes
+  it on every frame it receives (modem_v1 `iodev_lock_wlock`,
+  modem_io_device.c:453, 484): `umts_ipc0` (IPC, SIPC ch 0xeb),
+  `umts_rfs0` (the CP's file requests, ch 0xf5), `umts_router` (AT: RING,
+  +CMTI), `rmnet*`, `multipdp*`;
+- zrn-sleepd reads their `wakeup_count` and `event_count` right after its
+  `/sys/power/wakeup_count` write, and again 1.0 s after
+  `/sys/power/state` returns (the frames that wake the AP are read by the
+  resume path within milliseconds: 7 ms before modem_resume in J1);
+- every source that moved goes on the `woke:` line and into
+  `/run/zrn-sleepd/status` as `modem_rx=`:
+  `woke: modem (umts_ipc0 +2) wake_stat=0x81000000 after 140s`, or
+  `woke: modem (no channel rx)`; another reason with modem traffic in the
+  window reads `rtc (modem rx: umts_router +1)`.
+
+Not from the journal: the kernel's LNK-RX log never shows the AT channel
+(`log_enabled()`, modem/zrn-modem/modem_utils.c:303-323, has no case for
+ch 25, SIPC_CH_ID_BT_DUN), so a RING or +CMTI wake would read as
+unattributed there. No kernel or zrn-modem.ko change was needed.
+Host tests: `ModemRxTest` in test-sleepd-recovery.py (parsing a fake
+/sys/class/wakeup, an rfs-only, a router-only, no and a missing source,
+and cycle() recording the delta).
+
+Bench (30 Oct, on the charger, the CP's IPC kept alive by answering its
+file requests, modem/README.md; power/suspend/hub-bench/once-no-push.py,
+which is `once` with the timed-push inhibit not counted, because a busy
+Beeper chat held every sleep off for over an hour):
+
+| sleep | result |
+|---|---|
+| 11, 12, 13 (300 s) | RTC wakes after 297.1, 296.5, 297.1 s; `rtc (modem rx: umts_ipc0 +1)` on the first, nothing on the others; no `umts_rfs0` wake |
+| 14 | freezing aborted (335 tasks), then an EINT wake after 0.9 s from gpa1-6 (the MAX77705 charger) |
+| 15 | **the phone reset** about 60 s after `PM: suspend entry` (nothing logged; zrn-sleepd then switched sleep off: "the last sleep never came back") |
+| 21, 22 | charger EINT wakes (gpa1-6) after 7.7 and 6.8 s, `other (modem rx: umts_ipc0 +1)` |
+| 23 | a fw-abort (GRP4 bit 0 latched, grp4_at_smc 1) after 17.5 s; **the phone reset** during the retry's preparations (journal ends at the Wi-Fi unbind) |
+| 24 (just after boot) | `modem (umts_ipc0 +5, umts_router +1)` wake_stat 0x81000000 after 10.8 s |
+| 31, control: no answers to the CP | **the phone reset** during the preparations (journal ends at the Wi-Fi unbind) |
+| 32, control, 66 s after boot | `modem (umts_rfs0 +1)` after 3.7 s |
+
+**Open: three resets in the sleep path, with and without the modem
+answers**, so the answers are not the cause (observed, one control reset).
+All three came after the charger started raising EINT wakes (gpa1-6) and
+the battery discharged on the charger (-274 to -404 mA, input limit
+500 mA). Inferred, not shown: a hang the 60 s s3c2410 watchdog ended
+(`tmr_margin=60`); the console is suspended in sleep and ramoops held only
+the start of a boot. Sleeps 11-13, before the charger started, were clean.
+Sleep is switched off (zrn-sleepd's own safety switch-off) until this is
+understood.
+
+# The sensor hub and SoC sleep, round 2 — 2026-10-30
+
+**GNSS holds SoC sleep off (ztos-gnss-gate's timed-gnss); it does not
+survive a sleep.** Stock never sleeps through a pending host_req, because
+host_req is a wake IRQ there: the hub wakes the AP. Ours had host_req
+masked in EINT_WAKE, so a sleep with GNSS running slept through the hub's
+requests and the hub stopped answering 5 s after the wake (J0c, J0d). This
+round makes host_req a wake source and refuses a sleep while the hub talks.
+
+What stock does (REA on stock's Image, stock-syms.txt; the vendor source
+agrees):
+
+- `exynos_wkup_irq_set_wake` (0x3e8e20) clears the pin's bit, `1 << (hwirq +
+  eint_offset * 2)`, in a global mask on enable_irq_wake(on) and sets it on
+  off (0x3e8e74-0x3e8e8c); exynos-powermode.c writes that mask to PMU 0x60c.
+  So stock's EINT wake mask follows enable_irq_wake, and bcm_gps_spi
+  wake-enables host_req (gpa1-7, "ttyBCM", level-high; IRQ 107 or 109, it
+  varies by boot) while lhd
+  holds /dev/ttyBCM.
+- `ssp_suspend` (0xa83560): AP_SLEEP (gpa0-5) set 0, read back, printk, set
+  1 (0xa83594-0xa835c8); uLastResumeState = 0xd4. It sends no command (the
+  0xd4 send is commented out in ssp_dev.c too).
+- `ssp_resume` (0xa83928): AP_SLEEP 1, then `ssp_send_cmd(0xd3, 0)`
+  (0xa839a4-0xa839ac): MSG2SSP_AP_STATUS_RESUME, a bare 9-byte command.
+- `bbd_do_transfer` holds comm_mutex from the header until the echo's
+  payload is out: one transaction on the link at a time. A length-0
+  command is not waited for. The echo wait is 400 ms within 5 s of a
+  resume, else 1000 ms (ssp_spi_async).
+
+What ours does now:
+
+| piece | what |
+|---|---|
+| zrn-sleep-init `eint_follow` (0600, default 0x8000) | EINT bits whose wake follows their IRQ's wake setting; resolved at load (dmesg `eint bit 15 (gpa1-7) follows IRQ 109's wake setting` on 30 Oct). Each sleep, a followed bit whose IRQ is wake-enabled is opened in PMU 0x60c and in the GPIO EINT mask; `eint_effective` shows the word used (0xffe73ffd with lhd up). |
+| the refusal | in the finisher, a wake-enabled followed line that reads high (gpa1 DAT bit 7) refuses the sleep with EBUSY: `zrn-system-sleep: refused: host_req high (eint bit 15)`, `hub_refused` counts them. On the line level, not on the pending latch: the IRQ is level-triggered and bcm_spi_suspend disables it with disable_irq_nosync, so a latch with the line low is normal after any served request. That stale latch is write-1-cleared (`hub_pend_cleared`). |
+| GRP4 | cleared at each attempt once the line check has passed (`grp4_stale_clear`, default Y, counted in `grp4_stale_clears`); not sticky. `grp4_at_smc` is GRP4 read again right before the SMC; zrn-sleepd's fw-abort test uses it. `clear_grp4` stays, for a person at the bench. |
+| handoff line | adds `eint_eff=`, `hub_line=` (-1: nothing followed) and `grp4_at_smc=`. |
+| zrn-bbd `ap_sleep_pulse` (0644, default N; Y from /etc/modprobe.d/zrn-bbd.conf), `ap_sleep_pulse_us` (100) | at PM_SUSPEND_PREPARE, AP_SLEEP low for the given time and back high, as ssp_suspend; only while the hub is ready and host_req is a wake IRQ (a hub told the AP sleeps asks to be woken: pulsing with host_req masked is J0c on purpose). `zrn-bbd: AP_SLEEP pulse, read 0`, or `no AP_SLEEP pulse (why)`. |
+| zrn-bbd `resume_seq`, `ap_suspends` (/sys/class/sec/sensorhub) | at PM_POST_SUSPEND after a pulse, resume_seq goes up and is sysfs-notified. |
+| ztoscsf-sensord | one transaction in flight; on a resume_seq change it queues the bare 0xd3 (`D3 00 00 01 00 00 00 00 00`), behind the open transaction; 400 ms echo timeouts for 5 s after. The only writer on the link, so the kernel sends no hub command. |
+| zrn-sleepd | `hub` wake (wake_stat bit 0 with gpa1-7 pending, after key and bt), 5 s awake; `hub-busy` (EBUSY with hub_refused moved), retried in 5 s, not a failure; 3 of either within 120 s of boot time: awake 120 s (`sensor hub keeps the AP awake`). No automatic clear_grp4 any more; clear_grp4 is set back to N at start. |
+| bbd_suspend | msleep(20), not mdelay(20). |
+
+Bench results (30 Oct, on the charger, `zrn-sleepd once` through
+power/suspend/hub-bench/; the GNSS runs bypass timed-gnss, which only a
+bench does):
+
+| run | what | result |
+|---|---|---|
+| P1 | old sensord: one REMOVE (unwatch accel), screen on | no assert |
+| P2 | new sensord: 8 screen-offs each with accel, prox, both watched | 0 asserts in 24 (before: 8 of 8), 0 `no echo`, lhd PID unchanged |
+| P3 | new zrn-sleepd, old module, GPS off, 60 s | RTC wake, clear_grp4 N, no hub errors |
+| B1 a-d | new modules, GPS off, 3 x 60 s and 300 s | 4 RTC/modem wakes, 0 hub wakes, 0 refusals, 0 MCU_REQ_RESP/Assert/ESW, grp4_at_smc 0, PIDs unchanged; first fix 13.4-17.2 s after a reader came (P3, old module: 20.3 s); bbd_suspend 21, 24, 36 and 520 ms |
+| B2a | control, eint_follow=0, GNSS streaming | J0c again: a full 57 s sleep with gpa1-7 pending, then MCU_REQ_RESP twice and two hub resets (recovered by itself) |
+| B2b 2, 3 | eint_follow=0x8000, GNSS streaming | `hub` wakes after 0.8 and 1.2 s (wake_stat 0x80000001, gpa1-7); 0 hub errors; GNSS gapless (longest 1.4 s) |
+| B3 a-c | pulse on, GPS off, 60 s | RTC wakes, `AP_SLEEP pulse, read 0`, one 0xd3 each, 0 asserts, fix 13.5-14.3 s |
+| B3 d-f | pulse on, GNSS streaming | `hub` wakes after 0.7-0.9 s, one 0xd3 each, GNSS gapless; ap_suspends = resume_seq = 0xd3 sent = 6; no `bIsAPSleeping` |
+| screen on after B3 | watch accel, prox | first new reading 0.88 s and 0.13 s after screen on |
+| B5 | sensors/gnss/test-sleep-e2e.sh A-G (round 1's J1-J3 among them) | 0 crash lines in every phase, the sensor checks after A and E included (they asserted in round 1); Wi-Fi associated 4.6-5.5 s and push logged in 6-8 s after each return; B and D cancelled on timed-gnss; F: inhibit gone 1.1 s after the gate's kill -9; G (run again alone, since run straight after F its reader met the gate restarting): cap 601.3 s after the reader, engine back 1.8 s after screen on |
+| B4 x3 | a reader connects at the `suspend` step | the freeze beat the gate: full 57 s sleeps with the reader waiting, GPS on after the wake (fix 12-16 s); no hub reset |
+
+Not seen yet: a `hub-busy` refusal (hub_refused stayed 0: host_req was
+low at every check), a stale latch cleared (hub_pend_cleared 0) and a GRP4
+stale clear (grp4_stale_clears 0). The 520 ms bbd_suspend is still there
+with msleep; its cause is unknown. B2b1 and B2b4 were bench misfires (the
+gate rewrote timed-gnss in the bypass's window; then its 600 s screen-off
+cap), not results.
+
+The AP_SLEEP pulse is on by default from `/etc/modprobe.d/zrn-bbd.conf`
+(`options zrn_bbd ap_sleep_pulse=1`); delete that file to turn it off.
+Open: a reader that arrives after zrn-sleepd's re-check waits for the next
+wake before GPS starts (B4). Each B4 sleep was 57 s; with the doze and RTC
+limits a wait could be up to 300 or 1800 s.
+
+# Pins while the SoC sleeps; sleeps the firmware gives up — 2026-10-30
+
+**The sensor hub died after every SoC sleep because its power pin let go.**
+In SYS_SLEEP the TOP pin banks run on their power-down settings (CON_PDN
++0x10, 2 bits a pin: 0 out 0, 1 out 1, 2 input, 3 hold; PUD_PDN +0x14, 4 bits
+a pin). gpg0-2 (GPS_PWR_EN, the BCM4773's enable) was at the reset value,
+input with a pull-down, so the hub lost power for every sleep that reached
+the SoC sequence, aborted ones too, and came back in ROM without its patch
+(lhd OnCommunicationError, ESW:CRASHED at the next use; 9 of 9 on 29 Oct).
+Stock's DT holds it (pin-con-pdn 3, pud-pdn 0).
+
+zrn-sleep-init now applies a pin table at load (`pdn_pins[]` in platform.c,
+one row a pin; later stages only add rows):
+
+| pin | what | CON_PDN | PUD_PDN |
+|---|---|---|---|
+| gpg0-2 | GPS_PWR_EN, the sensor hub's power | 3 (hold) | 0 |
+| gpg0-1 | pm-wrsti, the PMIC's WRSTBI (stock's setting) | 3 (hold) | 0 |
+
+Not in it, on purpose: gpg0-5 (WL_REG_ON; Wi-Fi is unbound for every sleep,
+keeping it powered belongs to the WoWLAN work), gpg1-0 (codec reset),
+gpg2-0 and gpg3-6 (zrn-bt's own). Mainline pinctrl saves and restores the
+PDN registers across suspend, and gpio_restore() touches only CON, DAT, PUD
+and DRV, so the write lasts the boot.
+
+Outputs: one dmesg line a pin (`zrn-sleep-init: pdn gpg0-2 conpdn
+00002aaa->00002aba pudpdn 01111111->01111011`); read-only `pdn_applied` (bit
+8 x bank + pin of PERIC0: gpg0-1 is bit 33, gpg0-2 bit 34) and
+`chub_status_before` (PMU 0x14064084 at the SMC, also in the handoff line).
+`pdn=0` switches the table off. zrn-sleepd loads the module with insmod,
+which does not read modprobe.d, so zrn-sleepd passes it any
+`options zrn_sleep_init ...` line from /etc/modprobe.d itself.
+
+Proof, before the module (J0: a live read-modify-write of only those bits,
+then bench sleeps, `zrn-sleepd once`, a 45 s NMEA read after the wake):
+
+| run | GNSS during the sleep | pins held | result |
+|---|---|---|---|
+| J0a | off | gpg0-2 | 60 s RTC sleep; fix 10 s after the start; no hub errors |
+| J0b | on | gpg0-2 | firmware gave the sleep up at once (grp4=00000001, EINT gpa1-7 pending); GPS fine |
+| J0c | on (clear_grp4=1) | gpg0-2 | 60 s RTC sleep; 5 s after the wake `MCU_REQ_RESP timeout`, `hub reset`; gpsd restarted, fix 7 s later |
+| J0d | on | + gph0-4 0/0, gph0-5 1/0 (stock's CHUB rows) | the same `MCU_REQ_RESP timeout`: the CHUB rows do not help; put back |
+| J0e | off | gpg0-1, gpg0-2 | 120 s RTC sleep; fix 8 s; no hub errors; PMIC fine |
+| J1 (new module, after a reboot) | off | the table | woke by the modem after 16.5 s; fix 14 s; no hub errors |
+
+Before the fix every sleep that reached the SoC killed the hub, GNSS on or
+off. With it, an idle hub (lhd up, no gpsd) lives through sleeps. **A hub
+streaming GNSS still does not**: the SPI handshake (MCU_REQ gph0-5 / MCU_RESP
+gph0-4) times out after the wake and zrn-bbd resets the hub. GNSS holds
+SoC sleep off (ztos-gnss-gate's `timed-gnss` while it has readers); it does
+not survive a sleep. Stock never sleeps through a pending host_req, because
+host_req is a wake IRQ there (round 2, above).
+
+**What GRP4 bit 0 is (J0b).** A sleep with gpsd running found PMU_INTR_GEN
+GRP4 = 00000001 at the handoff, came straight back (wake_stat 0x80000001,
+smc 0) with gpa1-7 (the hub's host_req) pending in the EINT. So the hub's
+data line latches GRP4 bit 0 even though gpa1-7 is masked as a wake source
+in EINT_WAKE, and ACPM then gives the sleep up ('upend_wk'). The whole boot
+of aborted sleeps on 29 Oct (grp4 was not logged then) may well have been a
+hub holding host_req: a chip in ROM after the first sleep fits.
+
+## Sleeps the firmware gives up (zrn-sleepd)
+
+A sleep with smc 0, no wake source (wake_stat & 0x7fffffff, wake_stat2/3 and
+every EINT word 0) and under 2 s of boot time asleep, or any sleep with
+grp4_before set (grp4_at_smc with the round-2 module), is `fw-abort`: not a
+wake, no doze window. GRP4 is never forced clear from zrn-sleepd
+(clear_grp4 is written 0 at every cycle). Since 30 Oct the abort is
+classified `hub` or `other`; `hub` backs off and never pauses, three
+`other` in a row pause sleeping for 30 min, not for the boot (`zrn-sleepd
+enable` or a reboot also clears it): "Sleep holes closed in round 2" at the
+top.
+
+Also in zrn-sleepd now: the conditions are read again after the settle,
+between reading and writing wakeup_count (`cancelled`, 5 s, J3 below); the
+failure backoff counts failures in a row (30, 60, 120, 240, 300 s), reset by a
+real wake; an alarm due within 2 s (EBUSY from alarmtimer) is `alarm-due`, a
+3 s retry; the settle is 1 s when nothing was unbound; at 10 % battery sleeps
+last at most 600 s, at 4 % 120 s; a doze window ends PUSH_GRACE_S after the
+wake if zrn-pushd's connection lived through the sleep, and at 15 s if
+zrn-pushd has no network to try; each sleep logs charge_now in and out; an
+hourly summary line (cycles, fw-aborts, wakes by reason, % awake, mAh asleep
+and awake); `wakes=` and `woke_at=` in /run/zrn-sleepd/status; the wakeup
+sources on a refused or stalled sleep; any inhibit held over an hour.
+
+J3 (live): an inhibit file made during the preparations: `sleep cancelled:
+inhibit team-test`, no `PM: suspend entry`, Wi-Fi bound again, the RTC alarm
+cleared, entries unchanged.
+
+## The watchdog over the resume window (off)
+
+`wdt_resume_s` (0, off, by default; at most 82 s) arms the cluster-1
+watchdog (0x10060000) with reset on and its PMU route (bit 23 of
+0x14060408/0x1406040c) open, right after the exit tables return, so a hang
+before the watchdog driver's own resume resets the phone. After the resume
+(PM_POST_SUSPEND) it is left to the driver if the driver took it back, or
+stopped with the route bits put back. wdt-resume.h; host test in
+watchdog-test/test-routing.py. Not enabled: no real watchdog-expiry reset
+has been seen on this kernel yet, and the first test needs someone there.
+
+## Pin power-down audit (read-only, 30 Oct)
+
+Live CON/DAT/CON_PDN/PUD_PDN of PERIC0, PERIC1, FSYS0, FSYS1 and CHUB,
+against stock (sensors/stock-state/pinctrl.txt for PERIC0 and CHUB, the
+vendor DT's pin-con-pdn entries otherwise): 31 of 104 pins with a stock
+power-down setting differ (everything not in the table is at the reset
+value, input with a pull-down). Staged, not applied:
+
+| pins | stock | ours | what to do |
+|---|---|---|---|
+| gph0-4, gph0-5 (MCU_RESP, MCU_REQ) | 0/0, 1/0 | 2/1 | tried in J0d: no help for a hub streaming GNSS through a sleep; only if an idle hub ever fails again |
+| gpg0-5 (WL_REG_ON), gpf2-2 (pcie0_perst) | 3/1, 3 | 2/1 | the WoWLAN and host-wake work, step 0 |
+| gpg1-0 (codec reset) | 3/0 | 2/1 | the audio work: would the DSP keep its codec through a sleep |
+| gpf0-0, gpf0-1 (FSYS0, function 2) | 3/0 | 2/1 | storage: UFS resumes today; only with a reason |
+| gpd0-0 (function 2), gpd0-2 (out, high) | 3/0, 0/0 | 2/1 | look up what they drive first |
+| gpg1-7 (out, high) | 0/0 | 2/1 | as above |
+| gpg3-4, gpg3-5 | 0/1 | 2/1 | next to zrn-bt's gpg3-6: check with the expander |
+| gpp5-0/1, gpp6-0..3, gpc0-0/1, gpg3-0..3, gpf2-0 | 2/0 | 2/1 | pull only: a pull-down against an external pull-up leaks while asleep; a candidate once the sleep floor is measured |
+| gpf1-0..5 | 0/0 | 2/1 | unused pins; no change expected |
+
+# Full MIF sleep: stock's suspend path against ours — 2026-10-29
+
+The vendor kernel checkout (third_party/vendor-kernel, LineageOS
+exynos9810, 4.9.118) was sparse: only drivers/soc, sensorhub and the DT.
+Added drivers/devfreq, drivers/memory, drivers/thermal, drivers/mfd,
+drivers/regulator, drivers/soc/samsung, include/soc/samsung, drivers/clk.
+
+What stock's TWRP sleep (build/power-analysis/twrp-stock-sleep.log, MIF down
+1) runs before the firmware call, and ours:
+
+| stock | ours (mif-trial.sh) |
+|---|---|
+| exynos_tmu_suspend: ACPM TMU plugin IPC TMU_IPC_AP_SUSPEND (0x04, rsvd = cp net connected) on channel 12; TMU_IPC_AP_RESUME (0x10) after; TMU_IPC_INIT per zone at boot | plugin 7 copied and attached by load-acpm-tmu.py, never initialised, never told AP_SUSPEND/RESUME |
+| devfreq suspend: mif 421000, int 107000, fsys0 73000, cam 590000, intcam 630000, disp 200000, aud 0 (through ACPM DVFS, after DATA_INIT/SET_CONST at boot) | MIF 421 / INT 107 through s9p-acpm FVP; the others untouched |
+| s2mps18_pmic_suspend adc_mode 2 | none |
+| modem_suspend pda_active 0 (modem left running) | modem powered off |
+| etspi suspend SMC, mpsd (TEE), madera, dwc3, sec_ts, hall, fimc_is sensors, iva_ctl | none (their blocks are off or absent in ours) |
+| MIF req_Master 0x10 | 0x13 awake (modem bits) |
+
+The TMU row is the lead: the plugin runs on ACPM through the sleep; told
+nothing, it may keep polling or act on hardware in the domain going down.
+Not proof: trials before 18 Oct hung without the plugin loaded at all.
+
+ACPM SRAM plugin slots (initdata 0x5a0c, 48-byte entries; ACPM address =
+offset from 0x02039000): 1 0x1f800+0x800, 2 0x16c00+0x8c00, 4 0xc400+0x2800,
+5 0xb400+0x1000, 6 0xec00+0x8000, 7 (TMU, loaded by us) 0xd800+0x1400.
+The zero stretch 0xcbc0..0xd800 is inside plugin 4's slot: not a free place
+for the sleep log.
+
+Next trial (phone free, someone there for the key reset): send TMU INIT
+after loading the plugin, AP_SUSPEND before the sleep, AP_RESUME after
+(`s9p-acpm ipc 12 0 0x04 0 0` / `... 0 0x10 0 0`; INIT is `0 0x01 0 0`).
+
 # Current-install AP sleep verification — 2026-10-22
 
 Kernel #55 (`7.1.0-zboot`) completed two consecutive AP-only RTC suspend

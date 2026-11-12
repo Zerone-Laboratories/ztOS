@@ -120,7 +120,7 @@ def build_apps(stage: Path):
     out.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(SDK))
     from ztos_sdk import cli as sdk
-    projects = (OS / "apps" / "welcome", OS / "apps" / "whatsapp", ROOT / "apps" / "music")
+    projects = (OS / "apps" / "welcome", ROOT / "apps" / "music")
     for project in projects:
         p = sdk.find_project(str(project))
         python = "%d.%d" % sys.version_info[:2]
@@ -222,9 +222,25 @@ ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1; make -j"$(nproc)" &
 ch sh -c 'cd /usr/src/ztmetro && make install-browser'
 ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1' || true
 
+# push messages for Android apps in both runtimes (the sudoers rule comes
+# from the user templates in the rootfs overlay)
+step "building zrn-pushd (push for Android apps)"
+rm -rf "$R/usr/src/zrn-pushd"; mkdir -p "$R/usr/src"
+cp -a "$SRC/android/push" "$R/usr/src/zrn-pushd"
+ch sh -c 'cd /usr/src/zrn-pushd && make clean >/dev/null 2>&1; make && make install'
+install -Dm644 "$SRC/android/push/README.md" "$R/usr/local/share/doc/zrn-pushd/README.md"
+ch systemctl --global enable zrn-pushd.service
+rm -rf "$R/usr/src/zrn-pushd"
+
 step "adding ztOS's files"
 cp -a "$SRC/os/overlay/." "$R/"
 cp -a "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
+# the wallpapers and ringtones: scripts/pack-media.sh
+if [ -f "$SRC/prebuilts/ztos-media/ztos-media.tar.xz.partaa" ]; then
+	cat "$SRC"/prebuilts/ztos-media/ztos-media.tar.xz.part* | tar -C "$R" --no-same-owner -xJf -
+else
+	echo "WARNING: no prebuilts/ztos-media: this image has no wallpapers or ringtones (run scripts/pack-media.sh)" >&2
+fi
 ch update-desktop-database /usr/share/applications
 
 step "adding Android (Waydroid and the recipe for its image)"

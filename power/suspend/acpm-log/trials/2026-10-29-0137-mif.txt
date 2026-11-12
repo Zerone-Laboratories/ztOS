@@ -1,0 +1,37 @@
+index 19
+  0 hdr=4000e44c 'SLEEP+++'   val=0x4
+  1 hdr=4000e44c 'ente_pm+'   val=0x0
+  2 hdr=4000e44d 'ent_cpd+'   val=0x0
+  3 hdr=4000e44d 'ente_c2+'   val=0x0
+  4 hdr=4000e450 'ente_c2-'   val=0x0
+  5 hdr=4000e450 'nncpu_d+'   val=0x4
+  6 hdr=4000e459 'nncpu_d-'   val=0x4
+  7 hdr=4000e45a 'ent_cpd-'   val=0x4
+  8 hdr=4000e45a 'f_cpd+++'   val=0x1
+  9 hdr=4000e45b 'b_pwr_d+'   val=0x1
+ 10 hdr=4000e464 'b_pwr_d-'   val=0x1
+ 11 hdr=4000e465 'b_pwr_u+'   val=0x1
+ 12 hdr=4000e46a 'b_pwr_u-'   val=0x1
+ 13 hdr=4000e46a 'f_cpd---'   val=0x1
+ 14 hdr=4000e46a 'ent_soc+'   val=0x0
+ 15 hdr=4000e4aa 'ent_soc-'   val=0x0
+ 16 hdr=4000e4ab 'ent_mif+'   val=0x100000
+ 17 hdr=4000e4ab 'dramini+'   val=0x100000
+ 18 hdr=4000e4ac 'dramini-'   val=0x100000
+
+Reading (2026-10-29, ACPM SRAM disassembled, Thumb, arm-none-eabi-objdump):
+- enter_mif (ACPM 0x103b0) logs ent_mif+, then dramini+, calls 0xf01c(2, mode, 0,
+  0x80000000) (DRAM preparation), logs dramini-, then calls the MIF power-down
+  sequencer through a function table ([[0x104dc]+4]+12) and only then logs
+  ent_mif-. Entries 16-18 above are this; ent_mif- is written after DRAM is in
+  self-refresh, so its absence says nothing.
+- exit_mif (around 0x10184..0x10300) logs exi_mif+, runs the MIF power-up
+  sequencer ([[0x10368]+4]+8), then dramini+/0xf01c(2, mode, 3, ...)/dramini-
+  (mode <= 3), or TZMIF1/cmuinit/TZMIF2/sci_ini/dramini/TZMIF3 (mode > 3).
+- With the log in DRAM, no wake-side entry can be told apart from "no wake":
+  everything before DRAM is back is lost. Next: log into ACPM SRAM.
+- Free ACPM SRAM: 0xcbc0..0xd800 (ACPM addresses = offset from SoC 0x02039000)
+  is zero in every dump since 16 Oct and no code or literal refers into it
+  (0xd800..0xe800 is referenced: avoid). Pages 0-2 (0x0..0x3000) are not
+  readable from Linux (bus error). Vector table at 0x3000, initial SP 0x9000.
+  Plan: acpmlogptr.py clear 0x02045c00; acpmlogptr.py set 0xcc00 (0x810 bytes).
