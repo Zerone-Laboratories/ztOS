@@ -1,0 +1,170 @@
+{
+  "id": "samsung-beyondx",
+  "name": "Samsung Galaxy S10 5G",
+  "maker": "Samsung",
+  "model": "SM-G977N",
+  "codename": "beyondx",
+  "maintainer": "Omonulloh",
+  "contact": "https://github.com/urinbayevoff/omonullos-beyondx",
+  "added": "2026-11-18",
+  "summary": "omonullOS: a ztOS fork for the Exynos 9820. Mainline Linux 7.1 with our own 9820 drivers and device tree, booting from the phone's internal storage, with ztMETRO in Uzbek and English. Calls, SMS, Wi-Fi and Panfrost work; it is the maintainer's daily phone. Only the Korean SM-G977N has been tried.",
+  "photo": "photo.jpg",
+  "photo_caption": "",
+  "specs": [
+    [
+      "SoC",
+      "Samsung Exynos 9820"
+    ],
+    [
+      "CPU",
+      "2× Mongoose M4 at 2.73 GHz, 2× Cortex-A75 at 2.31 GHz, 4× Cortex-A55 at 1.95 GHz"
+    ],
+    [
+      "GPU",
+      "Mali-G76 MP12 (Panfrost)"
+    ],
+    [
+      "RAM",
+      "8 GB"
+    ],
+    [
+      "Storage",
+      "256 GB UFS 3.0"
+    ],
+    [
+      "Display",
+      "6.7 in, 1440×3040 Dynamic AMOLED"
+    ],
+    [
+      "Battery",
+      "4500 mAh"
+    ],
+    [
+      "Modem",
+      "Shannon LTE + S5100 5G (over PCIe)"
+    ],
+    [
+      "Kernel",
+      "Mainline Linux 7.1, modules for the phone's hardware"
+    ],
+    [
+      "Released",
+      "2019"
+    ],
+    [
+      "Source",
+      "[omonullos-beyondx](https://github.com/urinbayevoff/omonullos-beyondx)"
+    ]
+  ],
+  "install": {
+    "markdown": "A release (`beyondx-v*` on the [Releases page](https://github.com/urinbayevoff/omonullos-beyondx/releases)) has three files:\n\n| file | what it is | partition |\n|---|---|---|\n| `bxci*.img` | BOOT: mainline Linux 7.1, initramfs, uniLoader, the S10 5G device tree | `BOOT` |\n| `omonullos-beyondx-root.img.zst` | the root filesystem: ext4, label `ZR_ARCH`, 8 GiB, zstd | `USERDATA` |\n| `SHA256SUMS` | checksums of the two | |\n\nBuilt by GitHub Actions (`.github/workflows/build-image-beyondx.yml`) from the [source repo](https://github.com/urinbayevoff/omonullos-beyondx) only.\nNo firmware is in them: on the first boot `zvendor-firmware` copies the\nWi-Fi and audio firmware from the phone's own `VENDOR` partition (read only),\nand the modem boots from the phone's own `RADIO2`. So `VENDOR` and `RADIO2`\nmust still be the stock ones (tested with G977NKSU6HWD3).\n\n**This wipes Android.** USERDATA is overwritten: all of your Android data is\ngone. Only the Korean SM-G977N (Exynos 9820) was tried. Other S10 models are\ndifferent phones.\n\n## Before you start\n\n1. Unlock the bootloader (OEM unlock), as for any custom ROM.\n2. Flash TWRP into `RECOVERY`. It is your way back, see the end of this page.\n3. **Back up `EFS` and keep the copy off the phone.** It holds the IMEI and\n   the radio calibration. Nothing here writes to it, but you cannot get it back\n   if it is lost. Back up `BOOT` too, so you can go back.\n4. Check the downloads: `sha256sum -c SHA256SUMS`.\n\n## Flashing\n\nUnpack the root image and make it sparse. Download mode writes sparse images\nand skips the empty part:\n\n```sh\nzstd -d omonullos-beyondx-root.img.zst\nimg2simg omonullos-beyondx-root.img root.simg     # android-tools / simg2img package\n```\n\nPut the phone in Download mode (power off, hold Vol Down + Bixby, plug in the\ncable), then write the two partitions. We flash with\n[samloader-rs](https://github.com/topjohnwu/samloader-rs) 2.2.0:\n`samloader flash -p BOOT bxci*.img`, then `samloader flash -p USERDATA root.simg`.\nIts stock timeouts are too short for USERDATA (see below); we raised the\nsession-end and chunk timeouts to 900 s. Odin and Heimdall have not been tried.\n\n**Let the tool finish the session.** After the last data chunk, the phone\nspends a few minutes writing out the empty end of USERDATA, and only then\ncloses the session and reboots by itself. Do not unplug, do not press any\nkeys, and give your tool a long enough timeout for that step. With a 3 s\ntimeout the session was cut short twice. Each time, the first ext4 superblock\nwas left as a placeholder (`00 01 02 ...` at offset 0x400) and the phone stopped at\n`zboot: rescue shell: no filesystems labelled ZR_ARCH`.\n\n## First boot\n\nTakes longer than later boots: the firmware is copied out of `VENDOR` and the\nfilesystem grows from 8 GiB to the whole of USERDATA (`zboot-firstboot`). Then\nthe ztMETRO Start screen comes up, in Uzbek. Settings > language switches to English.\n\n- User `alarm`, password `alarm` (as in Arch Linux ARM). Change it with `passwd`.\n  `root` is locked; `alarm` is in `wheel` (sudo).\n- SSH is installed but not enabled (`sudo systemctl enable --now sshd`); it\n  takes keys only.\n- Wi-Fi: Settings > Wi-Fi. Calls and SMS: a SIM in slot 1.\n- Segoe fonts, Apple emoji, ztOS's wallpapers and ringtones are downloaded\n  from Settings > theme (see [FONTS.md](https://github.com/urinbayevoff/omonullos-beyondx/blob/main/docs/s10-5g/FONTS.md)); three wallpapers are built in.\n\nWhat works and what does not: the list on this page. Battery life is poor, and suspend\nis still experimental.\n\n## If it does not boot\n\n- **`rescue shell: no filesystems labelled ZR_ARCH`**: the superblock was\n  not written (see above). Boot TWRP (Vol Down + Power ~7 s, then at once\n  Vol Up + Bixby + Power; on our phone TWRP came up only with a USB cable\n  plugged in). In TWRP's terminal, check first: `e2fsck -fn /dev/block/sda33`\n  (`sda33` is userdata on our phone; check that it is on yours, e.g. with\n  `ls -l /dev/block/platform/*/by-name/userdata`, before writing anything). If it says bad magic / superblock, repair from the backup superblock:\n  `e2fsck -fy -b 32768 -B 4096 /dev/block/sda33`, then reboot to system.\n- **Anything else**: flash your saved BOOT back, or stock firmware with Odin."
+  },
+  "features": [
+    {
+      "category": "Core",
+      "feature": "Boot from internal storage",
+      "status": "working",
+      "notes": "uniLoader in BOOT, Arch Linux ARM on USERDATA; a panic falls back to recovery"
+    },
+    {
+      "category": "Display",
+      "feature": "Display (DECON)",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "Touch",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Display",
+      "feature": "GPU",
+      "status": "working",
+      "notes": "Panfrost on the Mali-G76"
+    },
+    {
+      "category": "Connectivity",
+      "feature": "Wi-Fi",
+      "status": "working",
+      "notes": "BCM4375 over PCIe; firmware copied from VENDOR on first boot"
+    },
+    {
+      "category": "Telephony",
+      "feature": "Calls",
+      "status": "working",
+      "notes": "Earpiece, speaker and microphone, clear audio both ways"
+    },
+    {
+      "category": "Telephony",
+      "feature": "SMS",
+      "status": "working",
+      "notes": "Send and receive, through Samsung's RIL"
+    },
+    {
+      "category": "Telephony",
+      "feature": "Mobile data",
+      "status": "untested",
+      "notes": ""
+    },
+    {
+      "category": "Audio",
+      "feature": "Speaker",
+      "status": "working",
+      "notes": ""
+    },
+    {
+      "category": "Power",
+      "feature": "Charging",
+      "status": "partial",
+      "notes": "Wall charger at the stock rate; no fast charge yet"
+    },
+    {
+      "category": "Power",
+      "feature": "Suspend",
+      "status": "partial",
+      "notes": "System sleep works (about 90-100 mA asleep), wakes on the power key, calls and SMS; still experimental"
+    },
+    {
+      "category": "Power",
+      "feature": "Battery life",
+      "status": "partial",
+      "notes": "About 350 mA awake with the screen off"
+    },
+    {
+      "category": "Sensors",
+      "feature": "Proximity",
+      "status": "broken",
+      "notes": "Being worked on"
+    },
+    {
+      "category": "Other",
+      "feature": "Camera",
+      "status": "broken",
+      "notes": "Not started"
+    },
+    {
+      "category": "Other",
+      "feature": "Bluetooth",
+      "status": "broken",
+      "notes": "Not started"
+    },
+    {
+      "category": "Other",
+      "feature": "GPS",
+      "status": "broken",
+      "notes": "Not started"
+    }
+  ],
+  "notes": [
+    {
+      "title": "Only the SM-G977N",
+      "text": "Other S10 models (G970, G973, G975) are different phones with different hardware. Do not flash this on them."
+    },
+    {
+      "title": "No firmware in the image",
+      "text": "Wi-Fi and audio firmware are copied from the phone's own VENDOR partition, and the modem boots from its own RADIO2. Keep both stock."
+    }
+  ]
+}
