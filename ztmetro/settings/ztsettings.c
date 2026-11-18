@@ -23,6 +23,7 @@
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include "ztos-hw.h"
 #include "zrnvibe.h"
@@ -34,6 +35,7 @@
 
 #include <cairo.h>
 #include <dirent.h>
+#include <glob.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <pango/pangocairo.h>
 #include <wayland-client.h>
@@ -317,6 +319,167 @@ static void read_sys_file(const char *path, char *out, size_t size) {
 		}
 		fclose(f);
 	}
+}
+
+/* ---------------------------------------------------------- this phone */
+/* What the phone is, read from the system once; the Galaxy S9's, which these
+ * pages were written on, where the system does not say. */
+
+/* its name: ztOSIAL's Device1, else the device tree's model. `full` adds the codename. */
+static const char *phone_name(bool full) {
+	static char name[96], with_codename[160];
+	if (!name[0]) {
+		char codename[48] = "";
+#ifdef HAVE_ZTOS_IAL
+		if (ztos_ial_get_string(NULL, "Device1", "Name", name, sizeof(name)) < 0) {
+			name[0] = 0;
+		}
+		if (ztos_ial_get_string(NULL, "Device1", "Codename", codename, sizeof(codename)) < 0) {
+			codename[0] = 0;
+		}
+#endif
+		if (!name[0]) {
+			read_sys_file("/proc/device-tree/model", name, sizeof(name));
+		}
+		if (!name[0]) {
+			snprintf(name, sizeof(name), "Samsung Galaxy S9");
+			snprintf(codename, sizeof(codename), "SM-G960N starlte");
+		}
+		snprintf(with_codename, sizeof(with_codename), codename[0] ? "%s (%s)" : "%s", name, codename);
+	}
+	return full ? with_codename : name;
+}
+
+/* "Snapdragon SDM670", from the SoC's own identification */
+static const char *soc_name(void) {
+	static char soc[80];
+	if (!soc[0]) {
+		char family[32], machine[40];
+		read_sys_file("/sys/devices/soc0/family", family, sizeof(family));
+		read_sys_file("/sys/devices/soc0/machine", machine, sizeof(machine));
+		snprintf(soc, sizeof(soc), "%s%s%s", machine[0] ? family : "Samsung Exynos 9810",
+			machine[0] && family[0] ? " " : "", machine);
+	}
+	return soc;
+}
+
+/* the last cpufreq policy, the big cluster: policy4 on the S9, policy6 on an SDM670 */
+static const char *big_policy(void) {
+	static char path[64];
+	if (!path[0]) {
+		int last = 4;
+		glob_t g;
+		if (glob("/sys/devices/system/cpu/cpufreq/policy*", 0, NULL, &g) == 0) {
+			last = 0;
+			for (size_t i = 0; i < g.gl_pathc; i++) {
+				int n = atoi(g.gl_pathv[i] + strlen("/sys/devices/system/cpu/cpufreq/policy"));
+				last = n > last ? n : last;
+			}
+		}
+		globfree(&g);
+		snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpufreq/policy%d", last);
+	}
+	return path;
+}
+
+/* a cluster's cores ("0-5") and range in MHz; the S9's when the policy says nothing */
+static void cluster(const char *policy, char *cores, size_t size, int *min_mhz, int *max_mhz) {
+	char path[128], buf[64];
+	snprintf(path, sizeof(path), "%s/related_cpus", policy);
+	read_sys_file(path, buf, sizeof(buf));
+	/* shortcut: a policy's cores taken as one run, first to last (true on every ARM SoC so far) */
+	const char *last = strrchr(buf, ' ');
+	if (buf[0]) {
+		snprintf(cores, size, last ? "%d-%d" : "%d", atoi(buf), last ? atoi(last + 1) : 0);
+	} else {
+		snprintf(cores, size, "%s", strstr(policy, "policy0") ? "0-3" : "4-7");
+	}
+	bool little = strstr(policy, "policy0") != NULL;
+	snprintf(path, sizeof(path), "%s/cpuinfo_min_freq", policy);
+	read_sys_file(path, buf, sizeof(buf));
+	*min_mhz = buf[0] ? atoi(buf) / 1000 : little ? 350 : 400;
+	snprintf(path, sizeof(path), "%s/cpuinfo_max_freq", policy);
+	read_sys_file(path, buf, sizeof(buf));
+	*max_mhz = buf[0] ? atoi(buf) / 1000 : little ? 1794 : 2704;
+}
+
+/* the GPU by its device tree name: "qcom,adreno-615.0" is "Adreno 615" */
+static const char *gpu_name(void) {
+	static char name[48];
+	if (!name[0]) {
+		char compatible[64];
+		int model;
+		read_sys_file(hw_file(hw_gpu(), "device/of_node/compatible"), compatible, sizeof(compatible));
+		if (sscanf(compatible, "qcom,adreno-%d", &model) == 1) {
+			snprintf(name, sizeof(name), "Adreno %d", model);
+		} else {
+			snprintf(name, sizeof(name), "Mali-G72 MP18");
+		}
+	}
+	return name;
+}
+
+/* its clock steps, "180, 267, 355, 430 MHz" */
+static void gpu_steps(char *out, size_t size) {
+	char hz[256];
+	read_sys_file(hw_file(hw_gpu(), "available_frequencies"), hz, sizeof(hz));
+	size_t o = 0;
+	out[0] = 0;
+	for (char *save = NULL, *t = strtok_r(hz, " ", &save); t && o < size; t = strtok_r(NULL, " ", &save)) {
+		o += snprintf(out + o, size - o, "%s%ld", o ? ", " : "", atol(t) / 1000000);
+	}
+	if (out[0] && o < size) {
+		snprintf(out + o, size - o, " MHz");
+	} else {
+		snprintf(out, size, "260, 455, 572 MHz");
+	}
+}
+
+/* the panel's mode, "1080x2160" */
+static const char *display_mode(void) {
+	static char mode[64];
+	if (!mode[0]) {
+		glob_t g;
+		if (glob("/sys/class/drm/card*-DSI-*/modes", 0, NULL, &g) == 0) {
+			read_sys_file(g.gl_pathv[0], mode, sizeof(mode));
+		}
+		globfree(&g);
+		if (!mode[0]) {
+			snprintf(mode, sizeof(mode), "Super AMOLED 1440x2960 @ 60.00 Hz");
+		}
+	}
+	return mode;
+}
+
+/* "3700 mAh Li-ion", from the battery's design capacity */
+static void battery_info(char *out, size_t size) {
+	char design[32], tech[24], health[24];
+	read_sys_file(hw_file(hw_battery(), "charge_full_design"), design, sizeof(design));
+	read_sys_file(hw_file(hw_battery(), "technology"), tech, sizeof(tech));
+	read_sys_file(hw_file(hw_battery(), "health"), health, sizeof(health));
+	if (!design[0]) {
+		snprintf(out, size, "3000 mAh Li-Ion, Health Good");
+		return;
+	}
+	snprintf(out, size, "%ld mAh %s%s%s", atol(design) / 1000, tech[0] ? tech : "battery",
+		health[0] ? ", Health " : "", health);
+}
+
+/* what the system lives on: eMMC, or the S9's UFS */
+static const char *storage_kind(void) {
+	struct stat st;
+	char link[64], *real;
+	const char *kind = "UFS 2.1 Storage";
+	if (stat("/", &st) == 0) {
+		snprintf(link, sizeof(link), "/sys/dev/block/%u:%u", major(st.st_dev), minor(st.st_dev));
+		if ((real = realpath(link, NULL))) {
+			if (strstr(real, "/mmcblk")) {
+				kind = "eMMC Storage";
+			}
+			free(real);
+		}
+	}
+	return kind;
 }
 
 /* The whole UI's animation speed, percent of what was measured on the Lumia */
@@ -917,18 +1080,19 @@ static double draw_main(cairo_t *cr) {
 	snprintf(detail, sizeof(detail), "%d%%, %s", bat, app.battery_saver ? "battery saver on" : "discharging");
 	y = zmc_entry(cr, y, "battery saver", detail, ACT_OPEN_PAGE, PAGE_BATTERY);
 
-	snprintf(detail, sizeof(detail), "Exynos 9810 (8 cores), %s", app.cpu_gov);
+	snprintf(detail, sizeof(detail), "%s (%ld cores), %s", soc_name(), sysconf(_SC_NPROCESSORS_CONF), app.cpu_gov);
 	y = zmc_entry(cr, y, "processor", detail, ACT_OPEN_PAGE, PAGE_CPU);
 
 	snprintf(detail, sizeof(detail), "3.5 GB RAM, swappiness %d", app.swappiness);
 	y = zmc_entry(cr, y, "virtual memory", detail, ACT_OPEN_PAGE, PAGE_VM);
 
-	snprintf(detail, sizeof(detail), "Mali-G72 MP18 (%s), 60 FPS", app.gpu_gov);
+	snprintf(detail, sizeof(detail), "%s (%s), 60 FPS", gpu_name(), app.gpu_gov);
 	y = zmc_entry(cr, y, "graphics", detail, ACT_OPEN_PAGE, PAGE_GPU);
 
 	y = zmc_entry(cr, y, "date + region", "date, time zone and regional formats", ACT_OPEN_PAGE, PAGE_DATE);
 
-	y = zmc_entry(cr, y, "about", "Samsung Galaxy S9, ztOS Mobile", ACT_OPEN_PAGE, PAGE_ABOUT);
+	snprintf(detail, sizeof(detail), "%s, ztOS Mobile", phone_name(false));
+	y = zmc_entry(cr, y, "about", detail, ACT_OPEN_PAGE, PAGE_ABOUT);
 
 	return y + 20;
 }
@@ -2620,7 +2784,8 @@ static double draw_battery(cairo_t *cr) {
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	char est[64];
-	snprintf(est, sizeof(est), "%s, %.2f V, Maxim MAX17055", stat[0] ? stat : "Discharging", v);
+	snprintf(est, sizeof(est), "%s, %.2f V%s", stat[0] ? stat : "Discharging", v,
+		strcmp(hw_battery(), HW_S9_BATTERY) == 0 ? ", Maxim MAX17055" : "");
 	zmc_text(cr, est, FONT_REGULAR, 14, MARGIN, y, 0);
 	y += 36;
 
@@ -2635,7 +2800,9 @@ static double draw_battery(cairo_t *cr) {
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Battery information", FONT_REGULAR, 13, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "3000 mAh Li-Ion, Health Good", FONT_REGULAR, 15, MARGIN, y + 20, 0);
+	char info[96];
+	battery_info(info, sizeof(info));
+	zmc_text(cr, info, FONT_REGULAR, 15, MARGIN, y + 20, 0);
 
 	return y + 60;
 }
@@ -2645,7 +2812,9 @@ static double draw_cpu(cairo_t *cr) {
 
 	char p0_f[32], p4_f[32], load[64];
 	read_sys_file("/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq", p0_f, sizeof(p0_f));
-	read_sys_file("/sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq", p4_f, sizeof(p4_f));
+	char path[96];
+	snprintf(path, sizeof(path), "%s/scaling_cur_freq", big_policy());
+	read_sys_file(path, p4_f, sizeof(p4_f));
 	read_sys_file("/proc/loadavg", load, sizeof(load));
 	double f0 = p0_f[0] ? atoi(p0_f) / 1000.0 : 1794.0;
 	double f4 = p4_f[0] ? atoi(p4_f) / 1000.0 : 2704.0;
@@ -2653,21 +2822,26 @@ static double draw_cpu(cairo_t *cr) {
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "SoC Architecture", FONT_REGULAR, 13, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "Samsung Exynos 9810 (10nm LPP)", FONT_SEMILIGHT, 20, MARGIN, y + 18, 0);
+	zmc_text(cr, soc_name(), FONT_SEMILIGHT, 20, MARGIN, y + 18, 0);
 	y += 56;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "LITTLE Cluster (Cores 0-3, Cortex-A55)", FONT_REGULAR, 13, MARGIN, y, 0);
-	char c0_str[64];
-	snprintf(c0_str, sizeof(c0_str), "%.0f MHz (350 - 1794 MHz)", f0);
+	char cores[16], label[64], c0_str[64];
+	int lo, hi;
+	cluster("/sys/devices/system/cpu/cpufreq/policy0", cores, sizeof(cores), &lo, &hi);
+	snprintf(label, sizeof(label), "LITTLE Cluster (Cores %s)", cores);
+	zmc_text(cr, label, FONT_REGULAR, 13, MARGIN, y, 0);
+	snprintf(c0_str, sizeof(c0_str), "%.0f MHz (%d - %d MHz)", f0, lo, hi);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, c0_str, FONT_REGULAR, 16, MARGIN, y + 20, 0);
 	y += 52;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "BIG Cluster (Cores 4-7, M3 Cheetah)", FONT_REGULAR, 13, MARGIN, y, 0);
+	cluster(big_policy(), cores, sizeof(cores), &lo, &hi);
+	snprintf(label, sizeof(label), "BIG Cluster (Cores %s)", cores);
+	zmc_text(cr, label, FONT_REGULAR, 13, MARGIN, y, 0);
 	char c4_str[64];
-	snprintf(c4_str, sizeof(c4_str), "%.0f MHz (400 - 2704 MHz)", f4);
+	snprintf(c4_str, sizeof(c4_str), "%.0f MHz (%d - %d MHz)", f4, lo, hi);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, c4_str, FONT_REGULAR, 16, MARGIN, y + 20, 0);
 	y += 52;
@@ -2715,7 +2889,7 @@ static double draw_vm(cairo_t *cr) {
 		double total_disk = (double)fs.f_blocks * fs.f_frsize / 1e9;
 		double free_disk = (double)fs.f_bavail * fs.f_frsize / 1e9;
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		zmc_text(cr, "UFS 2.1 Storage", FONT_REGULAR, 13, MARGIN, y, 0);
+		zmc_text(cr, storage_kind(), FONT_REGULAR, 13, MARGIN, y, 0);
 		char disk_str[64];
 		snprintf(disk_str, sizeof(disk_str), "%.1f GB free of %.1f GB", free_disk, total_disk);
 		cairo_set_source_rgb(cr, 1, 1, 1);
@@ -2736,13 +2910,14 @@ static double draw_gpu(cairo_t *cr) {
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "GPU Engine", FONT_REGULAR, 13, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "ARM Mali-G72 MP18 (Bifrost)", FONT_SEMILIGHT, 21, MARGIN, y + 18, 0);
+	zmc_text(cr, gpu_name(), FONT_SEMILIGHT, 21, MARGIN, y + 18, 0);
 	y += 56;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Clock frequency", FONT_REGULAR, 13, MARGIN, y, 0);
-	char f_str[64];
-	snprintf(f_str, sizeof(f_str), "%.0f MHz (260, 455, 572 MHz)", mhz);
+	char f_str[160], steps[128];
+	gpu_steps(steps, sizeof(steps));
+	snprintf(f_str, sizeof(f_str), "%.0f MHz (%s)", mhz, steps);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, f_str, FONT_REGULAR, 16, MARGIN, y + 20, 0);
 	y += 52;
@@ -2757,7 +2932,7 @@ static double draw_gpu(cairo_t *cr) {
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Display Hardware", FONT_REGULAR, 13, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "Super AMOLED 1440x2960 @ 60.00 Hz", FONT_REGULAR, 15, MARGIN, y + 20, 0);
+	zmc_text(cr, display_mode(), FONT_REGULAR, 15, MARGIN, y + 20, 0);
 	y += 52;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
@@ -2845,7 +3020,7 @@ static double draw_about(cairo_t *cr) {
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Phone", FONT_REGULAR, 13, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	y += zmc_text(cr, "Samsung Galaxy S9 (SM-G960N starlte)", FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
+	y += zmc_text(cr, phone_name(true), FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Operating System", FONT_REGULAR, 13, MARGIN, y, 0);
@@ -2911,7 +3086,8 @@ static double draw_perf(cairo_t *cr) {
 
 	char value[160], a[32], b[32], online[32];
 	read_sys_file("/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq", a, sizeof(a));
-	read_sys_file("/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq", b, sizeof(b));
+	snprintf(value, sizeof(value), "%s/scaling_max_freq", big_policy());
+	read_sys_file(value, b, sizeof(b));
 	read_sys_file("/sys/devices/system/cpu/online", online, sizeof(online));
 	snprintf(value, sizeof(value), "little %d MHz, big %d MHz, cores %s online",
 		atoi(a) / 1000, atoi(b) / 1000, online);
@@ -3553,8 +3729,8 @@ static void activate(int action, int arg) {
 		{
 			char cmd[256];
 			snprintf(cmd, sizeof(cmd),
-				"ztos-auth sh -c 'echo %s > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor && echo %s > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor' 2>/dev/null &",
-				app.cpu_gov, app.cpu_gov);
+				"ztos-auth sh -c 'echo %s > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor && echo %s > %s/scaling_governor' 2>/dev/null &",
+				app.cpu_gov, app.cpu_gov, big_policy());
 			if (system(cmd) != 0) {}
 		}
 		break;

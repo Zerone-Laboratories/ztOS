@@ -192,6 +192,10 @@ static int nav_h = NAV_BAR_H;
 #define STATUS_IN_MS	150	/* a status icon growing from its middle */
 #define STATUS_OUT_MS	70	/* and going: a frame or two, as on the phone */
 #define VOLUME_MAX	30
+/* A phone whose speaker can play louder installs this hook (`0..10`, or `status`): the
+ * media volume then goes on past VOLUME_MAX, and each step above it is one step of boost. */
+#define SPEAKER_BOOST	"/usr/local/bin/ztos-speaker-boost"
+#define VOLUME_BOOST	10
 #define CARD_SCALE	0.6f	/* a card against the app at full size */
 #define CARD_GAP	18
 #define SWITCH_MS	260
@@ -202,7 +206,7 @@ static int nav_h = NAV_BAR_H;
 #define FOV_DEG		34	/* vertical field of view of the one projection */
 /* the press, as everywhere (ZMC_TILT_* in core/zrnmetrocore.h) */
 #define TILT_DEG	14	/* how far a pressed tile leans toward the finger */
-#define TORCH_PATH	"/sys/class/leds/white:torch/brightness"	/* leds/zrn-flash.ko */
+#define TORCH_S9	"/sys/class/leds/white:torch"	/* leds/zrn-flash.ko */
 #define TORCH_LEVEL	9	/* of 15: the top of Samsung's torch table */
 #define TILT_IN_MS	70
 #define TILT_OUT_MS	200	/* back up on Log(10) (Windows Phone's TiltUp) */
@@ -6290,6 +6294,38 @@ static int shade_hit(struct zt_server *server, double x, double y) {
 	return -1;
 }
 
+/* The rear flash LED's brightness file, at a torch's current: the S9's at
+ * TORCH_LEVEL, else the first mainline "*:torch" or "*:flash" LED at its
+ * max_brightness (the torch mode's highest current). "" while there is none. */
+static const char *torch_path(int *level) {
+	static char path[160];
+	static int max;
+	const char *const leds[] = { TORCH_S9, "/sys/class/leds/*:torch", "/sys/class/leds/*:flash" };
+	for (size_t i = 0; i < sizeof(leds) / sizeof(leds[0]) && !path[0]; i++) {
+		glob_t g;
+		if (glob(leds[i], 0, NULL, &g) != 0) {
+			globfree(&g);
+			continue;
+		}
+		char file[200];
+		snprintf(file, sizeof(file), "%s/max_brightness", g.gl_pathv[0]);
+		FILE *f = i == 0 ? NULL : fopen(file, "r");
+		max = TORCH_LEVEL;
+		if (f) {
+			if (fscanf(f, "%d", &max) != 1 || max <= 0) {
+				max = 1;
+			}
+			fclose(f);
+		}
+		snprintf(path, sizeof(path), "%s/brightness", g.gl_pathv[0]);
+		globfree(&g);
+	}
+	if (level) {
+		*level = max;
+	}
+	return path;
+}
+
 /* One quick action, drawn with its top left corner at the origin. */
 static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double w, double h) {
 	int q = server->quick[i];
@@ -6303,7 +6339,7 @@ static void shade_tile_draw(struct zt_server *server, cairo_t *cr, int i, double
 	 * phone yet (no driver, no service), nor the flashlight while
 	 * zrn-flash is not loaded: shown, faint, and not pretending to switch */
 	bool missing = q == Q_ROTATION || q == Q_LOCATION ||
-		(q == Q_FLASHLIGHT && access(TORCH_PATH, W_OK) != 0) ||
+		(q == Q_FLASHLIGHT && access(torch_path(NULL), W_OK) != 0) ||
 		(q == Q_BLUETOOTH && access("/sys/class/bluetooth/hci0", F_OK) != 0);
 	bool on = q == Q_WIFI ? server->shade_wifi : q == Q_AIRPLANE ? server->shade_airplane :
 		q == Q_DATA ? server->cell_data_on : q == Q_VIBRATE ? server->haptics_enabled :
@@ -7956,13 +7992,14 @@ static void shade_activate(struct zt_server *server, int index) {
 		break;
 	case 100 + Q_FLASHLIGHT: {
 		/* the rear flash LED at a torch's current (leds/zrn-flash.ko) */
-		FILE *f = fopen(TORCH_PATH, "w");
+		int level;
+		FILE *f = fopen(torch_path(&level), "w");
 		if (!f) {
 			break;	/* not loaded: the tile is drawn faint */
 		}
 		hap(server, HAP_TAP, HG_SYSTEM);
 		server->shade_torch = !server->shade_torch;
-		fprintf(f, "%d\n", server->shade_torch ? TORCH_LEVEL : 0);
+		fprintf(f, "%d\n", server->shade_torch ? level : 0);
 		fclose(f);
 		draw_shade(server);
 		damage(server);
@@ -9906,11 +9943,15 @@ static void draw_volume(struct zt_server *server) {
 	cairo_paint(cr);
 	char text[16];
 	int level = server->volume_is_media ? server->volume : server->ring_volume;
+	int boost = level > VOLUME_MAX ? level - VOLUME_MAX : 0;
+	level -= boost;
 	snprintf(text, sizeof(text), "%02d/%d", level, VOLUME_MAX);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	draw_text(cr, text, FONT_SEMILIGHT, 26, 16, 8, 0, 0, false);
+	char label[48];
+	snprintf(label, sizeof(label), "media + apps, speaker boost %d/%d", boost, VOLUME_BOOST);
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	draw_text(cr, server->volume_is_media ? "media + apps" : (level ? "ringer + notifications" : "vibrate"), FONT_REGULAR, 12, 108, 20, 0, 0, false);
+	draw_text(cr, server->volume_is_media ? (boost ? label : "media + apps") : (level ? "ringer + notifications" : "vibrate"), FONT_REGULAR, 12, 108, 20, 0, 0, false);
 	cairo_set_source_rgb(cr, 0.25, 0.25, 0.25);
 	cairo_rectangle(cr, 16, VOLUME_H - 9, server->width - 32, 3);
 	cairo_fill(cr);
@@ -10284,23 +10325,35 @@ static int volume_pip(void *data) {
     return 0;
 }
 
+static int volume_top(bool media) {
+	return media && access(SPEAKER_BOOST, X_OK) == 0 ? VOLUME_MAX + VOLUME_BOOST : VOLUME_MAX;
+}
+
+static void speaker_boost(int level) {
+	char n[8];
+	snprintf(n, sizeof(n), "%d", level > VOLUME_MAX ? level - VOLUME_MAX : 0);
+	run_detached(SPEAKER_BOOST, n, NULL, NULL);
+}
+
 static void volume_step(struct zt_server *server, int by) {
     /* the stream is chosen on the first press; repeats keep it */
     if (!server->volume_repeat_by)
         server->volume_is_media = server->audio_known ? server->audio_active : server->media_playing;
     int *level = server->volume_is_media ? &server->volume : &server->ring_volume;
-    int previous = *level, to = previous + by;
-    *level = to < 0 ? 0 : to > VOLUME_MAX ? VOLUME_MAX : to;
+    int previous = *level, to = previous + by, top = volume_top(server->volume_is_media);
+    *level = to < 0 ? 0 : to > top ? top : to;
+    int plain = *level > VOLUME_MAX ? VOLUME_MAX : *level;	/* the boost is kept by the hook */
     config_keep(server->volume_is_media ? "media_volume" : "ring_volume",
-        (*level * 100 + VOLUME_MAX - 1) / VOLUME_MAX);
+        (plain * 100 + VOLUME_MAX - 1) / VOLUME_MAX);
     outputs_refresh();	/* a headset may have come or gone: for the next look */
     draw_volume(server);
     animate(server, &server->volume_y, 0.0f, 140, 0, false);
     wl_event_source_timer_update(server->volume_timer, server->media ? 4000 : 2000);
     if (server->volume_is_media) {
         char percent[16];
-        snprintf(percent, sizeof(percent), "%d%%", *level * 100 / VOLUME_MAX);
+        snprintf(percent, sizeof(percent), "%d%%", plain * 100 / VOLUME_MAX);
         run_detached("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", percent);
+        if (*level > VOLUME_MAX || previous > VOLUME_MAX) speaker_boost(*level);
     }
     hap(server, !server->volume_is_media && previous > 0 && *level == 0 ? HAP_TAP : HAP_TICK, HG_SYSTEM);
     if (!server->volume_is_media && *level != previous) {
@@ -14142,8 +14195,12 @@ static int reload(int signal_number, void *data) {
 	int n = server->n_tiles;
 	uint32_t accent = server->accent;
 	int strength = server->haptic_strength;
-	int ring_before = server->ring_volume;
+	int ring_before = server->ring_volume, volume_before = server->volume;
 	load_config(server);
+	if (volume_before > VOLUME_MAX) {	/* the config holds at most VOLUME_MAX; the boost goes on */
+		if (server->volume == VOLUME_MAX) server->volume = volume_before;
+		else speaker_boost(0);
+	}
 	if (server->style_config != server->style) {
 		/* the settings app chose the other style: the session starts again */
 		style_switch(server, server->style_config);
@@ -14627,6 +14684,14 @@ int main(int argc, char *argv[]) {
 		char percent[16];
 		snprintf(percent, sizeof(percent), "%d%%", server.volume * 100 / VOLUME_MAX);
 		run_detached("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", percent);
+		FILE *boost = server.volume == VOLUME_MAX && volume_top(true) > VOLUME_MAX
+			? popen(SPEAKER_BOOST " status 2>/dev/null", "r") : NULL;
+		if (boost) {	/* at full volume, the boost it was left at */
+			int n = 0;
+			if (fscanf(boost, "%d", &n) != 1) n = 0;
+			pclose(boost);
+			server.volume += n < 0 ? 0 : n > VOLUME_BOOST ? VOLUME_BOOST : n;
+		}
 	}
 	{
 		/* zrnperfd puts the shell first in line for the CPU (see there) */

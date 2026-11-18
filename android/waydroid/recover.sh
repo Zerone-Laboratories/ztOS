@@ -228,6 +228,7 @@ case $1 in
                timeout 3 lxc-attach "${lxc_args[@]}" -- /system/bin/service check waydroidplatform 2>/dev/null | grep -q ': found$'; then
                 settings
                 /usr/local/libexec/ztos-waydroid-audio
+                install -m644 /dev/null /run/ztos-waydroid-boot-ready  # read by ztMETRO's boot splash
                 exit 0
             fi
             sleep 1

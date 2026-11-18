@@ -19,6 +19,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -49,6 +50,7 @@ struct item {
 	char arg[48];		/* a module: what modprobe is given */
 	bool active;		/* running now, so "stop" rather than "start" */
 	bool extra;		/* not on our list: found failed by systemd */
+	bool optional;		/* one of extras[]: another phone's, if it is not installed */
 };
 
 static struct item items[MAX_ITEMS];
@@ -123,7 +125,11 @@ static void load_list(void) {
 		fclose(f);
 	}
 	for (size_t i = 0; i < sizeof(extras) / sizeof(extras[0]); i++) {
-		add(extras[i].kind, extras[i].id, extras[i].title);
+		int before = n_items;
+		struct item *it = add(extras[i].kind, extras[i].id, extras[i].title);
+		if (it && n_items > before) {
+			it->optional = true;
+		}
 	}
 }
 
@@ -614,8 +620,12 @@ static void log_start(const struct item *it) {
 
 /* --------------------------------------------------------------- devices */
 
+/* a path, or a glob(3) pattern such as any backlight's */
 static bool exists(const char *path) {
-	return access(path, F_OK) == 0;
+	glob_t g;
+	bool found = glob(path, GLOB_NOSORT, NULL, &g) == 0;
+	globfree(&g);
+	return found;
 }
 
 /* unit: the service or module behind it, whose page a tap opens.
@@ -625,19 +635,19 @@ static const struct device {
 	int radio;
 } devices[] = {
 	{ "Display", { "/sys/class/drm/card0-DSI-1", "/sys/class/drm/card1-DSI-1", "/sys/class/graphics/fb0" }, "no panel driver" },
-	{ "Display brightness", { "/sys/class/backlight/s9p-panel/brightness" }, "no backlight device: dimmed in software" },
-	{ "Graphics (Mali-G72)", { "/sys/class/devfreq/17500000.gpu", "/sys/bus/platform/drivers/panfrost" }, "no GPU driver" },
-	{ "Touch screen", { "/sys/bus/i2c/drivers/s6sy761" }, "no touch driver" },
+	{ "Display brightness", { "/sys/class/backlight/*/brightness" }, "no backlight device: dimmed in software" },
+	{ "Graphics", { "/sys/class/devfreq/*.gpu", "/sys/bus/platform/drivers/panfrost" }, "no GPU driver" },
+	{ "Touch screen", { "/sys/bus/i2c/drivers/s6sy761", "/sys/bus/rmi4/drivers/rmi4_physical" }, "no touch driver" },
 	{ "Wi-Fi", { "/sys/class/net/wlp1s0", "/sys/class/net/wlan0" }, "no Wi-Fi interface", "NetworkManager.service", 1 },
 	{ "Bluetooth", { "/sys/class/bluetooth/hci0" }, "no controller", "zrn-bluetooth.service", 2 },
-	{ "Mobile network", { "/dev/umts_ipc0", "/sys/module/zrn_modem" }, "no modem driver", "ztoscorenetworking-modem.service" },
-	{ "Battery", { "/sys/class/power_supply/max170xx_battery" }, "no fuel gauge" },
-	{ "Charger", { "/sys/class/power_supply/max77705-charger" }, "no charger driver", "zrn-charge.service" },
+	{ "Mobile network", { "/dev/umts_ipc0", "/sys/module/zrn_modem", "/sys/module/qcom_q6v5_mss" }, "no modem driver", "ztoscorenetworking.service" },
+	{ "Battery", { "/sys/class/power_supply/*battery*" }, "no fuel gauge" },
+	{ "Charger", { "/sys/class/power_supply/*charger*" }, "no charger driver", "zrn-charge.service" },
 	{ "Sound", { "/proc/asound/ZrnAbox", "/proc/asound/card0" }, "no sound card", "ztoscirrusaudio.service" },
 	{ "Sensors", { "/sys/module/zrn_bbd", "/run/ztoscsf-sensors/light" }, "no sensor hub", "ztoscsf-sensord.service" },
-	{ "Vibration", { "/sys/module/zrn_haptic" }, "no haptics driver", "zrn_haptic" },
+	{ "Vibration", { "/sys/module/zrn_haptic", "/sys/module/drv2624" }, "no haptics driver", "zrn_haptic" },
 	{ "Notification light", { "/sys/module/zrn_led" }, "no LED driver", "zrn_led" },
-	{ "Flashlight", { "/sys/class/leds/white:torch" }, "no flash driver" },
+	{ "Flashlight", { "/sys/class/leds/*:torch", "/sys/class/leds/*:flash" }, "no flash driver" },
 	{ "Camera", { "/dev/video0" }, "not supported yet" },
 	{ "Fingerprint", { NULL }, "not supported: held by the secure world" },
 	{ "Processor idle states", { "/sys/devices/system/cpu/cpu0/cpuidle" }, "cores only wait for interrupts", "zrn-cpuidle.service" },
@@ -655,6 +665,11 @@ static bool device_present(const struct device *d) {
 /* ----------------------------------------------------------------- pages */
 
 static const char *const state_name[] = { "crashed", "missing", "running" };
+
+/* another phone's service that this one does not have: not worth a row */
+static bool hidden(const struct item *it) {
+	return it->optional && it->state == ST_MISSING && strcmp(it->detail, "not installed") == 0;
+}
 
 /* A row: the name, and under it what it is doing, in red, amber or grey. */
 static double row(cairo_t *cr, double y, const char *title, const char *detail, enum state st,
@@ -692,7 +707,7 @@ static double draw_services(cairo_t *cr) {
 	}
 	int count[3] = { 0 };
 	for (int i = 0; i < n_items; i++) {
-		if (items[i].state < 3) {
+		if (items[i].state < 3 && !hidden(&items[i])) {
 			count[items[i].state]++;
 		}
 	}
@@ -706,7 +721,7 @@ static double draw_services(cairo_t *cr) {
 		}
 		y = group(cr, y, state_name[st], count[st]);
 		for (int i = 0; i < n_items; i++) {
-			if ((int)items[i].state == st) {
+			if ((int)items[i].state == st && !hidden(&items[i])) {
 				y = row(cr, y, items[i].title, items[i].detail, st, ACT_ITEM, i);
 			}
 		}
@@ -737,6 +752,9 @@ static double draw_devices(cairo_t *cr) {
 		const struct device *d = &devices[i];
 		bool in = device_present(d);
 		int linked = item_named(d->unit);
+		if (linked >= 0 && hidden(&items[linked])) {
+			linked = -1;
+		}
 		const char *detail = in ? "working" : d->missing;
 		if (d->radio == 1 && in && !wifi_on) {
 			detail = "switched off";
