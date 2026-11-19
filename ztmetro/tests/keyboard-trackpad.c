@@ -6,7 +6,7 @@
 
 static void hold_dot(struct zt_server *s, int id) {
     double x = osk_dot_x(s);
-    double y = s->height - NAV_H - s->osk_h + osk_dot_y(s);
+    double y = s->height - nav_h(s) - s->osk_h + osk_dot_y(s);
     touch_begin(s, id, x, y, now_ms());
     assert(s->osk_cursor_touch && !s->osk_trackpad);
     s->osk_cursor_touch->down_ms = now_ms() - LONG_PRESS_MS;
@@ -76,7 +76,7 @@ int main(void) {
     hold_dot(&s, 3);
     touch_end(&s, 3, now_ms(), true);
     assert(!s.osk_trackpad && !s.osk_cursor_touch);
-    x = osk_dot_x(&s); y = s.height-NAV_H-s.osk_h+osk_dot_y(&s);
+    x = osk_dot_x(&s); y = s.height-nav_h(&s)-s.osk_h+osk_dot_y(&s);
     touch_begin(&s, 4, x, y, now_ms());
     touch_end(&s, 4, now_ms(), false);
     assert(!s.osk_trackpad && !s.osk_cursor_touch);

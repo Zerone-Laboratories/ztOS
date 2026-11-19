@@ -2,6 +2,7 @@
 # the phone's stock firmware and EFS backups (IMEI, calibration)
 stock/
 .claude/
+.idea
 
 # Builds, inputs and outputs (made again by the scripts and the installer)
 build/
@@ -41,6 +42,11 @@ ztmetro/messages/ztmessages
 ztmetro/contacts/ztcontacts
 ztmetro/core/*-protocol.c
 ztmetro/core/*-client-protocol.h
+ztmetro/camera/ztcamera
+ztmetro/power/ztpower
+ztmetro/store/ztstore
+ztmetro/touchkeyd/ztos-touchkeyd
+ztmetro/splash/ztos-splash
 
 # SDK native renderer artifacts, rebuilt for each target
 sdk/native/prebuilt/*
