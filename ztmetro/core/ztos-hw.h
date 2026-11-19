@@ -1,7 +1,8 @@
 /* ztos-hw.h: where this phone's battery, backlight and GPU are, for the apps
  * that read them directly (Settings, the hardware test). ztOSIAL says
  * (Power1.CapacityNode, Display1.Node, Perf1.GpuDevfreq), asked once; without
- * ztos-iald, the Galaxy S9's, which these apps were written on.
+ * ztos-iald, the battery and charger are found as Power1's generic backend
+ * finds them, and the rest are the Galaxy S9's, which these apps were written on.
  *
  *	char path[256];
  *	snprintf(path, sizeof(path), "%s/capacity", hw_battery());
@@ -10,9 +11,11 @@
 #ifndef ZTOS_HW_H
 #define ZTOS_HW_H
 
+#include <dirent.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #ifdef HAVE_ZTOS_IAL
 #include <ztos-ial.h>
 #endif
@@ -47,11 +50,54 @@ static inline const char *hw_node(char *cache, size_t size, bool *asked, const c
 	return cache;
 }
 
+/* the power supply ztOSIAL's generic Power1 would pick, without ztos-iald: the
+ * battery (type "Battery"), or the charger (any other type with an online
+ * state); the first by name, as the backend sorts them. False when none is */
+static inline bool hw_supply(char *out, size_t size, bool battery)
+{
+	DIR *dir = opendir("/sys/class/power_supply");
+	struct dirent *e;
+	char best[256] = "";
+	while (dir && (e = readdir(dir))) {
+		char path[320], type[32] = "";
+		if (e->d_name[0] == '.')
+			continue;
+		snprintf(path, sizeof(path), "/sys/class/power_supply/%s/type", e->d_name);
+		FILE *f = fopen(path, "r");
+		if (!f)
+			continue;
+		if (!fgets(type, sizeof(type), f))
+			type[0] = 0;
+		fclose(f);
+		type[strcspn(type, "\n")] = 0;
+		bool is_battery = strcmp(type, "Battery") == 0;
+		if (battery != is_battery)
+			continue;
+		if (!battery) {
+			snprintf(path, sizeof(path), "/sys/class/power_supply/%s/online", e->d_name);
+			if (access(path, R_OK) != 0)
+				continue;
+		}
+		if (!best[0] || strcmp(e->d_name, best) < 0)
+			snprintf(best, sizeof(best), "%s", e->d_name);
+	}
+	if (dir)
+		closedir(dir);
+	if (best[0])
+		snprintf(out, size, "/sys/class/power_supply/%s", best);
+	return best[0] != 0;
+}
+
 static inline const char *hw_battery(void)
 {
 	static char path[192];
 	static bool asked;
-	return hw_node(path, sizeof(path), &asked, "Power1", "CapacityNode", true, HW_S9_BATTERY);
+	if (!asked) {
+		hw_node(path, sizeof(path), &asked, "Power1", "CapacityNode", true, "");
+		if (!path[0] && !hw_supply(path, sizeof(path), true))
+			snprintf(path, sizeof(path), "%s", HW_S9_BATTERY);
+	}
+	return path;
 }
 
 static inline const char *hw_backlight(void)
@@ -77,21 +123,8 @@ static inline const char *hw_charger(void)
 	if (!asked) {
 		asked = true;
 		snprintf(path, sizeof(path), "%s", HW_S9_CHARGER);
-		FILE *f = fopen(HW_S9_CHARGER "/online", "r");
-		if (f) {
-			fclose(f);
-		} else {
-			for (int i = 0; i < 8; i++) {
-				const char *names[] = { "ac", "usb", "AC", "USB", "charger", "mains", "max77705-charger", "pm8941-charger" };
-				char probe[160];
-				snprintf(probe, sizeof(probe), "/sys/class/power_supply/%s/online", names[i]);
-				if ((f = fopen(probe, "r"))) {
-					fclose(f);
-					snprintf(path, sizeof(path), "/sys/class/power_supply/%s", names[i]);
-					break;
-				}
-			}
-		}
+		if (access(HW_S9_CHARGER "/online", R_OK) != 0 && !hw_supply(path, sizeof(path), false))
+			snprintf(path, sizeof(path), "%s", HW_S9_CHARGER);
 	}
 	return path;
 }

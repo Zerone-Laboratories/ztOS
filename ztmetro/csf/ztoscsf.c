@@ -54,6 +54,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../core/ztos-hw.h"
+
 #define NAME		"ztOSCoreSensorFramework"
 #define COMPONENTS	"/etc/ztoscoresensorframework/components"
 #define MARKS		"/var/lib/ztoscsf"
@@ -410,7 +412,7 @@ static void battery_look(void)
 {
 	static bool warned;
 	int level = -1, online = 0, v;
-	FILE *f = fopen("/sys/class/power_supply/max170xx_battery/capacity", "r");
+	FILE *f = fopen(hw_file(hw_battery(), "capacity"), "r");
 	if (f) {
 		if (fscanf(f, "%d", &level) != 1)
 			level = -1;
@@ -420,7 +422,7 @@ static void battery_look(void)
 	struct dirent *e;
 	while (dir && (e = readdir(dir))) {
 		char path[320];
-		if (e->d_name[0] == '.' || strstr(e->d_name, "max170xx"))
+		if (e->d_name[0] == '.' || strcmp(e->d_name, strrchr(hw_battery(), '/') + 1) == 0)
 			continue;
 		snprintf(path, sizeof(path), "/sys/class/power_supply/%s/online", e->d_name);
 		f = fopen(path, "r");
@@ -438,7 +440,7 @@ static void battery_look(void)
 	 * runs by itself when a cable comes or goes) */
 	static int was_low = -1;
 	char status[24] = "";
-	f = fopen("/sys/class/power_supply/max170xx_battery/status", "r");
+	f = fopen(hw_file(hw_battery(), "status"), "r");
 	if (f) {
 		if (!fgets(status, sizeof(status), f))
 			status[0] = 0;
