@@ -342,7 +342,7 @@ void place() {
 		y += m.total;
 	}
 	/* a short conversation sits on the box, not under the title */
-	double room = zmc.height - ZMC_HEADER_H - 138;
+	double room = zmc.height - zmc_header_h() - 138;
 	if (y < room) {
 		double pad = room - y;
 		for (auto &p : msgs) p->y += pad;
@@ -841,7 +841,7 @@ void frame_step() {
 }
 
 double end_scroll() {
-	double top = ZMC_HEADER_H, content = top + std::ceil(list_total / ROW_H) * ROW_H + footer_height(P_CHAT) + 12;
+	double top = zmc_header_h(), content = top + std::ceil(list_total / ROW_H) * ROW_H + footer_height(P_CHAT) + 12;
 	return content > zmc.height ? content - zmc.height : 0;
 }
 
@@ -1434,14 +1434,23 @@ double draw_archived(cairo_t *cr) {
 	return tab_list(cr, y, P_ARCHIVED, int(archived.size()), draw_archived_row, archived_row_hit) + 24;
 }
 
+/* A name in the header, under its caps line, and a grey line under the name;
+ * the landscape header is shorter: the name goes up, the line beside the caps. */
+double name_y() { return zmc_landscape() ? 22 : 46; }
+
+void name_sub_line(cairo_t *cr, const char *text) {
+	if (zmc_landscape()) zmc_text_line(cr, text, FONT_REGULAR, 11.5, zmc.width / 2, 6, zmc.width / 2 - MARGIN);
+	else zmc_text_line(cr, text, FONT_REGULAR, 13, MARGIN, 82, zmc.width - 2 * MARGIN);
+}
+
 double draw_chat(cairo_t *cr) {
 	double y = zmc_header(cr, "");
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text_line(cr, open_name.c_str(), FONT_SEMILIGHT, 28, MARGIN, 46, zmc.width - 2 * MARGIN);
+	zmc_text_line(cr, open_name.c_str(), FONT_SEMILIGHT, 28, MARGIN, name_y(), zmc.width - 2 * MARGIN);
 	cairo_new_path(cr);
 	if (!presence_line.empty()) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		zmc_text_line(cr, presence_line.c_str(), FONT_REGULAR, 13, MARGIN, 82, zmc.width - 2 * MARGIN);
+		name_sub_line(cr, presence_line.c_str());
 		cairo_new_path(cr);
 	}
 	struct zmc_list l{};
@@ -1501,11 +1510,11 @@ double draw_status_view(cairo_t *cr) {
 	const StatusItem &it = p.items[size_t(status_item)];
 	double y = zmc_header(cr, "");
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text_line(cr, p.name.c_str(), FONT_SEMILIGHT, 28, MARGIN, 46, zmc.width - 2 * MARGIN);
+	zmc_text_line(cr, p.name.c_str(), FONT_SEMILIGHT, 28, MARGIN, name_y(), zmc.width - 2 * MARGIN);
 	cairo_new_path(cr);
 	std::string line = std::to_string(status_item + 1) + " of " + std::to_string(p.items.size()) + ", " + when_text(it.ts);
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text_line(cr, line.c_str(), FONT_REGULAR, 13, MARGIN, 82, zmc.width - 2 * MARGIN);
+	name_sub_line(cr, line.c_str());
 	cairo_new_path(cr);
 	double room = zmc.height - y - MARGIN, w = zmc.width - 2 * MARGIN;
 	if (it.kind == "image" && full_image) {
@@ -1532,7 +1541,7 @@ double draw_status_view(cairo_t *cr) {
 		zmc_text(cr, it.text.c_str(), FONT_SEMILIGHT, it.kind == "text" ? 28 : 16, MARGIN, y, w);
 		cairo_new_path(cr);
 	}
-	zmc_add_hit(0, ZMC_HEADER_H, zmc.width, zmc.height - ZMC_HEADER_H, ACT_STATUS_NEXT, 0);
+	zmc_add_hit(0, zmc_header_h(), zmc.width, zmc.height - zmc_header_h(), ACT_STATUS_NEXT, 0);
 	return zmc.height;
 }
 
@@ -1548,7 +1557,7 @@ double draw_status_post(cairo_t *cr) {
 double draw_info(cairo_t *cr) {
 	double y = zmc_header(cr, "");
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text_line(cr, open_name.c_str(), FONT_SEMILIGHT, 28, MARGIN, 46, zmc.width - 2 * MARGIN);
+	zmc_text_line(cr, open_name.c_str(), FONT_SEMILIGHT, 28, MARGIN, name_y(), zmc.width - 2 * MARGIN);
 	cairo_new_path(cr);
 	double side = 180;
 	if (cairo_surface_t *pic = picture_of(open_id)) {
@@ -2171,10 +2180,27 @@ void arrived(int page) {
 	focus_sync();
 }
 
+/* A new size (the phone turned): every bubble measured again at the new width
+ * (sizes and laid-out text were kept for the old one), placed again and its
+ * rows drawn again; the message box measured again. */
+void resized() {
+	zmc_list_lock(true);
+	layouts_held.clear();
+	for (auto &m : msgs) {
+		layout_drop(m.get());
+		m->measured = false;
+	}
+	place();
+	zmc_list_lock(false);
+	list_changed();
+	box_measure();
+	footer_rev++;
+}
+
 const struct zmc_app app = {
 	.app_id = "ztwhatsapp", .title = "WhatsApp", .caps = "WHATSAPP",
 	.render = render, .activate = activate, .back = back, .arrived = arrived,
-	.text = typed, .overlay = overlay, .touch = touch,
+	.text = typed, .overlay = overlay, .touch = touch, .resized = resized,
 };
 
 /* ---- invented data, for looking without a phone ----------------------------- */

@@ -898,7 +898,7 @@ static void rounded(cairo_t *cr, double x, double y, double w, double h, double 
 static double draw_web(cairo_t *cr, int page) {
 	/* the content area is the subsurface; paint it black underneath so nothing
 	 * of an old page shows through while a new one is still blank */
-	cairo_set_source_rgb(cr, 0, 0, 0);
+	zmc_bg(cr);	/* (the theme's background: white in light, as a blank page is) */
 	cairo_rectangle(cr, 0, 0, zmc.width, zmc.height);
 	cairo_fill(cr);
 
@@ -1001,7 +1001,7 @@ static double draw_web(cairo_t *cr, int page) {
 					13, ZMC_MARGIN, top + 14, 0);	/* E735 star, E721 search */
 				text_x = ZMC_MARGIN + 22;
 			}
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);	/* on the content area's background */
 			zmc_text_line(cr, s->title, FONT_SEMILIGHT, 18, text_x, top + 12,
 				zmc.width - text_x - ZMC_MARGIN);
 			cairo_set_source_rgb(cr, .65, .65, .65);
@@ -1029,7 +1029,7 @@ static double draw_tabs(cairo_t *cr, int page) {
 		cairo_set_source_rgb(cr, 0.15, 0.15, 0.15);
 		cairo_rectangle(cr, x, ty, cell, ch);
 		cairo_fill(cr);
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);	/* the title is under the cell, on the page */
 		zmc_text_line(cr, B.tabs[i].title[0] ? B.tabs[i].title : B.tabs[i].url,
 			FONT_SEMILIGHT, 14, x + 8, ty + ch + 2, cell - 16);
 		/* the cross's own hit first: the first hit that holds a tap takes
@@ -1107,7 +1107,7 @@ static double render(cairo_t *cr, int page) {
 			for (int i = 0; i < history_count; i++) list[n_list++] = i;
 		}
 		if (!n_list) {
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);
 			zmc_text(cr, B.hist_q[0] ? "nothing found" : "no history",
 				FONT_SEMILIGHT, 22, ZMC_MARGIN, y + 6, 0);
 		} else {
@@ -1143,7 +1143,7 @@ static double render(cairo_t *cr, int page) {
 					row += 34;
 					day = this;
 				}
-				cairo_set_source_rgb(cr, 1, 1, 1);
+				zmc_fg(cr);
 				zmc_text_line(cr, history[i].title, FONT_SEMILIGHT, 18, ZMC_MARGIN, row,
 					zmc.width - 2 * ZMC_MARGIN - 40);
 				cairo_set_source_rgb(cr, .65, .65, .65);
@@ -1162,12 +1162,12 @@ static double render(cairo_t *cr, int page) {
 			if (n_pages > 1) {
 				char counter[32];
 				snprintf(counter, sizeof counter, "%d/%d", history_page + 1, n_pages);
-				cairo_set_source_rgb(cr, 1, 1, 1);
+				zmc_fg(cr);
 				zmc_text_centred(cr, counter, FONT_REGULAR, 13, zmc.width / 2, zmc.height - 78);
 			}
 		}
 		double bottom = zmc.height - 60;
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text(cr, "previous", FONT_REGULAR, 15, ZMC_MARGIN, bottom, 0);
 		zmc_text(cr, "next", FONT_REGULAR, 15, zmc.width / 2 - 28, bottom, 0);
 		zmc_text(cr, "clear all", FONT_REGULAR, 15, zmc.width - 90, bottom, 0);
@@ -1179,7 +1179,7 @@ static double render(cairo_t *cr, int page) {
 	case P_FAVOURITES: {
 		double y = zmc_header(cr, "favourites");
 		if (!favourites_count) {
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);
 			zmc_text(cr, "no favourites", FONT_SEMILIGHT, 22, ZMC_MARGIN, y + 6, 0);
 			return y + 60;
 		}
@@ -1190,7 +1190,7 @@ static double render(cairo_t *cr, int page) {
 		if (favourite_page < 0) favourite_page = 0;
 		for (int i = favourite_page * rows; i < favourites_count && i < (favourite_page + 1) * rows; i++) {
 			double row = y + (i - favourite_page * rows) * 84;
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);
 			zmc_text_line(cr, favourites[i].title, FONT_SEMILIGHT, 18, ZMC_MARGIN, row,
 				zmc.width - 2 * ZMC_MARGIN - 40);
 			cairo_set_source_rgb(cr, .65, .65, .65);
@@ -1201,7 +1201,7 @@ static double render(cairo_t *cr, int page) {
 			zmc_add_hit(zmc.width - ZMC_MARGIN - 40, row, 40, 76, ACT_FAV_DELETE, i);
 		}
 		if (pages > 1) {
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);
 			zmc_text(cr, "previous", FONT_REGULAR, 14, ZMC_MARGIN, zmc.height - 44, 0);
 			zmc_text(cr, "next", FONT_REGULAR, 14, zmc.width / 2 - 21, zmc.height - 44, 0);
 			zmc_add_hit(0, zmc.height - 52, zmc.width / 2, 48, ACT_FAV_PAGE, -1);
@@ -1215,12 +1215,12 @@ static double render(cairo_t *cr, int page) {
 		for (int i=0; i<count; i++) {
 			char name[256], path[1024], detail[100]; unsigned long long got=0,total=0,speed=0; int state=0;
 			webview_download_info(i,name,sizeof name,path,sizeof path,&got,&total,&speed,&state);
-			double row=y+i*112; cairo_set_source_rgb(cr,1,1,1); zmc_text_line(cr,name,FONT_SEMILIGHT,20,ZMC_MARGIN,row,zmc.width-2*ZMC_MARGIN);
+			double row=y+i*112; zmc_fg(cr); zmc_text_line(cr,name,FONT_SEMILIGHT,20,ZMC_MARGIN,row,zmc.width-2*ZMC_MARGIN);
 			if(state==1) snprintf(detail,sizeof detail,"complete  %llu bytes",got); else if(state==2) snprintf(detail,sizeof detail,"failed  %llu bytes",got); else if(total) snprintf(detail,sizeof detail,"%llu%% %lluKB/s ETA %llus",got*100/total,speed/1024,speed?(total-got)/speed:0); else snprintf(detail,sizeof detail,"%llu bytes %lluKB/s",got,speed/1024);
 			cairo_set_source_rgb(cr,.65,.65,.65); zmc_text(cr,detail,FONT_REGULAR,12,ZMC_MARGIN,row+28,zmc.width-2*ZMC_MARGIN);
 			cairo_set_source_rgb(cr,.25,.25,.25); cairo_rectangle(cr,ZMC_MARGIN,row+48,zmc.width-2*ZMC_MARGIN,4); cairo_fill(cr);
 			if(!state&&total){accent(cr);cairo_rectangle(cr,ZMC_MARGIN,row+48,(zmc.width-2*ZMC_MARGIN)*(double)got/total,4);cairo_fill(cr);}
-			cairo_set_source_rgb(cr,1,1,1); zmc_text(cr,state?"open":"cancel",FONT_REGULAR,14,ZMC_MARGIN+5,row+62,0); zmc_text(cr,state==2?"retry":"remove",FONT_REGULAR,14,zmc.width/2+5,row+62,0);
+			zmc_fg(cr); zmc_text(cr,state?"open":"cancel",FONT_REGULAR,14,ZMC_MARGIN+5,row+62,0); zmc_text(cr,state==2?"retry":"remove",FONT_REGULAR,14,zmc.width/2+5,row+62,0);
 			zmc_add_hit(ZMC_MARGIN,row+54,zmc.width/2-ZMC_MARGIN,40,state?ACT_DL_OPEN:ACT_DL_CANCEL,i); zmc_add_hit(zmc.width/2,row+54,zmc.width/2-ZMC_MARGIN,40,state==2?ACT_DL_RETRY:ACT_DL_REMOVE,i);
 		} return y+count*112;
 	}
@@ -1747,7 +1747,19 @@ static void arrived(int page) {
 	}
 }
 
-static const struct zmc_app app = {
+/* A new size (the phone turned): every tab's web view is told it, or WebKit
+ * goes on laying pages out, and drawing them, at the old one. */
+static void resized(void) {
+	int x, y, w, h;
+	content_box(&x, &y, &w, &h);
+	for (int k = 0; k < B.n_tabs; k++) {
+		if (B.tabs[k].view) {
+			webview_place(B.tabs[k].view, x, y, w, h, zmc.scale);
+		}
+	}
+}
+
+static struct zmc_app app = {
 	.app_id = "superscan",
 	.title = "Superscan",
 	.caps = "INTERNET EXPLORER",
@@ -1761,6 +1773,7 @@ static const struct zmc_app app = {
 	.touch = touch,
 	.fixed = true,
 	.overlay_above_header = true,
+	.resized = resized,
 };
 
 int main(int argc, char **argv) {
@@ -1774,6 +1787,8 @@ int main(int argc, char **argv) {
 		"v4l2h264dec:NONE,v4l2h265dec:NONE,v4l2mpeg4dec:NONE,v4l2mpeg2dec:NONE,v4l2h263dec:NONE", 0);
 	const char *home = getenv("HOME");
 	snprintf(B.data_dir, sizeof(B.data_dir), "%s/.local/share/superscan", home ? home : "/tmp");
+	/* an app built on Superscan (zrn-uber) keeps its own cookies and data */
+	if (getenv("ZTB_DATA_DIR")) snprintf(B.data_dir, sizeof(B.data_dir), "%s", getenv("ZTB_DATA_DIR"));
 	{
 		/* cookies and site data from when it was ztbrowser come along once */
 		char old[600];
@@ -1792,6 +1807,9 @@ int main(int argc, char **argv) {
 	signal(SIGTERM, live_on_signal);
 	signal(SIGINT, live_on_signal);
 	signal(SIGHUP, live_on_signal);
+	/* an app built on Superscan names itself (its own window and tile) */
+	if (getenv("ZTB_APP_ID")) app.app_id = getenv("ZTB_APP_ID");
+	if (getenv("ZTB_APP_TITLE")) { app.title = getenv("ZTB_APP_TITLE"); app.caps = getenv("ZTB_APP_CAPS") ? getenv("ZTB_APP_CAPS") : app.title; }
 	int ret = zmc_run(&app, P_WEB);
 	suggest_reset();
 	g_clear_object(&suggest_soup);

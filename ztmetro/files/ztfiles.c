@@ -291,7 +291,7 @@ static double render(cairo_t *cr, int page) {
 		}
 		cairo_fill(cr);
 		if (job_done) {
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);
 			zmc_text(cr, job_ok ? "installed" : "installation failed", FONT_REGULAR, 18, 16, 250, 0);
 			zmc_button(cr, 16, 300, zmc.width - 32, "done", ACT_INSTALL_DONE, 0);
 		}

@@ -310,8 +310,69 @@ static struct app *app_holding(pid_t pid) {
 	return NULL;
 }
 
+/* --- a call in Waydroid ---------------------------------------------------- *
+ * A WhatsApp (or any) call in Android opens the microphone through Waydroid's
+ * audio HAL: a source-output named "Waydroid", next to its playing
+ * sink-input. Both, the microphone open WD_CALL_MIC_MS, is a call: the shell
+ * hears "call-active waydroid 1" (proximity at the ear). It ends WD_CALL_END_MS
+ * after the microphone closes (the HAL reopens its streams now and then).
+ * A voice note held that long with sound playing passes too: the proximity
+ * blank is then all it costs. */
+#define WD_CALL_MIC_MS	3000
+#define WD_CALL_END_MS	1000
+static bool wd_mic, wd_out, wd_call;
+static long wd_mic_since, wd_mic_gone;
+
+static void wd_call_tell(bool on) {
+	glob_t g;
+	if (glob("/run/user/*/ztmetro.ctl", 0, NULL, &g) == 0) {
+		for (size_t i = 0; i < g.gl_pathc; i++) {
+			int fd = open(g.gl_pathv[i], O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+			if (fd >= 0) {
+				const char *line = on ? "call-active waydroid 1\n" : "call-active waydroid 0\n";
+				if (write(fd, line, strlen(line)) < 0) {
+					/* the shell is busy: the next scan tells it again */
+				}
+				close(fd);
+			}
+		}
+	}
+	globfree(&g);
+	fprintf(stderr, "zrnperfd: waydroid call %s\n", on ? "started" : "over");
+}
+
+static void wd_call_check(long now) {
+	if (wd_mic) {
+		wd_mic_gone = 0;
+	} else if (wd_mic_since && !wd_mic_gone) {
+		wd_mic_gone = now;
+	}
+	if (wd_mic_gone && now - wd_mic_gone >= WD_CALL_END_MS) {
+		wd_mic_since = wd_mic_gone = 0;
+	}
+	bool want = wd_mic_since && wd_out && now - wd_mic_since >= WD_CALL_MIC_MS;
+	if (wd_call && wd_mic_since && !wd_mic_gone) {
+		want = true;	/* a call lasts while the microphone does */
+	}
+	if (want != wd_call) {
+		wd_call = want;
+		wd_call_tell(want);
+	}
+}
+
+static long wd_call_next(void) {
+	if (wd_mic_gone) {
+		return wd_mic_gone + WD_CALL_END_MS;
+	}
+	if (!wd_call && wd_mic_since && wd_out) {
+		return wd_mic_since + WD_CALL_MIC_MS;
+	}
+	return -1;
+}
+
 /* Which apps have a stream that is playing (or recording) now. */
 static void audio_scan(void) {
+	wd_mic = wd_out = false;
     if (waydroid.audio) {
         waydroid.audio = false;
         waydroid.audio_until = now_ms() + AUDIO_HOLD_MS;
@@ -354,6 +415,11 @@ static void audio_scan(void) {
 			if (strstr(obj, "\"corked\":false") && strstr(obj, "\"application.name\":\"Waydroid\"")) {
 				waydroid.audio = true;
 				waydroid.audio_until = 0;
+				if (k == 1) {
+					wd_mic = true;
+				} else {
+					wd_out = true;
+				}
 			}
 			if (strstr(obj, "\"corked\":false") && pidkey) {
 				struct app *a = app_holding(atoi(pidkey + 26));
@@ -368,6 +434,10 @@ static void audio_scan(void) {
 			obj = next;
 		}
 	}
+	if (wd_mic && !wd_mic_since) {
+		wd_mic_since = now_ms();
+	}
+	wd_call_check(now_ms());
 }
 
 static void audio_start(void) {
@@ -559,6 +629,7 @@ static bool pulse(long now) {
 		audio_rescan = 0;
 		audio_scan();
 	}
+	wd_call_check(now);
 	sweep();
 	bool any = false;
 	for (int i = 0; i < n_apps; i++) {
@@ -593,6 +664,10 @@ int tickle_timeout(void) {
 	}
 	if (audio_rescan && (next < 0 || audio_rescan < next)) {
 		next = audio_rescan;
+	}
+	long wd = wd_call_next();
+	if (wd >= 0 && (next < 0 || wd < next)) {
+		next = wd;
 	}
 	for (int i = 0; i < n_apps; i++) {
 		long at = -1;

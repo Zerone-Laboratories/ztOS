@@ -1358,6 +1358,101 @@ static void tune(WebKitSettings *s) {
 	webkit_settings_set_user_agent(s,
 		"Mozilla/5.0 (Linux; Android 14; ztOS) AppleWebKit/605.1.15 "
 		"(KHTML, like Gecko) Version/18.0 Mobile Safari/605.1.15 Superscan/1.0");
+	/* an app (zrn-uber) may need a plain mobile Safari agent for its site */
+	if (getenv("ZTB_USER_AGENT")) webkit_settings_set_user_agent(s, getenv("ZTB_USER_AGENT"));
+}
+
+/* ---- geolocation (app mode only) -------------------------------------------
+ * Only when ZTB_GEOLOCATION is set (zrn-uber): pages get the phone's GNSS.
+ * While WebKit wants positions, NMEA is read from ztos-gnss-gate on
+ * 127.0.0.1:10110; the gate powers the GNSS only while a reader is connected,
+ * so the GPS is on only while the page watches the location. */
+static GSocketConnection *geo_conn;
+static GDataInputStream *geo_in;
+static GCancellable *geo_cancel;
+
+static double nmea_deg(const char *v, const char *hemi) {
+	if (!v || !*v) return NAN;
+	double raw = g_ascii_strtod(v, NULL);
+	double deg = floor(raw / 100.0), min = raw - deg * 100.0;
+	double r = deg + min / 60.0;
+	if (hemi && (*hemi == 'S' || *hemi == 'W')) r = -r;
+	return r;
+}
+
+static void geo_read(GObject *src, GAsyncResult *res, gpointer data);
+
+static void geo_next(WebKitGeolocationManager *m) {
+	if (geo_in) g_data_input_stream_read_line_async(geo_in, G_PRIORITY_DEFAULT, geo_cancel, geo_read, m);
+}
+
+static void geo_read(GObject *src, GAsyncResult *res, gpointer data) {
+	WebKitGeolocationManager *m = data;
+	GError *err = NULL;
+	char *line = g_data_input_stream_read_line_finish(G_DATA_INPUT_STREAM(src), res, NULL, &err);
+	if (!line) {
+		if (err && !g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+			webkit_geolocation_manager_failed(m, "GNSS stream closed");
+		g_clear_error(&err);
+		return;
+	}
+	/* $..GGA,time,lat,N,lon,E,fix,sats,hdop,alt,... */
+	if (strlen(line) > 6 && !strncmp(line + 3, "GGA", 3)) {
+		char **f = g_strsplit(line, ",", 0);
+		if (g_strv_length(f) > 9 && atoi(f[6]) > 0) {
+			double lat = nmea_deg(f[2], f[3]), lon = nmea_deg(f[4], f[5]);
+			double hdop = g_ascii_strtod(f[8], NULL);
+			if (!isnan(lat) && !isnan(lon)) {
+				WebKitGeolocationPosition *p = webkit_geolocation_position_new(lat, lon,
+					hdop > 0 ? hdop * 5.0 : 20.0);
+				webkit_geolocation_position_set_altitude(p, g_ascii_strtod(f[9], NULL));
+				webkit_geolocation_manager_update_position(m, p);
+				webkit_geolocation_position_free(p);
+			}
+		}
+		g_strfreev(f);
+	}
+	g_free(line);
+	geo_next(m);
+}
+
+static void geo_stop(WebKitGeolocationManager *m, gpointer data) {
+	(void)m; (void)data;
+	if (geo_cancel) { g_cancellable_cancel(geo_cancel); g_clear_object(&geo_cancel); }
+	g_clear_object(&geo_in);
+	if (geo_conn) { g_io_stream_close(G_IO_STREAM(geo_conn), NULL, NULL); g_clear_object(&geo_conn); }
+	fprintf(stderr, "superscan: geolocation off\n");
+}
+
+static gboolean geo_start(WebKitGeolocationManager *m, gpointer data) {
+	(void)data;
+	if (geo_conn) return TRUE;
+	GSocketClient *c = g_socket_client_new();
+	GError *err = NULL;
+	geo_conn = g_socket_client_connect_to_host(c, "127.0.0.1", 10110, NULL, &err);
+	g_object_unref(c);
+	if (!geo_conn) {
+		fprintf(stderr, "superscan: no GNSS gate: %s\n", err ? err->message : "?");
+		g_clear_error(&err);
+		webkit_geolocation_manager_failed(m, "No location service");
+		return TRUE;
+	}
+	geo_in = g_data_input_stream_new(g_io_stream_get_input_stream(G_IO_STREAM(geo_conn)));
+	g_data_input_stream_set_newline_type(geo_in, G_DATA_STREAM_NEWLINE_TYPE_ANY);
+	geo_cancel = g_cancellable_new();
+	fprintf(stderr, "superscan: geolocation on (GNSS gate)\n");
+	geo_next(m);
+	return TRUE;
+}
+
+static gboolean permission_request(WebKitWebView *web, WebKitPermissionRequest *req, gpointer data) {
+	(void)web; (void)data;
+	if (WEBKIT_IS_GEOLOCATION_PERMISSION_REQUEST(req)) {
+		if (getenv("ZTB_GEOLOCATION")) webkit_permission_request_allow(req);
+		else webkit_permission_request_deny(req);
+		return TRUE;
+	}
+	return FALSE;
 }
 
 /* ---- the interface -------------------------------------------------------- */
@@ -1488,6 +1583,11 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 			"memory-pressure-settings", pressure, NULL);
 		webkit_memory_pressure_settings_free(pressure);
 		webkit_web_context_set_cache_model(browser_context, WEBKIT_CACHE_MODEL_WEB_BROWSER);
+		if (getenv("ZTB_GEOLOCATION")) {
+			WebKitGeolocationManager *gm = webkit_web_context_get_geolocation_manager(browser_context);
+			g_signal_connect(gm, "start", G_CALLBACK(geo_start), NULL);
+			g_signal_connect(gm, "stop", G_CALLBACK(geo_stop), NULL);
+		}
 	}
 	WebKitWebContext *context = g_object_ref(browser_context);
 	WebKitSettings *settings = webkit_settings_new();
@@ -1511,6 +1611,7 @@ struct webview *webview_create(struct wl_display *display, struct wl_compositor 
 	g_object_unref(ucm);
 	g_object_set_data(G_OBJECT(wv->web), "superscan-view", wv);
 	g_signal_connect(wv->web, "decide-policy", G_CALLBACK(decide_policy), wv);
+	g_signal_connect(wv->web, "permission-request", G_CALLBACK(permission_request), wv);
 	wv->view = webkit_web_view_get_wpe_view(wv->web);
 	if (wv->view) {
 		if (G_TYPE_CHECK_INSTANCE_TYPE(wv->view, zt_view_get_type())) {

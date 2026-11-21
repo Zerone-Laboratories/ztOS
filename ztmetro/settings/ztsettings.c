@@ -81,6 +81,7 @@ enum page {
 	PAGE_WALLS,	/* the background photo picker: categories, then one */
 	PAGE_NAVIGATION,
 	PAGE_BOOST,	/* Dynamic Boost System: RapidBoost and IntelligentBoost */
+	PAGE_POWER,	/* Power Management: the category over Performance, Boost, Battery + sleep */
 };
 
 enum action {
@@ -104,6 +105,8 @@ enum action {
 	ACT_BT_MENU_CLOSE,
 	ACT_COLUMNS,
 	ACT_STYLE,		/* arg: the shell's style, 0 Metro, 1 DotMatrix */
+	ACT_THEME,		/* arg: Metro's theme, 0 dark, 1 light */
+	ACT_FROST,		/* the frosted diffusion switch, toggled */
 	ACT_HAPTICS,
 	ACT_WIFI_RADIO,
 	ACT_WIFI_SUSPEND,
@@ -145,6 +148,8 @@ enum action {
 	ACT_GPU_GOVERNOR,
 	ACT_PERF_PROFILE,
 	ACT_PERF_DEEPSLEEP,
+	ACT_SLEEPD_TOGGLE,	/* SoC-sleep helper (zrn-sleepd) on/off */
+	ACT_WOWLAN_TOGGLE,	/* wake Waydroid on a push (WoWLAN) on/off */
 	ACT_TICKLE_BATTERY,	/* then _CHARGING, _SAVER, in that order */
 	ACT_TICKLE_CHARGING,
 	ACT_TICKLE_SAVER,
@@ -216,6 +221,8 @@ static struct {
 	int wall_target;			/* 0 both, 1 Start, 2 lock screen */
 	int columns;
 	int style;				/* ztRetrofit's look: 0 Metro, 1 DotMatrix */
+	int theme;				/* Metro theme: 0 dark (ZMC_THEME_DARK), 1 light */
+	int frost;				/* config `frost`: the frosted diffusion of the shell's and the apps' bars, 1 on */
 	bool haptics;
 	char scale_text[16];
 
@@ -255,6 +262,9 @@ static struct {
 	bool perf_deepsleep;
 	int tickle[3];		/* mode on battery, plugged in, power saver: 0 none .. 3 high */
 	char tickle_now[96];	/* what zrnperfd says it is doing */
+	bool sleepd_on;		/* the SoC-sleep helper (zrn-sleepd) is switched on */
+	bool wowlan_on;		/* wake Waydroid on a push, to decode the notification */
+	char sleep_status[160];	/* the live line from `zrn-sleepd status` */
 	bool dev_demo_tiles, dev_slow, dev_touches, dev_lock;
 	bool about_show_repo;
 	int menu_speed_idx;	/* the UI's animation speed: an index into menu_speeds */
@@ -270,6 +280,7 @@ static struct {
 	.haptic_group = { 100, 100, 100, 100, 100, 100 },
 	.quick = { 0, 1, 2, 3, 4, 5, 7, 8 },
 	.accent = 5,
+	.frost = 1,
 	.columns = 3,
 	.haptics = true,
 	.brightness = 50,
@@ -291,6 +302,7 @@ static struct {
 	.comp_algo_idx = 0,
 	.perf_profile = 1,
 	.perf_deepsleep = true,
+	.wowlan_on = true,	/* default: a push thaws Android at once (current behaviour) */
 	.menu_speed_idx = 1,
 	.tickle = { 2, 1, 3 },
 	.dev_lock = true,
@@ -375,6 +387,10 @@ static void config_load(void) {
 			app.columns = atoi(val);
 		} else if (strcmp(key, "style") == 0) {
 			app.style = strcmp(val, "dotmatrix") == 0 || strcmp(val, "1") == 0;
+		} else if (strcmp(key, "theme") == 0) {
+			app.theme = strcmp(val, "light") == 0 || strcmp(val, "1") == 0;
+		} else if (strcmp(key, "frost") == 0) {
+			app.frost = !(strcmp(val, "0") == 0 || strcmp(val, "off") == 0);
 		} else if (strcmp(key, "haptics") == 0) {
 			app.haptics = strcmp(val, "off") != 0 && strcmp(val, "0") != 0;
 		} else if (strcmp(key, "haptic_strength") == 0) {
@@ -429,6 +445,7 @@ static void config_load(void) {
 	}
 	if (f) fclose(f);
 	zmc.accent = ACCENTS[app.accent].color;
+	zmc.theme = app.theme ? ZMC_THEME_LIGHT : ZMC_THEME_DARK;
 
 	char buf[64];
 	read_sys_file("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor", buf, sizeof(buf));
@@ -497,6 +514,39 @@ static void perf_load(void) {
 	}
 }
 
+/* The SoC-sleep helper's live state: whether it is switched on, whether a push
+ * wakes Waydroid, and the one-line status zrn-sleepd keeps in /run. The daemon
+ * writes /run/zrn-sleepd/status as `state=`, `why=`, `sleeps=`, `wakes=`;
+ * /var/lib/zrn-sleep/enabled is present only while it is on; the WoWLAN choice
+ * is /var/lib/zrn-sleep/wake_waydroid (1 on, 0 off). */
+static void sleep_load(void) {
+	app.sleepd_on = access("/var/lib/zrn-sleep/enabled", F_OK) == 0;
+	char buf[32];
+	read_sys_file("/var/lib/zrn-sleep/wake_waydroid", buf, sizeof(buf));
+	app.wowlan_on = buf[0] ? atoi(buf) != 0 : true;	/* default on */
+
+	char state[32] = "", why[64] = "", sleeps[16] = "", wakes[80] = "", line[200];
+	FILE *f = fopen("/run/zrn-sleepd/status", "r");
+	while (f && fgets(line, sizeof(line), f)) {
+		char v[96];
+		if (sscanf(line, "state=%31[^\n]", v) == 1) snprintf(state, sizeof(state), "%s", v);
+		else if (sscanf(line, "why=%63[^\n]", v) == 1) snprintf(why, sizeof(why), "%s", v);
+		else if (sscanf(line, "sleeps=%15[^\n]", v) == 1) snprintf(sleeps, sizeof(sleeps), "%s", v);
+		else if (sscanf(line, "wakes=%79[^\n]", v) == 1) snprintf(wakes, sizeof(wakes), "%s", v);
+	}
+	if (f) fclose(f);
+
+	if (!app.sleepd_on)
+		snprintf(app.sleep_status, sizeof(app.sleep_status), "off");
+	else if (!state[0])
+		snprintf(app.sleep_status, sizeof(app.sleep_status), "on, zrn-sleepd not running");
+	else
+		snprintf(app.sleep_status, sizeof(app.sleep_status), "%s%s%s, %s sleeps%s%s",
+			state, why[0] ? ", " : "", why,
+			sleeps[0] ? sleeps : "0",
+			wakes[0] ? ", wakes " : "", wakes);
+}
+
 /* `text` as one word of a shell command, whatever is in it: in single quotes,
  * a quote inside written as '\''. */
 static void shell_quote(char *out, size_t size, const char *text) {
@@ -552,7 +602,7 @@ static void auto_load(void) {
 
 static void config_save(void) {
 	static const int timeouts[] = { 30, 60, 180, 300, 0 };
-	enum { N_KEYS = 23 + N_HAPTIC_GROUPS };
+	enum { N_KEYS = 25 + N_HAPTIC_GROUPS };
 	struct { const char *key; char value[300]; bool written; } keys[N_KEYS] = {
 		{ .key = "accent" }, { .key = "columns" }, { .key = "haptics" },
 		{ .key = "brightness" }, { .key = "timeout" }, { .key = "demo_tiles" },
@@ -589,6 +639,10 @@ static void config_save(void) {
 	snprintf(keys[21 + N_HAPTIC_GROUPS].value, 32, "%s", app.style ? "dotmatrix" : "metro");
 	keys[22 + N_HAPTIC_GROUPS].key = "dotmatrix_palette";
 	snprintf(keys[22 + N_HAPTIC_GROUPS].value, 32, "%s", dm_palette_names[app.palette]);
+	keys[23 + N_HAPTIC_GROUPS].key = "theme";
+	snprintf(keys[23 + N_HAPTIC_GROUPS].value, 32, "%s", app.theme ? "light" : "dark");
+	keys[24 + N_HAPTIC_GROUPS].key = "frost";
+	snprintf(keys[24 + N_HAPTIC_GROUPS].value, 32, "%d", app.frost ? 1 : 0);
 	snprintf(keys[0].value, 32, "%s", ACCENTS[app.accent].name);
 	snprintf(keys[1].value, 32, "%d", app.columns);
 	snprintf(keys[2].value, 32, "%s", app.haptics ? "on" : "off");
@@ -600,6 +654,7 @@ static void config_save(void) {
 	snprintf(keys[8].value, 32, "%s", app.dev_lock ? "on" : "off");
 	snprintf(keys[9].value, 32, "%d", menu_speeds[app.menu_speed_idx]);
 	zmc.accent = ACCENTS[app.accent].color;
+	zmc.theme = app.theme ? ZMC_THEME_LIGHT : ZMC_THEME_DARK;
 
 	char path[512], tmp[512], line[256];
 	config_path(path, sizeof(path));
@@ -914,8 +969,9 @@ static double draw_main(cairo_t *cr) {
 	char bat_buf[32];
 	read_sys_file(hw_file(hw_battery(), "capacity"), bat_buf, sizeof(bat_buf));
 	int bat = bat_buf[0] ? atoi(bat_buf) : 51;
-	snprintf(detail, sizeof(detail), "%d%%, %s", bat, app.battery_saver ? "battery saver on" : "discharging");
-	y = zmc_entry(cr, y, "battery saver", detail, ACT_OPEN_PAGE, PAGE_BATTERY);
+	snprintf(detail, sizeof(detail), "%d%%, %s", bat,
+		app.battery_saver ? "battery saver on" : "profiles, boost, sleep");
+	y = zmc_entry(cr, y, "power management", detail, ACT_OPEN_PAGE, PAGE_POWER);
 
 	snprintf(detail, sizeof(detail), "Exynos 9810 (8 cores), %s", app.cpu_gov);
 	y = zmc_entry(cr, y, "processor", detail, ACT_OPEN_PAGE, PAGE_CPU);
@@ -1045,7 +1101,7 @@ static double draw_installed_apps(cairo_t *cr) {
 	for (int i = installed_batch; i < end; i++) {
 		struct settings_app *a = &installed_apps[i];
 		installed_draw_icon(cr, a, y);
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text_line(cr, a->name, FONT_SEMILIGHT, 22, MARGIN + 52, y, zmc.width - 2 * MARGIN - 52);
 		cairo_set_source_rgb(cr, .6, .6, .6);
 		zmc_text_line(cr, bg_contains(a->id) ? "Background app" :
@@ -1064,7 +1120,7 @@ static double draw_app_detail(cairo_t *cr) {
 	if (installed_selected < 0 || installed_selected >= installed_count) return y;
 	struct settings_app *a = &installed_apps[installed_selected];
 	installed_draw_icon(cr, a, y);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	y += zmc_text(cr, a->name, FONT_SEMILIGHT, 24, MARGIN + 52, y, zmc.width - 2 * MARGIN - 52) + 28;
 	y = zmc_switch(cr, y, "Background app", bg_contains(a->id), ACT_APP_BACKGROUND);
 	cairo_set_source_rgb(cr, .6, .6, .6);
@@ -1083,12 +1139,9 @@ static double draw_apps(cairo_t *cr) {
 	y = zmc_entry(cr, y, "keyboard", app.haptics ? "vibrate on touch: on" : "vibrate on touch: off",
 		ACT_OPEN_PAGE, PAGE_KEYBOARD);
 
-	static const char *const profiles[] = { "Power saver", "Balanced", "Performance" };
-	snprintf(detail, sizeof(detail), "%s, low power when off: %s", profiles[app.perf_profile],
-		app.perf_deepsleep ? "on" : "off");
-	y = zmc_entry(cr, y, "performance", detail, ACT_OPEN_PAGE, PAGE_PERF);
-	y = zmc_entry(cr, y, "Dynamic Boost System", "RapidBoost and IntelligentBoost: what they do, live",
-		ACT_OPEN_PAGE, PAGE_BOOST);
+	/* Performance and Dynamic Boost System now live under Power Management
+	 * (system tab); the detail here is unused. */
+	(void)detail;
 
 	y = zmc_entry(cr, y, "developer tests", "demo tiles, slow motion, ZrnDevTest", ACT_OPEN_PAGE, PAGE_DEV);
 
@@ -1406,6 +1459,13 @@ static void wall_card(cairo_surface_t *img, unsigned rev, double x, double y, do
 		WALL_PW, WALL_PH, c, alpha);
 }
 
+/* How many photos across the grid has: three in portrait; in landscape one
+ * for every 110 points, or a tile (16:9 standing) is taller than the screen. */
+static int wall_cols(void) {
+	int cols = zmc_landscape() ? zmc.width / 110 : 3;
+	return cols < 3 ? 3 : cols;
+}
+
 /* the grid's cells and photos, on the GPU over the page: each swivels in by
  * itself, staggered, when the category opens and out when it leaves, then the
  * page turns back. A cell is a grey quad; its photo fades in over it when made.
@@ -1420,7 +1480,8 @@ static void wall_overlay(int page) {
 		cairo_surface_mark_dirty(wall_grey);
 	}
 	uint32_t now = zmc_now_ms();
-	double gap = 8, tw = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0, th = tw * 16.0 / 9.0;
+	int cols = wall_cols();
+	double gap = 8, tw = (zmc.width - 2 * MARGIN - (cols - 1) * gap) / cols, th = tw * 16.0 / 9.0;
 	int c = wall_cat_open;
 	const char *current = app.wall_target == 2 ? app.lock_wall : app.start_wall;
 	unsigned col = ACCENTS[app.accent].color;
@@ -1430,8 +1491,8 @@ static void wall_overlay(int page) {
 	if ((int32_t)(now - t0) < 0) return;	/* the page is still turning */
 	for (int i = 1; i <= cat_count[c]; i++) {
 		int k = cat_first[c] + i - 1;
-		double x = MARGIN + (i % 3) * (tw + gap), y = wall_grid_top + (i / 3) * (th + gap) - zmc.scroll;
-		if (y + th < ZMC_HEADER_H || y > zmc.height) continue;
+		double x = MARGIN + (i % cols) * (tw + gap), y = wall_grid_top + (i / cols) * (th + gap) - zmc.scroll;
+		if (y + th < zmc_header_h() || y > zmc.height) continue;
 		double own = (int32_t)(now - t0) - zb_delay(i), run = leaving ? ZB_SWIVEL_OUT_MS : ZB_SWIVEL_IN_MS;
 		if (own < 0 && !leaving) continue;	/* its turn has not come */
 		if (own >= run && leaving) continue;	/* gone */
@@ -1526,12 +1587,13 @@ static double draw_wall_categories(cairo_t *cr, double y) {
 static double draw_wall_grid(cairo_t *cr, double y) {
 	double gap = 8;
 	const char *current = app.wall_target == 2 ? app.lock_wall : app.start_wall;
-	double tw = (zmc.width - 2 * MARGIN - 2 * gap) / 3.0, th = tw * 16.0 / 9.0;
+	int cols = wall_cols();
+	double tw = (zmc.width - 2 * MARGIN - (cols - 1) * gap) / cols, th = tw * 16.0 / 9.0;
 	int c = wall_cat_open;
 	int count = cat_count[c];
 	wall_grid_top = y;
 	for (int i = 0; i <= count; i++) {
-		double x = MARGIN + (i % 3) * (tw + gap), ty = y + (i / 3) * (th + gap);
+		double x = MARGIN + (i % cols) * (tw + gap), ty = y + (i / cols) * (th + gap);
 		bool chosen;
 		if (i == 0) {
 			cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
@@ -1554,7 +1616,7 @@ static double draw_wall_grid(cairo_t *cr, double y) {
 			cairo_stroke(cr);
 		}
 	}
-	return y + ((count + 1 + 2) / 3) * (th + gap);
+	return y + ((count + 1 + cols - 1) / cols) * (th + gap);
 }
 
 /* the whole picker page: targets, then the categories or one of them */
@@ -1715,7 +1777,7 @@ static double draw_theme(cairo_t *cr) {
 	 * opens the full-screen picker (UIXMobile!ListPicker in full mode) */
 	y += 20;
 	accent_box_y = y;
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	cairo_set_line_width(cr, 2);
 	cairo_rectangle(cr, MARGIN + 1, y + 1, zmc.width - 2 * MARGIN - 2, 40);
 	cairo_stroke(cr);
@@ -1724,7 +1786,7 @@ static double draw_theme(cairo_t *cr) {
 	cairo_rectangle(cr, MARGIN + 10, y + 10, 22, 22);
 	cairo_fill(cr);
 	if (zmc.style == ZMC_STYLE_DOTMATRIX) dm_map_raw--;
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, zmc.style == ZMC_STYLE_DOTMATRIX ? dm_palette_names[app.palette] : ACCENTS[app.accent].name, FONT_REGULAR, 16, MARGIN + 42, y + 10, 0);
 	zmc_add_hit(0, y - 4, zmc.width, 50, ACT_ACCENT_OPEN, 0);
 	y += 62;
@@ -1752,6 +1814,18 @@ static double draw_theme(cairo_t *cr) {
 		zmc_add_hit(bx, y, btn_w, 36, ACT_COLUMNS, c);
 	}
 	y += 60;
+
+	/* Metro's light or dark theme (the SDK's Z_THEME_DARK / Z_THEME_LIGHT):
+	 * the background and the text swap, the accent stays. DotMatrix has its own
+	 * palette and ignores this, so the row is shown only under Metro. */
+	if (zmc.style != ZMC_STYLE_DOTMATRIX) {
+		y = zmc_switch(cr, y, "Light mode", app.theme == ZMC_THEME_LIGHT, ACT_THEME);
+		/* the blur behind the shell's bars and the apps' (zrn-frosted-diffusion); off saves the GPU work */
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+		zmc_text(cr, "bars show what is under them, blurred", FONT_REGULAR, 13.5, MARGIN, y, 0);
+		y += 22;
+		y = zmc_switch(cr, y, "frosted diffusion", app.frost, ACT_FROST);
+	}
 
 	/* ztRetrofit's styles: the same shell, the same apps, another look */
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
@@ -1821,7 +1895,7 @@ static double draw_display(cairo_t *cr) {
 	y += 62;
 
 	if (light_sensor) {
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text(cr, "Automatically adjust brightness", FONT_SEMILIGHT, 20, MARGIN, y, 0);
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		zmc_text(cr, app.autobrightness ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
@@ -1829,7 +1903,7 @@ static double draw_display(cairo_t *cr) {
 		zmc_add_hit(0, y - 4, zmc.width, 50, ACT_AUTOBRIGHTNESS, 0);
 		y += 66;
 
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text(cr, "OpenTone", FONT_SEMILIGHT, 20, MARGIN, y, 0);
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		zmc_text(cr, app.opentone ? "On" : "Off", FONT_REGULAR, 13, MARGIN, y + 26, 0);
@@ -2023,7 +2097,7 @@ static double draw_bluetooth(cairo_t *cr) {
 	double menu_at = -1;
 	for (int i = 0; i < bt.n; i++) {
 		struct bt_device *d = &bt.dev[i];
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text_line(cr, d->name, FONT_SEMILIGHT, 26, MARGIN, y, zmc.width - 2 * MARGIN);
 		char line[64];
 		if (d->connected && battery >= 0) {
@@ -2093,7 +2167,7 @@ static double draw_wifi(cairo_t *cr) {
 		if (n->in_use) {
 			zmc_set_rgb(cr, ACCENTS[app.accent].color);
 		} else {
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);
 		}
 		zmc_wifi_glyph(cr, MARGIN - 2, y + 8, 30, wifi_bars_of(n->signal));
 		zmc_text_line(cr, n->ssid, FONT_SEMILIGHT, 22, MARGIN + 42, y, zmc.width - MARGIN - 42 - 12);
@@ -2139,7 +2213,7 @@ static double draw_wifi_net(cairo_t *cr) {
 	for (int i = 0; i < app.n_networks; i++) {
 		if (strcmp(app.networks[i].ssid, wifi_net) == 0) n = &app.networks[i];
 	}
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	if (n) {
 		zmc_wifi_glyph(cr, MARGIN - 2, y + 2, 34, wifi_bars_of(n->signal));
 	}
@@ -2177,7 +2251,7 @@ static double draw_wifi_net(cairo_t *cr) {
 static double draw_wifi_join(cairo_t *cr) {
 	double y = zmc_header(cr, "sign in");
 	char shown[80];
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	y += zmc_text(cr, wifi_join_ssid, FONT_SEMILIGHT, 24, MARGIN, y, zmc.width - 2 * MARGIN) + 14;
 	if (wifi_show_password) {
 		snprintf(shown, sizeof(shown), "%s", wifi_password);
@@ -2596,7 +2670,7 @@ static double draw_audio(cairo_t *cr) {
 	y = audio_section(cr, y, "system");
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Sound engine", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "PipeWire 1.6.9 / PulseAudio Server", FONT_REGULAR, 15, MARGIN, y + 20, 0);
 
 	return y + 66;
@@ -2614,7 +2688,7 @@ static double draw_battery(cairo_t *cr) {
 
 	char big_str[16];
 	snprintf(big_str, sizeof(big_str), "%d%%", pct);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, big_str, FONT_LIGHT, 56, MARGIN, y, 0);
 	y += 64;
 
@@ -2624,7 +2698,7 @@ static double draw_battery(cairo_t *cr) {
 	zmc_text(cr, est, FONT_REGULAR, 14, MARGIN, y, 0);
 	y += 36;
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "Battery Saver mode", FONT_SEMILIGHT, 21, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, app.battery_saver ? "Conserving power" : "Standard performance", FONT_REGULAR, 13, MARGIN, y + 26, 0);
@@ -2634,7 +2708,7 @@ static double draw_battery(cairo_t *cr) {
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Battery information", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "3000 mAh Li-Ion, Health Good", FONT_REGULAR, 15, MARGIN, y + 20, 0);
 
 	return y + 60;
@@ -2652,7 +2726,7 @@ static double draw_cpu(cairo_t *cr) {
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "SoC Architecture", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "Samsung Exynos 9810 (10nm LPP)", FONT_SEMILIGHT, 20, MARGIN, y + 18, 0);
 	y += 56;
 
@@ -2660,7 +2734,7 @@ static double draw_cpu(cairo_t *cr) {
 	zmc_text(cr, "LITTLE Cluster (Cores 0-3, Cortex-A55)", FONT_REGULAR, 13, MARGIN, y, 0);
 	char c0_str[64];
 	snprintf(c0_str, sizeof(c0_str), "%.0f MHz (350 - 1794 MHz)", f0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, c0_str, FONT_REGULAR, 16, MARGIN, y + 20, 0);
 	y += 52;
 
@@ -2668,7 +2742,7 @@ static double draw_cpu(cairo_t *cr) {
 	zmc_text(cr, "BIG Cluster (Cores 4-7, M3 Cheetah)", FONT_REGULAR, 13, MARGIN, y, 0);
 	char c4_str[64];
 	snprintf(c4_str, sizeof(c4_str), "%.0f MHz (400 - 2704 MHz)", f4);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, c4_str, FONT_REGULAR, 16, MARGIN, y + 20, 0);
 	y += 52;
 
@@ -2681,7 +2755,7 @@ static double draw_cpu(cairo_t *cr) {
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "System Load Average", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, load[0] ? load : "0.05 0.10 0.08", FONT_REGULAR, 14, MARGIN, y + 20, 0);
 
 	return y + 60;
@@ -2700,7 +2774,7 @@ static double draw_vm(cairo_t *cr) {
 	zmc_text(cr, "Physical Memory (LPDDR4X)", FONT_REGULAR, 13, MARGIN, y, 0);
 	char ram_str[64];
 	snprintf(ram_str, sizeof(ram_str), "%.2f GB used of %.2f GB", used_ram, total_ram);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, ram_str, FONT_SEMILIGHT, 20, MARGIN, y + 20, 0);
 	y += 58;
 
@@ -2718,7 +2792,7 @@ static double draw_vm(cairo_t *cr) {
 		zmc_text(cr, "UFS 2.1 Storage", FONT_REGULAR, 13, MARGIN, y, 0);
 		char disk_str[64];
 		snprintf(disk_str, sizeof(disk_str), "%.1f GB free of %.1f GB", free_disk, total_disk);
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text(cr, disk_str, FONT_REGULAR, 16, MARGIN, y + 20, 0);
 		y += 52;
 	}
@@ -2735,7 +2809,7 @@ static double draw_gpu(cairo_t *cr) {
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "GPU Engine", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "ARM Mali-G72 MP18 (Bifrost)", FONT_SEMILIGHT, 21, MARGIN, y + 18, 0);
 	y += 56;
 
@@ -2743,7 +2817,7 @@ static double draw_gpu(cairo_t *cr) {
 	zmc_text(cr, "Clock frequency", FONT_REGULAR, 13, MARGIN, y, 0);
 	char f_str[64];
 	snprintf(f_str, sizeof(f_str), "%.0f MHz (260, 455, 572 MHz)", mhz);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, f_str, FONT_REGULAR, 16, MARGIN, y + 20, 0);
 	y += 52;
 
@@ -2756,13 +2830,13 @@ static double draw_gpu(cairo_t *cr) {
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Display Hardware", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "Super AMOLED 1440x2960 @ 60.00 Hz", FONT_REGULAR, 15, MARGIN, y + 20, 0);
 	y += 52;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Display Compositor", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "Wayland / wlroots 0.20 + OpenGL ES 2.0", FONT_REGULAR, 15, MARGIN, y + 20, 0);
 
 	return y + 60;
@@ -2776,7 +2850,7 @@ static double draw_keyboard(cairo_t *cr) {
         (app.key_height - 42) * 100 / 30, height, ACT_KEY_HEIGHT);
     y += 76;
     y = zmc_switch(cr, y, "Keyboard sounds", app.key_sound, ACT_KEY_SOUND);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "Vibrate on touch and typing", FONT_SEMILIGHT, 21, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, app.haptics ? "On" : "Off", FONT_REGULAR, 13.5, MARGIN, y + 28, 0);
@@ -2786,7 +2860,7 @@ static double draw_keyboard(cairo_t *cr) {
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Keyboard layout", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "English (United States)", FONT_REGULAR, 15, MARGIN, y + 20, 0);
 
 	return y + 60;
@@ -2815,7 +2889,7 @@ static double draw_haptics(cairo_t *cr) {
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		y += zmc_text(cr, HAPTIC_GROUPS[g].about, FONT_REGULAR, 12.5, MARGIN, y - 6, zmc.width - 2 * MARGIN) + 10;
 	}
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "Try them", FONT_SEMILIGHT, 26, MARGIN, y + 6, 0);
 	y += 50;
 	static const char *const pulses[] = { "tick", "tap", "click", "heavy" };
@@ -2844,12 +2918,12 @@ static double draw_about(cairo_t *cr) {
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Phone", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	y += zmc_text(cr, "Samsung Galaxy S9 (SM-G960N starlte)", FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Operating System", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	y += zmc_text(cr, "ztOS Mobile (Arch Linux ARM)", FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
 
 	struct utsname uts;
@@ -2857,13 +2931,13 @@ static double draw_about(cairo_t *cr) {
 		snprintf(value, sizeof(value), "Linux %s", uts.release);
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		zmc_text(cr, "Kernel", FONT_REGULAR, 13, MARGIN, y, 0);
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		y += zmc_text(cr, value, FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
 	}
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Shell", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	y += zmc_text(cr, "ztMETRO (Wayland / wlroots 0.20)", FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
 
 	struct sysinfo si;
@@ -2872,14 +2946,14 @@ static double draw_about(cairo_t *cr) {
 		snprintf(value, sizeof(value), "%ld hours, %ld mins", up / 3600, (up % 3600) / 60);
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		zmc_text(cr, "Uptime", FONT_REGULAR, 13, MARGIN, y, 0);
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		y += zmc_text(cr, value, FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
 	}
 
 	double start_y = y;
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "a project by", FONT_REGULAR, 13, MARGIN, y, 0);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	y += zmc_text(cr, "Zerone Brianstorm AKA Ometh Abeyrathne", FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 26;
 
 	if (app.about_show_repo) {
@@ -2894,6 +2968,45 @@ static double draw_about(cairo_t *cr) {
 }
 
 /* zrnperfd's settings: it runs as root and does the work; this only asks. */
+/* Power Management: the power-related pages gathered under one category, plus
+ * the SoC-sleep helper (zrn-sleepd) and the WoWLAN wake toggle. */
+static double draw_power(cairo_t *cr) {
+	double y = zmc_header(cr, "power");
+	char detail[128];
+
+	static const char *const profiles[] = { "Power saver", "Balanced", "Performance" };
+	snprintf(detail, sizeof(detail), "%s, low power when off: %s", profiles[app.perf_profile],
+		app.perf_deepsleep ? "on" : "off");
+	y = zmc_entry(cr, y, "Performance", detail, ACT_OPEN_PAGE, PAGE_PERF);
+	y = zmc_entry(cr, y, "Dynamic Boost System", "RapidBoost and IntelligentBoost: what they do, live",
+		ACT_OPEN_PAGE, PAGE_BOOST);
+
+	char bat_buf[32];
+	read_sys_file(hw_file(hw_battery(), "capacity"), bat_buf, sizeof(bat_buf));
+	int bat = bat_buf[0] ? atoi(bat_buf) : 51;
+	snprintf(detail, sizeof(detail), "%d%%, %s", bat, app.battery_saver ? "battery saver on" : "discharging");
+	y = zmc_entry(cr, y, "Battery Saver", detail, ACT_OPEN_PAGE, PAGE_BATTERY);
+
+	/* the SoC-sleep helper: zrn-sleepd (s2idle ~190 mA, 90 s screen-off settle,
+	 * 120 s doze poll). On/off runs `sudo zrn-sleepd enable|disable`. */
+	zmc_fg(cr);
+	zmc_text(cr, "Sleep", FONT_SEMILIGHT, 26, MARGIN, y + 12, 0);
+	y += 56;
+	y = zmc_switch(cr, y, "Sleep the SoC when idle", app.sleepd_on, ACT_SLEEPD_TOGGLE);
+	y = zmc_field(cr, y, "Status", app.sleep_status);
+
+	/* wake Waydroid for notifications (WoWLAN): on a push, thaw the container
+	 * to decode the notification, or leave it frozen until the next doze window */
+	y = zmc_switch(cr, y, "Wake Waydroid on push", app.wowlan_on, ACT_WOWLAN_TOGGLE);
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	y += zmc_text(cr, app.wowlan_on ?
+		"On a push, Android is thawed at once to show the notification." :
+		"Android stays frozen; the notification waits for the next sleep window.",
+		FONT_REGULAR, 13, MARGIN, y - 2, zmc.width - 2 * MARGIN) + 12;
+
+	return y + 20;
+}
+
 static double draw_perf(cairo_t *cr) {
 	static const char *const profiles[] = { "Power saver", "Balanced", "Performance" };
 	double y = zmc_header(cr, "performance");
@@ -2901,7 +3014,7 @@ static double draw_perf(cairo_t *cr) {
 	y = zmc_switch(cr, y, "Low power, screen off", app.perf_deepsleep, ACT_PERF_DEEPSLEEP);
 
 	static const char *const tickle_modes[] = { "None", "Nominal", "Moderate", "High" };
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "Tickle", FONT_SEMILIGHT, 26, MARGIN, y, 0);
 	y += 44;
 	y = picker(cr, y, "On battery", tickle_modes, 4, app.tickle[0], ACT_TICKLE_BATTERY);
@@ -2943,6 +3056,7 @@ static double render_page_content(cairo_t *cr, int p) {
 	switch (p) {
 	case PAGE_DATE: return draw_date(cr);
 	case PAGE_PERF: return draw_perf(cr);
+	case PAGE_POWER: return draw_power(cr);
 	case PAGE_BOOST: return draw_boost(cr);
 	case PAGE_DEV: return draw_dev(cr);
 	case PAGE_MAIN: return draw_main(cr);
@@ -3201,6 +3315,14 @@ static void activate(int action, int arg) {
 		app.style = arg;
 		config_save();	/* the shell reads it on SIGHUP and starts the session again in it */
 		break;
+	case ACT_THEME:
+		app.theme = !app.theme;	/* toggle dark <-> light */
+		config_save();	/* sets zmc.theme and SIGHUPs the shell, which re-reads the theme */
+		break;
+	case ACT_FROST:
+		app.frost = !app.frost;
+		config_save();	/* SIGHUPs the shell; apps follow the file by inotify */
+		break;
 	case ACT_HAPTICS:
 		app.haptics = !app.haptics;
 		config_save();
@@ -3405,6 +3527,19 @@ static void activate(int action, int arg) {
 	case ACT_PERF_DEEPSLEEP:
 		app.perf_deepsleep = !app.perf_deepsleep;
 		perf_tell(app.perf_deepsleep ? "deepsleep on\n" : "deepsleep off\n");
+		break;
+	case ACT_SLEEPD_TOGGLE:
+		/* needs root: the same passwordless sudo path the Power app uses */
+		if (system(app.sleepd_on ? "sudo -n /usr/local/sbin/zrn-sleepd disable >/dev/null 2>&1" :
+				"sudo -n /usr/local/sbin/zrn-sleepd enable >/dev/null 2>&1") != 0) {}
+		sleep_load();	/* reflect the new state at once */
+		break;
+	case ACT_WOWLAN_TOGGLE:
+		/* writes /var/lib/zrn-sleep/wake_waydroid (1 on, 0 off); zrn-pushd reads
+		 * it to decide whether a push thaws Waydroid or waits for the doze window */
+		app.wowlan_on = !app.wowlan_on;
+		if (system(app.wowlan_on ? "sudo -n /usr/local/sbin/zrn-sleepd wowlan on >/dev/null 2>&1" :
+				"sudo -n /usr/local/sbin/zrn-sleepd wowlan off >/dev/null 2>&1") != 0) {}
 		break;
 	case ACT_TICKLE_BATTERY:
 	case ACT_TICKLE_CHARGING:
@@ -3764,6 +3899,11 @@ static void perf_tick(void) {
 	zmc_redraw();
 }
 
+static void sleep_tick(void) {
+	sleep_load();
+	zmc_redraw();	/* the sleep status line is live while the page is open */
+}
+
 static bool back(void) {
 	if (open_picker) {	/* back closes an open picker first, as on the phone */
 		open_picker = 0;
@@ -3814,6 +3954,10 @@ static bool back(void) {
 		zmc_go(PAGE_MOBILE, -1);	/* it is under the cellular page */
 		return true;
 	}
+	if (zmc.page == PAGE_PERF || zmc.page == PAGE_BOOST || zmc.page == PAGE_BATTERY) {
+		zmc_go(PAGE_POWER, -1);	/* these three live under Power Management now */
+		return true;
+	}
 	zmc_go(hub_tab, -1);
 	return true;
 }
@@ -3845,6 +3989,9 @@ static void arrived(int page) {
 	} else if (page == PAGE_PERF) {
 		perf_load();
 		zmc_every(2000, perf_tick);	/* "Tickle now", while this page is open */
+	} else if (page == PAGE_POWER) {
+		sleep_load();
+		zmc_every(2000, sleep_tick);	/* the sleep status line is live here */
 	} else if (page == PAGE_BOOST) {
 		ib.text_at = 0;
 		ib_tick();
@@ -3883,7 +4030,7 @@ static const struct { const char *name; enum page page; } pages[] = {
 	{ "wifi", PAGE_WIFI }, { "bluetooth", PAGE_BLUETOOTH }, { "mobile", PAGE_MOBILE }, { "audio", PAGE_AUDIO },
 	{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
 	{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },
-	{ "perf", PAGE_PERF }, { "boost", PAGE_BOOST }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
+	{ "perf", PAGE_PERF }, { "power", PAGE_POWER }, { "boost", PAGE_BOOST }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
 };
 
 static int page_named(const char *name) {
@@ -3901,6 +4048,7 @@ static int render_to_file(const char *name, const char *path) {
 			}
 			if (pages[i].page == PAGE_INSTALLED_APPS) installed_load();
 			if (pages[i].page == PAGE_BOOST) ib_render_prepare();
+			if (pages[i].page == PAGE_POWER) sleep_load();
 			/* 664 points: the app area on the phone; ZT_RENDER_HEIGHT for a whole long page */
 			int height = getenv("ZT_RENDER_HEIGHT") ? atoi(getenv("ZT_RENDER_HEIGHT")) : 664;
 			return zmc_render_png(&settings, pages[i].page, height > 0 ? height : 664, path);

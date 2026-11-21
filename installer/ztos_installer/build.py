@@ -336,7 +336,7 @@ step "turning on ztOS's services"
 # (systemd-pstore: the kernel log of a crash or hang is kept in /var/lib/systemd/pstore)
 # (zrnperfd: the CPU and GPU clocks from ztOSIAL's Perf1; without it the
 # GPU rests at its lowest step and ztMETRO lags)
-for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoresensorframework ztos-update-check.timer \
+for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoru ztos-update-check.timer \
 		ztos-iald zrnperfd waydroid-container ztos-waydroid-images; do
 	ch systemctl enable "$u" > /dev/null 2>&1
 done

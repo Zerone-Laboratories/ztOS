@@ -12,7 +12,7 @@
 # SoC sleep is held off (zrn-sleepd's /run/zrn-sleepd/inhibit/timed-hub, its
 # mtime the expiry) from the driver load through the patch download until
 # the firmware is ready, or this attempt ends: a sleep must not land in the
-# middle of a hub reset. ztoscsf's power retry takes it before its reset.
+# middle of a hub reset. ztoscoru's power retry takes it before its reset.
 HOLD=/run/zrn-sleepd/inhibit/timed-hub
 hold() {
 	mkdir -p /run/zrn-sleepd/inhibit

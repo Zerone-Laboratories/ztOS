@@ -208,7 +208,7 @@ static void ib_neuron(cairo_t *cr, double x, double y, double r, double level, b
 	cairo_fill(cr);
 	cairo_set_line_width(cr, lit ? 2.2 : 1);
 	if (lit) zmc_accent(cr);
-	else cairo_set_source_rgba(cr, 1, 1, 1, 0.55);
+	else ib_rgba(cr, zmc_fg_color(), 0.55);	/* the page's ink: white was lost on a light page */
 	cairo_arc(cr, x, y, r, 0, 2 * M_PI);
 	cairo_stroke(cr);
 }
@@ -234,19 +234,29 @@ static int ib_top(const float *flow, int count, int n, int *out) {
  * tail. On the GPU (a small white disc, scaled), or into `cr` for --render. */
 static void ib_dot(cairo_t *cr, double x, double y, double r, double a) {
 	if (cr) {
-		ib_rgba(cr, 0xffffff, a);
+		ib_rgba(cr, zmc_fg_color(), a);
 		cairo_arc(cr, x, y, r, 0, 2 * M_PI);
 		cairo_fill(cr);
 		return;
 	}
+	/* in the page's ink, made again when the theme changes (white pulses
+	 * crossed a light page unseen) */
+	static int dot_theme = -1;
+	if (ib.dot && dot_theme != zmc.theme) {
+		cairo_surface_destroy(ib.dot);
+		ib.dot = NULL;
+	}
 	if (!ib.dot) {
 		int px = 32;
+		uint32_t ink = zmc_fg_color();
+		double ir = ((ink >> 16) & 255) / 255.0, ig = ((ink >> 8) & 255) / 255.0, ib_ = (ink & 255) / 255.0;
+		dot_theme = zmc.theme;
 		ib.dot = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, px, px);
 		cairo_t *d = cairo_create(ib.dot);
 		cairo_pattern_t *g = cairo_pattern_create_radial(px / 2.0, px / 2.0, 0, px / 2.0, px / 2.0, px / 2.0);
-		cairo_pattern_add_color_stop_rgba(g, 0, 1, 1, 1, 1);
-		cairo_pattern_add_color_stop_rgba(g, 0.55, 1, 1, 1, 1);
-		cairo_pattern_add_color_stop_rgba(g, 1, 1, 1, 1, 0);
+		cairo_pattern_add_color_stop_rgba(g, 0, ir, ig, ib_, 1);
+		cairo_pattern_add_color_stop_rgba(g, 0.55, ir, ig, ib_, 1);
+		cairo_pattern_add_color_stop_rgba(g, 1, ir, ig, ib_, 0);
 		cairo_set_source(d, g);
 		cairo_paint(d);
 		cairo_pattern_destroy(g);
@@ -300,7 +310,7 @@ static void ib_network(cairo_t *cr) {
 	zmc_text_centred(cr, "output layer", FONT_REGULAR, 12, x2, 6);
 	ib.t1 = ib.t2 = 0;
 	if (n <= 0) {
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text_centred(cr, ib.live ? "no model yet" : "zrnperfd is not publishing", FONT_SEMILIGHT, 17,
 			x1, 110);
 		return;
@@ -393,6 +403,12 @@ static void ib_overlay(int page) {
 		ib.net_dirty = true;
 	}
 	uint32_t now = zmc_now_ms();
+	static int net_theme = -1;
+	if (net_theme != zmc.theme) {
+		net_theme = zmc.theme;	/* its labels and rings are in the page's ink: at once in the new one */
+		ib.net_dirty = true;
+		ib.net_at = now - IB_NET_MS;
+	}
 	if (ib.net_dirty && (now - ib.net_at >= IB_NET_MS || !ib.net_rev)) {
 		ib.net_at = now;
 		cairo_t *cr = cairo_create(ib.net);
@@ -419,7 +435,7 @@ static double ib_rung_bars(cairo_t *cr, double y) {
 		double share = total > 0 ? ib.rung_ms[k] / total : 0;
 		char pct[16];
 		snprintf(pct, sizeof(pct), "%.0f %%", share * 100);
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text(cr, ib_rungs[k], FONT_REGULAR, 14, MARGIN, y, 0);
 		cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
 		cairo_rectangle(cr, MARGIN + 92, y + 6, w - 92 - 46, 10);
@@ -443,7 +459,7 @@ static double draw_boost(cairo_t *cr) {
 		y = zmc_field(cr, y, "zrnperfd", "not running, or the screen has been off since it started");
 	}
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "RapidBoost", FONT_SEMILIGHT, 26, MARGIN, y, 0);
 	y += 44;
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
@@ -460,7 +476,7 @@ static double draw_boost(cairo_t *cr) {
 	snprintf(value, sizeof(value), "%lu up, %lu down", ib.ups, ib.downs);
 	y = zmc_field(cr, y, "Steps", value);
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "IntelligentBoost", FONT_SEMILIGHT, 26, MARGIN, y, 0);
 	y += 44;
 	int mode = !strcmp(ib.mode, "on") ? 2 : !strcmp(ib.mode, "shadow") ? 1 : 0;
@@ -480,7 +496,7 @@ static double draw_boost(cairo_t *cr) {
 	snprintf(value, sizeof(value), "%lu checked against the processor, %lu wrong", ib.checks, ib.check_failures);
 	y = zmc_field(cr, y, "SCORE self-check", value);
 
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, "the network", FONT_SEMILIGHT, 26, MARGIN, y, 0);
 	y += 44;
 	ib.net_y = y;

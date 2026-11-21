@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * ztOSCoreSensorFramework (ztoscsf): the one place that knows every piece of
- * hardware support this system brings itself, starts each with the system,
- * and says so on the screen when one does not start or stops later.
+ * ztOSCOR-U, the ztOS Central Operations Register Unit (ztoscoru): the one
+ * place that knows every component this system brings itself (kernel modules,
+ * system units, the session's programs), starts each with the system, and
+ * says so on the screen when one does not start or stops later. It also
+ * notices the shell restarting, keeps the battery from running flat, and
+ * holds the sensor hub's two recovery attempts. (It was ztoscsf until
+ * 2026-11; ztOSCoreSensorFramework is now only the sensor hub and the
+ * sensors, which this watches like any other unit.)
  *
- * The pieces are listed in /etc/ztoscoresensorframework/components, one per
+ * The pieces are listed in /etc/ztoscoru/components, one per
  * line, "kind|id|argument|title":
  *
  *	module|zrn_haptic|zrn-haptic|Vibration motor
@@ -18,10 +23,14 @@
  *
  * Starting. Modules first, then the units in the order listed; none waits for
  * another (systemd has their own ordering). A module is loaded behind a mark
- * in /var/lib/ztoscsf: the file is written before modprobe and removed a few
- * seconds after. If loading ever stops the kernel, the phone restarts, the
- * mark is still there, and the module is left alone and reported, instead of
- * stopping the phone again at every start. `ztoscsf retry NAME` removes it.
+ * in /var/lib/ztoscoru: the file is written before modprobe and removed a few
+ * seconds after, with the number of loads in a row that did not finish. If
+ * loading stops the kernel, the phone restarts and the mark is still there.
+ * One such mark is tried once more (a restart in those few seconds leaves the
+ * same trace, and a module held back by mistake is a boot without it); at the
+ * second in a row the module is left alone and reported, instead of stopping
+ * the phone again at every start. A stop asked for while a module settles
+ * takes its mark away. `ztoscoru retry NAME` removes a mark by hand.
  *
  * Watching. Every PERIOD_S: each unit's state and restart count from one
  * `systemctl show`, each module in /sys/module, each session program in
@@ -31,11 +40,11 @@
  * Reporting. A line "notify APP|TITLE|TEXT" down the shell's control pipe
  * (/run/user/UID/ztmetro.ctl): ztMETRO shows a banner and keeps it in the
  * action centre. With no shell yet, reports wait in a queue. All of it is
- * also in the journal, and the present state in /run/ztoscsf/status.
+ * also in the journal, and the present state in /run/ztoscoru/status.
  *
- *	ztoscsf			run (the service does)
- *	ztoscsf status		print /run/ztoscsf/status
- *	ztoscsf retry NAME	forget a module's mark, so the next start tries again
+ *	ztoscoru		run (the service does)
+ *	ztoscoru status		print /run/ztoscoru/status
+ *	ztoscoru retry NAME	forget a module's mark, so the next start tries again
  */
 #define _GNU_SOURCE
 #include <ctype.h>
@@ -54,12 +63,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#define NAME		"ztOSCoreSensorFramework"
-#define COMPONENTS	"/etc/ztoscoresensorframework/components"
-#define MARKS		"/var/lib/ztoscsf"
-#define RUN_DIR		"/run/ztoscsf"
+#define NAME		"ztOSCOR-U"
+#define COMPONENTS	"/etc/ztoscoru/components"
+#define MARKS		"/var/lib/ztoscoru"
+#define RUN_DIR		"/run/ztoscoru"
 #define STATUS		RUN_DIR "/status"
-#define CSF_CTL		"/run/ztoscsf.ctl"
+#define CORU_CTL	"/run/ztoscoru.ctl"
 #define PERIOD_S	60	/* (every look runs a program or two: not more often than this) */
 #define QUIET_S		600	/* one report per piece in this long */
 #define START_GRACE_S	100	/* how long a unit may take to come up at first */
@@ -87,6 +96,7 @@ static char queue[MAX_QUEUE][512];
 static int q_len;
 static long started_at;
 static int kernel_faults = -1;
+static const char *marks = MARKS, *components = COMPONENTS;	/* see migrate_from_csf() */
 
 static long now_s(void)
 {
@@ -99,7 +109,7 @@ static void say(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	fprintf(stderr, "ztoscsf: ");
+	fprintf(stderr, "ztoscoru: ");
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 	va_end(ap);
@@ -177,7 +187,7 @@ static void report(struct part *p, const char *fmt, ...)
 
 static void load_parts(void)
 {
-	FILE *f = fopen(COMPONENTS, "r");
+	FILE *f = fopen(components, "r");
 	char line[256];
 	while (f && fgets(line, sizeof(line), f) && n_parts < MAX_PARTS) {
 		char kind[16] = "", id[64] = "", arg[64] = "", title[48] = "";
@@ -197,7 +207,7 @@ static void load_parts(void)
 		struct part *p = &parts[n_parts];
 		p->kind = !strcmp(kind, "module") ? K_MODULE : !strcmp(kind, "unit") ? K_UNIT : K_SESSION;
 		if (!id[0] || (strcmp(kind, "module") && strcmp(kind, "unit") && strcmp(kind, "session"))) {
-			say("%s: line not understood: %s|%s", COMPONENTS, kind, id);
+			say("%s: line not understood: %s|%s", components, kind, id);
 			continue;
 		}
 		snprintf(p->id, sizeof(p->id), "%s", id);
@@ -208,7 +218,7 @@ static void load_parts(void)
 	if (f)
 		fclose(f);
 	else
-		say("%s: %s", COMPONENTS, strerror(errno));
+		say("%s: %s", components, strerror(errno));
 }
 
 static void publish(void)
@@ -248,10 +258,43 @@ static bool module_loaded(const char *id)
 
 static void mark_path(const struct part *p, char *path, size_t size)
 {
-	snprintf(path, size, MARKS "/%s.loading", p->id);
+	snprintf(path, size, "%s/%s.loading", marks, p->id);
 }
 
-/* Load one module behind its mark. */
+/* A stop asked for while a module settles (the system going down, or this
+ * service started again, seconds after it began) is not a fault of the module:
+ * the mark must not outlive it. Anywhere else a stop just ends the daemon. */
+static volatile sig_atomic_t in_load, stopping;
+
+static void on_term(int sig)
+{
+	(void)sig;
+	if (!in_load)
+		_exit(0);
+	stopping = 1;
+}
+
+/* How many starts in a row left this mark behind: the number written in it,
+ * or 1 for a mark with nothing in it (those of before the count). */
+static int mark_strikes(const char *mark)
+{
+	char buf[16] = "";
+	int fd = open(mark, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	int k = n > 0 ? atoi(buf) : 0;
+	return k > 0 ? k : 1;
+}
+
+#define STRIKES_HELD	2	/* this many unfinished loads in a row hold a module back */
+
+/* Load one module behind its mark. One unfinished load is not proof that the
+ * module stops the phone (a restart inside the few seconds the mark is there
+ * leaves the same trace), and a module held back by mistake costs a boot
+ * without it: core power held back means no sleep. So the first mark found is
+ * tried once more, with the count in it; only a second in a row holds. */
 static void module_start(struct part *p)
 {
 	char mark[160];
@@ -262,27 +305,45 @@ static void module_start(struct part *p)
 		unlink(mark);
 		return;
 	}
-	if (access(mark, F_OK) == 0) {
+	int strikes = mark_strikes(mark);
+	if (strikes >= STRIKES_HELD) {
 		p->state = S_HELD;
-		report(p, "Held back: loading it stopped the phone last time. `ztoscsf retry %s` to try again.", p->id);
+		report(p, "Held back: loading it did not finish %d times in a row. `ztoscoru retry %s` to try again.",
+			strikes, p->id);
 		return;
 	}
+	if (strikes > 0)
+		say("%s: the last load did not finish; trying once more", p->id);
 	int fd = open(mark, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 	if (fd >= 0) {
+		dprintf(fd, "%d\n", strikes + 1);
 		fsync(fd);
 		close(fd);
 	}
 	sync();
+	in_load = 1;
 	say("loading %s (%s)", p->arg, p->title);
 	if (run("modprobe %s", p->arg) != 0 && !module_loaded(p->id)) {
 		unlink(mark);	/* it refused, cleanly: nothing to hold it back for */
+		in_load = 0;
 		p->state = S_FAILED;
 		report(p, "Did not start: the driver would not load.");
+		if (stopping)
+			_exit(0);
 		return;
 	}
-	sleep(SETTLE_S);	/* long enough for a fault to show */
+	for (int i = 0; i < SETTLE_S && !stopping; i++)
+		sleep(1);	/* long enough for a fault to show */
+	if (stopping) {
+		/* asked to stop while it settled: the kernel is alive and shutting
+		 * down in order, so this was no fault of the module */
+		unlink(mark);
+		sync();
+		_exit(0);
+	}
 	unlink(mark);
 	sync();
+	in_load = 0;
 	p->state = module_loaded(p->id) ? S_OK : S_FAILED;
 	p->seen_ok = p->state == S_OK;
 	if (p->state != S_OK)
@@ -471,7 +532,7 @@ static void battery_look(void)
  * ready"; it expires by itself if nobody does. */
 #define HUB_HOLD_DIR	"/run/zrn-sleepd/inhibit"
 #define HUB_HOLD	HUB_HOLD_DIR "/timed-hub"
-#define HUB_HOLD_TMP	"/run/zrn-sleepd/.hub-csf.tmp"
+#define HUB_HOLD_TMP	"/run/zrn-sleepd/.hub-coru.tmp"
 
 static void hub_hold(int seconds)
 {
@@ -626,14 +687,16 @@ static void look(bool first)
 
 static void start_all(void)
 {
-	mkdir(MARKS, 0755);
+	mkdir(marks, 0755);
 	mkdir(RUN_DIR, 0755);
 	/* the kernel stopped, and left its last words: said once for each time
 	 * (the record stays until someone deletes it, so its date is kept) */
 	struct stat st;
 	if (stat("/sys/fs/pstore/dmesg-ramoops-0", &st) == 0) {
 		long seen = 0;
-		FILE *f = fopen(MARKS "/crash-seen", "r");
+		char seen_path[160];
+		snprintf(seen_path, sizeof(seen_path), "%s/crash-seen", marks);
+		FILE *f = fopen(seen_path, "r");
 		if (f) {
 			if (fscanf(f, "%ld", &seen) != 1)
 				seen = 0;
@@ -641,7 +704,7 @@ static void start_all(void)
 		}
 		if (seen != (long)st.st_mtime) {
 			notify("System", "The phone restarted after the kernel stopped. Its last log is in /sys/fs/pstore.");
-			f = fopen(MARKS "/crash-seen", "w");
+			f = fopen(seen_path, "w");
 			if (f) {
 				fprintf(f, "%ld\n", (long)st.st_mtime);
 				fclose(f);
@@ -667,6 +730,38 @@ static void start_all(void)
 	}
 }
 
+/* ---- migration from ztoscsf ---------------------------------------------
+ * The watchdog was ztoscsf (ztoscoresensorframework.service) until 2026-11.
+ * Remove this block, its uses in main() (the call, `retry`'s fallback and
+ * the old pipe's link) and the marks/components variables' note, once every
+ * phone has run scripts/dev/migrate-coru.sh. */
+#define OLD_MARKS	"/var/lib/ztoscsf"
+#define OLD_COMPONENTS	"/etc/ztoscoresensorframework/components"
+#define OLD_CTL		"/run/ztoscsf.ctl"
+
+static void migrate_from_csf(void)
+{
+	/* The marks keep a module that once stopped the phone from being loaded
+	 * again: they move with the daemon, and are never left behind. If they
+	 * cannot be moved, they are used where they are. */
+	if (access(MARKS, F_OK) != 0 && access(OLD_MARKS, F_OK) == 0) {
+		if (rename(OLD_MARKS, MARKS) == 0) {
+			sync();
+			say("moved the marks from %s to %s", OLD_MARKS, MARKS);
+		} else {
+			marks = OLD_MARKS;
+			say("could not move %s to %s (%s): using the marks where they are", OLD_MARKS, MARKS,
+				strerror(errno));
+		}
+	} else if (access(OLD_MARKS, F_OK) == 0) {
+		say("both %s and %s are there: using %s", OLD_MARKS, MARKS, MARKS);
+	}
+	if (access(COMPONENTS, F_OK) != 0 && access(OLD_COMPONENTS, F_OK) == 0) {
+		components = OLD_COMPONENTS;
+		say("%s is missing: reading the old list, %s", COMPONENTS, OLD_COMPONENTS);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	if (argc >= 2 && !strcmp(argv[1], "status")) {
@@ -687,30 +782,40 @@ int main(int argc, char **argv)
 	}
 	if (argc == 3 && !strcmp(argv[1], "retry")) {
 		char mark[160];
-		snprintf(mark, sizeof(mark), MARKS "/%s.loading", argv[2]);
+		/* migration: not moved yet (only the daemon moves them) */
+		if (access(MARKS, F_OK) != 0 && access(OLD_MARKS, F_OK) == 0)
+			marks = OLD_MARKS;
+		snprintf(mark, sizeof(mark), "%s/%s.loading", marks, argv[2]);
 		if (unlink(mark) != 0) {
 			fprintf(stderr, "%s: %s\n", mark, strerror(errno));
 			return 1;
 		}
-		printf("%s will be tried again at the next start (or: systemctl restart ztoscoresensorframework)\n", argv[2]);
+		printf("%s will be tried again at the next start (or: systemctl restart ztoscoru)\n", argv[2]);
 		return 0;
 	}
 	if (argc > 1) {
-		fprintf(stderr, "usage: ztoscsf [status | retry NAME]\n");
+		fprintf(stderr, "usage: ztoscoru [status | retry NAME]\n");
 		return 2;
 	}
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGTERM, on_term);	/* see module_start: a stop must not leave a mark */
+	signal(SIGINT, on_term);
 	setvbuf(stderr, NULL, _IOLBF, 0);
 	started_at = now_s();
+	migrate_from_csf();
 	load_parts();
 	say("%s: %d components", NAME, n_parts);
 	start_all();
 
-	unlink(CSF_CTL);
-	if (mkfifo(CSF_CTL, 0666) == 0) {
-		chmod(CSF_CTL, 0666);
+	unlink(CORU_CTL);
+	if (mkfifo(CORU_CTL, 0666) == 0) {
+		chmod(CORU_CTL, 0666);
 	}
-	int ctl_fd = open(CSF_CTL, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+	int ctl_fd = open(CORU_CTL, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+	/* migration: a shell from before the rename still writes the old pipe */
+	unlink(OLD_CTL);
+	if (symlink(CORU_CTL, OLD_CTL) != 0)
+		say("%s: %s", OLD_CTL, strerror(errno));
 
 	sleep(3);
 	look(true);
@@ -737,6 +842,6 @@ int main(int argc, char **argv)
 		look(false);
 	}
 	if (ctl_fd >= 0) close(ctl_fd);
-	unlink(CSF_CTL);
+	unlink(CORU_CTL);
 	return 0;
 }

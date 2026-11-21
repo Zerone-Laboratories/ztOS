@@ -1,5 +1,8 @@
-# ztOSCoreSensorFramework: every piece of hardware support this system brings
-# itself. kind|id|argument|title, in the order they are started.
+# ztOSCOR-U (ztOS Central Operations Register Unit): every component this
+# system brings itself, which ztoscoru starts with the system and watches.
+# The sensor hub and the sensors below are ztOSCoreSensorFramework; ztOSCOR-U
+# only starts and watches them, like the others.
+# kind|id|argument|title, in the order they are started.
 #
 #   module   a kernel module with no service of its own (id: its name in
 #            /sys/module; argument: what modprobe is given)

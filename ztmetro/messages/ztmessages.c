@@ -340,12 +340,12 @@ static double draw_threads(cairo_t *cr) {
 		when_text(m->at, when, sizeof(when));
 		double when_w = zmc_text_width(when, FONT_REGULAR, 12.5);
 		bool unread = m->state == M_IN && m->at > read_before(m->number);
-		if (unread) zmc_accent(cr); else cairo_set_source_rgb(cr, 1, 1, 1);
+		if (unread) zmc_accent(cr); else zmc_fg(cr);
 		const double tile = 56, left = MARGIN + tile + 12;
 		const char *name = name_of(threads[t].number);
 		if (selecting) {
 			/* the tile makes way for the box that says it is chosen */
-			if (selected[t]) zmc_accent(cr); else cairo_set_source_rgb(cr, 1, 1, 1);
+			if (selected[t]) zmc_accent(cr); else zmc_fg(cr);
 			cairo_set_line_width(cr, 2);
 			cairo_rectangle(cr, MARGIN + 14, y + 14, 28, 28);
 			if (selected[t]) cairo_fill(cr); else cairo_stroke(cr);
@@ -365,7 +365,7 @@ static double draw_threads(cairo_t *cr) {
 			zmc_text_centred(cr, initial, FONT_SEMILIGHT, 26, MARGIN + tile / 2, y + 12);
 		}
 		cairo_new_path(cr);
-		if (unread) zmc_accent(cr); else cairo_set_source_rgb(cr, 1, 1, 1);
+		if (unread) zmc_accent(cr); else zmc_fg(cr);
 		zmc_text_line(cr, name, unread ? FONT_SEMIBOLD : FONT_SEMILIGHT, 24, left, y - 3, zmc.width - left - MARGIN - when_w - 10);
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		zmc_text(cr, when, FONT_REGULAR, 12.5, zmc.width - MARGIN - when_w, y + 8, 0);
@@ -382,7 +382,7 @@ static double draw_threads(cairo_t *cr) {
 		if (m->state == M_FAILED) {
 			zmc_accent(cr);
 		} else if (unread) {
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);
 		}
 		zmc_text_line(cr, line, FONT_REGULAR, 14, left, y + 30, zmc.width - left - MARGIN);
 		zmc_add_hit(0, y - 2, zmc.width, 58, ACT_OPEN, t);
@@ -468,7 +468,9 @@ static void sms_size(const char *text, int *used, int *of, int *parts) {
 static void draw_compose(cairo_t *cr, double y, int page) {
 	const double strip = box_h + 94, box_w = zmc.width - 2 * MARGIN;
 	bool dots = zmc.style == ZMC_STYLE_DOTMATRIX;
-	cairo_set_source_rgb(cr, 0, 0, 0);
+	/* the strip is the page's own background (black in dots, as it was) */
+	if (dots) cairo_set_source_rgb(cr, 0, 0, 0);
+	else zmc_bg(cr);
 	cairo_rectangle(cr, 0, y, zmc.width, strip + (more ? 44 : 0));
 	cairo_fill(cr);
 	/* Metro's box is pale with dark text; in dots a pale fill would drown
@@ -505,17 +507,21 @@ static void draw_compose(cairo_t *cr, double y, int page) {
 	cairo_new_path(cr);
 	double row = y + box_h + 18;
 	double dim = draft[0] ? 1 : 0.45;
-	cairo_set_source_rgb(cr, dim, dim, dim);
+	/* the buttons in the page's ink (white on a light strip was nothing) */
+	if (draft[0] && !dots) zmc_fg(cr);
+	else cairo_set_source_rgb(cr, dim, dim, dim);
 	zmc_round_button(cr, 46, row, "send", "send", ACT_SEND, 0);
 	cairo_new_path(cr);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	if (dots) cairo_set_source_rgb(cr, 1, 1, 1);
+	else zmc_fg(cr);
 	if (page == P_THREAD && !has_letters(with)) {
 		zmc_round_button(cr, 118, row, "call", "call", ACT_CALL, 0);
 		cairo_new_path(cr);
 	}
 	zmc_text(cr, "...", FONT_SEMIBOLD, 24, zmc.width - 40, row + 1, 0);
 	if (more) {
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		if (dots) cairo_set_source_rgb(cr, 1, 1, 1);
+		else zmc_fg(cr);
 		zmc_text(cr, page == P_THREAD ? "delete conversation" : "discard draft", FONT_REGULAR,
 			18, MARGIN, y + strip + 8, zmc.width - 2 * MARGIN);
 	}
@@ -646,8 +652,9 @@ static void bubble_size(cairo_t *cr, const struct message *m, char *stamp, size_
 static double draw_thread(cairo_t *cr) {
 	const char *name = name_of(with);
 	double y = zmc_header(cr, "");
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text_line(cr, name, FONT_SEMILIGHT, 28, MARGIN, 46, zmc.width - 2 * MARGIN);
+	zmc_fg(cr);
+	/* (in the header: under the caps line, which is higher in landscape) */
+	zmc_text_line(cr, name, FONT_SEMILIGHT, 28, MARGIN, zmc_landscape() ? 22 : 46, zmc.width - 2 * MARGIN);
 	cairo_new_path(cr);
 	time_t since = sample ? 0 : hidden_before(with);
 	/* A short conversation sits on the box, not under the title: with the
@@ -1124,10 +1131,25 @@ static void watch_files(void) {
 	zmc_watch_fd(fd, file_event, NULL);
 }
 
+/* A new size (the phone turned): the box measured again at its new width and
+ * the strip under it drawn again; a bubble still rising, drawn at the old
+ * width, lands at once; a conversation shows its end again. */
+static void resized(void) {
+	box_measure();
+	footer_revision++;
+	if (rise_message >= 0) {
+		rise_stop();
+	}
+	if (zmc.page == P_THREAD) {
+		zmc_scroll_end();
+	}
+}
+
 static const struct zmc_app messaging = {
 	.app_id = "ztmessages", .title = "Messaging", .caps = "MESSAGING",
 	.overlay = overlay, .touch = touch,
 	.render = render, .activate = activate, .back = back, .text = typed, .hold = hold,
+	.resized = resized,
 };
 
 int main(int argc, char **argv) {

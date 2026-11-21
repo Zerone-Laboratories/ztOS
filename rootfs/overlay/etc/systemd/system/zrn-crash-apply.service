@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply the ztOS crash-restart policy drop-ins to all ztOS services
+Before=graphical.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/zrn-crash-apply
+[Install]
+WantedBy=multi-user.target

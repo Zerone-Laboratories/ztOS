@@ -19,7 +19,7 @@ $(info removed programs built for another machine, to build them here: $(FOREIGN
 endif
 
 all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
-	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles splash/ztos-splash \
+	coru/ztoscoru notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles splash/ztos-splash \
 	store/ztstore power/ztpower camera/ztcamera sound/ztsound osial/ztosial
 
 sounds/ztos-sounds: sounds/ztos-sounds.c
@@ -177,14 +177,16 @@ check-store:
 		$(CC) -std=c11 -Wall -o /tmp/ztstore-test-$$t tests/test_$$t.c util.c json.c pkg.c repo.c appstream.c aur.c sections.c -lz && \
 		/tmp/ztstore-test-$$t || exit 1; done
 
-# ztOSCoreSensorFramework: starts every piece of hardware support with the
-# system, watches them, and reports what fails
-csf/ztoscsf: csf/ztoscsf.c
-	$(CC) $(CFLAGS) $(WARN) -o $@ csf/ztoscsf.c
+# ztOSCOR-U (ztOS Central Operations Register Unit): starts every component
+# with the system, watches them, and reports what fails
+coru/ztoscoru: coru/ztoscoru.c
+	$(CC) $(CFLAGS) $(WARN) -o $@ coru/ztoscoru.c
 
+# the boot splash on the framebuffer: the logo and what systemd is starting
+# (ztos-splash.service, docs/bootsplash/README.md)
 splash/ztos-splash: splash/ztos-splash.c
-	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags cairo pangocairo) -o $@ splash/ztos-splash.c \
-		$(shell pkg-config --libs cairo pangocairo)
+	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags cairo pangocairo libsystemd) -o $@ splash/ztos-splash.c \
+		$(shell pkg-config --libs cairo pangocairo libsystemd) -lm
 
 core/xdg-shell-client-protocol.h:
 	wayland-scanner client-header $(XDG) $@
@@ -253,7 +255,7 @@ install: check-arch
 	install -Dm755 modemd/ztoscorenetworkingd /usr/local/sbin/ztoscorenetworkingd
 	install -Dm644 modemd/ztoscorenetworking-modem.service /etc/systemd/system/ztoscorenetworking-modem.service
 	install -Dm644 modemd/ztoscorenetworking.service /etc/systemd/system/ztoscorenetworking.service
-	install -Dm755 csf/ztoscsf /usr/local/sbin/ztoscsf
+	install -Dm755 coru/ztoscoru /usr/local/sbin/ztoscoru
 	install -Dm755 notifyd/ztnotifyd /usr/local/bin/ztnotifyd
 	install -Dm755 phone/ztphone /usr/local/bin/ztphone
 	install -Dm755 messages/ztmessages /usr/local/bin/ztmessages
@@ -265,11 +267,11 @@ install: check-arch
 	install -Dm644 contacts/google-client.json.template /usr/local/share/ztos/google-client.json.template
 	install -Dm644 -t /usr/local/share/applications comm/ztphone.desktop comm/ztmessages.desktop comm/ztcontacts.desktop
 	install -Dm644 -t /usr/local/share/icons/hicolor/scalable/apps comm/ztphone.svg comm/ztmessages.svg comm/ztcontacts.svg
-	install -Dm644 csf/components /etc/ztoscoresensorframework/components
-	install -Dm644 csf/ztoscoresensorframework.service /etc/systemd/system/ztoscoresensorframework.service
+	install -Dm644 coru/components /etc/ztoscoru/components
+	install -Dm644 coru/ztoscoru.service /etc/systemd/system/ztoscoru.service
 
 clean:
-	rm -f sound/ztsound osial/ztosial auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices power/ztpower perfd/zrnperfd touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf notifyd/ztnotifyd splash/ztos-splash \
+	rm -f sound/ztsound osial/ztosial auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices power/ztpower perfd/zrnperfd touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd coru/ztoscoru notifyd/ztnotifyd splash/ztos-splash \
 		phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles store/ztstore camera/ztcamera core/viewporter-protocol.c core/viewporter-client-protocol.h \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c
 

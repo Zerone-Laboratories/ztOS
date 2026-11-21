@@ -1,0 +1,11 @@
+[Unit]
+Description=ztOSCOR-U (ztOS Central Operations Register Unit): starts this phone's components and reports what fails
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/local/sbin/ztoscoru
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

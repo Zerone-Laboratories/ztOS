@@ -39,6 +39,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -67,6 +73,7 @@ struct state {
 	char call[12];		/* "", dialing, ringing (theirs), incoming, active */
 	char call_number[32];
 	char ipc[8];		/* "", alive, silent: does the CP answer IPC probes (debug only) */
+	bool data_held;		/* data_on, but the session is dropped while Wi-Fi is connected */
 };
 static struct state now = { "?", "", -1, 0, 0, 0, -1, -1, -1, false, false, false, "", -1 };
 static struct state written;
@@ -138,12 +145,12 @@ static void publish(void)
 	fprintf(f, "call_result=%s\n", call_result);
 	fprintf(f, "call=%s\ncall_number=%s\n", now.call[0] ? now.call : "idle", now.call_number);
 	fprintf(f, "sim=%s\noperator=%s\nbars=%d\nregistered=%s\ntech=%s\nairplane=%d\ndata=%d\ndata_on=%d\n"
-		"ip=%s\nwifi_bars=%d\n",
+		"ip=%s\nwifi_bars=%d\ndata_held=%d\n",
 		now.sim, now.operator, bars, reg_name(reg), tech(),
 		/* (this modem's AT+CFUN? has been seen to say "off" while it is
 		 * registered: a registered radio is not in airplane mode) */
 		now.airplane && reg != 1 && reg != 5, now.data, now.data_on,
-		now.ip, now.wifi_bars);
+		now.ip, now.wifi_bars, now.data_held);
 	fprintf(f, "ipc=%s\nipc_last_rx=%.0f\n", now.ipc[0] ? now.ipc : "?", ipc_last_rx);
 	fclose(f);
 	chmod(STATUS ".new", 0644);
@@ -778,6 +785,9 @@ static void call_set(const char *state, const char *number)
 	if (!fake_call && !call_audio_route && (!strcmp(state, "active") || !strcmp(state, "dialing") || !strcmp(state, "ringing")))
 		call_audio(1);
 	if (!state[0] && now.call[0]) {
+		/* over: an answer pending from this call must not outlive it, or the next
+		 * call's RING is taken for this one's and never shown (2026-11-21) */
+		call_answering = false;
 		/* over: into the log */
 		if (!call_result[0]) snprintf(call_result, sizeof(call_result), "ended");
 		tell_shell("call_screen end\n");
@@ -953,7 +963,7 @@ static void on_line(char *l)
 	} else if (!strcmp(l, "RING") || !strncmp(l, "+CRING", 6)) {
 		if (strcmp(now.call, "incoming"))
 			fprintf(stderr, "ztoscorenetworkingd: modem: %s\n", l);
-		if (strcmp(now.call, "incoming") && !call_answering) {
+		if (strcmp(now.call, "incoming") && !(call_answering && now.call[0])) {
 			call_set("incoming", "");
 			/* light the screen and bring the call up (launch is refused on
 			 * the lock screen; the note stays for that) */
@@ -1033,7 +1043,7 @@ static void data_wish(bool on, bool say)
 		if (fd >= 0)
 			close(fd);
 		data_tried_at = 0;	/* now, not at the next half minute */
-		if (ctx_up) {
+		if (ctx_up && !now.data_held) {
 			/* still there from before it was switched off */
 			snprintf(now.ip, sizeof(now.ip), "%s", ctx_ip);
 			now.data = true;
@@ -1044,6 +1054,13 @@ static void data_wish(bool on, bool say)
 		now.data = false;	/* the interface comes down; the context stays */
 		now.ip[0] = 0;
 	}
+}
+
+/* Whether a data session should be up: the user's wish, held back while
+ * Wi-Fi is connected (see wifi_hold). The wish itself is never changed. */
+static bool data_want(void)
+{
+	return now.data_on && !now.data_held;
 }
 
 static void run(const char *fmt, ...)
@@ -1491,7 +1508,7 @@ static void data_keep(void)
 		}
 	}
 	bool registered = now.eps_reg == 1 || now.eps_reg == 5 || now.ps_reg == 1 || now.ps_reg == 5;
-	if (now.data_on && !ctx_up && registered &&
+	if (data_want() && !ctx_up && registered &&
 			(!data_tried_at || ms() - data_tried_at > 30000))
 		data_activate();
 }
@@ -1895,7 +1912,7 @@ static void ipc_message(int main_cmd, int sub, int type, int mseq, const unsigne
 		int result = data[3] | data[4] << 8;
 		if (result != 0x8000) {
 			fprintf(stderr, "ztoscorenetworkingd: data: 0d%02x refused (0x%04x)\n", data[1], result);
-		} else if (data[1] == 0x01 && now.data_on && !ctx_up) {
+		} else if (data[1] == 0x01 && data_want() && !ctx_up) {
 			data_bring_up();
 		}
 		data_asked_at = 0;
@@ -1913,7 +1930,7 @@ static void ipc_message(int main_cmd, int sub, int type, int mseq, const unsigne
 			ctx_up = true;
 			snprintf(data_dns[0], sizeof(data_dns[0]), "%d.%d.%d.%d", data[7], data[8], data[9], data[10]);
 			snprintf(data_dns[1], sizeof(data_dns[1]), "%d.%d.%d.%d", data[11], data[12], data[13], data[14]);
-			if (now.data_on) {
+			if (data_want()) {
 				snprintf(now.ip, sizeof(now.ip), "%s", ctx_ip);
 				now.data = true;
 			}
@@ -2196,7 +2213,7 @@ static void wifi_read(void)
 
 	/* 4. sysfs link carrier or operstate */
 	if (bars < 0) {
-		p = popen("for d in /sys/class/net/w*; do "
+		p = popen("for d in /sys/class/net/w*; do [ -d $d/wireless ] || continue; "
 			"[ \"$(cat $d/carrier 2>/dev/null)\" = 1 ] && echo up && break; "
 			"[ \"$(cat $d/operstate 2>/dev/null)\" = up ] && echo up && break; done", "r");
 		if (p) {
@@ -2214,6 +2231,101 @@ static void wifi_read(void)
 		if (++wifi_fail_count >= 3)
 			now.wifi_bars = -1;
 	}
+}
+
+/* ---- mobile data held off while Wi-Fi is connected ---------------------- */
+
+/*
+ * Like Android: Wi-Fi connected with an address for WIFI_HOLD_MS, and the
+ * data context is taken down (only DATA_CID; calls, SMS and the modem's own
+ * IMS context are left alone). Wi-Fi gone (disconnected, out of range, the
+ * driver unbound for sleep, the interface removed), and it is asked for
+ * again at once. Driven by rtnetlink link and address events, not polled.
+ * The user's switch (data_on, DATA_WISH) is not touched.
+ */
+#define WIFI_HOLD_MS	5000L
+static int nl_fd = -1;
+static long wifi_up_since;	/* Wi-Fi connected with an address since, 0 not */
+
+static bool wifi_connected(void)
+{
+	struct ifaddrs *ifa, *i;
+	bool up = false;
+	if (getifaddrs(&ifa) != 0)
+		return false;
+	for (i = ifa; i && !up; i = i->ifa_next) {
+		char path[96];
+		if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !(i->ifa_flags & IFF_RUNNING))
+			continue;
+		snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", i->ifa_name);
+		if (access(path, F_OK) != 0)
+			continue;
+		unsigned a = ntohl(((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr);
+		if ((a >> 16) != 0xa9fe)	/* not 169.254 link-local */
+			up = true;
+	}
+	freeifaddrs(ifa);
+	return up;
+}
+
+static void nl_open(void)
+{
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK,
+		.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR };
+	nl_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (nl_fd >= 0 && bind(nl_fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		close(nl_fd);
+		nl_fd = -1;
+	}
+	if (nl_fd < 0)
+		fprintf(stderr, "ztoscorenetworkingd: netlink: %s; Wi-Fi does not hold data off\n", strerror(errno));
+}
+
+/* Called on every netlink event and each pass of the loop: cheap. */
+static void wifi_hold(void)
+{
+	bool up = wifi_connected();
+	long t = ms();
+	if (!up) {
+		wifi_up_since = 0;
+		if (now.wifi_bars >= 0 && nl_fd >= 0)
+			now.wifi_bars = -1;
+		if (now.data_held) {
+			now.data_held = false;
+			data_tried_at = 0;	/* now */
+			if (ctx_up && now.data_on) {	/* never went down */
+				snprintf(now.ip, sizeof(now.ip), "%s", ctx_ip);
+				now.data = true;
+			}
+			fprintf(stderr, "ztoscorenetworkingd: data: Wi-Fi gone; mobile data back\n");
+		}
+		return;
+	}
+	if (!wifi_up_since) {
+		wifi_up_since = t;
+		if (now.wifi_bars < 0)
+			now.wifi_bars = 3;	/* wifi_read refines it */
+	}
+	if (!now.data_held && now.data_on && t - wifi_up_since >= WIFI_HOLD_MS) {
+		now.data_held = true;
+		fprintf(stderr, "ztoscorenetworkingd: data: Wi-Fi connected; mobile data held off\n");
+		if (ctx_up)
+			data_deactivate();
+		ctx_up = false;
+		now.data = false;
+		now.ip[0] = 0;
+		unlink(DATA_MARK);
+	}
+	if (now.data_held && !now.data_on)
+		now.data_held = false;	/* nothing to hold */
+}
+
+static void nl_readable(void)
+{
+	char buf[8192];
+	while (recv(nl_fd, buf, sizeof(buf), 0) > 0)
+		;	/* what changed is read back whole in wifi_hold */
+	wifi_hold();
 }
 
 /* ---- the loop ------------------------------------------------------------ */
@@ -2335,11 +2447,14 @@ int main(int argc, char **argv)
 			"coming up.\n");
 	}
 	data_wish(access(DATA_WISH, F_OK) == 0, false);
+	nl_open();
+	wifi_hold();
 	fprintf(stderr, "ztoscorenetworkingd: up\n");
 
 	for (;;) {
-		struct pollfd fds[4] = {
+		struct pollfd fds[5] = {
 			{ at_fd, POLLIN, 0 }, { ctl_fd, POLLIN, 0 }, { ipc_fd, POLLIN, 0 }, { rfs_fd, POLLIN, 0 },
+			{ nl_fd, POLLIN, 0 },
 		};
 		if (fake_call && ms() >= fake_until) {
 			call_set("", "");
@@ -2435,9 +2550,12 @@ int main(int argc, char **argv)
 			wait = 500;
 		if (busy && AT_TIMEOUT_MS - (ms() - sent_at) < wait)
 			wait = AT_TIMEOUT_MS - (ms() - sent_at);
+		if (wifi_up_since && !now.data_held && now.data_on &&
+				wifi_up_since + WIFI_HOLD_MS - ms() < wait)
+			wait = wifi_up_since + WIFI_HOLD_MS - ms();
 		if (wait < 0)
 			wait = 0;
-		if (poll(fds, 4, (int)wait) < 0 && errno != EINTR)
+		if (poll(fds, 5, (int)wait) < 0 && errno != EINTR)
 			break;
 		if (fds[0].revents & POLLIN)
 			at_readable();
@@ -2450,6 +2568,10 @@ int main(int argc, char **argv)
 			ipc_readable();
 		if (rfs_fd >= 0 && (fds[3].revents & POLLIN))
 			rfs_readable();
+		if (nl_fd >= 0 && (fds[4].revents & POLLIN))
+			nl_readable();
+		else if (wifi_up_since || now.data_held)
+			wifi_hold();	/* the hold-off timer, or the switch changed */
 		if (busy && ms() - sent_at > AT_TIMEOUT_MS) {
 			fprintf(stderr, "ztoscorenetworkingd: %s: no answer\n", sent);
 			if (!strncmp(sent, "AT+CMGS", 7)) sms_finish(false);

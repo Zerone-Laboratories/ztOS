@@ -3,8 +3,8 @@
  * Devices and Services: what of ztOS is running, what has crashed and what is
  * missing, for the person holding the phone. Two tabs:
  *
- *   services  ztOS's own services (the ztOSCoreSensorFramework list in
- *             /etc/ztoscoresensorframework/components, and the rest named
+ *   services  ztOS's own services (ztOSCOR-U's list of components in
+ *             /etc/ztoscoru/components, and the rest named
  *             below), the session's programs, and any other unit systemd
  *             holds as failed; crashed first, then missing, then running
  *   devices   the phone's hardware, and whether this kernel drives it
@@ -34,7 +34,8 @@ enum action { ACT_OPEN = 1, ACT_ITEM, ACT_RESTART, ACT_STARTSTOP, ACT_BOOT, ACT_
 enum state { ST_CRASHED, ST_MISSING, ST_RUNNING, ST_UNKNOWN };
 enum kind { K_SYSTEM, K_USER, K_MODULE, K_SESSION };
 
-#define COMPONENTS	"/etc/ztoscoresensorframework/components"
+#define COMPONENTS	"/etc/ztoscoru/components"
+#define OLD_COMPONENTS	"/etc/ztoscoresensorframework/components"	/* before 2026-11; remove later */
 #define MAX_ITEMS	96
 #define REFRESH_MS	3000
 #define RED		0xe51400	/* Windows Phone's red and amber */
@@ -55,9 +56,9 @@ static struct item items[MAX_ITEMS];
 static int n_items, shown = -1;	/* shown: the item on the detail page */
 static bool loaded;
 
-/* The units that are ztOS beyond the sensor framework's own list. */
+/* The units that are ztOS beyond ztOSCOR-U's own list. */
 static const struct { enum kind kind; const char *id, *title; } extras[] = {
-	{ K_SYSTEM, "ztoscoresensorframework.service", "ztOSCoreSensorFramework" },
+	{ K_SYSTEM, "ztoscoru.service", "ztOSCOR-U" },
 	{ K_SYSTEM, "zrn-bluetooth.service", "Bluetooth controller" },
 	{ K_SYSTEM, "zrn-bluetooth-addr.service", "Bluetooth address" },
 	{ K_SYSTEM, "bluetooth.service", "Bluetooth (BlueZ)" },
@@ -98,6 +99,9 @@ static struct item *add(enum kind kind, const char *id, const char *title) {
 
 static void load_list(void) {
 	FILE *f = fopen(COMPONENTS, "r");
+	if (!f) {		/* a phone not yet moved to ztOSCOR-U */
+		f = fopen(OLD_COMPONENTS, "r");
+	}
 	char line[256];
 	while (f && fgets(line, sizeof(line), f)) {
 		char *kind = strtok(line, "|\n"), *id = strtok(NULL, "|\n"), *arg = strtok(NULL, "|\n");
@@ -659,7 +663,7 @@ static const char *const state_name[] = { "crashed", "missing", "running" };
 /* A row: the name, and under it what it is doing, in red, amber or grey. */
 static double row(cairo_t *cr, double y, const char *title, const char *detail, enum state st,
 		int action, int arg) {
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text_line(cr, title, FONT_SEMILIGHT, 22, ZMC_MARGIN, y, zmc.width - 2 * ZMC_MARGIN);
 	if (st == ST_CRASHED) {
 		zmc_set_rgb(cr, RED);
@@ -820,7 +824,8 @@ static double draw_detail(cairo_t *cr) {
 		return y + 40;
 	}
 	for (int i = 0; i < logv.n; i++) {
-		cairo_set_source_rgb(cr, i == 0 ? 1.0 : 0.72, i == 0 ? 1.0 : 0.72, i == 0 ? 1.0 : 0.72);
+		if (i == 0) zmc_fg(cr);	/* the newest line in the page's ink */
+		else cairo_set_source_rgb(cr, 0.72, 0.72, 0.72);
 		y += zmc_text(cr, logv.lines[i], FONT_MONO, 9.5, ZMC_MARGIN, y, zmc.width - 2 * ZMC_MARGIN) + 5;
 	}
 	return y + 20;

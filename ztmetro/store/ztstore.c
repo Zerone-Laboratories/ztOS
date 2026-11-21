@@ -112,7 +112,7 @@ static void grey(cairo_t *cr) {
 }
 
 static void white(cairo_t *cr) {
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 }
 
 /* A page title: the core's own where it fits, else smaller and wrapped. */
@@ -148,7 +148,8 @@ static double note(cairo_t *cr, double y, const char *text) {
  * loading, so the page keeps its shape and nothing pops in or jumps about as
  * the cached lists and then the network lists arrive. */
 static void skel_box(cairo_t *cr, double x, double y, double w, double h) {
-	cairo_set_source_rgba(cr, 1, 1, 1, 0.07);
+	uint32_t ink = zmc_fg_color();	/* a faint wash of the page's ink: white was unseen on a light page */
+	cairo_set_source_rgba(cr, ((ink >> 16) & 255) / 255.0, ((ink >> 8) & 255) / 255.0, (ink & 255) / 255.0, 0.07);
 	cairo_rectangle(cr, x, y, w, h);
 	cairo_fill(cr);
 }
@@ -687,7 +688,7 @@ static void lrow_draw(cairo_t *cr, int set, int i) {
 		cairo_rectangle(cr, MARGIN, y, w, h);
 		cairo_fill(cr);
 		draw_tile_shaded(cr, MARGIN + w - 76, y + 14, 62, spot);
-		white(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
 		char caps[200];
 		snprintf(caps, sizeof(caps), "TOP OF \u201c%s\u201d", r->t);
 		for (char *c = caps; *c; c++) *c = (*c >= 'a' && *c <= 'z') ? *c - 32 : *c;
@@ -725,7 +726,7 @@ static void lrow_draw(cairo_t *cr, int set, int i) {
 			zmc_accent(cr);
 			cairo_rectangle(cr, x, ty, cell, CAT_ROW * 2 - gap);
 			cairo_fill(cr);
-			white(cr);
+			cairo_set_source_rgb(cr, 1, 1, 1);
 			char count[16];
 			snprintf(count, sizeof(count), "%d", f->count);
 			double cw = zmc_text_width(count, FONT_REGULAR, 11);
@@ -908,7 +909,7 @@ static double draw_zapps(cairo_t *cr) {
 			zmc_accent(cr);
 			cairo_rectangle(cr, MARGIN, y, tile, tile);
 			cairo_fill(cr);
-			white(cr);
+			cairo_set_source_rgb(cr, 1, 1, 1);
 			char first[2] = { a->name[0], 0 };
 			zmc_text_centred(cr, first, FONT_SEMILIGHT, 28, MARGIN + tile / 2, y + 8);
 			cairo_new_path(cr);
@@ -943,10 +944,11 @@ static double draw_zapp(cairo_t *cr) {
 		zmc_accent(cr);
 		cairo_rectangle(cr, MARGIN, y, 120, 120);
 		cairo_fill(cr);
-		white(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
 		char initial[2] = { a->name[0], 0 };
 		zmc_text_centred(cr, initial, FONT_SEMILIGHT, 56, MARGIN + 60, y + 24);
 		cairo_new_path(cr);
+		white(cr);	/* the name beside it: the page's ink, not the initial's white */
 	}
 	zmc_text_line(cr, a->name, FONT_SEMILIGHT, 24, x, y - 4, zmc.width - x - MARGIN);
 	grey(cr);
@@ -1226,7 +1228,10 @@ static double detail_head(cairo_t *cr, const char *title, const char *tab, const
 
 /* a band across the screen for what can be done */
 static void action_band(cairo_t *cr, double y, double h) {
-	cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
+	/* a step off the background: dark grey on black, light grey on white,
+	 * so the ink buttons on it read in both */
+	double k = zmc.theme == ZMC_THEME_LIGHT ? 0.88 : 0.12;
+	cairo_set_source_rgb(cr, k, k, k);
 	cairo_rectangle(cr, 0, y, zmc.width, h);
 	cairo_fill(cr);
 }
@@ -1339,7 +1344,7 @@ static double draw_detail_more(cairo_t *cr) {
 		cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
 		zmc_text(cr, "BUILT ON THIS PHONE", FONT_SEMIBOLD, 11, MARGIN + 14, top + 12, 0);
 		double th = zmc_text(cr, say, FONT_REGULAR, 13.5, MARGIN + 14, top + 34, bw - 28);
-		white(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
 		zmc_text(cr, "read the recipe", FONT_REGULAR, 15, MARGIN + 14, top + 44 + th, 0);
 		zmc_add_hit(MARGIN, top + 34 + th, bw, 40, ACT_RECIPE, 0);
 		y = top + 150 + 20;

@@ -328,7 +328,7 @@ static void job_run(const char *what, const char *cmd) {
 static const char *const state_name[] = { "not answering", "not on this phone", "connected" };
 
 static double row(cairo_t *cr, double y, const char *title, const char *detail, enum state st, int action, int arg) {
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text_line(cr, title, FONT_SEMILIGHT, 22, ZMC_MARGIN, y, zmc.width - 2 * ZMC_MARGIN);
 	if (st == ST_DOWN) {
 		zmc_set_rgb(cr, RED);
@@ -438,7 +438,7 @@ static double draw_device(cairo_t *cr) {
 		y = note(cr, y, "None declared.", 13.5);
 	}
 	for (int i = 0; i < device.n_caps; i++) {
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text_line(cr, device.caps[i], FONT_SEMILIGHT, 19, ZMC_MARGIN, y, zmc.width - 2 * ZMC_MARGIN);
 		y += 34;
 	}
@@ -474,7 +474,7 @@ static double draw_detail(cairo_t *cr) {
 		for (int i = 0; i < it->n_props; i++) {
 			cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 			zmc_text_line(cr, it->props[i].key, FONT_REGULAR, 12.5, ZMC_MARGIN, y, zmc.width - 2 * ZMC_MARGIN);
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);
 			y += 20 + zmc_text(cr, it->props[i].value, FONT_MONO, 11, ZMC_MARGIN, y + 20, zmc.width - 2 * ZMC_MARGIN) + 12;
 		}
 	}

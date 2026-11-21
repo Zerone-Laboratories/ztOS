@@ -1,0 +1,28 @@
+#!/bin/sh
+# ExecStopPost of every long-running ztOS service (see zrn-crash-apply). A
+# clean stop is nothing. A crash is told to the shell (a notification under
+# "System") and systemd starts the service again (Restart=on-failure). Crashes
+# are counted here, not starts: a service that is stopped and started on
+# purpose, however often, never reaches the limit. Five crashes within ten
+# minutes and the service is stopped for good, and the notification says so.
+# Arg 1: the unit's name (%n).
+unit="${1:-unknown}"
+case "${SERVICE_RESULT:-success}" in success|'') exit 0 ;; esac
+dir=/run/zrn-crash; mkdir -p "$dir"
+f="$dir/$unit"; now=$(date +%s); n=0; first=$now
+if [ -r "$f" ]; then
+	read -r n first < "$f" || { n=0; first=$now; }
+	[ $((now - first)) -le 600 ] 2>/dev/null || { n=0; first=$now; }
+fi
+n=$((n + 1)); echo "$n $first" > "$f"
+if [ "$n" -ge 5 ]; then
+	msg="This service has crashed 5 times; auto-restart stopped"
+	rm -f "$f"
+	systemctl --no-block stop "$unit" 2>/dev/null	# takes the pending restart away
+else
+	msg="This service has crashed and being auto-restarted"
+fi
+for ctl in /run/user/*/ztmetro.ctl; do
+	[ -p "$ctl" ] && timeout 2 sh -c 'printf "notify %s|%s\n" "$1" "$2" > "$3"' _ "$unit" "$msg" "$ctl" 2>/dev/null
+done
+exit 0

@@ -1,7 +1,10 @@
 #!/bin/sh
-# What greetd starts for the ztMETRO session. The log is kept for one run back.
+# What greetd starts for the ztMETRO session. The log is kept for five runs
+# back (ztmetro.log.1 is the last one), so the tail of a shell that died is
+# still there after a few quick restarts.
 log=${XDG_STATE_HOME:-$HOME/.local/state}/ztmetro.log
 mkdir -p "$(dirname "$log")"
+for i in 4 3 2 1; do [ -f "$log.$i" ] && mv -f "$log.$i" "$log.$((i+1))"; done
 [ -f "$log" ] && mv "$log" "$log.1"
 # A Waydroid session left from the shell before this one lost its display (its
 # hwcomposer aborts and cannot restart): restart it once the new display exists.
@@ -15,5 +18,18 @@ style=$(sed -n 's/^[[:space:]]*style[[:space:]]*=[[:space:]]*\([A-Za-z0-9]*\).*/
 	"${XDG_CONFIG_HOME:-$HOME/.config}/ztmetro/config" 2>/dev/null | tail -n 1)
 case "$style" in dotmatrix|1) style=dotmatrix ;; *) style=metro ;; esac
 export ZTRF_SHELL_STYLE=$style
+# Optional variables for the shell, one VAR=value per line (e.g. ZTMETRO_PERFLOG=1
+# while measuring); absent normally.
+envf=${XDG_CONFIG_HOME:-$HOME/.config}/ztmetro/env
+[ -f "$envf" ] && { set -a; . "$envf"; set +a; }
 systemctl --user set-environment ZTRF_SHELL_STYLE=$style >/dev/null 2>&1 || true
-exec /usr/local/bin/ztmetro >"$log" 2>&1
+# Not exec'd: when the shell ends, how it ended goes to the end of its log
+# (a signal shows as 128 + its number, e.g. 139 for SIGSEGV, 134 for SIGABRT).
+# greetd sees the session end when this script does, as before.
+/usr/local/bin/ztmetro >"$log" 2>&1 &
+pid=$!
+trap 'kill -TERM $pid 2>/dev/null' TERM INT HUP	# a logout or greetd stop reaches the shell
+wait $pid; status=$?
+while kill -0 $pid 2>/dev/null; do wait $pid; status=$?; done	# (wait returns early on a trapped signal)
+echo "$(date '+%F %T') ztmetro-session: the shell ended with status $status" >>"$log"
+exit "$status"

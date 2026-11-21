@@ -130,7 +130,7 @@ static void dialable(const char *number, char *out, size_t size) {
 
 static void person_row(cairo_t *cr, double y, const struct contact *c, int who) {
 	contact_tile(cr, MARGIN, y + 3, 48, c->name, c->uid);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text_line(cr, c->name, FONT_SEMILIGHT, 22, MARGIN + 60, y + 13, zmc.width - 2 * MARGIN - 60);
 	if (who >= 0) {
 		zmc_add_hit(0, y, zmc.width, 54, ACT_OPEN, who);
@@ -207,7 +207,7 @@ static void draw_row(cairo_t *cr, int row) {
 	zmc_accent(cr);
 	cairo_rectangle(cr, MARGIN, 6, 42, 42);
 	cairo_fill(cr);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	cairo_set_source_rgb(cr, 1, 1, 1);	/* white on the accent in either theme, as the phone's letters */
 	zmc_text(cr, text, FONT_SEMILIGHT, 26, MARGIN + 6, 14, 0);
 }
 
@@ -225,7 +225,7 @@ static bool row_hit(int row, double x, double y, struct zmc_hit *hit) {
 
 static double draw_all(cairo_t *cr) {
 	double y = zmc_header(cr, "people");
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_round_button(cr, MARGIN + 22, y, "add", "new", ACT_NEW, 0);
 	zmc_round_button(cr, MARGIN + 22 + 76, y, "search", "search", ACT_SEARCH, 0);
 	zmc_round_button(cr, MARGIN + 22 + 152, y, "refresh", "google", ACT_GOOGLE, 0);
@@ -310,7 +310,7 @@ static double draw_card(cairo_t *cr) {
 	struct contact *c = &contacts[shown];
 	contact_tile(cr, MARGIN, y, 150, c->name, c->uid);
 	y += 162;
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	y += zmc_text(cr, c->name, FONT_LIGHT, 34, MARGIN, y, zmc.width - 2 * MARGIN) + 12;
 
 	if (c->mobile[0]) {
@@ -335,7 +335,7 @@ static double draw_card(cairo_t *cr) {
 		y = zmc_field(cr, y + 4, "From Google", "Changes made here stay on this phone.");
 	}
 	y += 14;
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_round_button(cr, MARGIN + 22, y, "edit", "edit", ACT_EDIT, 0);
 	zmc_round_button(cr, MARGIN + 22 + 76, y, "delete", confirm_delete ? "tap again" : "delete", ACT_DELETE, 0);
 	return y + 90;
@@ -391,7 +391,7 @@ static double draw_edit(cairo_t *cr) {
 		y += zmc_text(cr, edit_note, FONT_REGULAR, 13.5, MARGIN, y, zmc.width - 2 * MARGIN) + 10;
 	}
 	y += 6;
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_round_button(cr, MARGIN + 22, y, "save", "save", ACT_SAVE, 0);
 	zmc_round_button(cr, MARGIN + 22 + 76, y, "cancel", "cancel", ACT_CANCEL, 0);
 	return y + 90;
