@@ -2349,6 +2349,19 @@ static void present_gpu(uint32_t ms) {
 	} else if (!zmc.quit_after_anim && (zmc.slide_active || zmc.swiping || zmc.spring) &&
 			draw_pivot(NULL, zmc.scale)) {
 		/* The same spring and title parallax, composed as textured quads. */
+	} else if (!zmc.quit_after_anim && zmc.page_solid) {
+		/* one colour: a rect, no 15 MB page read by the GPU each frame
+		 * (and no page drawn and uploaded for it) */
+		zmg_rect(0, 0, zmc.width, zmc.height, ((zmc.page_rgb >> 16) & 255) / 255.0f,
+			((zmc.page_rgb >> 8) & 255) / 255.0f, (zmc.page_rgb & 255) / 255.0f);
+		if (zmc.app->overlay) {
+			zmc.app->overlay(zmc.page);
+		}
+		if (!zmc.app->overlay_above_header) {
+			/* (the title's strip over it, as from the cache: the same colour) */
+			zmg_rect(0, 0, zmc.width, HEADER_H, ((zmc.page_rgb >> 16) & 255) / 255.0f,
+				((zmc.page_rgb >> 8) & 255) / 255.0f, (zmc.page_rgb & 255) / 255.0f);
+		}
 	} else if (!zmc.quit_after_anim) {
 		cache_ensure(zmc.scale);
 		double s = zmc.scale, off = zmc.scroll;
@@ -4085,6 +4098,15 @@ void zmc_gpu_rect(double x, double y, double w, double h, double r, double g, do
 
 void zmc_present(void) {
 	present();
+}
+
+/* a picture handed to the GPU ahead of its first use (it is uploaded now, not in a frame) */
+void zmc_gpu_prepare(cairo_surface_t *source, unsigned revision) {
+	zmg_prepare(source, revision);
+}
+
+bool zmc_gpu_ready(void) {
+	return zmg_ready();
 }
 
 /* ---- named transitions (ztmetro/core; see the Lumia 530 notes) -------------

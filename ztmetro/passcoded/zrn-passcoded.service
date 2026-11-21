@@ -1,0 +1,31 @@
+[Unit]
+Description=zrn-passcoded: the lock screen's passcode, in a LUKS2 vault
+# Off until the owner sets a passcode in Settings. The shell unlocks with a
+# swipe whenever this is not running or does not answer.
+Documentation=file:///usr/local/share/doc/ztos/zrn-passcode.md
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/zrn-passcoded
+Restart=on-failure
+RestartSec=1
+StateDirectory=zrn-passcode
+StateDirectoryMode=0700
+UMask=0077
+# Argon2id uses 64 MiB per check; leave room, and never swap the key material
+MemoryMax=256M
+MemorySwapMax=0
+NoNewPrivileges=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/zrn-passcode /run
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

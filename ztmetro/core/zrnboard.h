@@ -40,6 +40,16 @@
 #define ZB_SWIVEL_IN_WEIGHT	200.0	/* Log */
 #define ZB_SWIVEL_OUT_WEIGHT	150.0	/* Exp */
 #define ZB_STAGGER_MS		12.0	/* the next tile, in reading order */
+/* Readerboard (the same firmware): rows of a panel, each turning about its own
+ * middle line, top-down, 30 ms apart. In -45 to 0 degrees in 350 ms, Log 150;
+ * out 0 to +90 in 250 ms, Exp 150. The app list's letters and the call
+ * screen's rows use these. */
+#define ZB_RB_IN_DEG		(-45.0)
+#define ZB_RB_OUT_DEG		90.0
+#define ZB_RB_IN_MS		350.0
+#define ZB_RB_OUT_MS		250.0
+#define ZB_RB_WEIGHT		150.0	/* Log in, Exp out */
+#define ZB_RB_ROW_MS		30.0
 #define ZB_SCRIM_IN_MS		100.0
 /* a tile takes a tap once it is where it looks: nearly flat this long after its start */
 #define ZB_TAP_READY_MS		100.0
@@ -59,6 +69,13 @@ static inline double zb_delay(int i) {
 static inline double zb_swivel_ease(double t, int in) {
 	t = t < 0 ? 0 : t > 1 ? 1 : t;
 	double k = (in ? ZB_SWIVEL_IN_WEIGHT : ZB_SWIVEL_OUT_WEIGHT) / 30.0;
+	return in ? 1 - (exp(k * (1 - t)) - 1) / (exp(k) - 1) : (exp(k * t) - 1) / (exp(k) - 1);
+}
+
+/* Readerboard's curve: Log 150 in, Exp 150 out, as zb_swivel_ease */
+static inline double zb_rb_ease(double t, int in) {
+	t = t < 0 ? 0 : t > 1 ? 1 : t;
+	double k = ZB_RB_WEIGHT / 30.0;
 	return in ? 1 - (exp(k * (1 - t)) - 1) / (exp(k) - 1) : (exp(k * t) - 1) / (exp(k) - 1);
 }
 

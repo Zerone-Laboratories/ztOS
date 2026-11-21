@@ -149,6 +149,11 @@ struct zmc_state {
 	int anim_frames;
 	bool anim_active;
 	bool anim_cache_ready;	/* destination page already rendered for GLES */
+	/* the page is one flat colour (page_rgb) for now: drawn as that, not
+	 * from its cache, and the cache not drawn again (a call's panels
+	 * flipping over their background: ztphone) */
+	bool page_solid;
+	uint32_t page_rgb;
 	bool anim_prepared;	/* the destination was drawn ahead, while idle */
 	bool anim_target_pending;	/* prepare it in the black gap after the outgoing rows */
 	bool anim_back;		/* going back or closing: the old page turns away */
@@ -287,6 +292,9 @@ void *zmc_gpu_dmabuf_import(int w, int h, uint32_t fourcc, uint64_t modifier, in
 void zmc_gpu_dmabuf_free(void *image);
 void zmc_gpu_dmabuf(void *image, const double corners[4][3], double alpha);
 void zmc_present(void);
+/* true when frames are drawn on the GPU (an .overlay runs only then) */
+void zmc_gpu_prepare(cairo_surface_t *source, unsigned revision);
+bool zmc_gpu_ready(void);
 
 /* Named Windows Phone transitions, from the Lumia 530 firmware. Draw one frame
  * at progress t (0..1) of `source` over the rectangle (x,y,w,h, points), on the
