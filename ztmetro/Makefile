@@ -20,7 +20,8 @@ endif
 
 all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest devices/ztdevices perfd/zrnperfd touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
 	coru/ztoscoru notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles splash/ztos-splash \
-	store/ztstore power/ztpower camera/ztcamera sound/ztsound osial/ztosial
+	store/ztstore power/ztpower camera/ztcamera sound/ztsound osial/ztosial \
+	passcoded/zrn-passcoded passcoded/zrn-passcode
 
 sounds/ztos-sounds: sounds/ztos-sounds.c
 	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags libpulse) -o $@ $< $(shell pkg-config --libs libpulse) -lm
@@ -67,7 +68,15 @@ APP_LIBS = $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(APP_PKGS)) $(IAL_LIBS)
 camera/ztcamera: camera/ztcamera.c $(CORE_DEPS)
 	$(APP_BUILD) -o $@ camera/ztcamera.c $(CORE) $(APP_LIBS)
 
-settings/ztsettings: settings/ztsettings.c settings/boostpage.h $(CORE_DEPS)
+# the passcode daemon (root) and its tool; Settings and the shell speak to it
+# through passcoded/passcode-proto.h
+passcoded/zrn-passcoded: passcoded/zrn-passcoded.c passcoded/passcode-proto.h ztos-user.h
+	$(CC) $(CFLAGS) $(WARN) -o $@ passcoded/zrn-passcoded.c -lcryptsetup -lcrypto -lpthread
+
+passcoded/zrn-passcode: passcoded/zrn-passcode.c passcoded/passcode-proto.h
+	$(CC) $(CFLAGS) $(WARN) -o $@ passcoded/zrn-passcode.c
+
+settings/ztsettings: settings/ztsettings.c settings/boostpage.h settings/passcodepage.h passcoded/passcode-proto.h $(CORE_DEPS)
 	$(APP_BUILD) -o $@ settings/ztsettings.c $(CORE) $(APP_LIBS)
 
 devtest/zrndevtest: devtest/zrndevtest.c $(CORE_DEPS)
@@ -248,6 +257,10 @@ install: check-arch
 	install -Dm644 store/data/ztstore.svg /usr/local/share/icons/hicolor/scalable/apps/ztstore.svg
 	install -Dm755 perfd/zrnperfd /usr/local/sbin/zrnperfd
 	install -Dm644 perfd/zrnperfd.service /etc/systemd/system/zrnperfd.service
+	install -Dm755 passcoded/zrn-passcoded /usr/local/sbin/zrn-passcoded
+	install -Dm755 passcoded/zrn-passcode /usr/local/sbin/zrn-passcode
+	install -Dm644 passcoded/zrn-passcoded.service /etc/systemd/system/zrn-passcoded.service
+	install -Dm644 passcoded/README.md /usr/local/share/doc/ztos/zrn-passcode.md
 	install -Dm755 touchkeyd/ztos-touchkeyd /usr/local/sbin/ztos-touchkeyd
 	install -Dm644 touchkeyd/ztos-touchkeyd.service /etc/systemd/system/ztos-touchkeyd.service
 	install -Dm755 sensord/ztoscsf-sensord /usr/local/sbin/ztoscsf-sensord
@@ -271,7 +284,7 @@ install: check-arch
 	install -Dm644 coru/ztoscoru.service /etc/systemd/system/ztoscoru.service
 
 clean:
-	rm -f sound/ztsound osial/ztosial auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices power/ztpower perfd/zrnperfd touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd coru/ztoscoru notifyd/ztnotifyd splash/ztos-splash \
+	rm -f sound/ztsound osial/ztosial auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices power/ztpower perfd/zrnperfd passcoded/zrn-passcoded passcoded/zrn-passcode touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd coru/ztoscoru notifyd/ztnotifyd splash/ztos-splash \
 		phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles store/ztstore camera/ztcamera core/viewporter-protocol.c core/viewporter-client-protocol.h \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c
 

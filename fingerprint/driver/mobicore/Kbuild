@@ -1,0 +1,8 @@
+# zrn-mobicore: Trustonic Kinibi (t-base 400C) NWd driver for the Exynos 9810,
+# ported from Samsung's GPL gud-exynos9810 (LineageOS lineage-17.1) to 7.1.
+obj-m += zrn-mobicore.o
+zrn-mobicore-y := admin.o client.o clientlib.o clock.o fastcall.o iwp.o \
+	logging.o main.o mcp.o mmu.o nq.o pm.o scheduler.o session.o \
+	teeclientapi.o user.o zrn_compat.o
+ccflags-y += -DNDEBUG -Wno-declaration-after-statement -I$(src) -I$(src)/public \
+	-DCONFIG_TRUSTONIC_TEE_LPAE -DZRN_EXYNOS9810

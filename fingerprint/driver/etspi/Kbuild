@@ -1,0 +1,3 @@
+# zrn-etspi: Egistec ET510 /dev/esfp0, secure (TZ) mode, for 7.1.0-zboot.
+# stock/ holds the Samsung GPL source it was ported from (reference only).
+obj-m += zrn-etspi.o

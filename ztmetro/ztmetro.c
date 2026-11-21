@@ -28,6 +28,7 @@
  */
 #define _GNU_SOURCE
 #include "core/zrnboard.h"
+#include "passcoded/passcode-proto.h"
 #ifdef HAVE_ZTOS_IAL
 #include <ztos-ial.h>
 #endif
@@ -750,6 +751,7 @@ struct zt_server {
 	bool locked;
 	bool call_over_lock;	/* only the phone call may cover the lock */
 	bool ringing;		/* ztphone: an incoming call is ringing ("ringing on|off") */
+	bool ring_silenced;	/* power has silenced it once: power is its own again */
 
 	/* app switcher: the apps as a row of cards, newest on the right */
 	bool switcher;
@@ -823,6 +825,9 @@ struct zt_server {
 	int battery_level;
 	uint32_t net_active_ms;		/* when the network last carried anything */
 	bool shade_row;			/* the action centre's own status row is being redrawn apart */
+	bool shade_row_only;		/* the panel's row is stale under that: the panel drawn again at rest */
+	uint64_t shade_sig_rest;	/* shade_sig but for the status row */
+	struct wl_event_source *shade_later;	/* when to draw it */
 	/* which quick action is in each of the action centre's eight places */
 	int quick[8];
 	/* notifications: a banner as each arrives, and the list in the action centre */
@@ -863,6 +868,25 @@ struct zt_server {
 	int menu_speed;			/* the whole UI's motion, percent of normal speed */
 	bool show_touches;
 	bool lock_enabled;
+	unsigned status_gen;		/* draw_status's count: the shade's row is as old as this */
+	uint64_t shade_sig;		/* what the shade's panel was last drawn from (shade_panel_sig) */
+	uint64_t peek_sig;		/* shade_panel_sig when the row over the panel (peek_layer) was last painted */
+	struct wl_event_source *notes_later;	/* a notification come during a pull: the panel once it ends */
+	/* zrn-passcoded (the passcode over the lock; see pc_needed) */
+	bool pc_required;		/* the last status said enabled=1 */
+	uint32_t pc_status_ms;		/* when that status came */
+	int pc_length;			/* the PIN's length: as many boxes */
+	char pc_typed[72];		/* wiped (explicit_bzero) after every send */
+	bool pc_pad, pc_checking, pc_note_err;
+	int pc_pressed;			/* the key lit, -1 none */
+	int pc_fd, pc_status_fd;	/* a verify / a status in flight, -1 none */
+	struct wl_event_source *pc_watch, *pc_status_watch;
+	struct wl_event_source *pc_verify_timer, *pc_status_timer, *pc_tick_timer;
+	long pc_locked_until, pc_skew;	/* the daemon's wait and clock skew */
+	int pc_failures;
+	char pc_note[96];		/* "wrong PIN", "try again in 0:30" */
+	float pc_shake;			/* the boxes' shake on a wrong PIN, 1 to 0 */
+	struct zt_layer pc_layer, pc_box_layer;
 	int demo_saved_timeout;
 	/* the volume keys' banner */
 	int volume;			/* 0..30, as the phone counts it */
@@ -944,6 +968,7 @@ struct zt_server {
 	int bar_held_w[2], bar_held_h[2];
 	bool status_clear, nav_clear;	/* their layers were drawn without a background */
 	struct zt_layer shade_tile_layer[8];	/* the quick actions, one texture each */
+	uint64_t shade_tile_sig[8];	/* what each was drawn from (shade_tile_sig) */
 	struct zt_layer shade_vhandle;		/* turned: the sheet's bar, down its moving side */
 	float shade_tilt_x[8], shade_tilt_y[8], shade_press[8];
 	/* Splash screen & boot transition */
@@ -1188,6 +1213,9 @@ static void draw_dialog(struct zt_server *);
 static void ftrace_mark(struct zt_server *server, const char *what, double ms);
 static double ftrace_clock(void);
 static void run_detached(const char *, const char *, const char *, const char *);
+static void pc_status_refresh(struct zt_server *server);
+static void pc_pad_close(struct zt_server *server);
+static void pc_render(struct zt_server *server);
 static void call_end_begin(struct zt_server *server, bool close_after);
 static struct zt_toplevel *call_front(struct zt_server *server);
 static bool ringing_key(struct zt_server *server, uint32_t keycode);
@@ -1594,20 +1622,28 @@ static void perf_tell(const char *command);
  * what is charged to it, but most of these were first read by another
  * process (Mesa, LLVM, libc, the fonts: every app maps them) and are charged
  * there, unprotected; ten minutes idle with the screen off cost the next
- * swipe about 5,000 major faults (2026-11-21). Only pages mapped now are
- * locked (mincore over the read-only and executable file mappings; locking
- * them whole would be hundreds of MB of LLVM never touched). zrnperfd raises
+ * swipe about 5,000 major faults (2026-11-21). Only the pages mapped into
+ * the shell now are locked (the present bit of /proc/self/pagemap over the
+ * read-only and executable file mappings: mincore said "in the page cache",
+ * which was 128 MB of LLVM and the rest that the shell never touches), and
+ * at most PIN_MAX. zrnperfd raises
  * the shell's RLIMIT_MEMLOCK for it; without that it locks what fits. Done
  * when the screen goes off, so the set is what the shell last drew with. */
+#define PIN_MAX	(64UL * 1024 * 1024)
 static void pin_file_pages(void) {
 	static bool told;
 	FILE *f = fopen("/proc/self/maps", "r");
 	if (!f) return;
+	int pm = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+	if (pm < 0) {
+		fclose(f);
+		return;
+	}
 	long page = sysconf(_SC_PAGESIZE);
 	char line[600];
 	size_t locked = 0;
 	int err = 0;
-	unsigned char *vec = NULL;
+	uint64_t *vec = NULL;
 	size_t vec_n = 0;
 	while (fgets(line, sizeof(line), f)) {
 		unsigned long a, b;
@@ -1620,17 +1656,21 @@ static void pin_file_pages(void) {
 		}
 		size_t n = (b - a) / (size_t)page;
 		if (n > vec_n) {
-			unsigned char *nv = realloc(vec, n);
+			uint64_t *nv = realloc(vec, n * sizeof(uint64_t));
 			if (!nv) break;
 			vec = nv;
 			vec_n = n;
 		}
-		if (mincore((void *)a, b - a, vec) != 0) continue;
+		if (pread(pm, vec, n * sizeof(uint64_t), (off_t)(a / (size_t)page * sizeof(uint64_t))) !=
+				(ssize_t)(n * sizeof(uint64_t))) {
+			continue;
+		}
 		/* each run of pages in use, locked as it is (MLOCK_ONFAULT: nothing new read in) */
-		for (size_t i = 0; i < n; ) {
-			if (!(vec[i] & 1)) { i++; continue; }
+#define PIN_PRESENT(i)	(vec[i] >> 63 & 1)
+		for (size_t i = 0; i < n && locked < PIN_MAX; ) {
+			if (!PIN_PRESENT(i)) { i++; continue; }
 			size_t j = i;
-			while (j < n && (vec[j] & 1)) j++;
+			while (j < n && PIN_PRESENT(j)) j++;
 			if (syscall(SYS_mlock2, (void *)(a + i * page), (j - i) * page, 1 /* MLOCK_ONFAULT */) == 0) {
 				locked += (j - i) * page;
 			} else if (!err) {
@@ -1640,6 +1680,7 @@ static void pin_file_pages(void) {
 		}
 	}
 	fclose(f);
+	close(pm);
 	free(vec);
 	if (!told || err) {
 		wlr_log(err ? WLR_ERROR : WLR_INFO, "pinned %zu kB of the shell's file pages%s%s", locked / 1024,
@@ -5697,6 +5738,7 @@ static bool tile_on_screen(struct zt_server *server, const struct tile *t) {
 /* A tile's faces drawn again after its signal changed, if it is looked at;
  * if not, they are remembered as out of date (and the first back is always
  * made, for the tile to turn to). Under DotMatrix there are no tiles to draw. */
+static bool shell_in_motion(struct zt_server *server);
 static void tile_faces(struct zt_server *server, int i) {
 	struct tile *t = &server->tiles[i];
 	if (server->width <= 0) {
@@ -5710,7 +5752,11 @@ static void tile_faces(struct zt_server *server, int i) {
 		damage(server);
 		return;
 	}
-	bool seen = tile_on_screen(server, t);
+	/* while Start moves or turns it waits, stale, for the next tick at rest
+	 * (live_tick): a chat's traffic rewrote a live tile's signal several
+	 * times a second, and each repaint (two faces, 4-7 ms) in a turn made
+	 * its frames 30-60 ms apart (2026-11-22) */
+	bool seen = tile_on_screen(server, t) && !shell_in_motion(server) && server->rot_phase == ROT_IDLE;
 	bool has_back = t->size != TILE_SMALL && t->live;
 	if (has_back && (seen || !t->back_layer.tex)) {
 		draw_tile_back(server, i);
@@ -6091,7 +6137,9 @@ static void power_tick(struct zt_server *server, bool force) {
 		server->power_ms = 0;		/* the next time it is wanted: at once */
 		return;
 	}
-	if (!force && server->power_ms && now - server->power_ms < 1900) {
+	/* every 5 s: each new reading repaints the tile and costs Start two
+	 * whole frames, and at rest that was most of the idle redraws (2026-11-22) */
+	if (!force && server->power_ms && now - server->power_ms < 4900) {
 		return;
 	}
 	server->power_ms = now ? now : 1;
@@ -6143,6 +6191,7 @@ static void tile_flip_to(struct zt_server *server, struct tile *t, bool to_back)
  * back gets its up-to-date faces, the power draw is read when it is looked
  * at, at most one tile turns, and signal files are looked for only if the
  * directory could not be watched. */
+#define LIVE_FLIP_GAP_MS	12000
 static bool shell_in_motion(struct zt_server *server);
 static void live_tick(struct zt_server *server) {
 	static int ticks;
@@ -6177,12 +6226,32 @@ static void live_tick(struct zt_server *server) {
 			}
 		}
 	}
+	/* One turn on Start at a time, and none within LIVE_FLIP_GAP_MS of the
+	 * last: each turn is ~43 frames of the whole of Start, and with every
+	 * live tile on its own 4-10 s clock they came every few seconds, most of
+	 * Start's idle cost (2026-11-22: 410 frames a minute at rest) */
+	static uint32_t last_flip;
+	if (last_flip && now - last_flip < LIVE_FLIP_GAP_MS) {
+		return;
+	}
 	for (int i = 0; i < server->n_tiles; i++) {
 		struct tile *t = &server->tiles[i];
 		if (!t->live || !t->back_layer.tex || now < t->next_flip_ms) {
 			continue;
 		}
-		tile_flip_to(server, t, t->flip < 90.0f);
+		bool to_back = t->flip < 90.0f;
+		if ((to_back && t->back_stale) || (!to_back && t->front_stale)) {
+			/* the face it turns to painted now, at rest, and the turn on the
+			 * next tick: painted (3-5 ms), uploaded and the frost made again
+			 * in the turn's first frame, it missed a vblank (30 ms, 2026-11-22) */
+			if (to_back) draw_tile_back(server, i);
+			else { draw_tile(server, i); t->front_stale = false; }
+			t->next_flip_ms = now + 900;
+			damage(server);
+			break;
+		}
+		tile_flip_to(server, t, to_back);
+		last_flip = now;
 		break;
 	}
 }
@@ -6468,7 +6537,7 @@ static void board_open(struct zt_server *server) {
 		server->board_drawn_light = light;
 	}
 	server->list_v = 0;
-	motion_lease(now_ms() + (uint32_t)(zb_delay(ZB_CELLS - 1) + ZB_SWIVEL_IN_MS));	/* as for any other animation */
+	motion_lease(now_ms() + (uint32_t)(zb_delay(ZB_CELLS - 1) + ZB_RB_IN_MS));	/* as for any other animation */
 	ftrace_mark(server, "board_open", ftrace_clock() - trace0);
 	server->board_state = 1;
 	server->board_start = now_ms();
@@ -6483,7 +6552,7 @@ static void board_close(struct zt_server *server) {
 		/* closed on its way in: each tile goes from the angle it has */
 		server->board_came_ms = server->board_state == 1 ? (uint32_t)(now_ms() - server->board_start) : HUGE_VAL;
 		server->board_state = 3;
-		motion_lease(now_ms() + (uint32_t)(zb_delay(ZB_CELLS - 1) + ZB_SWIVEL_OUT_MS));
+		motion_lease(now_ms() + (uint32_t)(zb_delay(ZB_CELLS - 1) + ZB_RB_OUT_MS));
 		server->board_start = now_ms();
 		server->board_clock_waits = true;
 		damage(server);
@@ -6781,6 +6850,16 @@ static bool list_prepare(struct zt_server *server) {
 	 * drops or slides (the boot's hand-over stuttered under them) */
 	int ahead = server->board_state == 3 ? 1 : 2;
 	if (animating(server, &server->lock_y)) {
+		ahead = 0;
+	}
+	/* nor in the first 250 ms after anything stopped moving: that frame is
+	 * the motion's last one, and two rows painted in it (3-4 ms, and the
+	 * frost made again) made it miss its vblank after every turn (22 ms,
+	 * 2026-11-22). Rows wanted in sight are still drawn at once. */
+	static uint32_t moved_at;
+	if (server->rot_phase != ROT_IDLE || shell_in_motion(server)) {
+		moved_at = now_ms() | 1;
+	} else if (moved_at && now_ms() - moved_at < 250) {
 		ahead = 0;
 	}
 	if (!in_sight && (server->rot_phase != ROT_IDLE || shell_in_motion(server))) {
@@ -7892,17 +7971,31 @@ static bool shell_in_motion(struct zt_server *server) {
 }
 
 static void draw_status(struct zt_server *server);
-static void status_idle(void *data) {
+static uint64_t shade_panel_sig(struct zt_server *server);
+static int shade_later_fired(void *data);
+static bool shade_pulling(struct zt_server *server);
+static int status_idle(void *data) {
 	struct zt_server *server = data;
+	if (server->st_pending && (shell_in_motion(server) || server->moving || server->rot_phase != ROT_IDLE ||
+			shade_pulling(server))) {
+		wl_event_source_timer_update(server->st_idle, 150);	/* (still settling: later) */
+		return 0;
+	}
+	wl_event_source_remove(server->st_idle);
 	server->st_idle = NULL;
 	if (server->st_pending) {
 		draw_status(server);
 		damage(server);
 	}
+	return 0;
 }
 
 static void draw_status(struct zt_server *server) {
-	if ((shell_in_motion(server) && server->rot_phase == ROT_IDLE) || server->rot_phase == ROT_TURN) {
+	server->status_gen++;
+	if (((shell_in_motion(server) || shade_pulling(server)) && server->rot_phase == ROT_IDLE) ||
+			server->rot_phase == ROT_TURN) {
+		/* (and while the action centre is pulled: the row and the panel's
+		 * row over it, painted mid-pull, were a 33 ms frame, round 10) */
 		/* The whole row painted and uploaded is 2-10 ms on the little cores:
 		 * its timers (the network's arrows, Bluetooth, the battery, the
 		 * modem) fired mid-swipe and that frame missed its vblank. Drawn
@@ -7960,7 +8053,9 @@ static void draw_status(struct zt_server *server) {
 		/* held down: the same row with its second line. The action centre's
 		 * top is the same thing: while an icon moves, it is drawn from here,
 		 * not by drawing the whole panel again every frame */
-		server->shade_row = in_shade;
+		/* (the same row the panel's would be: kept over it, if it was) */
+		server->shade_row = in_shade || (server->shade_row && !retro_on(server));
+		server->peek_sig = shade_panel_sig(server);
 		buffer = zt_buffer_create(server, server->width, PEEK_H, &cr);
 		if (retro_on(server)) {
 			cairo_set_source_rgb(cr, 0, 0, 0);
@@ -7970,6 +8065,17 @@ static void draw_status(struct zt_server *server) {
 		cairo_paint(cr);
 		status_row(server, cr, true, false, true, -1);
 		zt_buffer_show(server, &server->peek_layer, buffer, cr, server->width, PEEK_H);
+	}
+	if (!in_shade && server->shade_layer.tex && !retro_on(server) && server->shade_sig != shade_panel_sig(server) &&
+			(!server->shade_row || server->peek_sig != shade_panel_sig(server))) {
+		/* the action centre's row painted again too, a while after, while
+		 * it is shut and nothing is touched (shade_later_fired): painted at
+		 * the pull, its first frame took 25 ms (round 10, 2026-11-22) */
+		server->shade_row_only = true;
+		if (!server->shade_later) {
+			server->shade_later = wl_event_loop_add_timer(server->loop, shade_later_fired, server);
+		}
+		if (server->shade_later) wl_event_source_timer_update(server->shade_later, 600);
 	}
 }
 
@@ -8402,7 +8508,9 @@ static void lock(struct zt_server *server) {
 	animate(server, &server->switch_t, 0.0f, 1, 0, true);
 	animate(server, &server->lock_y, 0.0f, 1, 0, true);
 	server->lock_y = 0.0f;
+	server->pc_pad = false;
 	draw_lock(server);
+	pc_status_refresh(server);	/* whether a passcode is to be asked for */
 	wlr_log(WLR_INFO, "locked");
 }
 
@@ -8506,7 +8614,11 @@ static int net_tick(void *data) {
 		redraw = true;
 	} else if (charging && battery < 100) {
 		/* Instant blink: toggle between fully visible (1.0f) and fully invisible (0.0f) with no after-image */
-		snap(server, &server->st_plug, server->st_plug > 0.5f ? 0.0f : 1.0f);
+		/* set, not snapped: a snap is a 1 ms animation, and its second
+		 * frame of the whole of Start each second was half the idle
+		 * redraws on the charger (2026-11-22) */
+		anim_stop(server, &server->st_plug);
+		server->st_plug = server->st_plug > 0.5f ? 0.0f : 1.0f;
 		damage(server);
 	}
 	if (redraw) {
@@ -8813,18 +8925,155 @@ static void notes_build(struct zt_server *server) {
 	}
 }
 
-static void draw_shade(struct zt_server *server) {
-	const double height = shade_panel_h(server);
-	server->shade_row = false;	/* the panel's own row is as new as any */
-	/* the quick actions first, each into a texture of its own */
+/* the quick actions, each into a texture of its own */
+/* What a quick action's tile is drawn from (shade_tile_draw) */
+static uint64_t shade_tile_sig(struct zt_server *server, int i, double w, double h) {
+	int q = server->quick[i];
+	bool missing = q == Q_LOCATION ||
+		(q == Q_FLASHLIGHT && access(TORCH_PATH, W_OK) != 0) ||
+		(q == Q_BLUETOOTH && access("/sys/class/bluetooth/hci0", F_OK) != 0);
+	bool on = q == Q_WIFI ? server->shade_wifi : q == Q_AIRPLANE ? server->shade_airplane :
+		q == Q_DATA ? server->cell_data_on : q == Q_VIBRATE ? server->haptics_enabled :
+		q == Q_FLASHLIGHT ? server->shade_torch : q == Q_BLUETOOTH ? server->shade_bt :
+		q == Q_ROTATION ? server->rotation_lock : q == Q_BRIGHTNESS;
+	uint64_t s = (uint64_t)q;
+	s = s * 31 + (uint64_t)missing;
+	s = s * 31 + (uint64_t)on;
+	s = s * 31 + (uint64_t)(q == Q_BRIGHTNESS ? server->shade_brightness : 0);
+	s = s * 31 + (uint64_t)shell_light(server);
+	s = s * 31 + (uint64_t)shell_bg_color(server);
+	s = s * 31 + (uint64_t)server->accent;
+	s = s * 31 + (uint64_t)dots() * 2 + (uint64_t)retro_on(server);
+	s = s * 31 + (uint64_t)(w * 64) * 7 + (uint64_t)(h * 64);
+	s = s * 31 + (uint64_t)(server->scale * 1000);
+	return s | 1;
+}
+
+static void draw_shade_tiles(struct zt_server *server) {
 	for (int i = 0; i < 8 && !g_dump_dir; i++) {
 		double x, y, w, h;
 		shade_tile_rect(server, i, &x, &y, &w, &h);
+		/* only those changed: all eight painted and uploaded were 7-9 ms
+		 * of a pull's first frame (round 10, 2026-11-22) */
+		uint64_t sig = shade_tile_sig(server, i, w, h);
+		if (server->shade_tile_layer[i].tex && server->shade_tile_sig[i] == sig) {
+			continue;
+		}
+		server->shade_tile_sig[i] = sig;
 		cairo_t *tile_cr;
 		struct zt_buffer *tile = zt_buffer_create(server, w, h, &tile_cr);
 		shade_tile_draw(server, tile_cr, i, w, h);
 		zt_buffer_show(server, &server->shade_tile_layer[i], tile, tile_cr, w, h);
 	}
+}
+
+/* What the shade's panel (one 1440x2800 texture: 23-72 ms to paint and
+ * upload) is drawn from, outside its own tiles and notifications' textures. */
+static uint64_t shade_panel_sig_gen(struct zt_server *server, uint64_t gen) {
+	uint64_t s = gen;
+	s = s * 31 + (uint64_t)server->accent;
+	s = s * 31 + (uint64_t)(server->n_notes == 0);
+	s = s * 31 + (uint64_t)shell_light(server);
+	s = s * 31 + (uint64_t)server->orient;
+	s = s * 31 + (uint64_t)server->width * 7 + (uint64_t)server->height;
+	return s | 1;
+}
+static uint64_t shade_panel_sig(struct zt_server *server) {
+	return shade_panel_sig_gen(server, server->status_gen);
+}
+
+/* the action centre's top row alone, into the peek layer drawn over the panel */
+static void shade_row_paint(struct zt_server *server) {
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, server->width, PEEK_H, &cr);
+	set_rgb(cr, shell_bg_color(server));
+	cairo_paint(cr);
+	status_row(server, cr, true, false, true, -1);
+	zt_buffer_show(server, &server->peek_layer, buffer, cr, server->width, PEEK_H);
+	server->shade_row = true;
+	server->peek_sig = shade_panel_sig(server);
+}
+
+static void draw_shade(struct zt_server *server);
+/* the panel drawn whole once nothing moves (shade_row_only) */
+static int shade_later_fired(void *data) {
+	struct zt_server *server = data;
+	if (!server->shade_row_only) {
+		return 0;
+	}
+	bool touching = false;
+	for (int i = 0; i < MAX_TOUCH; i++) {
+		touching |= server->touches[i].used;
+	}
+	if (shell_in_motion(server) || server->moving || server->shade_open || server->shade_h > 0.1f || touching ||
+			server->rot_phase != ROT_IDLE) {
+		/* (open, the row over it is right; drawn whole while it is out of
+		 * sight: at rest open, the finger pushing it back came in the
+		 * middle of the 23-44 ms, 2026-11-22; and never with a finger down,
+		 * which may be the next pull's) */
+		wl_event_source_timer_update(server->shade_later, 500);
+		return 0;
+	}
+	if (server->shade_sig_rest == shade_panel_sig_gen(server, 0) && server->shade_layer.tex && !retro_on(server)) {
+		/* only its row out of date: the row over it (peek_layer) stays,
+		 * and the panel is not drawn again at all. Drawn whole here, a pull
+		 * begun as it ran took 33-112 ms for its first frame (round 9,
+		 * 2026-11-22) */
+		if (server->shade_sig != shade_panel_sig(server) &&
+				(!server->shade_row || server->peek_sig != shade_panel_sig(server))) {
+			shade_row_paint(server);
+		}
+		server->shade_row_only = false;
+		return 0;
+	}
+	draw_shade(server);
+	return 0;
+}
+
+/* The panel brought up to date: when only its status row has changed,
+ * that row alone (shade_row_paint) and the panel whole later, at rest */
+static void shade_refresh(struct zt_server *server) {
+	if (server->shade_sig_rest == shade_panel_sig_gen(server, 0) && server->shade_layer.tex &&
+			!retro_on(server) && (shell_in_motion(server) || server->moving || server->shade_row_only ||
+			(server->shade_h > 0.1f && !server->shade_open))) {
+		shade_row_paint(server);
+		server->shade_row_only = true;
+		if (!server->shade_later) {
+			server->shade_later = wl_event_loop_add_timer(server->loop, shade_later_fired, server);
+		}
+		if (server->shade_later) wl_event_source_timer_update(server->shade_later, 1200);
+		return;
+	}
+	draw_shade(server);
+}
+
+static void draw_shade(struct zt_server *server) {
+	const double height = shade_panel_h(server);
+	if (!g_dump_dir && server->shade_layer.tex && !retro_on(server) &&
+			(server->shade_open || server->shade_h > 0.1f) &&
+			server->shade_sig_rest == shade_panel_sig_gen(server, 0)) {
+		/* On screen, with nothing of the panel changed but perhaps its
+		 * status row: its tiles and notifications (textures of their own),
+		 * and the row alone over it (shade_row_paint); the panel whole once
+		 * it is out of sight (shade_later_fired). Painted whole here, any
+		 * redraw during a pull was a 23-44 ms frame (2026-11-22) */
+		draw_shade_tiles(server);
+		notes_build(server);
+		if (server->shade_sig != shade_panel_sig(server)) {
+			shade_row_paint(server);
+			server->shade_row_only = true;
+			if (!server->shade_later) {
+				server->shade_later = wl_event_loop_add_timer(server->loop, shade_later_fired, server);
+			}
+			if (server->shade_later) wl_event_source_timer_update(server->shade_later, 1200);
+		}
+		return;
+	}
+	server->shade_row = false;	/* the panel's own row is as new as any */
+	server->shade_sig = shade_panel_sig(server);
+	server->shade_sig_rest = shade_panel_sig_gen(server, 0);
+	server->shade_row_only = false;
+	draw_shade_tiles(server);
 
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, height, &cr);
@@ -13739,6 +13988,10 @@ static int press_fired(void *data) {
 
 /* A nav button, or the phone's own key for it, pressed and let go. */
 static void nav_activate(struct zt_server *server, int index) {
+	if (server->locked && server->pc_pad) {
+		if (index == NAV_BACK) pc_pad_close(server);	/* the lock drops back */
+		return;
+	}
 	if (server->switcher) {
 		switcher_close(server);	/* any button: back to where we were */
 		return;
@@ -14088,6 +14341,7 @@ static int toast_hide(void *data) {
 
 /* An update that should not alert (a download's progress): the app's note with
  * this title changes in place, or a new one is kept; no sound, banner or buzz. */
+static void shade_notes_changed(struct zt_server *server);
 static void note_quiet(struct zt_server *server, const char *who, const char *app, const char *title, const char *text) {
 	int i = 0;
 	while (i < server->n_notes && (strcmp(server->notes[i].app, app) || strcmp(server->notes[i].title, title)))
@@ -14109,11 +14363,55 @@ static void note_quiet(struct zt_server *server, const char *who, const char *ap
 	if (server->width == 0) {
 		return;
 	}
-	if (server->shade_open || server->shade_h > 0.1f) {
-		draw_shade(server);
-	}
+	shade_notes_changed(server);
 	lock_notes_changed(server);
 	damage(server);
+}
+
+/* A finger pulling the action centre, or it gliding open or shut */
+static bool shade_pulling(struct zt_server *server) {
+	if (animating(server, &server->shade_h)) {
+		return true;
+	}
+	for (int i = 0; i < MAX_TOUCH; i++) {
+		if (server->touches[i].used && server->touches[i].role == ROLE_SHADE) {
+			return true;
+		}
+	}
+	return !server->shade_open && server->shade_h > 0.1f;
+}
+
+static int notes_later_fired(void *data) {
+	struct zt_server *server = data;
+	if (shade_pulling(server)) {
+		wl_event_source_timer_update(server->notes_later, 120);
+		return 0;
+	}
+	if (server->shade_open || server->shade_h > 0.1f) {
+		draw_shade(server);
+		damage(server);
+	}
+	return 0;
+}
+
+/* The notifications changed: the panel brought up to date, if it shows.
+ * During a pull, once the pull is over: the list's textures all drawn again
+ * mid-pull were a 33-112 ms frame (round 9, 2026-11-22); till then it shows
+ * the list as it was. */
+static void shade_notes_changed(struct zt_server *server) {
+	if (!server->shade_open && server->shade_h <= 0.1f) {
+		return;
+	}
+	if (shade_pulling(server)) {
+		if (!server->notes_later) {
+			server->notes_later = wl_event_loop_add_timer(server->loop, notes_later_fired, server);
+		}
+		if (server->notes_later) {
+			wl_event_source_timer_update(server->notes_later, 120);
+			return;
+		}
+	}
+	draw_shade(server);
 }
 
 static void note_add_from(struct zt_server *server, const char *who, const char *app, const char *title, const char *text) {
@@ -14137,9 +14435,7 @@ static void note_add_from(struct zt_server *server, const char *who, const char 
 	draw_toast(server);
 	animate(server, &server->toast_y, 1.0f, 300, 0, false);  /* swivel in */
 	wl_event_source_timer_update(server->toast_timer, TOAST_MS);
-	if (server->shade_open || server->shade_h > 0.1f) {
-		draw_shade(server);
-	}
+	shade_notes_changed(server);
 	lock_notes_changed(server);
 	hap(server, HAP_HEAVY, HG_SYSTEM);
 	damage(server);
@@ -14159,9 +14455,7 @@ static void note_by_id(struct zt_server *server, uint32_t nid, bool quiet, const
 		if (server->width == 0) {
 			return;
 		}
-		if (server->shade_open || server->shade_h > 0.1f) {
-			draw_shade(server);
-		}
+		shade_notes_changed(server);
 		lock_notes_changed(server);
 		damage(server);
 		return;
@@ -14528,6 +14822,7 @@ static void screen_set(struct zt_server *server, bool on) {
 		const char *id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
 		/* an Android app under the lock screen (lock() below) is not in front */
 		bool locking = server->locked || (on && server->lock_enabled && server->width);
+		if (on && server->locked) pc_status_refresh(server);
 		waydroid_power_request(demoloop || (waydroid_window(id) && !locking) ? "active" : "idle");
 		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
 	}
@@ -15210,6 +15505,430 @@ static void card_close(struct zt_server *server, struct zt_toplevel *gone) {
  * the view frame (the apps, Start, the keyboard, the banners) goes by (x, y),
  * the same point in the view; the bars, the lock and the action centre's pull
  * go by the glass. Upright the two are the same. */
+/* The lock opens: the swipe, or a right passcode. The only place the lock
+ * is let go. */
+static void lock_open(struct zt_server *server) {
+	server->pc_pad = false;
+	server->pc_checking = false;
+	explicit_bzero(server->pc_typed, sizeof(server->pc_typed));
+	wl_event_source_timer_update(server->pc_tick_timer, 0);
+	server->locked = false;
+	server->unlock_ms = now_ms() | 1;
+	if (!server->boot_logo_done) {
+		char marker[256];
+		if (access(runtime_file(marker, sizeof(marker), "ztmetro-logo-unlocked"), F_OK) == 0) server->boot_logo_done = true;
+		else if (!retro_on(server)) boot_logo_prepare(server);	/* (DotMatrix: its home's own) */
+	}
+	hap(server, HAP_TAP, HG_SLIDE);
+	ui_sound(server, UIS_UNLOCK);
+	animate(server, &server->lock_y, (float)-server->height, 200, 0, false);
+	if (retro_on(server) && server->shown) {
+		/* the app that was open lights up again, dot by dot */
+		server->app_angle = TURN_IN_DEG;
+		animate(server, &server->app_angle, 0.0f, 450, 0, false);
+	}
+	const char *shown_id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
+	if (waydroid_window(shown_id)) {
+		/* the Android app that was open is in front again */
+		waydroid_power_request("active");
+		run_detached("ztos-waydroid-power", "sync", NULL, NULL);
+	}
+	wlr_log(WLR_INFO, "unlocked");
+}
+
+/* ---- the passcode over the lock (zrn-passcoded; passcoded/LOCKSCREEN-SPEC.md) ----
+ *
+ * The shell never waits on the daemon: every request is a non-blocking
+ * SOCK_SEQPACKET connection watched from the event loop, with a timer. A
+ * passcode is asked for only while the last status (under 10 s old) said
+ * enabled=1; the daemon down, slow, or answering anything else lets the
+ * owner in with the swipe, as before. The digits are wiped after every send
+ * and never logged. A password (kind alnum) is not typed on the lock yet:
+ * Settings offers only a PIN; one set some other way falls back to the swipe
+ * (logged). */
+#define PC_STALE_MS	10000
+#define PC_KEYS		12	/* 1-9, delete, 0, ok */
+#define PC_EMERGENCY	12	/* the hit index of "emergency call" */
+
+static int pc_cb_status(int fd, uint32_t mask, void *data);
+static int pc_cb_verify(int fd, uint32_t mask, void *data);
+static void lock_open(struct zt_server *server);
+static void draw_pc(struct zt_server *server);
+
+/* a request on a fresh non-blocking connection; the fd, or -1 */
+static int pc_send(const char *msg, size_t len) {
+	int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0) return -1;
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", pc_socket_path());
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+			send(fd, msg, len, MSG_NOSIGNAL | MSG_DONTWAIT) != (ssize_t)len) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static void pc_drop(struct zt_server *server, bool verify) {
+	struct wl_event_source **w = verify ? &server->pc_watch : &server->pc_status_watch;
+	int *fd = verify ? &server->pc_fd : &server->pc_status_fd;
+	if (*w) { wl_event_source_remove(*w); *w = NULL; }
+	if (*fd >= 0) { close(*fd); *fd = -1; }
+	wl_event_source_timer_update(verify ? server->pc_verify_timer : server->pc_status_timer, 0);
+}
+
+static bool pc_needed(struct zt_server *server) {
+	return server->pc_required && server->pc_status_ms &&
+		now_ms() - server->pc_status_ms < PC_STALE_MS;
+}
+
+static void pc_status_refresh(struct zt_server *server) {
+	if (server->pc_status_fd >= 0) return;	/* one already on its way */
+	const char *req = "status\n";
+	server->pc_status_fd = pc_send(req, strlen(req));
+	if (server->pc_status_fd < 0) {
+		if (server->pc_required) wlr_log(WLR_ERROR, "passcode: daemon unreachable, falling back to swipe");
+		server->pc_required = false;
+		return;
+	}
+	server->pc_status_watch = wl_event_loop_add_fd(server->loop, server->pc_status_fd,
+		WL_EVENT_READABLE, pc_cb_status, server);
+	wl_event_source_timer_update(server->pc_status_timer, PC_TIMEOUT_STATUS_MS);
+}
+
+static int pc_status_late(void *data) {
+	struct zt_server *server = data;
+	pc_drop(server, false);
+	if (server->pc_required) wlr_log(WLR_ERROR, "passcode: status timed out, falling back to swipe");
+	server->pc_required = false;
+	return 0;
+}
+
+static void pc_take_wait(struct zt_server *server, const char *reply) {
+	long until = pc_get_long(reply, "locked_until", 0), now = pc_get_long(reply, "now", 0);
+	server->pc_failures = (int)pc_get_long(reply, "failures", server->pc_failures);
+	if (now > 0) server->pc_skew = (long)time(NULL) - now;
+	server->pc_locked_until = until;
+}
+
+static long pc_wait_left(struct zt_server *server) {
+	if (!server->pc_locked_until) return 0;
+	long left = server->pc_locked_until - ((long)time(NULL) - server->pc_skew);
+	return left > 0 ? left : 0;
+}
+
+static void pc_note_wait(struct zt_server *server) {
+	long left = pc_wait_left(server);
+	if (left > 0) {
+		snprintf(server->pc_note, sizeof(server->pc_note), "try again in %ld:%02ld", left / 60, left % 60);
+		server->pc_note_err = false;
+		wl_event_source_timer_update(server->pc_tick_timer, 1000);
+	}
+}
+
+static int pc_cb_status(int fd, uint32_t mask, void *data) {
+	struct zt_server *server = data;
+	char reply[PC_MAX + 1];
+	ssize_t n = recv(fd, reply, PC_MAX, MSG_DONTWAIT);
+	pc_drop(server, false);
+	if (n <= 0) {
+		wlr_log(WLR_ERROR, "passcode: no status, falling back to swipe");
+		server->pc_required = false;
+		return 0;
+	}
+	reply[n] = 0;
+	char kind[16];
+	if (!pc_ok(reply)) {
+		wlr_log(WLR_ERROR, "passcode: status not ok, falling back to swipe");
+		server->pc_required = false;
+		return 0;
+	}
+	pc_get(reply, "kind", kind, sizeof(kind));
+	bool enabled = pc_get_long(reply, "enabled", 0) == 1;
+	server->pc_length = (int)pc_get_long(reply, "length", 0);
+	if (enabled && (strcmp(kind, "pin") || server->pc_length < 4 || server->pc_length > 16)) {
+		wlr_log(WLR_ERROR, "passcode: kind %s not typed on the lock yet, falling back to swipe", kind);
+		enabled = false;
+	}
+	server->pc_required = enabled;
+	server->pc_status_ms = now_ms() | 1;
+	pc_take_wait(server, reply);
+	if (!enabled && server->pc_pad) {
+		server->pc_pad = false;	/* turned off meanwhile: the plain lock again */
+		explicit_bzero(server->pc_typed, sizeof(server->pc_typed));
+		animate(server, &server->lock_y, 0.0f, 220, 0, false);
+		damage(server);
+	} else if (server->pc_pad && pc_wait_left(server) > 0) {
+		pc_note_wait(server);
+		draw_pc(server);
+	}
+	return 0;
+}
+
+static void pc_pad_open(struct zt_server *server) {
+	server->pc_pad = true;
+	explicit_bzero(server->pc_typed, sizeof(server->pc_typed));
+	server->pc_note[0] = 0;
+	server->pc_pressed = -1;
+	pc_note_wait(server);
+	/* the lock settles back (the finger lifted it): only the photo shows
+	 * round the pad, never what is under the lock; the clock and the
+	 * notification row go while the pad is up */
+	animate(server, &server->lock_y, 0.0f, 220, 0, false);
+	draw_pc(server);
+	pc_status_refresh(server);	/* (a wait set meanwhile shows) */
+	wlr_log(WLR_INFO, "passcode: pad up");
+}
+
+static void pc_pad_close(struct zt_server *server) {
+	if (!server->pc_pad) return;
+	server->pc_pad = false;
+	explicit_bzero(server->pc_typed, sizeof(server->pc_typed));
+	pc_drop(server, true);
+	server->pc_checking = false;
+	animate(server, &server->lock_y, 0.0f, 220, 0, false);
+	damage(server);
+}
+
+/* the answer to a check: in, a shake, a wait, or (anything odd) the swipe */
+static void pc_verdict(struct zt_server *server, const char *reply) {
+	server->pc_checking = false;
+	char code[24] = "";
+	if (reply && pc_ok(reply)) {
+		wlr_log(WLR_INFO, "passcode ok");
+		server->pc_failures = 0;
+		server->pc_locked_until = 0;
+		lock_open(server);
+		return;
+	}
+	if (reply) pc_get(reply, "code", code, sizeof(code));
+	if (reply && (!strcmp(code, "wrong") || !strcmp(code, "locked"))) {
+		pc_take_wait(server, reply);
+		wlr_log(WLR_INFO, "passcode wrong (%d)", server->pc_failures);
+		server->pc_shake = 1.0f;
+		animate(server, &server->pc_shake, 0.0f, 300, 0, true);
+		hap(server, HAP_HEAVY, HG_SYSTEM);
+		server->pc_note_err = true;
+		if (!strcmp(code, "locked") || pc_wait_left(server) > 0) {
+			pc_note_wait(server);
+		} else if (server->pc_failures >= 3 && server->pc_failures < 5) {
+			snprintf(server->pc_note, sizeof(server->pc_note), "wrong PIN. %d more tr%s before a wait",
+				5 - server->pc_failures, 5 - server->pc_failures == 1 ? "y" : "ies");
+		} else {
+			snprintf(server->pc_note, sizeof(server->pc_note), "wrong PIN");
+		}
+		draw_pc(server);
+		return;
+	}
+	wlr_log(WLR_ERROR, "passcode fallback: %s, falling back to swipe", reply ? (code[0] ? code : "bad reply") : "no reply");
+	lock_open(server);
+}
+
+static int pc_cb_verify(int fd, uint32_t mask, void *data) {
+	struct zt_server *server = data;
+	char reply[PC_MAX + 1];
+	ssize_t n = recv(fd, reply, PC_MAX, MSG_DONTWAIT);
+	pc_drop(server, true);
+	if (n > 0) reply[n] = 0;
+	pc_verdict(server, n > 0 ? reply : NULL);
+	explicit_bzero(reply, sizeof(reply));
+	return 0;
+}
+
+static int pc_verify_late(void *data) {
+	struct zt_server *server = data;
+	pc_drop(server, true);	/* a late reply is ignored */
+	pc_verdict(server, NULL);
+	return 0;
+}
+
+static int pc_tick(void *data) {
+	struct zt_server *server = data;
+	if (!server->pc_pad) return 0;
+	if (pc_wait_left(server) > 0) {
+		pc_note_wait(server);
+	} else {
+		server->pc_locked_until = 0;
+		server->pc_note[0] = 0;
+	}
+	draw_pc(server);
+	return 0;
+}
+
+static void pc_submit(struct zt_server *server) {
+	char msg[128];
+	int len = snprintf(msg, sizeof(msg), "verify\npass=%s", server->pc_typed);
+	explicit_bzero(server->pc_typed, sizeof(server->pc_typed));
+	server->pc_fd = len > 0 && len < (int)sizeof(msg) ? pc_send(msg, (size_t)len) : -1;
+	explicit_bzero(msg, sizeof(msg));
+	if (server->pc_fd < 0) {
+		pc_verdict(server, NULL);	/* the daemon went: never trapped */
+		return;
+	}
+	server->pc_checking = true;
+	motion_lease(now_ms() + 2500);	/* Argon2 at the clocks of a moving screen, not idle ones */
+	server->pc_watch = wl_event_loop_add_fd(server->loop, server->pc_fd, WL_EVENT_READABLE, pc_cb_verify, server);
+	wl_event_source_timer_update(server->pc_verify_timer, PC_TIMEOUT_CHECK_MS);
+	snprintf(server->pc_note, sizeof(server->pc_note), "checking...");
+	server->pc_note_err = false;
+	draw_pc(server);
+}
+
+/* the pad's geometry, in screen points */
+struct pc_geo { double top, box_y, note_y, keys_y, kw, kh, gap, em_y; };
+static struct pc_geo pc_geo(struct zt_server *server) {
+	struct pc_geo g;
+	g.top = server->height * 0.26;
+	g.box_y = g.top + 62;
+	g.note_y = g.box_y + 46;
+	g.keys_y = g.note_y + 28;
+	g.gap = 6;
+	g.kh = 62;
+	g.kw = (server->width - 2 * 24 - 2 * g.gap) / 3;
+	g.em_y = g.keys_y + 4 * (g.kh + g.gap) + 4;
+	return g;
+}
+
+/* which key (0..11), PC_EMERGENCY, or -1 */
+static int pc_hit(struct zt_server *server, double x, double y) {
+	struct pc_geo g = pc_geo(server);
+	if (y >= g.em_y && y < g.em_y + 44) return PC_EMERGENCY;
+	if (y < g.keys_y || x < 24 || x >= server->width - 24) return -1;
+	int row = (int)((y - g.keys_y) / (g.kh + g.gap)), col = (int)((x - 24) / (g.kw + g.gap));
+	if (row > 3 || col > 2) return -1;
+	return row * 3 + col;
+}
+
+static void draw_pc(struct zt_server *server) {
+	if (!server->width) return;
+	struct pc_geo g = pc_geo(server);
+	double W = server->width, H = server->height;
+	double ar = ((server->accent >> 16) & 0xff) / 255.0, ag = ((server->accent >> 8) & 0xff) / 255.0,
+		ab = (server->accent & 0xff) / 255.0;
+	bool waiting = pc_wait_left(server) > 0, off = waiting || server->pc_checking;
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, W, H, &cr);
+	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+	cairo_set_source_rgba(cr, 0, 0, 0, 0);
+	cairo_paint(cr);
+	cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+	cairo_set_source_rgba(cr, 0, 0, 0, 0.7);
+	cairo_rectangle(cr, 0, g.top, W, H - g.top);
+	cairo_fill(cr);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	draw_text(cr, "enter PIN", FONT_SEMILIGHT, 24, 24, g.top + 16, 0, 0, false);
+	if (server->pc_note[0]) {
+		if (server->pc_note_err) cairo_set_source_rgb(cr, ar, ag, ab);
+		else cairo_set_source_rgb(cr, 0.65, 0.65, 0.65);
+		draw_text(cr, server->pc_note, FONT_REGULAR, 14, 24, g.note_y, 0, 0, false);
+	}
+	static const char *labels[PC_KEYS] = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "delete", "0", "ok" };
+	for (int i = 0; i < PC_KEYS; i++) {
+		double x = 24 + (i % 3) * (g.kw + g.gap), y = g.keys_y + (i / 3) * (g.kh + g.gap);
+		bool down = server->pc_pressed == i && !off;
+		if (down) cairo_set_source_rgb(cr, ar, ag, ab);
+		else cairo_set_source_rgba(cr, 1, 1, 1, off ? 0.14 * 0.4 : 0.14);
+		cairo_rectangle(cr, x, y, g.kw, g.kh);
+		cairo_fill(cr);
+		cairo_set_source_rgba(cr, 1, 1, 1, off ? 0.4 : 1.0);
+		bool word = strlen(labels[i]) > 1;
+		draw_text(cr, labels[i], word ? FONT_REGULAR : FONT_SEMILIGHT, word ? 17 : 30, x, y, g.kw, g.kh, true);
+	}
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	cairo_set_line_width(cr, 2);
+	double ew = text_width("emergency call", FONT_SEMILIGHT, 17) + 28;
+	cairo_rectangle(cr, (W - ew) / 2, g.em_y + 3, ew, 38);
+	if (server->pc_pressed == PC_EMERGENCY) cairo_fill(cr); else cairo_stroke(cr);
+	if (server->pc_pressed == PC_EMERGENCY) cairo_set_source_rgb(cr, 0, 0, 0);
+	draw_text(cr, "emergency call", FONT_SEMILIGHT, 17, (W - ew) / 2, g.em_y + 3, ew, 38, true);
+	zt_buffer_show(server, &server->pc_layer, buffer, cr, W, H);
+	/* the boxes, a layer of their own: they shake without a redraw */
+	struct zt_buffer *bb = zt_buffer_create(server, W, 40, &cr);
+	int n = server->pc_length > 0 ? server->pc_length : 4, typed = (int)strlen(server->pc_typed);
+	double bw = 22, bgap = 10, bx = 24;
+	for (int i = 0; i < n; i++) {
+		if (i < typed) {
+			cairo_set_source_rgb(cr, ar, ag, ab);
+			cairo_rectangle(cr, bx + i * (bw + bgap), 4, bw, 30);
+			cairo_fill(cr);
+		} else {
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			cairo_set_line_width(cr, 2);
+			cairo_rectangle(cr, bx + i * (bw + bgap) + 1, 5, bw - 2, 28);
+			cairo_stroke(cr);
+		}
+	}
+	zt_buffer_show(server, &server->pc_box_layer, bb, cr, W, 40);
+	damage(server);
+}
+
+/* the pad drawn over the lock (render): the boxes shaken by pc_shake */
+static void pc_render(struct zt_server *server) {
+	if (!server->pc_pad || !server->locked || !server->pc_layer.tex) return;
+	layer_draw(server, &server->pc_layer, 0, 0, 1.0f);
+	if (server->pc_box_layer.tex) {
+		float s = server->pc_shake;
+		float dx = s > 0 ? 14.0f * s * sinf(s * 6.0f * (float)M_PI) : 0;
+		layer_draw(server, &server->pc_box_layer, dx, (float)pc_geo(server).box_y, 1.0f);
+	}
+}
+
+static void pc_emergency(struct zt_server *server) {
+	wlr_log(WLR_INFO, "passcode: emergency call (the lock stays locked)");
+	server->call_over_lock = true;
+	run_detached("/bin/sh", "-c", "exec env ZTMETRO_NO_ENTRANCE=1 ztphone --emergency", NULL);
+}
+
+/* a finger on the pad (touch down): which key, lit at once */
+static void pc_touch_down(struct zt_server *server, struct touch_point *p, double x, double y) {
+	int k = pc_hit(server, x, y);
+	bool off = pc_wait_left(server) > 0 || server->pc_checking;
+	p->index = k >= 0 && (k == PC_EMERGENCY || !off) ? 100 + k : -1;
+	if (p->index >= 0) {
+		server->pc_pressed = k;
+		ui_sound(server, UIS_KEY);
+		hap(server, HAP_TAP, HG_KEYS);
+		draw_pc(server);
+	}
+}
+
+/* the finger lifted: the key's action, or a swipe down closing the pad */
+static void pc_touch_up(struct zt_server *server, struct touch_point *p, bool cancelled) {
+	int k = p->index >= 100 ? p->index - 100 : -1;
+	bool was = server->pc_pressed >= 0;
+	server->pc_pressed = -1;
+	if (!cancelled && p->moved && p->py - p->py0 > server->height / 6.0) {
+		pc_pad_close(server);
+		return;
+	}
+	if (cancelled || k < 0 || p->moved) {
+		if (was) draw_pc(server);
+		return;
+	}
+	if (k == PC_EMERGENCY) {
+		draw_pc(server);
+		pc_emergency(server);
+		return;
+	}
+	if (pc_wait_left(server) > 0 || server->pc_checking) return;
+	size_t len = strlen(server->pc_typed);
+	if (k == 9) {
+		if (len) server->pc_typed[len - 1] = 0;
+	} else if (k == 11) {
+		if (len >= 4) { pc_submit(server); return; }
+	} else if (len + 1 < sizeof(server->pc_typed) && (int)len < 16) {
+		server->pc_typed[len] = (char)(k == 10 ? '0' : '1' + k);
+		server->pc_typed[len + 1] = 0;
+		if (server->pc_note_err) server->pc_note[0] = 0;
+		if ((int)len + 1 == server->pc_length) {	/* the last digit: sent at once */
+			draw_pc(server);
+			pc_submit(server);
+			return;
+		}
+	}
+	draw_pc(server);
+}
+
 static void touch_begin(struct zt_server *server, int32_t id, double px, double py, uint32_t time) {
 	double x, y;
 	if (prox_touch_blocked(server)) {
@@ -15417,6 +16136,11 @@ static void touch_begin(struct zt_server *server, int32_t id, double px, double 
 		/* (the lock is upright on the glass in every orientation) */
 		p->role = ROLE_LOCK;	/* nothing under it can be reached */
 		p->index = -1;
+		if (server->pc_pad && !retro_on(server)) {
+			pc_touch_down(server, p, px, py);
+			return;
+		}
+		if (!retro_on(server)) pc_status_refresh(server);	/* fresh by the time the swipe ends */
 		if (retro_on(server)) {
 			/* the DotMatrix lock: only its box unlocks, swiped across */
 			float x0, y0, x1, y1;
@@ -15506,7 +16230,36 @@ static void touch_begin(struct zt_server *server, int32_t id, double px, double 
 		server->shade_wifi = wifi_up();
 		modem_read(server);
 		server->shade_airplane = server->cell_airplane;
-		draw_shade(server);
+		/* the panel again only if what it shows has changed since it was
+		 * last drawn (every change draws it at once anyway): painting it
+		 * here made the pull's first frame 44-99 ms (2026-11-22) */
+		if (server->shade_layer.tex && (server->shade_sig == shade_panel_sig(server) ||
+				(server->shade_row && server->peek_sig == shade_panel_sig(server) && !retro_on(server) &&
+				server->shade_sig_rest == shade_panel_sig_gen(server, 0)))) {
+			/* (or the panel with the row over it, both as they are now) */
+			draw_shade_tiles(server);
+			notes_build(server);
+		} else if (server->shade_sig_rest == shade_panel_sig_gen(server, 0) && server->shade_layer.tex &&
+				!retro_on(server)) {
+			/* only the status row has changed (the data arrows come and go
+			 * all through a chat's traffic): that row alone, over the
+			 * panel's, as while an icon moves (shade_row); the panel
+			 * itself drawn again once the pull is over. Drawn here whole,
+			 * the pull's first frame took 45-65 ms (2026-11-22) */
+			draw_shade_tiles(server);
+			notes_build(server);
+			shade_row_paint(server);
+			server->shade_row_only = true;
+			if (!server->shade_later) {
+				server->shade_later = wl_event_loop_add_timer(server->loop, shade_later_fired, server);
+			}
+			if (server->shade_later) wl_event_source_timer_update(server->shade_later, 1200);
+		} else {
+			wlr_log(WLR_INFO, "shade: drawn whole at the pull (tex %u, row sig %s, rest sig %s)",
+				server->shade_layer.tex, server->shade_sig == shade_panel_sig(server) ? "same" : "changed",
+				server->shade_sig_rest == shade_panel_sig_gen(server, 0) ? "same" : "changed");
+			draw_shade(server);
+		}
 		/* resting on it instead of pulling: the second line only */
 		wl_event_source_timer_update(server->long_press_timer, PEEK_HOLD_MS);
 		return;
@@ -15886,6 +16639,13 @@ static void touch_update(struct zt_server *server, int32_t id, double px, double
 			}
 			break;
 		}
+		if (p->moved && server->locked && server->pc_pad) {
+			if (server->pc_pressed >= 0) {	/* a key slid off: not pressed */
+				server->pc_pressed = -1;
+				draw_pc(server);
+			}
+			break;
+		}
 		if (p->moved && server->locked) {
 			/* it goes up with the finger, and no lower than where it sits
 			 * (the lock is upright on the glass: the glass's points) */
@@ -16249,6 +17009,10 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 		if (!server->locked) {
 			break;
 		}
+		if (server->pc_pad && !retro_on(server)) {
+			pc_touch_up(server, p, cancelled);
+			break;
+		}
 		bool dm_swiped = false;
 		if (retro_on(server)) {
 			float x0, y0, x1, y1;
@@ -16261,28 +17025,12 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 			}
 		}
 		if (dm_swiped || (!retro_on(server) && !cancelled && p->py - p->py0 < -server->height / 5.0)) {
-			server->locked = false;
-			server->unlock_ms = now_ms() | 1;
-			if (!server->boot_logo_done) {
-				char marker[256];
-				if (access(runtime_file(marker, sizeof(marker), "ztmetro-logo-unlocked"), F_OK) == 0) server->boot_logo_done = true;
-				else if (!retro_on(server)) boot_logo_prepare(server);	/* (DotMatrix: its home's own) */
+			if (pc_needed(server) && !retro_on(server)) {
+				pc_pad_open(server);	/* the lock rises and the pad comes up */
+				break;
 			}
-			hap(server, HAP_TAP, HG_SLIDE);
-			ui_sound(server, UIS_UNLOCK);
-			animate(server, &server->lock_y, (float)-server->height, 200, 0, false);
-			if (retro_on(server) && server->shown) {
-				/* the app that was open lights up again, dot by dot */
-				server->app_angle = TURN_IN_DEG;
-				animate(server, &server->app_angle, 0.0f, 450, 0, false);
-			}
-			const char *shown_id = server->shown ? server->shown->xdg_toplevel->app_id : NULL;
-			if (waydroid_window(shown_id)) {
-				/* the Android app that was open is in front again */
-				waydroid_power_request("active");
-				run_detached("ztos-waydroid-power", "sync", NULL, NULL);
-			}
-			wlr_log(WLR_INFO, "unlocked");
+			if (server->pc_required) wlr_log(WLR_ERROR, "passcode: status stale, falling back to swipe");
+			lock_open(server);
 		} else if (!p->moved) {
 			/* a tap: it lifts a little and drops, to show which way it goes */
 			server->lock_y = -26.0f;
@@ -16695,12 +17443,35 @@ static void ctl_command(struct zt_server *server, char *line) {
 		}
 	} else if (!strcmp(line, "ringing on") || !strcmp(line, "ringing off")) {
 		server->ringing = !strcmp(line, "ringing on");
+		if (!server->ringing) server->ring_silenced = false;
 	} else if (!strcmp(line, "calltest hide")) {
 		/* the made-up call ends: the phone says "call ended", flips its
 		 * panels out and goes (the unmap brings back what it covered) */
 		char fpath[256];
 		unlink(runtime_file(fpath, sizeof(fpath), "ztmetro-fakecall"));
 		if (!call_front(server)) call_end_begin(server, false);
+	} else if (!strcmp(line, "test charging on") || !strcmp(line, "test charging off")) {
+		test_charging = !strcmp(line + 14, "on");	/* (the once-a-second look picks it up) */
+	} else if (strncmp(line, "backdrop ", 9) == 0) {
+		/* backdrop APP RRGGBB | backdrop APP off: the call screen of APP is
+		 * drawn over what is behind it frosted, RRGGBB (its own flat
+		 * background) keyed out of its window (call_backdrop_draw) */
+		char app_id[32], what[16];
+		unsigned int rgb;
+		if (sscanf(line + 9, "%31s %15s", app_id, what) == 2) {
+			bool was = server->bd_app[0] != 0;
+			if (strcmp(what, "off") != 0 && sscanf(what, "%x", &rgb) == 1) {
+				snprintf(server->bd_app, sizeof(server->bd_app), "%s", app_id);
+				server->bd_key = rgb & 0xffffff;
+			} else if (!strcmp(server->bd_app, app_id)) {
+				server->bd_app[0] = 0;
+			}
+			if (was != (server->bd_app[0] != 0)) {
+				server->call_bd.valid = false;
+				if (server->width > 0) draw_status(server);
+				damage(server);
+			}
+		}
 	} else if (!strcmp(line, "call_screen end")) {
 		/* the phone shows "call ended", flips its panels out and goes: what
 		 * it covered comes back when its window does (the unmap); at once
@@ -17291,6 +18062,9 @@ static bool ringing_key(struct zt_server *server, uint32_t keycode) {
 	if (!server->ringing || !call_front(server) || (keycode != KEY_POWER && keycode != KEY_VOLUMEDOWN)) {
 		return false;
 	}
+	if (keycode == KEY_POWER && server->ring_silenced) {
+		return false;	/* (the second press: the key's own) */
+	}
 	const char *word = keycode == KEY_POWER ? "silence" : "reject";
 	char path[256];
 	FILE *f = fopen(runtime_file(path, sizeof(path), "ztphone-callkey"), "w");
@@ -17299,7 +18073,11 @@ static bool ringing_key(struct zt_server *server, uint32_t keycode) {
 		fclose(f);
 	}
 	wlr_log(WLR_INFO, "ringing: %s pressed, the call told to %s", keycode == KEY_POWER ? "power" : "volume down", word);
-	server->ringing = false;	/* (a second press is the key's own again) */
+	if (keycode == KEY_POWER) {
+		server->ring_silenced = true;
+	} else {
+		server->ringing = false;	/* (rejected: nothing rings any more) */
+	}
 	activity(server);
 	return true;
 }
@@ -17676,7 +18454,7 @@ static void board_frame(struct zt_server *server) {
 	double ms = (uint32_t)(now_ms() - server->board_start);
 	bool out = server->board_state == 3;
 	double last = zb_delay(ZB_CELLS - 1);
-	double run = last + (out ? ZB_SWIVEL_OUT_MS : ZB_SWIVEL_IN_MS);
+	double run = last + (out ? ZB_RB_OUT_MS : ZB_RB_IN_MS);	/* Readerboard's keyframes (zrnboard.h) */
 	if (out && ms >= run) {
 		server->board_state = 0;
 		server->board_more = true;
@@ -17697,19 +18475,19 @@ static void board_frame(struct zt_server *server) {
 	double side = board_side(server), pitch = side + ZB_GAP;
 	for (int i = 0; l->tex && i < ZB_CELLS; i++) {
 		double delay = zb_delay(i), own = server->board_state == 2 ? run : ms - delay;
-		double from = ZB_SWIVEL_IN_DEG, deg;
+		double from = ZB_RB_IN_DEG, deg;
 		if (out) {
 			double came = server->board_came_ms - delay;
-			if (came <= 0 || own >= ZB_SWIVEL_OUT_MS) {
+			if (came <= 0 || own >= ZB_RB_OUT_MS) {
 				continue;	/* never came, or gone */
 			}
-			from = came < ZB_SWIVEL_IN_MS ? ZB_SWIVEL_IN_DEG * (1 - zb_swivel_ease(came / ZB_SWIVEL_IN_MS, 1)) : 0;
-			deg = from + (ZB_SWIVEL_OUT_DEG - from) * zb_swivel_ease(own / ZB_SWIVEL_OUT_MS, 0);
+			from = came < ZB_RB_IN_MS ? ZB_RB_IN_DEG * (1 - zb_rb_ease(came / ZB_RB_IN_MS, 1)) : 0;
+			deg = from + (ZB_RB_OUT_DEG - from) * zb_rb_ease(own / ZB_RB_OUT_MS, 0);
 		} else {
 			if (own < 0) {
 				continue;	/* its turn has not come */
 			}
-			deg = from * (1 - zb_swivel_ease(own / ZB_SWIVEL_IN_MS, 1));
+			deg = from * (1 - zb_rb_ease(own / ZB_RB_IN_MS, 1));
 		}
 		float x = BOARD_MARGIN + (float)((i % ZB_COLS) * pitch), y = (float)((i / ZB_COLS) * pitch);
 		mat_identity(m);
@@ -18378,7 +19156,12 @@ static bool frost_atlas_draw(struct zt_server *server, struct wlr_output *output
 		if (!todo[k]) {
 			continue;
 		}
-		glBindFramebuffer(GL_FRAMEBUFFER, s->fbo[0]);
+		/* into the other of its two: tex[0] may still be read by the frame
+		 * before, still on the GPU, and writing it made this frame's passes
+		 * wait for that one (a blur 11-12 ms of the GPU, not 5-6, round 9,
+		 * 2026-11-22); tex[1] is free on this path, and the two change
+		 * places after */
+		glBindFramebuffer(GL_FRAMEBUFFER, s->fbo[1]);
 		glViewport(0, 0, s->qw, s->qh);
 		float v0 = (float)off[k] / ah, vh = (float)(hk[k] / 2) / ah;
 		/* tex[0]'s pixel i covers the strip's pixels 4i..4i+3 (and past
@@ -18390,6 +19173,11 @@ static bool frost_atlas_draw(struct zt_server *server, struct wlr_output *output
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 		frame_quads += 1;
 		frame_px += (double)s->qw * s->qh;
+		GLuint t = s->tex[0], f = s->fbo[0];
+		s->tex[0] = s->tex[1];
+		s->fbo[0] = s->fbo[1];
+		s->tex[1] = t;
+		s->fbo[1] = f;
 		s->sig = scan->sig[k];
 		s->valid = true;
 		s->made = frost_frame;
@@ -18423,8 +19211,13 @@ static void frost_prepare(struct zt_server *server, struct wlr_output *output, G
 		}
 		if (s->valid && s->sig == scan->sig[k]) {
 			frosted[k] = true;	/* nothing under it has changed */
-		} else if (s->valid && s->made + 1 == frost_frame &&
-				(shell_in_motion(server) || server->rot_phase == ROT_TURN)) {
+		} else if (s->valid && (shell_in_motion(server) || server->rot_phase == ROT_TURN) &&
+				(s->made + 1 == frost_frame || (frost_frame & 1u) != (uint32_t)k)) {
+			/* (and the two bars take turns: the status bar's blur on even
+			 * frames, the nav bar's on odd, never both in one frame while
+			 * moving. Both at once, a turn's frame took 12-16 ms and missed
+			 * its vblank (frost 2, 2026-11-22); each still at most a
+			 * frame old) */
 			/* Moving: blurred again every other frame, the blur a frame
 			 * old between. Each blur is a copy out of the frame half-way
 			 * (the tiler writes it out and reads it back) and three passes;
@@ -20481,12 +21274,28 @@ static void render_frame(struct zt_server *server) {
 	 * frame missed every other vblank whenever the data arrow came and went
 	 * (as it does all through a chat's traffic). Drawn as it ends up once
 	 * things are still. */
-	bool st_defer = shell_in_motion(server);
+	if (server->shade_layer.tex && !server->shade_open && server->shade_h <= 0.1f && !server->shade_row_only &&
+			!retro_on(server) && server->shade_sig_rest != shade_panel_sig_gen(server, 0)) {
+		/* the action centre's panel out of date in more than its row (a
+		 * notification come or gone, a turn, the accent): drawn again out
+		 * of sight once things are still, not in the next pull's first
+		 * frame (23-44 ms, 2026-11-22) */
+		server->shade_row_only = true;
+		if (!server->shade_later) {
+			server->shade_later = wl_event_loop_add_timer(server->loop, shade_later_fired, server);
+		}
+		if (server->shade_later) wl_event_source_timer_update(server->shade_later, 600);
+	}
+	bool st_defer = shell_in_motion(server) || shade_pulling(server);
 	if (!st_defer && server->st_pending && server->rot_phase != ROT_TURN && !server->st_idle) {
 		/* what was held while things moved: painted once this frame is
 		 * out (the loop's next idle), not before it is drawn, where its
 		 * 3-12 ms made the swipe's last frame miss its vblank */
-		server->st_idle = wl_event_loop_add_idle(server->loop, status_idle, server);
+		/* (a moment after, not at the loop's next idle: that came between
+		 * the last moving frame and the settle's frame after it, and its
+		 * 3-5 ms made that one miss its vblank, 2026-11-22) */
+		server->st_idle = wl_event_loop_add_timer(server->loop, status_idle, server);
+		if (server->st_idle) wl_event_source_timer_update(server->st_idle, 250);
 	}
 	if (status_moving(server) && st_defer) {
 		server->st_was_moving = true;
@@ -20511,7 +21320,7 @@ static void render_frame(struct zt_server *server) {
 			lock_status_redraw(server);
 		}
 		if (server->shade_open || server->shade_h > 0.1f) {
-			draw_shade(server);
+			shade_refresh(server);	/* (a pull's frame: 23-44 ms whole, 2026-11-22) */
 		}
 	}
 	running = running || server->moving;
@@ -21357,15 +22166,16 @@ static void render_frame(struct zt_server *server) {
 		}
 		/* the clock block rises by LOCK_LIFT as the notification row comes in */
 		float lift = server->lock_lift < 0.0f ? 0.0f : server->lock_lift > 1.0f ? 1.0f : server->lock_lift;
-		if (server->lock_clock_layer.tex) {
+		if (server->lock_clock_layer.tex && !server->pc_pad) {
 			layer_draw(server, &server->lock_clock_layer, 0,
 				server->lock_y + (float)LOCK_CLOCK_Y(server) - LOCK_LIFT * lift, 1.0f);
 		}
-		if (server->lock_note_layer.tex && lift > 0.0f) {
+		if (server->lock_note_layer.tex && lift > 0.0f && !server->pc_pad) {
 			layer_draw(server, &server->lock_note_layer, 0,
 				server->lock_y + (float)LOCK_NOTE_Y(server) + LOCK_LIFT * (1.0f - lift), lift);
 		}
 		plug_over(server, server->lock_y, true);
+		pc_render(server);
 	}
 	/* The call: its backdrop over the whole screen, the nav bar's strip
 	 * included, as one picture, from the call's first frame to its last; then
@@ -22181,6 +22991,8 @@ int main(int argc, char *argv[]) {
 	server.app_alpha = 1.0f;
 	server.lock_enabled = true;
 	server.key_sound_fd = -1;
+	server.pc_fd = server.pc_status_fd = -1;
+	server.pc_pressed = -1;
 	server.volume = 24;
 	server.volume_y = -(VOLUME_H + MEDIA_H + OUTPUT_H);
 	server.toast_y = 0.0f;
@@ -22368,6 +23180,9 @@ int main(int argc, char *argv[]) {
 	server.st_plug = 1.0f;
 	server.charging = on_charger();
 	server.toast_timer = wl_event_loop_add_timer(server.loop, toast_hide, &server);
+	server.pc_verify_timer = wl_event_loop_add_timer(server.loop, pc_verify_late, &server);
+	server.pc_status_timer = wl_event_loop_add_timer(server.loop, pc_status_late, &server);
+	server.pc_tick_timer = wl_event_loop_add_timer(server.loop, pc_tick, &server);
 	server.home_flip_timer = wl_event_loop_add_timer(server.loop, home_flip_fired, &server);
 	server.signal_sweep_timer = wl_event_loop_add_timer(server.loop, signal_sweep_fired, &server);
 	server.bars_step_timer = wl_event_loop_add_timer(server.loop, bars_step_fired, &server);

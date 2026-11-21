@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Galaxy S9 (starlte) rear fingerprint sensor: Egistec ET510 on SPI1, and the
+ * Kinibi TEE notification interrupt. NOT APPLIED: the zrn-mobicore and
+ * zrn-etspi modules work without these nodes (IRQ and GPIOs from module
+ * parameters and gpiod lookup tables). This file records the stock board
+ * description in mainline syntax, for when the drivers move in-tree.
+ *
+ * Source: G960N boot.img DTB (rev16..rev26 identical), see fingerprint/README.md.
+ *
+ * SPI1 itself (spi@10450000) must stay WITHOUT a Linux SPI controller driver:
+ * stock marks it "secure-mode" and the Kinibi fingerprint trustlet drives its
+ * registers through the secure SPI driver. A normal-world spi-s3c64xx probe
+ * would reset the block under the TA. Hence no &spi_1 node here.
+ */
+
+/ {
+	/* stock: tee { compatible = "samsung,exynos-tee"; interrupts = <0 0xe9 0>; } */
+	tee {
+		compatible = "samsung,exynos-tee";
+		interrupts = <GIC_SPI 233 IRQ_TYPE_EDGE_RISING>;
+	};
+
+	fingerprint {
+		compatible = "zrn,et510-secure";
+		/* stock etspi-* properties, as GPIO descriptors */
+		drdy-gpios = <&gpa1 3 GPIO_ACTIVE_HIGH>;	/* btp-irq, finger detect */
+		ldo-gpios = <&gpm43 0 GPIO_ACTIVE_HIGH>;	/* btp-ldo, sensor power */
+		sleep-gpios = <&expander_gpios 6 GPIO_ACTIVE_HIGH>; /* PCAL6524 P0.6, SLEEP/RESETn */
+		chip-id = "ET510";
+		orientation = <0>;
+		spi-max-frequency = <13000000>;
+		pinctrl-names = "default", "pins_poweron", "pins_poweroff";
+		pinctrl-0 = <&btp_irq_sleep &btp_ldo>;
+		pinctrl-1 = <&btp_irq &spi1_clk &spi1_cs &spi1_miso &spi1_mosi>;
+		pinctrl-2 = <&btp_irq_sleep &spi1_bus_inactive &spi1_miso_inactive>;
+	};
+};
+
+&pinctrl_alive {	/* pinctrl@14050000 */
+	btp_irq: btp-irq {
+		samsung,pins = "gpa1-3";
+		samsung,pin-function = <EXYNOS_PIN_FUNC_INPUT>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
+		samsung,pin-drv = <3>;
+	};
+	btp_irq_sleep: btp-irq-sleep {
+		samsung,pins = "gpa1-3";
+		samsung,pin-function = <EXYNOS_PIN_FUNC_INPUT>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_DOWN>;
+		samsung,pin-drv = <3>;
+	};
+};
+
+&pinctrl_cmgp {	/* pinctrl@14220000 */
+	btp_ldo: btp-ldo {
+		samsung,pins = "gpm43-0";
+		samsung,pin-function = <EXYNOS_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_DOWN>;
+		samsung,pin-drv = <0>;
+	};
+};
+
+&pinctrl_peric0 {	/* pinctrl@10430000 */
+	spi1_clk: spi1-clk {
+		samsung,pins = "gpp0-0";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_DOWN>;
+		samsung,pin-drv = <2>;
+	};
+	spi1_mosi: spi1-mosi {
+		samsung,pins = "gpp0-1";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_DOWN>;
+		samsung,pin-drv = <2>;
+	};
+	spi1_miso: spi1-miso {
+		samsung,pins = "gpp0-2";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_DOWN>;
+		samsung,pin-drv = <2>;
+	};
+	spi1_cs: spi1-cs {
+		samsung,pins = "gpp0-3";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_DOWN>;
+		samsung,pin-drv = <2>;
+	};
+	spi1_bus_inactive: spi1-bus-inactive {
+		samsung,pins = "gpp0-3", "gpp0-1", "gpp0-0";
+		samsung,pin-function = <EXYNOS_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
+		samsung,pin-drv = <2>;
+	};
+	spi1_miso_inactive: spi1-miso-inactive {
+		samsung,pins = "gpp0-2";
+		samsung,pin-function = <EXYNOS_PIN_FUNC_INPUT>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_DOWN>;
+		samsung,pin-drv = <2>;
+	};
+};

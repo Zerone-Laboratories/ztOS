@@ -82,9 +82,14 @@ enum page {
 	PAGE_NAVIGATION,
 	PAGE_BOOST,	/* Dynamic Boost System: RapidBoost and IntelligentBoost */
 	PAGE_POWER,	/* Power Management: the category over Performance, Boost, Battery + sleep */
+	PAGE_PASSCODE,	/* the lock screen's passcode (zrn-passcoded): passcodepage.h */
+	PAGE_PASSCODE_ENTRY,	/* typing one: new, confirm, current */
+	PAGE_PASSCODE_KEY,	/* the recovery key, shown once */
 };
 
 enum action {
+	ACT_PC_TOGGLE = 800, ACT_PC_CHANGE, ACT_PC_KEY, ACT_PC_BOX, ACT_PC_SUBMIT, ACT_PC_KIND, ACT_PC_ARCHIVE,
+	ACT_PC_KEY_DONE, ACT_PC_KEY_SAVE,
 	ACT_RINGTONE = 700,
 	ACT_APP_SELECT = 600, ACT_APP_BACKGROUND, ACT_APP_BATCH,
 	ACT_DATE_AUTO = 500, ACT_DATE_FIELD, ACT_DATE_REGION, ACT_DATE_SAVE, ACT_DATE_SYNC, ACT_DATE_LANG,
@@ -579,6 +584,7 @@ static void perf_tell(const char *command) {
 }
 
 #include "boostpage.h"
+#include "passcodepage.h"
 
 /* Auto brightness is sensord's: it has the light sensor. Without its status
  * the phone has no light sensor to go by (the J5), and nothing is offered. */
@@ -936,6 +942,7 @@ static double draw_main(cairo_t *cr) {
 	snprintf(detail, sizeof(detail), "%d%% brightness, %s timeout",
 		bright_now > 0 ? bright_now : app.brightness, app.timeout_idx == 4 ? "Never" : "1 min");
 	y = zmc_entry(cr, y, "display", detail, ACT_OPEN_PAGE, PAGE_DISPLAY);
+	y = zmc_entry(cr, y, "passcode", pc_summary(), ACT_OPEN_PAGE, PAGE_PASSCODE);
 
 	wifi_summary(wifi, sizeof(wifi));
 	y = zmc_entry(cr, y, "Wi-Fi", wifi, ACT_OPEN_PAGE, PAGE_WIFI);
@@ -2457,6 +2464,7 @@ static double draw_date(cairo_t *cr) {
 }
 
 static void typed(const char *text) {
+	if (zmc.page == PAGE_PASSCODE_ENTRY && pc.typing) { pc_type(text); return; }
     if (zmc.page == PAGE_DATE && date_focus >= 0 && !date_pipe) {
         char *field = date_fields[date_focus]; size_t len = strlen(field);
         if (text[0] == '\b') { if (len) field[len-1] = 0; }
@@ -3105,6 +3113,9 @@ static double render_page_content(cairo_t *cr, int p) {
 	case PAGE_APN: return draw_apn(cr);
 	case PAGE_WIFI_JOIN: return draw_wifi_join(cr);
 	case PAGE_WIFI_NET: return draw_wifi_net(cr);
+	case PAGE_PASSCODE: return draw_passcode(cr);
+	case PAGE_PASSCODE_ENTRY: return draw_passcode_entry(cr);
+	case PAGE_PASSCODE_KEY: return draw_passcode_key(cr);
 	}
 	return 0;
 }
@@ -3147,6 +3158,7 @@ static void activate(int action, int arg) {
 		return;
 	}
 	open_picker = 0;
+	if (pc_activate(action, arg)) return;
 	if (action >= ACT_QUICK_SLOT && action <= ACT_QUICK_LAST) {
 		if (arg >= 0 && arg < N_QUICK) {
 			app.quick[action - ACT_QUICK_SLOT] = arg;
@@ -3913,6 +3925,7 @@ static bool back(void) {
 	if (zmc.page == PAGE_MAIN || zmc.page == PAGE_APPS) {
 		return false;	/* either tab of the hub: back leaves the app */
 	}
+	if (pc_back()) return true;
 	if (zmc.page == PAGE_APP_DETAIL) { zmc_go(PAGE_INSTALLED_APPS, -1); return true; }
 	if (zmc.page == PAGE_INSTALLED_APPS) { zmc_go(PAGE_APPS, -1); return true; }
 	zmc_every(0, NULL);	/* the performance page's refresh, if it was running */
@@ -3964,6 +3977,8 @@ static bool back(void) {
 
 static void arrived(int page) {
 	if (page != PAGE_AUDIO) ringtone_stop();
+	if (page == PAGE_MAIN || page == PAGE_PASSCODE) pc_refresh();	/* the hub's line and the page */
+	if (page == PAGE_PASSCODE || page == PAGE_PASSCODE_ENTRY) zmc_every(1000, pc_tick);	/* a wait counts down */
     if (page == PAGE_DATE) { date_focus = -1; date_job(false); }
 	if (page == PAGE_MAIN || page == PAGE_APPS) {
 		hub_tab = page;	/* swiped to: where back returns to from under it */
@@ -4031,6 +4046,7 @@ static const struct { const char *name; enum page page; } pages[] = {
 	{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
 	{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },
 	{ "perf", PAGE_PERF }, { "power", PAGE_POWER }, { "boost", PAGE_BOOST }, { "dev", PAGE_DEV }, { "haptics", PAGE_HAPTICS }, { "quick", PAGE_QUICK }, { "apn", PAGE_APN }, { "wifijoin", PAGE_WIFI_JOIN }, { "wifinet", PAGE_WIFI_NET },
+	{ "passcode", PAGE_PASSCODE }, { "passcode-entry", PAGE_PASSCODE_ENTRY }, { "passcode-key", PAGE_PASSCODE_KEY },
 };
 
 static int page_named(const char *name) {
@@ -4049,6 +4065,7 @@ static int render_to_file(const char *name, const char *path) {
 			if (pages[i].page == PAGE_INSTALLED_APPS) installed_load();
 			if (pages[i].page == PAGE_BOOST) ib_render_prepare();
 			if (pages[i].page == PAGE_POWER) sleep_load();
+			if (pages[i].page >= PAGE_PASSCODE && pages[i].page <= PAGE_PASSCODE_KEY) pc_render_prepare(pages[i].page);
 			/* 664 points: the app area on the phone; ZT_RENDER_HEIGHT for a whole long page */
 			int height = getenv("ZT_RENDER_HEIGHT") ? atoi(getenv("ZT_RENDER_HEIGHT")) : 664;
 			return zmc_render_png(&settings, pages[i].page, height > 0 ? height : 664, path);
