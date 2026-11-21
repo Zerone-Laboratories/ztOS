@@ -397,7 +397,7 @@
           <dt>Kernel</dt><dd>Mainline Linux 7.1</dd>
           <dt>Devices</dt><dd>The <a href="#devices">device list</a>, QEMU; others through <a href="#ztconflo">ztConflo</a></dd>
           <dt>Graphics</dt><dd>Mesa Panfrost, OpenGL ES 3.1 on the S9's Mali-G72</dd>
-          <dt>Apps</dt><dd>Native C apps, and Python and Qt through the SDK</dd>
+          <dt>Apps</dt><dd>Native C apps, C apps through zrn-sdk, and Python and Qt through the older ztOS SDK</dd>
           <dt>Structure</dt><dd>A <a href="#structure">GSI and a device layer</a>, joined by ztOSIAL</dd>
           <dt>Written in</dt><dd>C, Python, shell</dd>
           <dt>Licence</dt><dd>GPL 3; ztOSIAL LGPL 2.1 or later</dd>
@@ -542,16 +542,18 @@
 
   <section class="section" id="sdk">
     <div class="wrap">
-      <div><h2>The SDK</h2><p class="sub">Make apps in C, C++, Rust or Python.</p></div>
+      <div><h2>The SDK</h2><p class="sub">Make apps in C, with Windows Phone 8.1's own controls.</p></div>
       <div class="body">
-        <p>The new SDK is <b>zrn-sdk</b>: one small GPU toolkit, libzrnui, under all four languages, in Metro or DotMatrix, whichever the system is set to. Apps ship as one signed <code>.zexec</code> file, and the store builds them from your source. It runs on a computer today and has not yet run on a phone.</p>
-<pre>zrn new "Notes" --lang c  <span class="c"># or cpp, rust, python</span>
-cd notes &amp;&amp; zrn build
-zrn render out.png        <span class="c"># see it with no phone, no display</span></pre>
-        <p><a class="btn" href="https://sdk.ztos.online">Open the SDK wiki</a></p>
-        <p>The wiki at <a href="https://sdk.ztos.online">sdk.ztos.online</a> covers every way to make an app, every UI element with real renders and code in each language, every animation running live with its real numbers (swivel, turnstile, fade, tilt), publishing to the store, and what is still missing.</p>
+        <p>The SDK is <b>zrn-sdk v2</b>, written in C23 and built with CMake. It has two libraries. <b>zrnui</b> is the UI core: the Windows Phone 8.1 controls (pages, Pivot, Hub, buttons, toggles, sliders, lists, pickers, app bars, flyouts, dialogs), layout, theme and text, drawn by OpenGL ES 2 or in software. <b>zrnapp</b> puts that in an ordinary Wayland window: the event loop, touch and keyboard, the shell's scale. <b>zrnkit</b> installs both. Version 1 (libzrnui, the Python and Rust bindings, the templates) is gone.</p>
+<pre>cd examples/demoapp
+cmake --preset host-debug && cmake --build --preset host-debug
+./build/host-debug/demoapp                     <span class="c"># a tour of the controls, on the computer</span>
+tools/zrn run &lt;phone ip&gt; examples/helloworld   <span class="c"># build for aarch64, upload, run on the phone</span></pre>
+        <p>The libraries are LGPL-2.1-or-later, so apps under any licence can link them. The examples are MIT.</p>
+        <p><b>New in the SDK</b>: apps follow the shell's theme and accent live, continuum and slide-up page transitions, frosted diffusion backgrounds, colour emoji and swipe gestures. The store builds and signs v2 apps itself; how to publish one is on the wiki.</p>
+        <p><a class="btn" href="https://sdk.ztos.online">Open the SDK wiki</a> <a class="btn" href="https://github.com/Zerone-Laboratories/zrn-sdk">Open zrn-sdk</a></p>
         <h3>The older Python SDK</h3>
-        <p>The ztOS SDK builds an app into a single file: a small C launcher with the app's Python code, pages, pictures and the <code>ztos</code> runtime zipped behind it. Pages, lists, pivots, entries, toggles, round buttons, app bars and dialogs all come from the runtime, with the toolkit's own numbers for every motion.</p>
+        <p>Welcome and Updates are still built with the ztOS SDK, which builds an app into a single file: a small C launcher with the app's Python code, pages, pictures and the <code>ztos</code> runtime zipped behind it.</p>
 <pre>ztos-sdk new "Notes"     <span class="c"># a new app, from the template</span>
 ztos-sdk run             <span class="c"># try it on the computer</span>
 ztos-sdk deploy          <span class="c"># build, install on the phone, open it</span>
