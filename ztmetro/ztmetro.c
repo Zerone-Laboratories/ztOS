@@ -19211,6 +19211,16 @@ static void frost_prepare(struct zt_server *server, struct wlr_output *output, G
 		}
 		if (s->valid && s->sig == scan->sig[k]) {
 			frosted[k] = true;	/* nothing under it has changed */
+		} else if (s->valid && server->rot_phase == ROT_TURN &&
+				(frost_frame & 3u) != 2u * (uint32_t)k) {
+			/* Turning: each bar's blur once in four frames, and on the
+			 * frames between none at all. With one of the two blurred on
+			 * every frame of the turn, the frames that blurred were the
+			 * ones that missed their vblank (12 of 14 turn frames over
+			 * 20 ms in round 10, 2026-11-22: the blur's 1-2 ms of the GPU
+			 * on top of the turn's own 8-13). The turning picture under
+			 * a bar is blurred to nothing; three frames old does not show */
+			frosted[k] = true;
 		} else if (s->valid && (shell_in_motion(server) || server->rot_phase == ROT_TURN) &&
 				(s->made + 1 == frost_frame || (frost_frame & 1u) != (uint32_t)k)) {
 			/* (and the two bars take turns: the status bar's blur on even
