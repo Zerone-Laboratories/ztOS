@@ -252,7 +252,12 @@ except BaseException as e:
 
 def compile_ui(path: Path) -> str:
     uic = shutil.which("pyside6-uic")
-    command = [uic] if uic else (["/usr/lib/qt6/uic", "-g", "python"] if Path("/usr/lib/qt6/uic").exists() else None)
+    command = [uic] if uic else None
+    # Qt 6's own uic writes Python with -g python: Arch keeps it in /usr/lib/qt6,
+    # Debian and Ubuntu (the CI runner) in /usr/lib/qt6/libexec
+    for candidate in ("/usr/lib/qt6/uic", "/usr/lib/qt6/libexec/uic"):
+        if command is None and Path(candidate).exists():
+            command = [candidate, "-g", "python"]
     if command is None:
         raise Fail("no uic to compile .ui files with (pacman -S pyside6 or qt6-base)")
     result = subprocess.run([*command, str(path)], capture_output=True, text=True)

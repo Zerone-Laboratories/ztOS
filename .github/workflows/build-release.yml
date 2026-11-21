@@ -52,7 +52,8 @@ jobs:
             xz-utils \
             zstd \
             curl \
-            python3
+            python3 \
+            qt6-base-dev-tools
 
       - name: Configure namespaces and mount propagation
         run: |
