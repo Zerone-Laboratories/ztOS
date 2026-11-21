@@ -1,3 +1,0 @@
-# ztOSCoreSensorFramework (ztOS in QEMU): no phone hardware here; only the
-# session's own pieces are watched.
-session|ztapps||App list

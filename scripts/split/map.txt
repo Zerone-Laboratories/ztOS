@@ -32,7 +32,7 @@ ztos-device-samsung-starlte  scripts/flash.sh
 ztos-device-samsung-starlte  scripts/dev/samsung-power-audit.py
 ztos-device-samsung-starlte  ztmetro/sensord/
 ztos-device-samsung-starlte  ztmetro/modemd/
-ztos-device-samsung-starlte  ztmetro/csf/
+ztos-device-samsung-starlte  ztmetro/coru/
 
 # ---- the build, the installer, the emulator target ---------------------------
 ztos-build      installer/

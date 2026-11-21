@@ -35,7 +35,7 @@
 #define DB_RANGE 15.0
 #define F_MIN 20.0
 #define F_MAX 20000.0
-#define PLOT_H 230.0
+#define PLOT_H plot_h()	/* 230 points; less in landscape (plot_h) */
 #define PLOT_LABEL 26.0	/* the dB labels, left of the plot */
 
 enum page { P_EQ, P_FX, P_OUT };
@@ -273,7 +273,14 @@ static double response_db(const struct prof *p, double f) {
 /* ---- plot geometry -------------------------------------------------------- */
 static double plot_x(void) { return MARGIN + PLOT_LABEL; }
 static double plot_w(void) { return zmc.width - MARGIN - plot_x(); }
-static double plot_top(void) { return 150; }	/* page points */
+static double plot_top(void) { return zmc_header_h() + 46; }	/* page points: 150 in portrait */
+/* In landscape the screen is about 360 points tall: the plot leaves room for
+ * its labels and the readout under it. */
+static double plot_h(void) {
+	if (!zmc_landscape()) return 230;
+	double h = zmc.height - plot_top() - 70;
+	return h < 120 ? 120 : h > 230 ? 230 : h;
+}
 static double fx(double f) { return plot_x() + plot_w() * log(f / F_MIN) / log(F_MAX / F_MIN); }
 static double xf(double x) {
 	double t = (x - plot_x()) / plot_w();
@@ -299,6 +306,11 @@ static void rect(double x, double y, double w, double h, double r, double g, dou
 		zmc_gpu_rect(x, y - scroll_off(), w, h, r, g, b);
 	}
 }
+/* a grey of the plot's grid, as far from the background in light as in dark
+ * (the dark one's near-black lines were a heavy mesh on a light page) */
+static double grid(double k) {
+	return zmc.theme == ZMC_THEME_LIGHT ? 1 - k : k;
+}
 static void rgbc(uint32_t c, double k, double *r, double *g, double *b) {
 	*r = ((c >> 16) & 255) / 255.0 * k;
 	*g = ((c >> 8) & 255) / 255.0 * k;
@@ -309,20 +321,24 @@ static void draw_plot(void) {
 	double px = plot_x(), pw = plot_w(), top = plot_top(), r, g, b;
 	/* grid: every 6 dB, the 0 dB line stronger; decades and their tens */
 	for (int d = -12; d <= 12; d += 6) {
-		rect(px, gy(d) - (d == 0 ? 1 : 0.5), pw, d == 0 ? 2 : 1, d == 0 ? 0.42 : 0.2, d == 0 ? 0.42 : 0.2, d == 0 ? 0.42 : 0.2);
+		double k = grid(d == 0 ? 0.42 : 0.2);
+		rect(px, gy(d) - (d == 0 ? 1 : 0.5), pw, d == 0 ? 2 : 1, k, k, k);
 	}
-	rect(px, top - 0.5, pw, 1, 0.2, 0.2, 0.2);
-	rect(px, top + PLOT_H - 0.5, pw, 1, 0.2, 0.2, 0.2);
+	rect(px, top - 0.5, pw, 1, grid(0.2), grid(0.2), grid(0.2));
+	rect(px, top + PLOT_H - 0.5, pw, 1, grid(0.2), grid(0.2), grid(0.2));
 	for (double dec = 10; dec < 20000; dec *= 10) {
 		for (int m = 1; m < 10; m++) {
 			double f = dec * m;
 			if (f < F_MIN || f > F_MAX) continue;
-			double k = (m == 1) ? 0.34 : 0.14;
+			double k = grid((m == 1) ? 0.34 : 0.14);
 			rect(fx(f) - 0.5, top, 1, PLOT_H, k, k, k);
 		}
 	}
 	/* the curve: dim accent between it and 0 dB, the line in accent */
 	rgbc(zmc.accent, 0.40, &r, &g, &b);
+	if (zmc.theme == ZMC_THEME_LIGHT) {
+		r += 0.6; g += 0.6; b += 0.6;	/* the accent at 40 % over the background, white here */
+	}
 	const double step = 2.0;
 	int n = (int)(pw / step);
 	double y0 = gy(0), prev = 0;
@@ -346,14 +362,16 @@ static void draw_plot(void) {
 		rect(px + i * step, lo - 1.3, step + 0.6, h, r, g, b);
 	}
 	(void)prev;
-	/* the handles: squares, as Metro draws them */
+	/* the handles: squares, as Metro draws them, in the accent and the ink */
+	uint32_t ink = zmc_fg_color();
+	double ir = ((ink >> 16) & 255) / 255.0, ig = ((ink >> 8) & 255) / 255.0, ib = (ink & 255) / 255.0;
 	for (int i = 0; i < N_BANDS; i++) {
 		double x = fx(p->b[i].f), y = gy(p->b[i].g);
 		if (i == S.sel) {
 			rect(x - 14, y - 14, 28, 28, r, g, b);
-			rect(x - 10, y - 10, 20, 20, 1, 1, 1);
+			rect(x - 10, y - 10, 20, 20, ir, ig, ib);
 		} else {
-			rect(x - 9, y - 9, 18, 18, 1, 1, 1);
+			rect(x - 9, y - 9, 18, 18, ir, ig, ib);
 			rect(x - 6, y - 6, 12, 12, r * 0.9, g * 0.9, b * 0.9);
 		}
 	}
@@ -374,7 +392,7 @@ static void readout_text(cairo_t *cr, double y) {
 	snprintf(part[2], 48, "%+.1f dB   Q %.2f", b->g, b->q);
 	double x = MARGIN, size = 19;
 	for (int i = 0; i < 3; i++) {
-		if (i == 0) cairo_set_source_rgb(cr, 1, 1, 1); else zmc_accent(cr);
+		if (i == 0) zmc_fg(cr); else zmc_accent(cr);
 		zmc_text(cr, part[i], FONT_SEMILIGHT, size, x, y, 0);
 		x += zmc_text_width(part[i], FONT_SEMILIGHT, size) + 16;
 	}
@@ -387,6 +405,11 @@ static double readout_y;	/* page points */
 
 static void readout_update(void) {
 	int scale = S.png ? 1 : zmc.scale;
+	if (readout_surface && cairo_image_surface_get_width(readout_surface) != (int)(zmc.width * scale)) {
+		/* (the window has a new width: the old one would be stretched) */
+		cairo_surface_destroy(readout_surface);
+		readout_surface = NULL;
+	}
 	if (!readout_surface) {
 		readout_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
 			(int)(zmc.width * scale), (int)(READOUT_H * scale));
@@ -430,7 +453,8 @@ static void chip(cairo_t *cr, double x, double y, double w, const char *label, b
 		cairo_set_line_width(cr, 2);
 		cairo_rectangle(cr, x + 1, y + 1, w - 2, h - 2);
 		cairo_stroke(cr);
-		cairo_set_source_rgb(cr, 0.9, 0.9, 0.9);
+		double k = grid(0.9);	/* near the ink: near-white was unseen on a light page */
+		cairo_set_source_rgb(cr, k, k, k);
 	}
 	zmc_text_centred(cr, label, FONT_SEMIBOLD, 13.5, x + w / 2, y + 9);
 	zmc_add_hit(x, y, w, h, action, arg);
@@ -490,7 +514,7 @@ static double draw_eq(cairo_t *cr) {
 	zmc_button(cr, MARGIN + w3 + 8, y, w3, "Q  +", A_QUP, 0);
 	zmc_button(cr, MARGIN + 2 * (w3 + 8), y, w3, "reset band", A_BAND_RESET, 0);
 	y += 54;
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	snprintf(line, sizeof(line), "preamp   %+.1f dB", p->preamp);
 	zmc_text(cr, line, FONT_SEMILIGHT, 21, MARGIN, y + 6, 0);
 	zmc_button(cr, zmc.width - MARGIN - 128, y, 60, "-", A_PREAMP_DOWN, 0);
@@ -678,7 +702,7 @@ static bool touch(int phase, int id, double x, double y, uint32_t time) {
 	if (zmc.page != P_EQ) return false;
 	double py = y + zmc.scroll;
 	if (phase == 0) {
-		if (y < ZMC_HEADER_H || !in_plot(x, py)) return false;
+		if (y < zmc_header_h() || !in_plot(x, py)) return false;
 		int best = -1;
 		double bd = 34 * 34;
 		for (int i = 0; i < N_BANDS; i++) {

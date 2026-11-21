@@ -416,14 +416,21 @@ static double shape(enum curve c, double w, double t) {
 
 static double lerp(double a, double b, double t) { return a + (b - a) * t; }
 
-/* The four rows, drawn once at the screen's scale and kept as textures. */
+/* The four rows, drawn once at the screen's scale and kept as textures; made
+ * again when the window has a new width (the phone turned). */
 static cairo_surface_t *cards[STAGE_ROWS];
 static double card_w;
 
 static void cards_make(void) {
 	static const char *labels[STAGE_ROWS] = { "wi-fi", "bluetooth", "theme", "display" };
-	if (cards[0]) {
+	if (cards[0] && card_w == zmc.width - 2 * ZMC_MARGIN) {
 		return;
+	}
+	for (int r = 0; r < STAGE_ROWS; r++) {
+		if (cards[r]) {
+			cairo_surface_destroy(cards[r]);
+			cards[r] = NULL;
+		}
 	}
 	int sc = zmc.scale > 0 ? zmc.scale : 1;
 	card_w = zmc.width - 2 * ZMC_MARGIN;
@@ -468,7 +475,7 @@ static void card_quad(cairo_surface_t *card, double x, double y, double w, doubl
 }
 
 static double stage_top(void) {
-	return ZMC_HEADER_H + 120;
+	return zmc_header_h() + 120;
 }
 
 /* The preview page's moving part, every frame on the GPU. */

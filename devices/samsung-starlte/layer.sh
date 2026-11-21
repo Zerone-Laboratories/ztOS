@@ -30,6 +30,14 @@ install -m755 "$DEVROOT/power/rtc/initialize-calendar.py" \
 install -m644 "$DEVROOT/prebuilts/power/zrn-sleep-init.ko" \
 	"$DEVROOT/prebuilts/power/zrn-exynos-rtc.ko" \
 	"$DEVROOT/prebuilts/power/exynos9810_acpm_tmu.fw" "$PW/mif-trial/"
+# the cameras: loaded by hand with zrn-cam-probe, never at boot
+install -Dm755 "$DEVROOT/camera/driver/zrn-cam-probe" "$R/usr/local/sbin/zrn-cam-probe"
+install -Dm644 "$DEVROOT/camera/driver/90-zrn-cam.rules" "$R/etc/udev/rules.d/90-zrn-cam.rules"
+if [ -f "$DEVROOT/camera/driver/zrn-cam.ko" ]; then
+	install -Dm644 "$DEVROOT/camera/driver/zrn-cam.ko" "$R/var/lib/zrn-cam/zrn-cam.ko"
+else
+	echo "WARNING: no camera/driver/zrn-cam.ko: this image has no camera driver" >&2
+fi
 install -Dm644 -t "$R/usr/lib/firmware/brcm" "$DEVROOT"/firmware/bcmdhd* "$DEVROOT"/firmware/nvram*
 install -Dm644 "$DEVROOT/third_party/s9plus/firmware/bcm4361B2_semco.hcd" \
 	"$R/usr/lib/firmware/brcm/BCM.samsung,starlte.hcd"

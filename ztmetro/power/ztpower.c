@@ -478,7 +478,7 @@ static double draw_page_sleep(cairo_t *cr) {
 	// Large, crisp percentage number
 	char cap_str[16];
 	snprintf(cap_str, sizeof(cap_str), "%d%%", pdata.capacity);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, cap_str, FONT_LIGHT, 56, ZMC_MARGIN, y, 0);
 	y += 62;
 
@@ -612,6 +612,14 @@ static void clock_label(time_t t, char *out, size_t sz) {
 	strftime(out, sz, "%H:%M", &tm);
 }
 
+/* An x-axis tick label: wall-clock HH:MM, with the weekday when the run spans
+ * more than a day so two identical HH:MM from different days are not confused. */
+static void axis_label(time_t t, char *out, size_t sz, bool with_day) {
+	struct tm tm;
+	localtime_r(&t, &tm);
+	strftime(out, sz, with_day ? "%a %H:%M" : "%H:%M", &tm);
+}
+
 static double draw_page_drain(cairo_t *cr) {
 	double y = zmc_pivot_next(cr, "drain", "history", ACT_TAB, PAGE_HISTORY);
 	double w = zmc.width - 2 * ZMC_MARGIN;
@@ -634,7 +642,7 @@ static double draw_page_drain(cairo_t *cr) {
 	/* the headline: how much has gone, and how fast */
 	char big[32];
 	snprintf(big, sizeof(big), "%d%%", used_pct);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, big, FONT_LIGHT, 56, ZMC_MARGIN, y, 0);
 	y += 62;
 
@@ -647,8 +655,9 @@ static double draw_page_drain(cairo_t *cr) {
 	zmc_text(cr, sub, FONT_REGULAR, 13.5, ZMC_MARGIN, y, 0);
 	y += 30;
 
-	/* the graph: percent over time, the sleeps shaded under it */
-	double gx = ZMC_MARGIN + 30, gw = w - 30, gy = y, gh = 190;
+	/* the graph: percent over time, the sleeps shaded under it; 190 points
+	 * tall, less where the screen is short (landscape), to stay on it */
+	double gx = ZMC_MARGIN + 30, gw = w - 30, gy = y, gh = fmin(190, fmax(120, zmc.height - 200));
 	int hi = a->percent, lo = a->percent;
 	for (int i = 0; i < drain.n; i++) {
 		if (drain.s[i].percent > hi) hi = drain.s[i].percent;
@@ -664,7 +673,10 @@ static double draw_page_drain(cairo_t *cr) {
 #define GX(when) (gx + gw * (double)((when) - a->t) / tspan)
 #define GY(p) (gy + gh * (double)(hi - (p)) / (hi - lo))
 
-	cairo_set_source_rgb(cr, 0.16, 0.16, 0.16);
+	/* the sleeps: a shade a little off the background (near-black was a dark
+	 * slab on a light page) */
+	double nap = zmc.theme == ZMC_THEME_LIGHT ? 0.84 : 0.16;
+	cairo_set_source_rgb(cr, nap, nap, nap);
 	for (int i = 0; i < drain.n_naps; i++) {
 		double x0 = GX(drain.naps[i][0] < a->t ? a->t : drain.naps[i][0]);
 		double x1 = GX(drain.naps[i][1] > b->t ? b->t : drain.naps[i][1]);
@@ -705,16 +717,35 @@ static double draw_page_drain(cairo_t *cr) {
 #undef GX
 #undef GY
 
-	char t0[16], t1[16];
-	clock_label(a->t, t0, sizeof(t0));
-	clock_label(b->t, t1, sizeof(t1));
+	/* the x-axis: wall-clock ticks evenly across the span. The sample times are
+	 * real epoch seconds (zrn-batlog writes `epoch pct charge online avg`), so a
+	 * tick at a->t + span*k/ticks maps to gx + gw*k/ticks and carries that time.
+	 * The weekday is added when the run is longer than a day. */
+	bool multiday = span >= 20 * 3600;
+	const int ticks = multiday ? 3 : 4;
 	cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);
-	zmc_text(cr, t0, FONT_REGULAR, 11, gx, gy + gh + 4, 0);
-	const char *end = drain.plugged ? t1 : "now";
-	zmc_text(cr, end, FONT_REGULAR, 11, gx + gw - zmc_text_width(end, FONT_REGULAR, 11),
-		 gy + gh + 4, 0);
-	y = gy + gh + 22;
-	cairo_set_source_rgb(cr, 0.16, 0.16, 0.16);
+	cairo_set_line_width(cr, 1);
+	for (int k = 0; k <= ticks; k++) {
+		time_t tt = a->t + (time_t)llround((double)span * k / ticks);
+		double tx = gx + gw * (double)k / ticks;
+		char lab[24];
+		/* on battery the last sample is the present: label the right end "now" */
+		if (k == ticks && !drain.plugged)
+			snprintf(lab, sizeof(lab), "now");
+		else
+			axis_label(tt, lab, sizeof(lab), multiday);
+		double tw = zmc_text_width(lab, FONT_REGULAR, 11);
+		double lx = k == 0 ? tx : k == ticks ? tx - tw : tx - tw / 2;
+		if (lx < gx) lx = gx;
+		if (lx + tw > gx + gw) lx = gx + gw - tw;
+		zmc_text(cr, lab, FONT_REGULAR, 11, lx, gy + gh + 6, 0);
+		double mx = round(tx) + 0.5;
+		cairo_move_to(cr, mx, gy + gh);
+		cairo_line_to(cr, mx, gy + gh + 3);
+		cairo_stroke(cr);
+	}
+	y = gy + gh + 24;
+	cairo_set_source_rgb(cr, nap, nap, nap);
 	cairo_rectangle(cr, ZMC_MARGIN, y + 3, 10, 10);
 	cairo_fill(cr);
 	cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);

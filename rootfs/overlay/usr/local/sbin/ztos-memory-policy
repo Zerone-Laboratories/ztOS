@@ -15,6 +15,9 @@ fi
 if [ -b /dev/zram0 ] && ! awk '$1 == "/dev/zram0" { found=1 } END { exit !found }' /proc/swaps; then
     swapon -p 100 /dev/zram0
 fi
+# zram: read back only the faulting page; read-ahead of 8 pages only adds delay
+# to every fault (the shell's frames while swapping)
+echo 0 > /proc/sys/vm/page-cluster
 
 # LXC puts Android outside the container service's cgroup. Reclaim softly;
 # leave memory.max unlimited so this policy never imposes an Android OOM cap.

@@ -51,6 +51,10 @@ class Settings:
         return WORK / self.target
 
 
+# the zrn-sdk an image carries; a change here is a change to what apps run on
+ZRN_SDK_COMMIT = "93341760775f0f4fea048b895e11402ae952e487"
+
+
 def say(*words):
     print("ztos:", *words, flush=True)
 
@@ -82,7 +86,7 @@ def packages(target: str) -> list:
 def check_host():
     """What building needs on this computer."""
     missing = []
-    for tool in ("unshare", "newuidmap", "bsdtar", "mkfs.fat", "mcopy", "mmd", "sfdisk", "python3"):
+    for tool in ("unshare", "newuidmap", "bsdtar", "mkfs.fat", "mcopy", "mmd", "sfdisk", "python3", "xz"):
         if shutil.which(tool) is None:
             missing.append(tool)
     if not Path("/usr/bin/mke2fs").exists() and not Path("/usr/sbin/mke2fs").exists():
@@ -212,6 +216,13 @@ sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$GSIVERSION\"/" "$R/usr/src/zto
 ch sh -c 'cd /usr/src/ztos-ial && make clean >/dev/null 2>&1; make && make install PREFIX=/usr'
 rm -rf "$R/usr/src/ztos-ial"
 
+# zrn-sdk, at a pinned commit: git checks the object name, so this is that tree.
+# ztOS apps (.zexec) need libzrnui and zrn-exec from it.
+step "installing zrn-sdk (what ztOS apps run on)"
+rm -rf "$R/usr/src/zrn-sdk"; mkdir -p "$R/usr/src/zrn-sdk"
+ch sh -c "cd /usr/src/zrn-sdk && git init -q && git fetch -q --depth 1 https://github.com/Zerone-Laboratories/zrn-sdk $ZRNSDK && git checkout -q --detach FETCH_HEAD && [ \"\$(git rev-parse HEAD)\" = $ZRNSDK ] && make install PREFIX=/usr"
+rm -rf "$R/usr/src/zrn-sdk"
+
 step "building ztMETRO and its apps"
 rm -rf "$R/usr/src/ztmetro"; mkdir -p "$R/usr/src"
 cp -a "$SRC/ztmetro" "$R/usr/src/ztmetro"
@@ -272,7 +283,7 @@ install -d "$S/lib/ztos"
 install -m644 "$SRC"/sdk/runtime/ztos/*.py "$S/lib/ztos/"
 ch python3 -m compileall -q /etc/skel/.local/share/ztos/lib > /dev/null || true
 
-step "installing ztOS's apps (Welcome, Updates)"
+step "installing ztOS's apps (Welcome, Music)"
 install -d "$R/usr/local/lib/ztos/apps" "$R/usr/local/share/applications" "$R/usr/local/share/icons/hicolor/scalable/apps"
 for f in "$STAGEDIR"/apps/*.desktop; do
 	id=$(basename "$f" .desktop)
@@ -325,7 +336,7 @@ step "turning on ztOS's services"
 # (systemd-pstore: the kernel log of a crash or hang is kept in /var/lib/systemd/pstore)
 # (zrnperfd: the CPU and GPU clocks from ztOSIAL's Perf1; without it the
 # GPU rests at its lowest step and ztMETRO lags)
-for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoresensorframework ztos-update-check.timer \
+for u in greetd NetworkManager systemd-resolved sshd systemd-pstore ztos-pstore-keep ztoscoru ztos-update-check.timer \
 		ztos-iald zrnperfd waydroid-container ztos-waydroid-images; do
 	ch systemctl enable "$u" > /dev/null 2>&1
 done
@@ -389,7 +400,7 @@ def run_stage(s: Settings, log: Path) -> None:
         "ROOTIMG": str(s.dir / "root.img"), "SIZE": str(s.size_gb), "MKE2FS": mke2fs,
         "LABEL": "ZR_ARCH" if s.target == "starlte" else "ztos-root",
         "PKGCACHE": str(PKGCACHE),
-        "DEVDIR": DEVICES.get(s.target, ""), "GSIVERSION": gsi_version(),
+        "DEVDIR": DEVICES.get(s.target, ""), "GSIVERSION": gsi_version(), "ZRNSDK": ZRN_SDK_COMMIT,
         # the device layer: devices/<dir> here; after the repository split, a
         # checkout of the device's own repository (ZTOS_DEVICE=<path>)
         "DEVSRC": os.environ.get("ZTOS_DEVICE") or str(ROOT / "devices" / DEVICES.get(s.target, "none")),

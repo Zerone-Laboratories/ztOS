@@ -1,0 +1,34 @@
+#!/bin/sh
+# Install the ztOS crash-notify drop-in into every ztOS service that is meant
+# to keep running. The drop-in restarts a daemon that dies and gives up after
+# five starts in ten minutes; that limit counts every start, so it must never
+# reach a job that is started over and over on purpose: a oneshot, or anything
+# a timer, path or socket starts. From those the drop-in is taken away again
+# (an earlier version of this script gave it to them, and a timer's job that
+# runs every minute was refused after its fifth run).
+SRC=/usr/local/share/ztos/zrn-crash.conf
+changed=no
+for u in $(systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' \
+          | grep -E '^(zrn-|ztos-|ztoscore|ztoscoru|ztoscsf|ztoscirrus)' | grep '\.service$'); do
+	d="/etc/systemd/system/$u.d"
+	keep=yes
+	case "$u" in zrn-usb-watchdog.service|zrn-cpuidle-reset.service|zrn-testmode-restore.service|*@.service) keep=no;; esac
+	case "$(systemctl show "$u" -p Type --value 2>/dev/null)" in simple|exec|notify|notify-reload|dbus|forking) ;; *) keep=no;; esac
+	[ -z "$(systemctl show "$u" -p TriggeredBy --value 2>/dev/null)" ] || keep=no
+	if [ "$keep" = yes ]; then
+		cmp -s "$SRC" "$d/zrn-crash.conf" && continue	# already in place: nothing to do
+		mkdir -p "$d"; cp "$SRC" "$d/zrn-crash.conf"; changed=yes
+	elif [ -e "$d/zrn-crash.conf" ]; then
+		rm -f "$d/zrn-crash.conf"; rmdir "$d" 2>/dev/null; changed=yes
+		systemctl reset-failed "$u" 2>/dev/null	# forget a start limit it was held by
+		echo "crash policy taken off $u (not a long-running service)"
+	fi
+done
+# Reloading systemd takes about two seconds in the middle of the boot, and this
+# runs at every boot: only when a drop-in was really added, changed or removed.
+if [ "$changed" = yes ]; then
+	systemctl daemon-reload
+	echo "applied crash policy to the long-running ztOS services"
+else
+	echo "crash policy already in place; nothing changed"
+fi

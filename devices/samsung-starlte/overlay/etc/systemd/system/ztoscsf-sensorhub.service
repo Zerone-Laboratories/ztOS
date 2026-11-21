@@ -5,7 +5,7 @@ After=multi-user.target
 [Service]
 ExecStartPre=/usr/local/sbin/ztoscsf-sensorhub
 ExecStart=/usr/local/sbin/ztoscsf-sensorhub --run
-# ztoscsf owns the two recovery attempts. Do not restart a dead hub forever.
+# ztOSCOR-U (ztoscoru) owns the two recovery attempts. Do not restart a dead hub forever.
 Restart=no
 KillMode=control-group
 TimeoutStopSec=5

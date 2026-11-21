@@ -1,0 +1,45 @@
+[Unit]
+# The ztOS logo and, below it, what systemd is starting, from the first
+# moment of userspace until the shell takes the display; then the same tree
+# published in /run/ztos-splash/tree for the shell to draw under its own
+# logo, until the shell creates /run/ztos-splash/done. Nothing depends on it
+# and nothing waits for it: it orders itself after nothing, so it starts in
+# systemd's first batch, and no unit orders itself after it.
+# docs/bootsplash/README.md. Off: systemctl mask ztos-splash.service,
+# or touch /etc/ztos/nosplash, or ztos.nosplash on the kernel command line.
+Description=ztOS boot splash
+DefaultDependencies=no
+ConditionPathExists=/dev/fb0
+ConditionPathExists=!/etc/ztos/nosplash
+ConditionKernelCommandLine=!ztos.nosplash
+# the initramfs (stage 2) gave the screen to the text console: keep it there
+ConditionPathExists=!/run/ztos-nosplash
+# a rescue or emergency shell, and shutdown, get the text console back
+# (stopping it runs ExecStopPost, which binds the console again unless the
+# shell has the display)
+Conflicts=shutdown.target emergency.service rescue.service
+Before=shutdown.target emergency.service rescue.service
+
+[Service]
+Type=simple
+# Drawing (before the hand-over): the text console comes back when no shell
+# has the display 120 s in, when no job changes for 60 s, or when
+# zboot-charge-hold (low battery, it talks on the console) has held 6 s.
+# Publishing (after it): until the shell's `done`, at most 300 s in all.
+ExecStart=/usr/local/bin/ztos-splash --boot --timeout 120 --stall 60 --lifetime 300 --yield zboot-charge-hold.service:6
+# after any end, a crash or a kill included: the text console back unless
+# the shell took the display (the program clears the mark when it does)
+ExecStopPost=-/usr/local/bin/ztos-splash --restore
+Restart=no
+# /run/ztos-splash: the tree for the shell; the program gives it to the
+# shell's user (for `done`); systemd removes it when the splash ends
+RuntimeDirectory=ztos-splash
+RuntimeDirectoryMode=0755
+# a backstop to the program's own 300 s
+RuntimeMaxSec=330
+TimeoutStopSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target

@@ -34,12 +34,41 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include "zrnvibe.h"
 
 #include "zrnmetrocore.h"
 #include "zrnboard.h"
 #include "comm.h"
 #include "contact-photo.h"
+
+/* A test of the call screens without a call: ZTPHONE_FAKE_CALL=FILE reads the
+ * call ("call=incoming", "call_number=...") from FILE instead of the modem
+ * daemon's report, and nothing is told to the modem. */
+static const char *fake_call(void) {
+	const char *f = getenv("ZTPHONE_FAKE_CALL");
+	return f && f[0] ? f : NULL;
+}
+static void phone_value(const char *key, char *out, size_t size) {
+	const char *fake = fake_call();
+	if (!fake) {
+		modem_value(key, out, size);
+		return;
+	}
+	char line[160];
+	size_t len = strlen(key);
+	out[0] = 0;
+	FILE *f = fopen(fake, "r");
+	while (f && fgets(line, sizeof(line), f)) {
+		if (!strncmp(line, key, len) && line[len] == '=') {
+			line[strcspn(line, "\r\n")] = 0;
+			snprintf(out, size, "%s", line + len + 1);
+		}
+	}
+	if (f) fclose(f);
+}
+#define modem_value phone_value
+#define modem_tell(...) (fake_call() ? true : modem_tell(__VA_ARGS__))
 
 #define MARGIN ZMC_MARGIN
 
@@ -211,7 +240,60 @@ static bool ring_vibration(char *pattern, size_t size) {
 	return ring_volume() ? ring != 0 : silent != 0;
 }
 
+/* The keys while a call rings (the owner, 2026-11-21): power once silences
+ * the ringer and the vibration (the call goes on ringing on the screen),
+ * volume down rejects it as "ignore" does. The shell has the keys; it is told
+ * here whether the call rings ("ringing on|off" on its control pipe) and
+ * passes a press back as a word in $XDG_RUNTIME_DIR/ztphone-callkey, which
+ * is acted on only if this call is still incoming: what is sure of the call
+ * is this app, so a stale word never rejects one. */
+static bool ring_silenced, ring_told;
+
+static void ring_tell(bool on) {
+	if (on == ring_told) return;
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	char path[300];
+	snprintf(path, sizeof(path), "%s/ztmetro.ctl", runtime ? runtime : "/run/user/1000");
+	int fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) return;
+	const char *line = on ? "ringing on\n" : "ringing off\n";
+	if (write(fd, line, strlen(line)) == (ssize_t)strlen(line)) ring_told = on;
+	close(fd);
+}
+
+static void activate(int action, int arg);
+
+static void call_keys_take(void) {
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	char path[300], word[16] = "";
+	snprintf(path, sizeof(path), "%s/ztphone-callkey", runtime ? runtime : "/run/user/1000");
+	FILE *f = fopen(path, "r");
+	if (!f) return;
+	if (!fgets(word, sizeof(word), f)) word[0] = 0;
+	fclose(f);
+	unlink(path);
+	word[strcspn(word, "\r\n")] = 0;
+	bool ringing = !strcmp(state, "incoming") && !ending;
+	fprintf(stderr, "ztphone: call key '%s'%s%s\n", word, ringing ? "" : " (not ringing: ignored)",
+		fake_call() ? " (test call: nothing to the modem)" : "");
+	if (!ringing) return;
+	if (!strcmp(word, "silence")) {
+		ring_silenced = true;
+		sound_stop();	/* (and the vibration with it) */
+	} else if (!strcmp(word, "reject")) {
+		activate(ACT_HANGUP, 0);	/* exactly the "ignore" button */
+	}
+}
+
 static void call_sound(void) {
+	bool rings = !strcmp(state, "incoming") && !ending;
+	if (!rings) ring_silenced = false;
+	ring_tell(rings && !ring_silenced);
+	if (fake_call()) return;	/* (a test: no ring, no vibration) */
+	if (rings && ring_silenced) {
+		sound_stop();
+		return;
+	}
 	if (!strcmp(state, "incoming")) {
 		char file[80];
 		ringtone(file, sizeof(file));
@@ -357,12 +439,12 @@ static double draw_history(cairo_t *cr) {
 		describe(c, detail, sizeof(detail));
 		when_text(c->at, when, sizeof(when));
 		/* the round button rings back; the rest opens the call */
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_round_button(cr, MARGIN + 22, y + 2, "call", "", ACT_REDIAL, i);
 		double tw = zmc_text_width(when, FONT_REGULAR, 13);
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 		zmc_text(cr, when, FONT_REGULAR, 13, zmc.width - MARGIN - tw, y + 6, 0);
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text_line(cr, name_of(c->number), FONT_SEMILIGHT, 24, MARGIN + 58, y, zmc.width - MARGIN - 58 - tw - 14);
 		if (missed) {
 			zmc_accent(cr);
@@ -473,7 +555,7 @@ static void draw_suggestions(cairo_t *cr, double y, double bottom) {
 		const char *num = number_has(c->mobile, digits) ? c->mobile :
 			number_has(c->other, digits) ? c->other : t9_word(c->name, digits) ? c->mobile : NULL;
 		if (!num || !num[0] || !strcmp(num, digits)) continue;
-		cairo_set_source_rgb(cr, 1, 1, 1);
+		zmc_fg(cr);
 		zmc_text_line(cr, c->name, FONT_REGULAR, 16, MARGIN, y + 1, zmc.width * 0.55);
 		zmc_accent(cr);
 		zmc_text_line(cr, num, FONT_REGULAR, 13.5, MARGIN, y + 21, zmc.width - 2 * MARGIN);
@@ -506,7 +588,7 @@ static void contacts_row_draw(cairo_t *cr, int row) {
 	}
 	const struct contact *c = &contacts[v];
 	contact_tile(cr, MARGIN, 7, 48, c->name, c->uid);
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text_line(cr, c->name, FONT_SEMILIGHT, 24, MARGIN + 60, 6, zmc.width - 2 * MARGIN - 60);
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text_line(cr, c->mobile[0] ? c->mobile : c->other, FONT_REGULAR, 13.5, MARGIN + 60, 37, zmc.width - 2 * MARGIN - 60);
@@ -580,7 +662,7 @@ static double draw_keypad(cairo_t *cr) {
 	double y = zmc_pivot_next(cr, "keypad", "contacts", ZMC_ACT_PIVOT, P_CONTACTS) - 14;
 	/* the number so far, and under it whose it is */
 	double size = strlen(digits) > 13 ? 26 : 34;
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	zmc_text(cr, digits, FONT_LIGHT, size, MARGIN, y + (34 - size) / 2, zmc.width - 2 * MARGIN - 50);
 	if (digits[0]) {
 		const char *name = name_of(digits);
@@ -637,11 +719,11 @@ static double draw_keypad(cairo_t *cr) {
 	int actions[2] = { ACT_DIAL, ACT_SAVE };
 	for (int i = 0; i < 2; i++) {
 		double x = MARGIN + i * (bw + 10);
-		cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);
+		cairo_set_source_rgb(cr, 0.4, 0.4, 0.4);	/* a muted grey outline, visible on either theme */
 		cairo_set_line_width(cr, 1.5);
 		cairo_rectangle(cr, x + 0.75, btn_y + 0.75, bw - 1.5, btn_h - 1.5);
 		cairo_stroke(cr);
-		cairo_set_source_rgb(cr, 0.92, 0.92, 0.92);
+		zmc_fg(cr);	/* the label follows the theme: black in light, white in dark (was near-white, invisible in light) */
 		zmc_text_centred(cr, words[i], FONT_REGULAR, 16, x + bw / 2, btn_y + 12);
 		zmc_add_hit(x, btn_y, bw, btn_h, actions[i], 0);
 	}
@@ -651,10 +733,157 @@ static double draw_keypad(cairo_t *cr) {
 
 /* ---- a call --------------------------------------------------------------- */
 
+/* The call screen's flat background, exactly: the shell keys this colour out
+ * of the window and shows what is behind the call there, blurred and grainy
+ * under it (zrn-frosted-diffusion), asked for with `backdrop` on its control
+ * pipe while the call page is in front. */
+#define CALL_BG		0x1a1a1a
+static bool backdrop_told;
+static void backdrop_tell(bool on) {
+	if (on == backdrop_told) return;
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	char path[300], line[64];
+	snprintf(path, sizeof(path), "%s/ztmetro.ctl", runtime ? runtime : "/run/user/1000");
+	int fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) return;
+	if (on) snprintf(line, sizeof(line), "backdrop ztphone %06x\n", CALL_BG);
+	else snprintf(line, sizeof(line), "backdrop ztphone off\n");
+	if (write(fd, line, strlen(line)) == (ssize_t)strlen(line)) backdrop_told = on;
+	close(fd);
+}
+
+/* ---- the call's panels flipping in and out --------------------------------
+ *
+ * The Lumia 530's PhoneShellUI.dll (the CallProgress overlay ShellChrome
+ * loads): the shell shows this window flat over the call's backdrop, and the
+ * call's panels flip about their own X axes, each on its own keyframes:
+ *   FlipInIncomingCall    pivot 0.5: -40 deg held to 360 ms, Log 50 to 0 at 600; seen from 350
+ *   FlipOutIncomingCall   0 to 90 deg by 220 ms, Exp 10; gone at 220
+ *   FlipInButtonStripOnShow   pivot 0.5: -90 deg held to 250 ms, Log 150 to 0 at 500; seen from 250
+ *   FlipOutButtonStripOnHide  0 held to 250 ms, Exp 10 to 90 at 500; gone at 500
+ * The top edge goes away from the eye both ways. Iris's Log and Exp curves at
+ * weight w are taken as 1 - (1 - t)^k and t^k, k = 1 + w / ZTPHONE_FLIP_K
+ * (50; the native formula is not pinned down). While they move the page is
+ * the plain background (keyed out by the shell: the blur shows) and the
+ * panels are quads of one picture of the page (call_flip_overlay). */
+static uint32_t flip_in_at, flip_out_at;	/* when each began (0: not) */
+static bool flip_in_done;
+static cairo_surface_t *flip_img;
+static unsigned flip_rev;
+static double flip_split;	/* points: where the button strip begins (the main panel above it) */
+#define FLIP_IN_MS	600
+#define FLIP_OUT_MS	500
+
+static double flip_k(double weight) {
+	static double div;
+	if (!div) {
+		const char *e = getenv("ZTPHONE_FLIP_K");
+		div = e && atof(e) > 0 ? atof(e) : 50.0;
+	}
+	return 1.0 + weight / div;
+}
+static double flip_log(double t, double w) {
+	t = t < 0 ? 0 : t > 1 ? 1 : t;
+	return 1.0 - pow(1.0 - t, flip_k(w));
+}
+static double flip_exp(double t, double w) {
+	t = t < 0 ? 0 : t > 1 ? 1 : t;
+	return pow(t, flip_k(w));
+}
+static bool flip_moving(void) {
+	return flip_out_at || (flip_in_at && !flip_in_done);
+}
+
+/* one panel, (x, y, w, h) in points, of the page's picture, turned `deg` about its middle line */
+static void flip_panel(double y, double h, double deg) {
+	if (h <= 0 || !flip_img) return;
+	double a = fabs(deg) * M_PI / 180, c[4][3], k = (double)zmc.scale;
+	for (int i = 0; i < 4; i++) {
+		double u = ((i & 2) ? h : 0) - h / 2;
+		c[i][0] = (i & 1) ? zmc.width : 0;
+		c[i][1] = y + h / 2 + u * cos(a);
+		c[i][2] = u * sin(a);	/* (the top edge away from the eye) */
+	}
+	zmc_gpu_quad_region(flip_img, flip_rev, 0, y * k, zmc.width * k, h * k, c, 1.0);
+}
+
+static void call_flip_overlay(int page) {
+	if (page != P_CALL || !flip_moving()) return;
+	uint32_t now = zmc_now_ms();
+	double main_deg = 0, strip_deg = 0;
+	bool main_seen = true, strip_seen = true;
+	if (flip_out_at) {
+		double t = (int32_t)(now - flip_out_at);
+		main_seen = t < 220;
+		main_deg = 90 * flip_exp(t / 220.0, 10);
+		strip_seen = t < 500;
+		strip_deg = t < 250 ? 0 : 90 * flip_exp((t - 250) / 250.0, 10);
+		if (t >= FLIP_OUT_MS) {
+			zmc_quit();
+			return;
+		}
+	} else {
+		double t = (int32_t)(now - flip_in_at);
+		main_seen = t >= 350;
+		main_deg = t < 360 ? -40 : -40 * (1 - flip_log((t - 360) / 240.0, 50));
+		strip_seen = t >= 250;
+		strip_deg = t < 250 ? -90 : -90 * (1 - flip_log((t - 250) / 250.0, 150));
+		if (t >= FLIP_IN_MS) {
+			flip_in_done = true;
+			zmc_redraw();	/* the page itself again, flat */
+			return;
+		}
+	}
+	if (main_seen) flip_panel(0, flip_split, main_deg);
+	if (strip_seen) flip_panel(flip_split, zmc.height - flip_split, strip_deg);
+	zmc_present();
+}
+
+/* The call's panels out, then the window goes (zmc_quit, at the end) */
+static void call_flip_out(void) {
+	if (flip_out_at) return;
+	flip_out_at = zmc_now_ms();
+	if (!flip_out_at) flip_out_at = 1;
+	zmc_redraw();
+}
+
+static double draw_call_body(cairo_t *cr);
+
 static double draw_call(cairo_t *cr) {
-	bool incoming = !strcmp(state, "incoming"), active = !strcmp(state, "active");
-	cairo_set_source_rgb(cr, 0.10, 0.10, 0.10);
+	cairo_set_source_rgb(cr, ((CALL_BG >> 16) & 0xff) / 255.0, ((CALL_BG >> 8) & 0xff) / 255.0,
+		(CALL_BG & 0xff) / 255.0);
 	cairo_paint(cr);
+	backdrop_tell(true);
+	if (!flip_in_at && !strcmp(state, "incoming") && !getenv("ZTPHONE_NO_FLIP")) {
+		flip_in_at = zmc_now_ms();
+		if (!flip_in_at) flip_in_at = 1;
+	}
+	if (!flip_moving()) {
+		return draw_call_body(cr);
+	}
+	/* moving: the page is its background; the panels are drawn from a
+	 * picture of it, on the GPU, by call_flip_overlay */
+	int k = zmc.scale > 0 ? zmc.scale : 1;
+	if (!flip_img || cairo_image_surface_get_width(flip_img) != zmc.width * k ||
+			cairo_image_surface_get_height(flip_img) != zmc.height * k) {
+		if (flip_img) cairo_surface_destroy(flip_img);
+		flip_img = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, zmc.width * k, zmc.height * k);
+	}
+	cairo_t *ic = cairo_create(flip_img);
+	cairo_scale(ic, k, k);
+	cairo_set_source_rgb(ic, ((CALL_BG >> 16) & 0xff) / 255.0, ((CALL_BG >> 8) & 0xff) / 255.0,
+		(CALL_BG & 0xff) / 255.0);
+	cairo_paint(ic);
+	draw_call_body(ic);
+	cairo_destroy(ic);
+	cairo_surface_flush(flip_img);
+	flip_rev++;
+	return zmc.height;
+}
+
+static double draw_call_body(cairo_t *cr) {
+	bool incoming = !strcmp(state, "incoming"), active = !strcmp(state, "active");
+	flip_split = zmc.height - 150;
 	double w = zmc.width - 2 * MARGIN, y = 34;
 	zmc_accent(cr);
 	zmc_text(cr, ending ? "CALL ENDED" : incoming ? "INCOMING CALL" : active ? "IN CALL" : "CALLING",
@@ -743,7 +972,7 @@ static double draw_entry(cairo_t *cr) {
 	double y = zmc_header(cr, "call");
 	const char *name = name_of(entry);
 	bool known = strcmp(name, entry) != 0;
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 	y += zmc_text(cr, name, FONT_LIGHT, 32, MARGIN, y - 8, zmc.width - 2 * MARGIN) + 8;
 	y = zmc_entry(cr, y, "call", entry, ACT_ENTRY_CALL, 0);
 	y = zmc_entry(cr, y, "text", entry, ACT_ENTRY_TEXT, 0);
@@ -766,7 +995,7 @@ static double draw_entry(cairo_t *cr) {
 		if (!strcmp(calls[i].type, "missed")) {
 			zmc_accent(cr);
 		} else {
-			cairo_set_source_rgb(cr, 1, 1, 1);
+			zmc_fg(cr);
 		}
 		zmc_text(cr, detail, FONT_REGULAR, 15, MARGIN, y, zmc.width - 2 * MARGIN);
 		y += 26;
@@ -847,9 +1076,12 @@ static void dial(const char *who) {
 }
 
 /* The call is over on this page, now: its sound, "call ended", and away. */
+static void ring_tell(bool on);
 static void call_over(const char *result) {
 	answered_at = 0;
 	sound_stop();
+	ring_tell(false);
+	if (!fake_call())	/* (a test: silent, as it rang silent) */
 	sound_play(!strcmp(result, "busy") ? "Disconnct.wav" : !strcmp(result, "drop") ? "Calldrop.wav" : "Busy.wav", false);
 	ending = true;
 	ended_at = zmc_now_ms();
@@ -1134,6 +1366,7 @@ static const char *call_seen(const char *now) {
 /* How the call stands, from the modem daemon's report: four times a second.
  * This is the only place the report reaches the page. */
 static void tick(void) {
+	if (zmc.page != P_CALL) backdrop_tell(false);
 	while (waitpid(-1, NULL, WNOHANG) > 0) {}
 	char now[16], who[40];
 	modem_value("call", now, sizeof(now));
@@ -1156,7 +1389,7 @@ static void tick(void) {
 			ending = false;
 			number[0] = 0;
 			if (call_screen_only) {
-				zmc_quit();
+				call_flip_out();	/* the panels flip out, then it quits */
 				return;
 			}
 			want_page(came_from);
@@ -1207,6 +1440,7 @@ static void tick(void) {
 	if (on_call() && page_wanted < 0 && zmc.page != P_CALL && !page_moving()) {
 		want_page(P_CALL);	/* whatever turned away from a call in progress */
 	}
+	call_keys_take();
 	call_sound();
 	settle();
 }
@@ -1219,6 +1453,7 @@ static void tab_arrived(int page) {
 static const struct zmc_app phone = {
 	.app_id = "ztphone", .title = "Phone", .caps = "PHONE",
 	.render = render, .activate = activate, .back = back, .text = typed, .hold = hold, .arrived = tab_arrived,
+	.overlay = call_flip_overlay,
 };
 
 int main(int argc, char **argv) {

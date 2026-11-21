@@ -1,0 +1,283 @@
+diff --git a/ztmetro/notifyd/ztnotifyd.c b/ztmetro/notifyd/ztnotifyd.c
+index 2de5eb5..dd93275 100644
+--- a/ztmetro/notifyd/ztnotifyd.c
++++ b/ztmetro/notifyd/ztnotifyd.c
+@@ -33,7 +33,9 @@
+  * Everything goes to the shell as lines down its control pipe
+  * ($XDG_RUNTIME_DIR/ztmetro.ctl): "notifyh ICON|APP|TITLE|TEXT" (ICON says
+  * whose picture to draw: the sender's desktop entry, else its icon name, and
+- * "notifyqh" is the same without alerting), "media
++ * "notifyqh" is the same without alerting; "notifyx ID|ICON|APP|TITLE|TEXT" and
++ * "notifyxq" for one that replaces by ID and opens when tapped, "notifyclose ID"
++ * to take it away), "media
+  * STATE|TITLE|ARTIST|PLAYER". Its own state is in $XDG_RUNTIME_DIR/ztnotifyd.status.
+  */
+ #define _GNU_SOURCE
+@@ -115,7 +117,17 @@ static int method_notify(sd_bus_message *m, void *userdata, sd_bus_error *error)
+ 	 * (a download's percent; Android only alerts once for those) */
+ 	bool quiet = false;
+ 	const char *entry = NULL;
+-	if (sd_bus_message_skip(m, "as") >= 0 && sd_bus_message_enter_container(m, 'a', "{sv}") > 0) {
++	/* An app offering "default" wants to hear of a tap */
++	bool has_default = false;
++	char **actions = NULL;
++	if (sd_bus_message_read_strv(m, &actions) >= 0 && actions) {
++		for (char **a = actions; a[0] && a[1]; a += 2)
++			has_default = has_default || !strcmp(a[0], "default");
++		for (char **a = actions; *a; a++)
++			free(*a);
++		free(actions);
++	}
++	if (sd_bus_message_enter_container(m, 'a', "{sv}") > 0) {
+ 		while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
+ 			const char *key = NULL, *type = NULL;
+ 			int on = 0;
+@@ -153,19 +165,49 @@ static int method_notify(sd_bus_message *m, void *userdata, sd_bus_error *error)
+ 	clean(b, sizeof(b), body);
+ 	if (a[0] >= 'a' && a[0] <= 'z')
+ 		a[0] -= 32;	/* "firefox" reads better as "Firefox" */
+-	fprintf(stderr, "ztnotifyd: %s: %s\n", a, s);
+-	shell_tell("%s %s|%s|%s|%s", quiet ? "notifyqh" : "notifyh", who, a, s[0] ? s : b, s[0] ? b : "");
+-	return sd_bus_reply_method_return(m, "u", replaces ? replaces : next_id++);
++	/* (the app's name only: a title can be a person's) */
++	fprintf(stderr, "ztnotifyd: a notification from %s\n", a);
++	uint32_t id = replaces ? replaces : next_id++;
++	if (has_default)
++		shell_tell("%s %u|%s|%s|%s|%s", quiet ? "notifyxq" : "notifyx", id, who, a, s[0] ? s : b, s[0] ? b : "");
++	else
++		shell_tell("%s %s|%s|%s|%s", quiet ? "notifyqh" : "notifyh", who, a, s[0] ? s : b, s[0] ? b : "");
++	return sd_bus_reply_method_return(m, "u", id);
++}
++
++static void emit_closed(uint32_t id, uint32_t reason)
++{
++	sd_bus_emit_signal(bus, "/org/freedesktop/Notifications", "org.freedesktop.Notifications",
++		"NotificationClosed", "uu", id, reason);
+ }
+ 
+ static int method_close(sd_bus_message *m, void *userdata, sd_bus_error *error)
+ {
++	uint32_t id = 0;
++	int r = sd_bus_message_read(m, "u", &id);
++	if (r < 0)
++		return r;
++	shell_tell("notifyclose %u", id);
++	emit_closed(id, 3);	/* closed by a call to CloseNotification */
++	return sd_bus_reply_method_return(m, "");
++}
++
++/* The shell's tap on a notification that offered "default" (ztnotifyd --invoke) */
++static int method_invoke(sd_bus_message *m, void *userdata, sd_bus_error *error)
++{
++	uint32_t id = 0;
++	int r = sd_bus_message_read(m, "u", &id);
++	if (r < 0)
++		return r;
++	sd_bus_emit_signal(bus, "/org/freedesktop/Notifications", "org.freedesktop.Notifications",
++		"ActionInvoked", "us", id, "default");
++	emit_closed(id, 2);	/* dismissed by the user */
+ 	return sd_bus_reply_method_return(m, "");
+ }
+ 
+ static int method_capabilities(sd_bus_message *m, void *userdata, sd_bus_error *error)
+ {
+-	return sd_bus_reply_method_return(m, "as", 1, "body");
++	return sd_bus_reply_method_return(m, "as", 2, "body", "actions");
+ }
+ 
+ static int method_information(sd_bus_message *m, void *userdata, sd_bus_error *error)
+@@ -184,6 +226,12 @@ static const sd_bus_vtable notifications_vtable[] = {
+ 	SD_BUS_VTABLE_END
+ };
+ 
++static const sd_bus_vtable ztos_vtable[] = {
++	SD_BUS_VTABLE_START(0),
++	SD_BUS_METHOD("Invoke", "u", "", method_invoke, SD_BUS_VTABLE_UNPRIVILEGED),
++	SD_BUS_VTABLE_END
++};
++
+ /* ---- 2. what is playing ---------------------------------------------------- */
+ 
+ static long media_look_at;	/* a player said something: look, a moment later */
+@@ -598,8 +646,19 @@ static void on_usr1(int sig)
+ 
+ /* ---- the loop --------------------------------------------------------------- */
+ 
+-int main(void)
++int main(int argc, char **argv)
+ {
++	if (argc == 3 && !strcmp(argv[1], "--invoke")) {
++		/* one tap, from the shell: it must not block a frame on the bus */
++		sd_bus *caller = NULL;
++		int called = sd_bus_open_user(&caller);
++		if (called >= 0)
++			called = sd_bus_call_method(caller, "org.freedesktop.Notifications",
++				"/org/freedesktop/Notifications", "org.ztos.Notifications1", "Invoke",
++				NULL, NULL, "u", (uint32_t)strtoul(argv[2], NULL, 10));
++		sd_bus_flush_close_unref(caller);
++		return called < 0;
++	}
+ 	runtime_dir = getenv("XDG_RUNTIME_DIR");
+ 	if (!runtime_dir) {
+ 		fprintf(stderr, "ztnotifyd: no XDG_RUNTIME_DIR\n");
+@@ -619,6 +678,9 @@ int main(void)
+ 	} else {
+ 		r = sd_bus_add_object_vtable(bus, NULL, "/org/freedesktop/Notifications",
+ 			"org.freedesktop.Notifications", notifications_vtable, NULL);
++		if (r >= 0)
++			r = sd_bus_add_object_vtable(bus, NULL, "/org/freedesktop/Notifications",
++				"org.ztos.Notifications1", ztos_vtable, NULL);
+ 		if (r >= 0)
+ 			r = sd_bus_request_name(bus, "org.freedesktop.Notifications",
+ 				SD_BUS_NAME_REPLACE_EXISTING | SD_BUS_NAME_ALLOW_REPLACEMENT);
+diff --git a/ztmetro/ztmetro.c b/ztmetro/ztmetro.c
+index 0e0a776..3c41098 100644
+--- a/ztmetro/ztmetro.c
++++ b/ztmetro/ztmetro.c
+@@ -639,6 +639,7 @@ struct zt_server {
+ 	struct {
+ 		char app[32], title[48], text[200];
+ 		char who[96];		/* whose it is, as the sender said (note_key) */
++		uint32_t nid;		/* ztnotifyd's id, when a tap is to reach its sender */
+ 		time_t at;
+ 		bool expanded;		/* tapped in the action centre: all of its text */
+ 	} notes[MAX_NOTES];
+@@ -7928,6 +7929,21 @@ static void modem_tell(const char *line) {
+ 	}
+ }
+ 
++/* A notification goes from the list, by its place in it. */
++static void note_remove(struct zt_server *server, int i) {
++	memmove(&server->notes[i], &server->notes[i + 1], sizeof(server->notes[0]) * (size_t)(server->n_notes - i - 1));
++	server->n_notes--;
++	server->notes_dirty = true;
++	lock_notes_changed(server);
++}
++
++/* A tap on a notification whose sender offered to open: it hears of it. */
++static void note_invoke(uint32_t nid) {
++	char id[16];
++	snprintf(id, sizeof(id), "%u", nid);
++	run_detached("ztnotifyd", "--invoke", id, NULL);
++}
++
+ static void shade_activate(struct zt_server *server, int index) {
+ 	if (index >= 8) {
+ 		hap(server, HAP_TICK, HG_SYSTEM);
+@@ -8045,6 +8061,15 @@ static void shade_activate(struct zt_server *server, int index) {
+ 		break;
+ 	default:
+ 		if (index >= 20 && index - 20 < server->n_notes) {
++			if (server->notes[index - 20].nid) {
++				/* its sender opens it */
++				note_invoke(server->notes[index - 20].nid);
++				note_remove(server, index - 20);
++				draw_shade(server);
++				shade_set_open(server, false);
++				damage(server);
++				break;
++			}
+ 			/* a notification: opened to all of its text, or shut again */
+ 			server->notes[index - 20].expanded = !server->notes[index - 20].expanded;
+ 			server->notes_dirty = true;
+@@ -10034,7 +10059,7 @@ static void note_add_from(struct zt_server *server, const char *who, const char
+ 	if (server->n_notes < MAX_NOTES) {
+ 		server->n_notes++;
+ 	}
+-	wlr_log(WLR_INFO, "notification: %s: %s", title, text);
++	wlr_log(WLR_INFO, "notification from %s", app);	/* (never who or what: a log is kept) */
+ 	ui_sound(server, UIS_NOTIFY);
+ 	if (server->width == 0) {
+ 		return;	/* no screen yet: it is in the list when there is one */
+@@ -10050,6 +10075,44 @@ static void note_add_from(struct zt_server *server, const char *who, const char
+ 	damage(server);
+ }
+ 
++/* notifyx: one notification by its sender's id. A new message for it moves it to
++ * the top and alerts; a quiet one changes it where it is. */
++static void note_by_id(struct zt_server *server, uint32_t nid, bool quiet, const char *who,
++		const char *app, const char *title, const char *text) {
++	int i = 0;
++	while (i < server->n_notes && server->notes[i].nid != nid)
++		i++;
++	if (i < server->n_notes && quiet) {
++		snprintf(server->notes[i].title, sizeof(server->notes[i].title), "%s", title);
++		snprintf(server->notes[i].text, sizeof(server->notes[i].text), "%s", text);
++		server->notes_dirty = true;
++		if (server->width == 0) {
++			return;
++		}
++		if (server->shade_open || server->shade_h > 0.1f) {
++			draw_shade(server);
++		}
++		lock_notes_changed(server);
++		damage(server);
++		return;
++	}
++	if (i < server->n_notes) {
++		note_remove(server, i);
++	}
++	if (quiet) {
++		note_quiet(server, who, app, title, text);
++		for (i = 0; i < server->n_notes; i++) {
++			if (!server->notes[i].nid && !strcmp(server->notes[i].app, app) && !strcmp(server->notes[i].title, title)) {
++				server->notes[i].nid = nid;
++				break;
++			}
++		}
++	} else {
++		note_add_from(server, who, app, title, text);
++		server->notes[0].nid = nid;
++	}
++}
++
+ static void note_add(struct zt_server *server, const char *app, const char *title, const char *text) {
+ 	note_add_from(server, "", app, title, text);
+ }
+@@ -11073,7 +11136,12 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
+ 		return;
+ 	}
+ 	if (server->toast_y > 0.5f && y < TOAST_H) {
+-		/* a finger on a notification's banner puts it away */
++		/* a finger on a notification's banner puts it away, and opens it
++		 * if its sender can (behind the lock, it stays in the list) */
++		if (!server->locked && server->n_notes > 0 && server->notes[0].nid) {
++			note_invoke(server->notes[0].nid);
++			note_remove(server, 0);
++		}
+ 		wl_event_source_timer_update(server->toast_timer, 0);
+ 		toast_hide(server);
+ 		p->role = ROLE_NONE;
+@@ -12264,6 +12332,32 @@ static void ctl_command(struct zt_server *server, char *line) {
+ 			*bar = *second = 0;
+ 			note_quiet(server, "", line + 8, bar + 1, second + 1);
+ 		}
++	} else if (strncmp(line, "notifyx ", 8) == 0 || strncmp(line, "notifyxq ", 9) == 0) {
++		/* notifyx ID|WHO|APP|TITLE|TEXT, from ztnotifyd: see note_by_id */
++		bool quiet = line[7] == 'q';
++		char *num = line + (quiet ? 9 : 8);
++		char *who = strchr(num, '|'), *app = who ? strchr(who + 1, '|') : NULL;
++		char *title = app ? strchr(app + 1, '|') : NULL;
++		char *text = title ? strchr(title + 1, '|') : NULL;
++		if (text) {
++			*who++ = 0;
++			*app++ = 0;
++			*title++ = 0;
++			*text++ = 0;
++			note_by_id(server, (uint32_t)strtoul(num, NULL, 10), quiet, who, app, title, text);
++		}
++	} else if (strncmp(line, "notifyclose ", 12) == 0) {
++		uint32_t nid = (uint32_t)strtoul(line + 12, NULL, 10);
++		for (int i = 0; nid && i < server->n_notes; i++) {
++			if (server->notes[i].nid == nid) {
++				note_remove(server, i);
++				if (server->width && (server->shade_open || server->shade_h > 0.1f)) {
++					draw_shade(server);
++				}
++				damage(server);
++				break;
++			}
++		}
+ 	} else if (strncmp(line, "notifyh ", 8) == 0 || strncmp(line, "notifyqh ", 9) == 0) {
+ 		/* notifyh WHO|APP|TITLE|TEXT, from ztnotifyd: WHO says whose it is */
+ 		bool quiet = line[6] == 'q';

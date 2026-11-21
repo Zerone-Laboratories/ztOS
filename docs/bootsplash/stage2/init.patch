@@ -1,0 +1,100 @@
+--- a/initramfs/init
++++ b/initramfs/init
+@@ -33,6 +33,75 @@
+ 	sed -n "s/.*\b$1=\([^ ]*\).*/\1/p" /proc/cmdline
+ }
+ 
++# --- splash (docs/bootsplash/STAGE2.md) ---------------------------------------
++# The kernel keeps fbcon off the screen (fbcon=map:9) and uniLoader has drawn
++# the ztOS logo already. Here the same picture goes into the display driver's
++# own buffer, which userspace's splash then draws its tree into, and once the
++# root is mounted the user's theme replaces it if it is the other one. The text
++# comes back, with the whole log so far, when volume down is held now, with
++# zboot.text=1, with /etc/ztos/nosplash on the root, in the rescue shell and
++# when switch_root fails; /run/ztos-nosplash then keeps userspace's splash off.
++# Without /bin/zboot-fb in the initramfs none of this happens.
++SPLASH=
++SPLASH_PID=
++splash_show() {	# dark | light, in the background
++	( zcat /splash-$1.raw.gz 2>/dev/null | zboot-fb paint && echo "$1" > /run/zboot.splash ) &
++	SPLASH_PID=$!
++}
++splash_wait() {
++	[ -n "$SPLASH_PID" ] && wait "$SPLASH_PID" 2>/dev/null
++	SPLASH_PID=
++}
++text_console() {
++	[ -n "$SPLASH" ] || return 0
++	SPLASH=
++	splash_wait
++	: > /run/ztos-nosplash
++	zboot-fb console && log "text console on the screen: $*"
++}
++if [ -x /bin/zboot-fb ]; then
++	SPLASH=1
++	if [ "$(arg zboot.text)" = 1 ]; then
++		text_console "zboot.text=1"
++	elif zboot-fb key 114; then
++		text_console "volume down held"
++	else
++		splash_show "$(cat /splash-theme 2>/dev/null || echo dark)"
++	fi
++fi
++
++# After the root is mounted: the theme of the user greetd logs in (the shell's
++# splash is in it), read as ztos-splash reads it. At a scale of the user's own
++# the logo is not where the shell draws it: the picture is left as it is and
++# userspace's splash paints its own.
++splash_theme() {
++	[ -n "$SPLASH" ] || return 0
++	r=/newroot
++	if [ -e $r/etc/ztos/nosplash ]; then
++		text_console "/etc/ztos/nosplash"
++		return 0
++	fi
++	u=$(sed -n '/^\[initial_session\]/,/^\[/s/^[[:space:]]*user[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
++		$r/etc/greetd/config.toml 2>/dev/null | head -n 1)
++	home=$(awk -F: -v u="$u" '$1 == u { print $6 }' $r/etc/passwd 2>/dev/null)
++	cfg=$r$home/.config/ztmetro/config
++	val() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*/\1/p" "$cfg" 2>/dev/null | tail -n 1; }
++	theme=dark
++	case "$(val theme)" in light|1) theme=light ;; esac
++	case "$(val style)" in dotmatrix|1) theme=dark ;; esac
++	splash_wait
++	shown=$(cat /run/zboot.splash 2>/dev/null)
++	case "$(val scale)/$(val display_size)" in
++	/|auto/|/normal|auto/normal) ;;
++	*) log "splash: ${shown:-no} logo; a scale of its own is left to userspace"; return 0 ;;
++	esac
++	if [ "$theme" != "$shown" ]; then
++		splash_show "$theme"
++		splash_wait
++	fi
++	log "splash: $(cat /run/zboot.splash 2>/dev/null || echo no) logo for ${u:-nobody}"
++}
++
+ log "===== zboot on $(uname -r), $(cat /proc/device-tree/model 2>/dev/null) ====="
+ log "cpus online: $(cat /sys/devices/system/cpu/online)  mem: $(awk '/MemTotal/{printf "%d MB", $2/1024}' /proc/meminfo)"
+ 
+@@ -122,6 +191,7 @@
+ 
+ rescue() {
+ 	log "rescue shell: $*"
++	text_console "rescue shell"
+ 	touch /run/zboot.hold 2>/dev/null
+ 	usb_up
+ 	cp "$LOG" /run/zboot.rescue 2>/dev/null
+@@ -153,6 +223,7 @@
+ 	umount /newroot
+ 	rescue "no /sbin/init on ZR_ARCH"
+ }
++splash_theme
+ 
+ # The gadget goes with the initramfs: the root system builds its own.
+ if [ -d /sys/kernel/config/usb_gadget/zboot ]; then
+@@ -175,4 +246,5 @@
+ exec switch_root /newroot /sbin/init
+ 
+ echo "zboot| switch_root failed" > /dev/kmsg
++text_console "switch_root failed"
+ exec sh -i </dev/console >/dev/console 2>&1

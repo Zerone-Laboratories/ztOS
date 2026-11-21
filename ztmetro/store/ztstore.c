@@ -1,3 +1,7 @@
+#ifdef HAVE_RSVG
+#include <strings.h>
+#include <librsvg/rsvg.h>
+#endif
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * ztstore: the ztOS App Store. Apps from the repos in pacman.conf and from the
@@ -12,6 +16,7 @@
  * through root services (install.c).
  */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -27,6 +32,7 @@
 #include "jobs.h"
 #include "search.h"
 #include "sections.h"
+#include "ztapps.h"
 #include "zrnmetrocore.h"
 
 #define MARGIN		ZMC_MARGIN
@@ -38,11 +44,11 @@
 #define LIST_MAX	100	/* rows on one page (each is a hit; the core keeps 160) */
 #define GREY		0.6
 
-enum page { P_TOP, P_CATS, P_INSTALLED, P_SEARCH, P_LIST, P_DETAIL, P_PROGRESS };
+enum page { P_TOP, P_CATS, P_INSTALLED, P_SEARCH, P_LIST, P_DETAIL, P_PROGRESS, P_ZAPPS, P_ZAPP, P_DETAIL_MORE, P_ZAPP_MORE };
 enum action {
 	ACT_PKG = 1, ACT_SEARCHBOX, ACT_FILTER, ACT_SEE_ALL, ACT_CAT, ACT_GROUP, ACT_INSTALL, ACT_REMOVE,
 	ACT_OPEN, ACT_UPDATE, ACT_PROGRESS, ACT_CANCEL, ACT_DONE, ACT_CHECK_UPDATES, ACT_UPDATE_ALL,
-	ACT_RECIPE, ACT_FIND, ACT_RETRY,
+	ACT_RECIPE, ACT_FIND, ACT_RETRY, ACT_LROW, ACT_ZAPP, ACT_ZINSTALL, ACT_ZREMOVE, ACT_ZOPEN, ACT_ZREFRESH,
 };
 
 /* ---- what the pages show (touched only on the main loop) ------------------------- */
@@ -106,7 +112,7 @@ static void grey(cairo_t *cr) {
 }
 
 static void white(cairo_t *cr) {
-	cairo_set_source_rgb(cr, 1, 1, 1);
+	zmc_fg(cr);
 }
 
 /* A page title: the core's own where it fits, else smaller and wrapped. */
@@ -142,7 +148,8 @@ static double note(cairo_t *cr, double y, const char *text) {
  * loading, so the page keeps its shape and nothing pops in or jumps about as
  * the cached lists and then the network lists arrive. */
 static void skel_box(cairo_t *cr, double x, double y, double w, double h) {
-	cairo_set_source_rgba(cr, 1, 1, 1, 0.07);
+	uint32_t ink = zmc_fg_color();	/* a faint wash of the page's ink: white was unseen on a light page */
+	cairo_set_source_rgba(cr, ((ink >> 16) & 255) / 255.0, ((ink >> 8) & 255) / 255.0, (ink & 255) / 255.0, 0.07);
 	cairo_rectangle(cr, x, y, w, h);
 	cairo_fill(cr);
 }
@@ -188,11 +195,7 @@ static void meta_of(const struct pkg *p, char *out, size_t size) {
 }
 
 /* One package: its tile, its name, a line about it, and where it is from. */
-static double row(cairo_t *cr, double y, struct pkg *p) {
-	int idx = add_row(p);
-	if (idx < 0) {
-		return y;
-	}
+static void row_paint(cairo_t *cr, double y, struct pkg *p) {
 	double x = MARGIN + 68, w = zmc.width - x - MARGIN;
 	draw_tile(cr, MARGIN, y, 56, p);
 	white(cr);
@@ -214,6 +217,14 @@ static double row(cairo_t *cr, double y, struct pkg *p) {
 	char meta[128];
 	meta_of(p, meta, sizeof(meta));
 	zmc_text_line(cr, meta, FONT_REGULAR, 11.5, x + bw + 8, y + 43, w - bw - 8);
+}
+
+static double row(cairo_t *cr, double y, struct pkg *p) {
+	int idx = add_row(p);
+	if (idx < 0) {
+		return y;
+	}
+	row_paint(cr, y, p);
 	zmc_add_hit(0, y - 6, zmc.width, 70, ACT_PKG, idx);
 	return y + 76;
 }
@@ -318,7 +329,16 @@ static void free_retired(void) {
 static void start_load(void);
 
 /* the first half: the phone's own packages and lists from cached copies */
+static void lrows_forget(void);
+static void apply_load_(void *arg);
 static void apply_load(void *arg) {
+	zmc_list_lock(true);
+	lrows_forget();
+	apply_load_(arg);
+	lrows_forget();
+	zmc_list_lock(false);
+}
+static void apply_load_(void *arg) {
 	struct load *l = arg;
 	rows_forget();
 	if (ri) {
@@ -367,10 +387,13 @@ static void apply_load(void *arg) {
 static void load_done(void *arg) {
 	struct load *l = arg;
 	if (l->sections.n) {
+		zmc_list_lock(true);
+		lrows_forget();
 		rows_forget();
 		vec_free(&sections, section_free);
 		sections = l->sections;
 		memset(&l->sections, 0, sizeof(l->sections));
+		zmc_list_lock(false);
 	}
 	free_load(l);
 	loading = false;
@@ -623,7 +646,384 @@ static struct pkg *spotlight(int *from) {
 	return NULL;
 }
 
+static double detail_head(cairo_t *cr, const char *title, const char *tab, const char *next, int next_page);
+static void action_band(cairo_t *cr, double y, double h);
+
+/* ---- long pages as a zmc_list, as People's: rows are painted once on the core's
+ * thread and then only moved, icons are decoded there, and no page-sized texture
+ * is ever uploaded when a page changes. What rows read changes under the list lock. */
+enum lkind { L_SPOT0, L_SPOT1, L_HEAD, L_PKG, L_NOTE, L_SKEL, L_CAT0, L_CAT1, L_GROUP, L_HEADC };
+struct lrow { int kind, sec; struct pkg *p; const char *t, *c; };
+#define LROWS_MAX 900
+#define CAT_ROW 57.0
+/* one table for each page: a neighbouring tab is drawn ahead while another is in front */
+enum { SET_TOP, SET_LIST, SET_MINE, SET_CATS, SETS };
+static struct { struct lrow r[LROWS_MAX]; int n; uint64_t rev; bool built; } lset[SETS];
+
+/* the data changed: nothing may read the old rows again (under the list lock) */
+static void lrows_forget(void) {
+	for (int i = 0; i < SETS; i++) {
+		lset[i].n = 0;
+		lset[i].built = false;
+		lset[i].rev += 8;
+	}
+}
+static struct section *spot_sec;
+
+static void lrows_add(int set, int kind, int sec, struct pkg *p, const char *t, const char *c) {
+	if (lset[set].n < LROWS_MAX) lset[set].r[lset[set].n++] = (struct lrow){ kind, sec, p, t, c };
+}
+
+static void lrow_draw(cairo_t *cr, int set, int i) {
+	if (i >= lset[set].n) return;
+	struct lrow *r = &lset[set].r[i];
+	switch (r->kind) {
+	case L_SPOT0: case L_SPOT1: {
+		struct pkg *spot = r->p;
+		double w = zmc.width - 2 * MARGIN, h = 150, y = r->kind == L_SPOT0 ? 0 : -76;
+		cairo_save(cr);
+		cairo_rectangle(cr, 0, 0, zmc.width, 76);
+		cairo_clip(cr);
+		zmc_accent(cr);
+		cairo_rectangle(cr, MARGIN, y, w, h);
+		cairo_fill(cr);
+		draw_tile_shaded(cr, MARGIN + w - 76, y + 14, 62, spot);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		char caps[200];
+		snprintf(caps, sizeof(caps), "TOP OF \u201c%s\u201d", r->t);
+		for (char *c = caps; *c; c++) *c = (*c >= 'a' && *c <= 'z') ? *c - 32 : *c;
+		zmc_text_line(cr, caps, FONT_SEMIBOLD, 10.5, MARGIN + 14, y + 14, w - 104);
+		zmc_text_line(cr, pkg_title(spot), FONT_LIGHT, 30, MARGIN + 14, y + 66, w - 28);
+		zmc_text_line(cr, pkg_blurb(spot), FONT_REGULAR, 13, MARGIN + 14, y + 112, w - 28);
+		cairo_restore(cr);
+		break;
+	}
+	case L_HEAD:
+		if (r->sec >= 0) {
+			grey(cr);
+			double sw = zmc_text_width("see all", FONT_REGULAR, 14);
+			zmc_text(cr, "see all", FONT_REGULAR, 14, zmc.width - MARGIN - sw, 28, 0);
+		}
+		/* one line: a fixed row has no room for a title to wrap into its caption */
+		white(cr);
+		zmc_text_line(cr, r->t, FONT_SEMILIGHT, 24, MARGIN, r->c ? 14 : 28, zmc.width - 2 * MARGIN - (r->sec >= 0 ? 70 : 0));
+		if (r->c) {
+			grey(cr);
+			zmc_text_line(cr, r->c, FONT_REGULAR, 12, MARGIN, 50, zmc.width - 2 * MARGIN);
+		}
+		break;
+	case L_PKG:
+		row_paint(cr, 6, r->p);
+		break;
+	case L_CAT0: case L_CAT1: {
+		double gap = 10, cell = (zmc.width - 2 * MARGIN - 2 * gap) / 3, ty = r->kind == L_CAT0 ? 0 : -CAT_ROW;
+		cairo_save(cr);
+		cairo_rectangle(cr, 0, 0, zmc.width, CAT_ROW);
+		cairo_clip(cr);
+		for (int k = 0; k < 3 && r->sec + k < cats.n; k++) {
+			struct facet *f = cats.v[r->sec + k];
+			double x = MARGIN + k * (cell + gap);
+			zmc_accent(cr);
+			cairo_rectangle(cr, x, ty, cell, CAT_ROW * 2 - gap);
+			cairo_fill(cr);
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			char count[16];
+			snprintf(count, sizeof(count), "%d", f->count);
+			double cw = zmc_text_width(count, FONT_REGULAR, 11);
+			zmc_text(cr, count, FONT_REGULAR, 11, x + cell - cw - 8, ty + 6, 0);
+			zmc_text(cr, f->label, FONT_REGULAR, 13.5, x + 8, ty + CAT_ROW * 2 - gap - 44, cell - 14);
+		}
+		cairo_restore(cr);
+		break;
+	}
+	case L_GROUP: {
+		struct facet *f = groups.v[r->sec];
+		white(cr);
+		zmc_text_line(cr, f->label, FONT_SEMILIGHT, 21, MARGIN, 4, zmc.width - 2 * MARGIN);
+		grey(cr);
+		char detail[48];
+		snprintf(detail, sizeof(detail), "%d package%s", f->count, f->count == 1 ? "" : "s");
+		zmc_text_line(cr, detail, FONT_REGULAR, 12.5, MARGIN, 32, zmc.width - 2 * MARGIN);
+		break;
+	}
+	case L_HEADC:
+		white(cr);
+		zmc_text_line(cr, r->t, FONT_SEMILIGHT, 24, MARGIN, 4, zmc.width - 2 * MARGIN);
+		grey(cr);
+		if (r->c) zmc_text_line(cr, r->c, FONT_REGULAR, 12, MARGIN, 36, zmc.width - 2 * MARGIN);
+		break;
+	case L_NOTE:
+		grey(cr);
+		zmc_text_line(cr, r->t, FONT_REGULAR, 14, MARGIN, 8, zmc.width - 2 * MARGIN);
+		break;
+	case L_SKEL:
+		skel_row(cr, 6);
+		break;
+	}
+}
+
+static bool lrow_hit(int set, int i, double x, double y, struct zmc_hit *hit) {
+	if (i >= lset[set].n) return false;
+	struct lrow *r = &lset[set].r[i];
+	if (r->kind == L_HEAD && r->sec >= 0) {
+		double sw = zmc_text_width("see all", FONT_REGULAR, 14);
+		if (x < zmc.width - MARGIN - sw - 16) return false;
+		*hit = (struct zmc_hit){ .x = zmc.width - MARGIN - sw - 16, .y = 16, .w = sw + 32, .h = 44, .action = ACT_SEE_ALL, .arg = r->sec };
+		return true;
+	}
+	if (r->kind == L_CAT0 || r->kind == L_CAT1) {
+		double gap = 10, cell = (zmc.width - 2 * MARGIN - 2 * gap) / 3;
+		int k = (int)((x - MARGIN) / (cell + gap));
+		if (k < 0 || k > 2 || r->sec + k >= cats.n) return false;
+		*hit = (struct zmc_hit){ .x = 0, .y = 0, .w = 0, .h = 0, .action = ACT_CAT, .arg = r->sec + k };
+		return true;
+	}
+	if (r->kind == L_GROUP) {
+		*hit = (struct zmc_hit){ .x = 0, .y = 0, .w = zmc.width, .h = CAT_ROW, .action = ACT_GROUP, .arg = r->sec };
+		return true;
+	}
+	if (r->kind == L_PKG || r->kind == L_SPOT0 || r->kind == L_SPOT1) {
+		*hit = (struct zmc_hit){ .x = 0, .y = 0, .w = zmc.width, .h = 76, .action = ACT_LROW, .arg = set * 1000 + i };
+		return true;
+	}
+	return false;
+}
+
+static void draw0(cairo_t *cr, int i) { lrow_draw(cr, 0, i); }
+static void draw1(cairo_t *cr, int i) { lrow_draw(cr, 1, i); }
+static void draw2(cairo_t *cr, int i) { lrow_draw(cr, 2, i); }
+static void draw3(cairo_t *cr, int i) { lrow_draw(cr, 3, i); }
+static bool hit3(int i, double x, double y, struct zmc_hit *h) { return lrow_hit(3, i, x, y, h); }
+static bool hit0(int i, double x, double y, struct zmc_hit *h) { return lrow_hit(0, i, x, y, h); }
+static bool hit1(int i, double x, double y, struct zmc_hit *h) { return lrow_hit(1, i, x, y, h); }
+static bool hit2(int i, double x, double y, struct zmc_hit *h) { return lrow_hit(2, i, x, y, h); }
+
+static double lrows_show(cairo_t *cr, double y, int set) {
+	static void (*const draws[])(cairo_t *, int) = { draw0, draw1, draw2, draw3 };
+	static bool (*const hits[])(int, double, double, struct zmc_hit *) = { hit0, hit1, hit2, hit3 };
+	/* (+ the set: two lists never share a row's texture) */
+	struct zmc_list l = { .count = lset[set].n, .row_h = set == SET_CATS ? CAT_ROW : 76, .revision = lset[set].rev + (uint64_t)set + 16,
+		.draw_row = draws[set], .row_hit = hits[set] };
+	return zmc_list(cr, y, &l) + 24;
+}
+
+/* ---- ztOS apps: the store's own, built from source and signed ---------------------- */
+static struct zapps zapps;
+static bool zapps_busy, zapps_loaded;
+static int zapp_shown = -1;
+static char zapp_note[240];
+
+struct zjob { struct zapps got; bool refresh; char id[128]; bool remove; const char *err; };
+
+static bool zapps_refreshed, zapps_acting, pend_remove;
+static char pend_id[128];
+static bool zapp_confirm;
+static void zapps_start(bool refresh, const char *id, bool remove);
+
+static void zapps_done(void *arg) {
+	struct zjob *j = arg;
+	zapps_free(&zapps);
+	zapps = j->got;
+	zapps_busy = false;
+	zapps_loaded = true;
+	zmc_busy(false);
+	if (j->err && j->err[0]) snprintf(zapp_note, sizeof(zapp_note), "%s", j->err);
+	bool then_refresh = !j->refresh && !j->id[0] && !zapps_refreshed;
+	free(j);
+	zmc_redraw();
+	/* what is held shows at once; the network comes behind it */
+	zapps_acting = false;
+	if (pend_id[0]) {
+		char id[128];
+		snprintf(id, sizeof(id), "%s", pend_id);
+		pend_id[0] = 0;
+		zapps_start(false, id, pend_remove);
+	} else if (then_refresh) {
+		zapps_refreshed = true;
+		zapps_start(true, NULL, false);
+	}
+}
+
+static void zapps_work(void *arg) {
+	struct zjob *j = arg;
+	if (j->id[0]) j->err = j->remove ? zapps_remove(j->id) : zapps_install(j->id);
+	zapps_load(&j->got, j->refresh);
+}
+
+static void zapps_start(bool refresh, const char *id, bool remove) {
+	if (zapps_busy) {
+		/* a refresh on a slow network must not hold up a tap */
+		if (id) { snprintf(pend_id, sizeof(pend_id), "%s", id); pend_remove = remove; zapps_acting = true; zmc_redraw(); }
+		return;
+	}
+	zapps_acting = id != NULL;
+	struct zjob *j = calloc(1, sizeof(*j));
+	j->refresh = refresh;
+	j->remove = remove;
+	if (id) snprintf(j->id, sizeof(j->id), "%s", id);
+	zapps_busy = true;
+	zapp_note[0] = 0;
+	zmc_busy(true);
+	job_run(zapps_work, zapps_done, j);
+}
+
+/* An app's picture from the signed index. false: it has none. */
+static bool zapp_icon(cairo_t *cr, struct zapp *a, double x, double y, double size) {
+#ifdef HAVE_RSVG
+	if (!a->icon_b64 || !a->icon_b64[0]) return false;
+	gsize n = 0;
+	guchar *raw = g_base64_decode(a->icon_b64, &n);
+	RsvgHandle *h = raw ? rsvg_handle_new_from_data(raw, n, NULL) : NULL;
+	g_free(raw);
+	if (!h) return false;
+	RsvgRectangle box = { x, y, size, size };
+	bool ok = rsvg_handle_render_document(h, cr, &box, NULL);
+	g_object_unref(h);
+	return ok;
+#else
+	(void)cr; (void)a; (void)x; (void)y; (void)size;
+	return false;
+#endif
+}
+
+static double draw_zapps(cairo_t *cr) {
+	zmc.pivot_after = "categories";
+	double y = zmc_pivot_next(cr, "ztOS apps", "top", ZMC_ACT_PIVOT, P_TOP);
+	grey(cr);
+	y += zmc_text(cr, "Built by the store from their source and signed. Moderators approve each one.",
+		FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 12;
+	if (zapps.error[0]) {
+		zmc_accent(cr);
+		y += zmc_text(cr, zapps.error, FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 12;
+	}
+	if (zapp_note[0]) {
+		zmc_accent(cr);
+		y += zmc_text(cr, zapp_note, FONT_REGULAR, 14, MARGIN, y, zmc.width - 2 * MARGIN) + 12;
+	}
+	for (int i = 0; i < zapps.n; i++) {
+		struct zapp *a = &zapps.apps[i];
+		char detail[200];
+		snprintf(detail, sizeof(detail), "%s%s", a->update ? "update available: " : a->installed[0] ? "installed: " : "", a->summary);
+		double tile = 56, tx = MARGIN + tile + 12;
+		if (!zapp_icon(cr, a, MARGIN, y, tile)) {
+			zmc_accent(cr);
+			cairo_rectangle(cr, MARGIN, y, tile, tile);
+			cairo_fill(cr);
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			char first[2] = { a->name[0], 0 };
+			zmc_text_centred(cr, first, FONT_SEMILIGHT, 28, MARGIN + tile / 2, y + 8);
+			cairo_new_path(cr);
+		}
+		white(cr);
+		zmc_text_line(cr, a->name, FONT_SEMILIGHT, 25.5, tx, y - 4, zmc.width - tx - MARGIN);
+		grey(cr);
+		zmc_text_line(cr, detail, FONT_REGULAR, 12, tx, y + 31, zmc.width - tx - MARGIN);
+		zmc_add_hit(0, y - 2, zmc.width, 60, ACT_ZAPP, i);
+		y += 68;
+	}
+	if (!zapps.n && !zapps_busy && !zapps.error[0]) {
+		grey(cr);
+		y += zmc_text(cr, "Nothing here yet.", FONT_REGULAR, 16, MARGIN, y, 0) + 12;
+	}
+	for (int i = 0; i < zapps.n_revoked; i++) {
+		char line[300];
+		snprintf(line, sizeof(line), "%s %s was withdrawn: %s", zapps.revoked[i].id, zapps.revoked[i].version, zapps.revoked[i].reason);
+		grey(cr);
+		y += zmc_text(cr, line, FONT_REGULAR, 13, MARGIN, y, zmc.width - 2 * MARGIN) + 8;
+	}
+	y = button(cr, MARGIN, y + 8, zmc.width - 2 * MARGIN, "check the store", ACT_ZREFRESH, 0) + 18;
+	return y + 24;
+}
+
+static double draw_zapp(cairo_t *cr) {
+	if (zapp_shown < 0 || zapp_shown >= zapps.n) return zmc_header(cr, "app");
+	struct zapp *a = &zapps.apps[zapp_shown];
+	double y = detail_head(cr, a->name, "details", "more", P_ZAPP_MORE), w = zmc.width - 2 * MARGIN;
+	double x = MARGIN + 134;
+	if (!zapp_icon(cr, a, MARGIN, y, 120)) {
+		zmc_accent(cr);
+		cairo_rectangle(cr, MARGIN, y, 120, 120);
+		cairo_fill(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		char initial[2] = { a->name[0], 0 };
+		zmc_text_centred(cr, initial, FONT_SEMILIGHT, 56, MARGIN + 60, y + 24);
+		cairo_new_path(cr);
+		white(cr);	/* the name beside it: the page's ink, not the initial's white */
+	}
+	zmc_text_line(cr, a->name, FONT_SEMILIGHT, 24, x, y - 4, zmc.width - x - MARGIN);
+	grey(cr);
+	zmc_text_line(cr, a->update ? "update available" : a->installed[0] ? "installed" : "not installed", FONT_REGULAR, 14, x, y + 94, zmc.width - x - MARGIN);
+	y += 136;
+	white(cr);
+	y += zmc_text(cr, a->summary, FONT_REGULAR, 15, MARGIN, y, w) + 14;
+	char line[300];
+	grey(cr);
+	snprintf(line, sizeof(line), "Publisher: %s", a->author);
+	y += zmc_text(cr, line, FONT_REGULAR, 13, MARGIN, y, w) + 2;
+	snprintf(line, sizeof(line), "version %s", a->version);
+	y += zmc_text(cr, line, FONT_REGULAR, 13, MARGIN, y, w) + 16;
+	if (zapp_note[0]) {
+		zmc_accent(cr);
+		y += zmc_text(cr, zapp_note, FONT_REGULAR, 14, MARGIN, y, w) + 12;
+	}
+	int rows = zapp_confirm ? 3 : (zapps_acting ? 0 : (a->update || !a->installed[0]) + (a->installed[0] ? 1 : 0));
+	action_band(cr, y, (rows ? rows : 1) * 58 + 12);
+	y += 12;
+	if (zapps_acting) {
+		white(cr);
+		zmc_text_centred(cr, "working...", FONT_SEMILIGHT, 17, zmc.width / 2.0, y + 11);
+		cairo_new_path(cr);
+		y += 46;
+	} else {
+		if (a->update || !a->installed[0]) y = button(cr, MARGIN, y, w, a->update ? "update" : "install", ACT_ZINSTALL, 0) + 12;
+		if (a->installed[0] && zapp_confirm) {
+			white(cr);
+			char say[240];
+			snprintf(say, sizeof(say), "This removes %s and deletes everything it stored on this phone.", a->name);
+			y += zmc_text(cr, say, FONT_REGULAR, 15, MARGIN, y, w) + 10;
+			y = button(cr, MARGIN, y, w, "yes, remove and delete", ACT_ZREMOVE, 1) + 12;
+		} else if (a->installed[0]) {
+			y = button(cr, MARGIN, y, w, "remove", ACT_ZREMOVE, 0) + 12;
+		}
+	}
+	return y + 40;
+}
+
+static double draw_zapp_more(cairo_t *cr) {
+	if (zapp_shown < 0 || zapp_shown >= zapps.n) return zmc_header(cr, "app");
+	struct zapp *a = &zapps.apps[zapp_shown];
+	double y = detail_head(cr, a->name, "more", "details", P_ZAPP);
+	y = zmc_field(cr, y, "it asks for", a->permissions[0] ? a->permissions : "nothing");
+	y = zmc_field(cr, y, "licence", a->licence);
+	y = zmc_field(cr, y, "source", a->source);
+	return y + 24;
+}
+
+static void lrows_top(void) {
+	if (lset[SET_TOP].built) return;
+	lset[SET_TOP].built = true;
+	int from = -1;
+	struct pkg *spot = spotlight(&from);
+	if (spot) {
+		struct section *sp = sections.v[from];
+		lrows_add(SET_TOP, L_SPOT0, 0, spot, sp->title, NULL);
+		lrows_add(SET_TOP, L_SPOT1, 0, spot, sp->title, NULL);
+	}
+	for (int i = 0; i < sections.n; i++) {
+		struct section *sc = sections.v[i];
+		int first = i == from ? 1 : 0;
+		lrows_add(SET_TOP, L_HEAD, sc->items.n > first ? i : -1, NULL, sc->title, sc->caption);
+		if (!sc->items.n) {
+			if (loading && !sc->note) for (int k = 0; k < ROWS_SHOWN; k++) lrows_add(SET_TOP, L_SKEL, 0, NULL, NULL, NULL);
+			else lrows_add(SET_TOP, L_NOTE, 0, NULL, sc->note ? sc->note : "Nothing here yet.", NULL);
+			continue;
+		}
+		for (int k = first; k < sc->items.n && k < first + ROWS_SHOWN; k++) lrows_add(SET_TOP, L_PKG, 0, sc->items.v[k], NULL, NULL);
+	}
+}
+
 static double draw_top(cairo_t *cr) {
+	zmc.pivot_after = "installed";
 	double y = zmc_pivot_next(cr, "top", "categories", ZMC_ACT_PIVOT, P_CATS);
 	y = zmc_textbox(cr, y - 8, "search your repos and the AUR", "", false, ACT_SEARCHBOX, 0);
 	if (load_note[0]) {
@@ -646,101 +1046,30 @@ static double draw_top(cairo_t *cr) {
 		}
 		return y + 20;
 	}
-	/* the first list's first package, large */
-	int from = -1;
-	struct pkg *spot = spotlight(&from);
-	if (!spot && loading) {
-		skel_box(cr, MARGIN, y, zmc.width - 2 * MARGIN, 150);
-		y += 150 + 26;
-	}
-	if (spot) {
-		struct section *s = sections.v[from];
-		double w = zmc.width - 2 * MARGIN, h = 150;
-		zmc_accent(cr);
-		cairo_rectangle(cr, MARGIN, y, w, h);
-		cairo_fill(cr);
-		draw_tile_shaded(cr, MARGIN + w - 76, y + 14, 62, spot);
-		white(cr);
-		char caps[200];
-		snprintf(caps, sizeof(caps), "TOP OF “%s”", s->title);
-		for (char *c = caps; *c; c++) {
-			*c = (*c >= 'a' && *c <= 'z') ? *c - 32 : *c;
-		}
-		zmc_text_line(cr, caps, FONT_SEMIBOLD, 10.5, MARGIN + 14, y + 14, w - 104);
-		zmc_text_line(cr, pkg_title(spot), FONT_LIGHT, 30, MARGIN + 14, y + 66, w - 28);
-		zmc_text_line(cr, pkg_blurb(spot), FONT_REGULAR, 13, MARGIN + 14, y + 112, w - 28);
-		int idx = add_row(spot);
-		if (idx >= 0) {
-			zmc_add_hit(MARGIN, y, w, h, ACT_PKG, idx);
-		}
-		y += h + 26;
-	}
-	for (int i = 0; i < sections.n; i++) {
-		struct section *s = sections.v[i];
-		int first = (i == from) ? 1 : 0;	/* (the spotlight is already up there) */
-		if (s->items.n > first) {
-			grey(cr);
-			double sw = zmc_text_width("see all", FONT_REGULAR, 14);
-			zmc_text(cr, "see all", FONT_REGULAR, 14, zmc.width - MARGIN - sw, y + 8, 0);
-			zmc_add_hit(zmc.width - MARGIN - sw - 16, y - 4, sw + 32, 40, ACT_SEE_ALL, i);
-		}
-		y = heading(cr, y, s->title, s->caption);
-		if (!s->items.n) {
-			if (loading && !s->note) {
-				for (int k = 0; k < ROWS_SHOWN; k++) {
-					y = skel_row(cr, y);
-				}
-				y += 14;
-			} else {
-				y = note(cr, y, s->note ? s->note : "Nothing here yet.");
-			}
-			continue;
-		}
-		for (int k = first; k < s->items.n && k < first + ROWS_SHOWN; k++) {
-			y = row(cr, y, s->items.v[k]);
-		}
-		y += 14;
-	}
-	return y + 20;
+	lrows_top();
+	return lrows_show(cr, y, SET_TOP);
 }
 
 static double draw_cats(cairo_t *cr) {
+	zmc.pivot_after = "ztOS apps";
 	double y = zmc_pivot_next(cr, "categories", "installed", ZMC_ACT_PIVOT, P_INSTALLED);
-	y = heading(cr, y, "apps", n_apps ? "AppStream categories · your repos" : NULL);
-	if (!cats.n) {
-		y = note(cr, y, loading ? "Reading your repos…" :
-			"No app data on this phone yet. Installing archlinux-appstream-data adds names, icons and categories.");
-	}
-	double gap = 10, cell = (zmc.width - 2 * MARGIN - 2 * gap) / 3;
-	for (int i = 0; i < cats.n; i++) {
-		struct facet *f = cats.v[i];
-		double x = MARGIN + (i % 3) * (cell + gap), ty = y + (i / 3) * (cell + gap);
-		zmc_accent(cr);
-		cairo_rectangle(cr, x, ty, cell, cell);
-		cairo_fill(cr);
-		white(cr);
-		char count[16];
-		snprintf(count, sizeof(count), "%d", f->count);
-		double cw = zmc_text_width(count, FONT_REGULAR, 11);
-		zmc_text(cr, count, FONT_REGULAR, 11, x + cell - cw - 8, ty + 6, 0);
-		zmc_text(cr, f->label, FONT_REGULAR, 13.5, x + 8, ty + cell - 44, cell - 14);
-		zmc_add_hit(x, ty, cell, cell, ACT_CAT, i);
-	}
-	y += ((cats.n + 2) / 3) * (cell + gap) + 24;
-	if (groups.n) {
-		y = heading(cr, y, "package groups", "whole sets that install together");
-		for (int i = 0; i < groups.n; i++) {
-			struct facet *f = groups.v[i];
-			char detail[48];
-			snprintf(detail, sizeof(detail), "%d package%s", f->count, f->count == 1 ? "" : "s");
-			y = zmc_entry(cr, y, f->label, detail, ACT_GROUP, i);
+	if (!lset[SET_CATS].built) {
+		lset[SET_CATS].built = true;
+		lrows_add(SET_CATS, L_HEADC, -1, NULL, "apps", n_apps ? "AppStream categories \u00b7 your repos" : NULL);
+		if (!cats.n) lrows_add(SET_CATS, L_NOTE, -1, NULL, loading ? "Reading your repos\u2026" : "No app data on this phone yet.", NULL);
+		for (int i = 0; i < cats.n; i += 3) {
+			lrows_add(SET_CATS, L_CAT0, i, NULL, NULL, NULL);
+			lrows_add(SET_CATS, L_CAT1, i, NULL, NULL, NULL);
 		}
+		if (groups.n) lrows_add(SET_CATS, L_HEADC, -1, NULL, "package groups", "whole sets that install together");
+		for (int i = 0; i < groups.n; i++) lrows_add(SET_CATS, L_GROUP, i, NULL, NULL, NULL);
 	}
-	return y + 20;
+	return lrows_show(cr, y, SET_CATS);
 }
 
 static double draw_installed(cairo_t *cr) {
-	double y = zmc_pivot_next(cr, "installed", "top", ZMC_ACT_PIVOT, P_TOP);
+	zmc.pivot_after = "top";
+	double y = zmc_pivot_next(cr, "installed", "ztOS apps", ZMC_ACT_PIVOT, P_ZAPPS);
 	/* the system's updates come from ztos-update: Arch updates everything at
 	 * once, never one package on its own */
 	y = heading(cr, y, "updates", "your repos, through the system updater");
@@ -796,10 +1125,12 @@ static double draw_installed(cairo_t *cr) {
 	if (!mine.n) {
 		y = note(cr, y, loading ? "Reading…" : "Nothing yet.");
 	}
-	for (int i = 0; i < mine.n && i < LIST_MAX; i++) {
-		y = row(cr, y, mine.v[i]);
+	if (!lset[SET_MINE].built) {
+		lset[SET_MINE].built = true;
+		for (int i = 0; i < mine.n && i < LIST_MAX; i++) lrows_add(SET_MINE, L_PKG, 0, mine.v[i], NULL, NULL);
 	}
-	return y + 20;
+	if (!lset[SET_MINE].n) return y + 20;
+	return lrows_show(cr, y, SET_MINE);
 }
 
 static double draw_search(cairo_t *cr) {
@@ -866,15 +1197,43 @@ static double draw_list(cairo_t *cr) {
 	if (!list_items.n) {
 		return note(cr, y, "Nothing here.");
 	}
-	for (int i = 0; i < list_items.n && i < LIST_MAX; i++) {
-		y = row(cr, y, list_items.v[i]);
+	if (!lset[SET_LIST].built) {
+		lset[SET_LIST].built = true;
+		for (int i = 0; i < list_items.n && i < LIST_MAX; i++) lrows_add(SET_LIST, L_PKG, 0, list_items.v[i], NULL, NULL);
+		if (list_items.n > LIST_MAX) lrows_add(SET_LIST, L_NOTE, 0, NULL, "and more: search to find them.", NULL);
 	}
-	if (list_items.n > LIST_MAX) {
-		char more[96];
-		snprintf(more, sizeof(more), "and %d more: search to find them.", list_items.n - LIST_MAX);
-		y = note(cr, y, more);
-	}
-	return y + 20;
+	return lrows_show(cr, y, SET_LIST);
+}
+
+static struct zmc_app app;
+
+/* Windows Phone's store page: the app's name small over a pivot, a big tile with
+ * the name and whether you have it beside it, what it is, who it is from, and what
+ * can be done with it in a band across the screen. */
+static const char *detail_caps(const char *title) {
+	static char caps[64];
+	size_t i = 0;
+	for (; title[i] && i + 1 < sizeof(caps); i++) caps[i] = (char)toupper((unsigned char)title[i]);
+	caps[i] = 0;
+	return caps;
+}
+
+static double detail_head(cairo_t *cr, const char *title, const char *tab, const char *next, int next_page) {
+	app.caps = detail_caps(title);
+	zmc.pivot_after = NULL;
+	double y = zmc_pivot_next(cr, tab, next, ZMC_ACT_PIVOT, next_page);
+	app.caps = "APP STORE";
+	return y;
+}
+
+/* a band across the screen for what can be done */
+static void action_band(cairo_t *cr, double y, double h) {
+	/* a step off the background: dark grey on black, light grey on white,
+	 * so the ink buttons on it read in both */
+	double k = zmc.theme == ZMC_THEME_LIGHT ? 0.88 : 0.12;
+	cairo_set_source_rgb(cr, k, k, k);
+	cairo_rectangle(cr, 0, y, zmc.width, h);
+	cairo_fill(cr);
 }
 
 static double draw_detail(cairo_t *cr) {
@@ -882,28 +1241,40 @@ static double draw_detail(cairo_t *cr) {
 	if (!p) {
 		return zmc_header(cr, "app");
 	}
-	double y = page_title(cr, pkg_title(p));
-	double x = MARGIN + 110, w = zmc.width - x - MARGIN;
-	draw_tile(cr, MARGIN, y, 96, p);
+	double y = detail_head(cr, pkg_title(p), "details", "more", P_DETAIL_MORE);
+	double x = MARGIN + 134, w = zmc.width - x - MARGIN;
+	draw_tile(cr, MARGIN, y, 120, p);
 	white(cr);
-	zmc_text_line(cr, p->name, FONT_SEMILIGHT, 20, x, y, w);
+	zmc_text_line(cr, pkg_title(p), FONT_SEMILIGHT, 24, x, y - 4, w);
 	grey(cr);
-	char line[256];
-	if (pkg_is_aur(p)) {
-		snprintf(line, sizeof(line), "AUR · %s", p->packager ? p->packager : "no maintainer");
-	} else {
-		snprintf(line, sizeof(line), "from %s", p->repo);
+	zmc_text_line(cr, p->installed ? (has_update(p) ? "update available" : "installed") : "not installed", FONT_REGULAR, 14, x, y + 94, w);
+	y += 136;
+	double bw = zmc.width - 2 * MARGIN, half = (bw - 12) / 2;
+	white(cr);
+	if (p->summary && p->desc && strcmp(p->summary, p->desc)) {
+		y += zmc_text(cr, p->summary, FONT_SEMILIGHT, 18, MARGIN, y, bw) + 8;
 	}
-	zmc_text_line(cr, line, FONT_REGULAR, 13, x, y + 30, w);
+	if (p->desc) {
+		y += zmc_text(cr, p->desc, FONT_REGULAR, 15, MARGIN, y, bw) + 14;
+	}
+	if (details_loading) {
+		y = note(cr, y, "Getting the details…");
+	}
+	char line[256];
+	grey(cr);
+	if (pkg_is_aur(p)) snprintf(line, sizeof(line), "Publisher: %s (AUR)", p->packager ? p->packager : "no maintainer");
+	else snprintf(line, sizeof(line), "From: %s", p->repo);
+	y += zmc_text(cr, line, FONT_REGULAR, 13, MARGIN, y, bw) + 2;
 	snprintf(line, sizeof(line), "version %s", p->version ? p->version : "?");
-	zmc_text_line(cr, line, FONT_REGULAR, 13, x, y + 50, w);
+	y += zmc_text(cr, line, FONT_REGULAR, 13, MARGIN, y, bw) + 2;
 	if (p->installed && p->installed_version && has_update(p)) {
 		snprintf(line, sizeof(line), "you have %s", p->installed_version);
-		zmc_text_line(cr, line, FONT_REGULAR, 13, x, y + 70, w);
+		y += zmc_text(cr, line, FONT_REGULAR, 13, MARGIN, y, bw) + 2;
 	}
-	y += 116;
-	/* what can be done with it */
-	double bw = zmc.width - 2 * MARGIN, half = (bw - 12) / 2;
+	y += 14;
+	int rows = p->installed && has_update(p) && pkg_is_aur(p) ? 2 : 1;
+	action_band(cr, y, rows * 58 + 12);
+	y += 12;
 	if (inst.state == INST_RUNNING && !strcmp(inst.name, p->name)) {
 		y = button(cr, MARGIN, y, bw, inst.removing ? "removing…" : "installing…", ACT_PROGRESS, 0);
 	} else if (p->installed) {
@@ -919,17 +1290,15 @@ static double draw_detail(cairo_t *cr) {
 	} else {
 		y = button(cr, MARGIN, y, bw, "install", ACT_INSTALL, 0);
 	}
-	y += 22;
-	white(cr);
-	if (p->summary && p->desc && strcmp(p->summary, p->desc)) {
-		y += zmc_text(cr, p->summary, FONT_SEMILIGHT, 18, MARGIN, y, bw) + 8;
+	return y + 40;
+}
+
+static double draw_detail_more(cairo_t *cr) {
+	struct pkg *p = shown;
+	if (!p) {
+		return zmc_header(cr, "app");
 	}
-	if (p->desc) {
-		y += zmc_text(cr, p->desc, FONT_REGULAR, 15, MARGIN, y, bw) + 18;
-	}
-	if (details_loading) {
-		y = note(cr, y, "Getting the details…");
-	}
+	double y = detail_head(cr, pkg_title(p), "more", "details", P_DETAIL), bw = zmc.width - 2 * MARGIN;
 	char v[256];
 	if (pkg_is_aur(p)) {
 		snprintf(v, sizeof(v), "%.0f", p->votes);
@@ -975,13 +1344,14 @@ static double draw_detail(cairo_t *cr) {
 		cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
 		zmc_text(cr, "BUILT ON THIS PHONE", FONT_SEMIBOLD, 11, MARGIN + 14, top + 12, 0);
 		double th = zmc_text(cr, say, FONT_REGULAR, 13.5, MARGIN + 14, top + 34, bw - 28);
-		white(cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
 		zmc_text(cr, "read the recipe", FONT_REGULAR, 15, MARGIN + 14, top + 44 + th, 0);
 		zmc_add_hit(MARGIN, top + 34 + th, bw, 40, ACT_RECIPE, 0);
 		y = top + 150 + 20;
 	}
 	return y + 20;
 }
+
 
 static double draw_progress(cairo_t *cr) {
 	double y = zmc_header(cr, inst.removing ? "removing" : "installing");
@@ -1041,6 +1411,10 @@ static double render(cairo_t *cr, int page) {
 	case P_LIST: return draw_list(cr);
 	case P_DETAIL: return draw_detail(cr);
 	case P_PROGRESS: return draw_progress(cr);
+	case P_ZAPPS: return draw_zapps(cr);
+	case P_ZAPP: return draw_zapp(cr);
+	case P_DETAIL_MORE: return draw_detail_more(cr);
+	case P_ZAPP_MORE: return draw_zapp_more(cr);
 	}
 	return 0;
 }
@@ -1118,11 +1492,40 @@ static void install_finished(bool ok) {
 }
 
 static void activate(int action, int arg) {
+	if (action == ACT_SEE_ALL || action == ACT_CAT || action == ACT_GROUP) {
+		zmc_list_lock(true);	/* the list's items are about to be replaced */
+		lset[SET_LIST].n = 0;
+		lset[SET_LIST].built = false;
+		lset[SET_LIST].rev += 8;
+		zmc_list_lock(false);
+	}
 	if (action != ACT_SEARCHBOX && zmc.page == P_SEARCH && typing) {
 		typing = false;
 		zmc_keyboard(false);
 	}
 	switch (action) {
+	case ACT_LROW:
+		if (arg / 1000 < SETS && arg % 1000 < lset[arg / 1000].n && lset[arg / 1000].r[arg % 1000].p) open_details(lset[arg / 1000].r[arg % 1000].p);
+		break;
+	case ACT_ZAPP:
+		zapp_shown = arg;
+		zapp_confirm = false;
+		zapp_note[0] = 0;
+		zmc_go(P_ZAPP, 1);
+		break;
+	case ACT_ZREFRESH:
+		zapps_start(true, NULL, false);
+		break;
+	case ACT_ZREMOVE:
+		if (arg == 0) {	/* ask first: the app's data goes with it */
+			zapp_confirm = true;
+			break;
+		}
+		zapp_confirm = false;
+		/* fall through */
+	case ACT_ZINSTALL:
+		if (zapp_shown >= 0 && zapp_shown < zapps.n) zapps_start(false, zapps.apps[zapp_shown].id, action == ACT_ZREMOVE);
+		break;
 	case ACT_PKG:
 		if (arg >= 0 && arg < n_rows && rows[arg]) {
 			open_details(rows[arg]);
@@ -1224,10 +1627,14 @@ static bool back(void) {
 		typing = false;
 		zmc_keyboard(false);
 	}
-	if (zmc.page == P_TOP || zmc.page == P_CATS || zmc.page == P_INSTALLED) {
+	if (zmc.page == P_TOP || zmc.page == P_CATS || zmc.page == P_INSTALLED || zmc.page == P_ZAPPS) {
 		return false;	/* close */
 	}
-	int to = n_nav > 0 ? nav[--n_nav] : P_TOP;
+	if (zmc.page == P_ZAPP || zmc.page == P_ZAPP_MORE) {
+		zmc_go(P_ZAPPS, -1);
+		return true;
+	}
+	int to = n_nav > 0 ? nav[--n_nav] : P_ZAPPS;
 	if (zmc.page == P_PROGRESS && inst.state != INST_RUNNING) {
 		inst_clear();
 	}
@@ -1236,6 +1643,8 @@ static bool back(void) {
 }
 
 static void arrived(int page) {
+	if (page == P_TOP || page == P_CATS || page == P_INSTALLED || page == P_ZAPPS) zmc_pivot_changed();
+	if (page == P_ZAPPS && !zapps_loaded) zapps_start(false, NULL, false);
 	if (page == P_INSTALLED) {
 		read_updates();
 		check_aur_updates();
@@ -1289,7 +1698,7 @@ static void typed(const char *t) {
 	debounce();
 }
 
-static const struct zmc_app app = {
+static struct zmc_app app = {
 	.app_id = "ztstore", .title = "App Store", .caps = "APP STORE",
 	.render = render, .activate = activate, .back = back, .arrived = arrived, .text = typed,
 };
@@ -1303,9 +1712,9 @@ int main(int argc, char **argv) {
 		load_local(l);
 		apply_load(l);
 		loading = false;
-		const char *names[] = { "top", "categories", "installed", "search", "list", "detail", "progress" };
+		const char *names[] = { "top", "categories", "installed", "search", "list", "detail", "progress", "ztosapps", "ztosapp", "more", "ztosmore" };
 		int page = P_TOP;
-		for (int i = 0; i < 7; i++) {
+		for (int i = 0; i < 11; i++) {
 			if (!strcmp(argv[2], names[i])) {
 				page = i;
 			}
@@ -1323,11 +1732,13 @@ int main(int argc, char **argv) {
 				search_repo(ri, query, 50, &found_repo);
 			}
 		}
+		if (page >= P_ZAPPS) { zapps_load(&zapps, false); zapp_shown = 0; }
 		read_updates();
 		return zmc_render_png(&app, page, 2400, argv[3]);
 	}
 	jobs_init();
 	inst_init(install_changed, install_finished);
 	start_load();
-	return zmc_run(&app, P_TOP);
+	zapps_start(false, NULL, false);
+	return zmc_run(&app, P_ZAPPS);
 }

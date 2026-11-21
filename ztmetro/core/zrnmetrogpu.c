@@ -13,6 +13,11 @@ bool zmc_perflog(void);	/* zrnmetrocore.c */
 #include <wayland-egl.h>
 #include <math.h>
 #include <stdint.h>
+
+/* the themed page background (zrnmetrocore.c): white in light, black in dark.
+ * The frame clear matches it, so the entrance and the page-turn gap show the
+ * theme colour, not black. */
+uint32_t zmc_bg_color(void);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,7 +181,8 @@ void zmg_begin(int w, int h, int scale) {
 	glViewport(0, 0, w * scale, h * scale);
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_DEPTH_TEST);
-	glClearColor(0, 0, 0, 1);
+	uint32_t zbg = zmc_bg_color();
+	glClearColor(((zbg >> 16) & 0xff) / 255.0f, ((zbg >> 8) & 0xff) / 255.0f, (zbg & 0xff) / 255.0f, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
