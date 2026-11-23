@@ -236,6 +236,31 @@ static DEFINE_MUTEX(stream_lock);
 static struct delayed_work watchdog_work;
 static unsigned int watchdog_recoveries;
 module_param(watchdog_recoveries, uint, 0444);
+/*
+ * Runtime idle. When nothing at all is using the DSP, a timer parks it: it is
+ * told to suspend (ABOX_SUSPEND -> WFI, which drops its ACPM MIF/DRAM vote) and
+ * SYSPOWER_CTRL is dropped. The AUD domain stays powered and booted stays set,
+ * but the reload-free wake (SYSPOWER=1 + ABOX_RESUME) is a hardware dead-end
+ * here: the CA7 never leaves WFI (confirmed live, "DSP would not wake from
+ * idle"). So the next use always reloads the firmware with dsp_boot(); the
+ * reload cost is accepted. Parking releases the AUD MIF vote even while
+ * WhatsApp's keep_awake vetoes system suspend, so the internal flexpmu
+ * MIF-request count (SoC 0x0204b264) falls to 0 while audio is idle.
+ * Self-recovers: a reload that fails flags a DSP fault, and the watchdog
+ * restarts the DSP, so audio is never left dead.
+ */
+static struct delayed_work idle_work;
+static bool dsp_idle;			/* DSP parked idle (AUD domain up, SRAM retained) */
+module_param(dsp_idle, bool, 0444);
+MODULE_PARM_DESC(dsp_idle, "1 while the DSP is parked idle (read-only)");
+static bool dsp_autoidle = true;
+module_param(dsp_autoidle, bool, 0644);
+MODULE_PARM_DESC(dsp_autoidle, "park the DSP (release its MIF vote) when no audio is active (default on)");
+static void abox_idle_work(struct work_struct *work);
+static void abox_dsp_unidle(void);
+static void abox_wake_for_control(void);
+static void arm_idle_if_quiet(void);
+static bool abox_idle_ready(void);
 static u32 fw_version;
 static DEFINE_SPINLOCK(ipc_lock);
 static int abox_irq;
@@ -338,6 +363,30 @@ static struct snd_pcm *capture_pcm;
 static unsigned int cap_irqs, cap_msgs;
 module_param(cap_irqs, uint, 0444);
 module_param(cap_msgs, uint, 0444);
+
+/* The DSP is parkable (abox_idle_work) only when nothing at all is using it:
+ * no media stream, no in-call route, no DSM, no voice (VSS) stream, no capture
+ * open. Mirrors the gates the close/suspend paths use before they drop the
+ * speaker path. Call under stream_lock. */
+static bool abox_idle_ready(void)
+{
+	return booted && !suspending && !any_active() && !call_route &&
+		!dsm_on && !vss_started && !READ_ONCE(cap.opened);
+}
+
+/* idle_block: live bitmask of why abox_idle_ready() is false (debug readback).
+ * bit0 !booted, bit1 suspending, bit2 any_active, bit3 call_route, bit4 dsm_on,
+ * bit5 vss_started, bit6 cap.opened. 0 = idle-ready. */
+static int idle_block_get(char *buf, const struct kernel_param *kp)
+{
+	u32 b = (!booted) | (suspending << 1) | (any_active() << 2) |
+		(!!call_route << 3) | (dsm_on << 4) | (vss_started << 5) |
+		(READ_ONCE(cap.opened) << 6);
+
+	return sysfs_emit(buf, "%#x\n", b);
+}
+static const struct kernel_param_ops idle_block_ops = { .get = idle_block_get };
+module_param_cb(idle_block, &idle_block_ops, NULL, 0444);
 
 static void pmu_update(u32 reg, u32 mask, u32 val)
 {
@@ -1034,6 +1083,47 @@ on:
 	return 0;
 }
 
+/* The AUD CMU/sysreg clock tree the DSP core runs on. Saved live at suspend
+ * (domain still powered), written back at resume: once the MIF vote is dropped
+ * the flexpmu sleep sequence powers the AUD domain down, and it comes back with
+ * PLL_AUD unlocked and the muxes/dividers at reset defaults. Without this the
+ * CA7 boots on the wrong clock and never finishes its handshake (dsp_boot
+ * -ETIMEDOUT); only the watchdog's aud_power_cycle() -- which restores the same
+ * registers -- recovered it. Same registers and PLL relock as aud_power_cycle(),
+ * minus the PMU off/on (sleep did it) and the TZPC SMC (the block is reachable
+ * from the AP after resume). Safe: the CA7 is not running here (core_off'd). */
+static u32 pm_aud_saved[ARRAY_SIZE(aud_regs)];
+static void aud_clocks_save(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(aud_regs); i++)
+		pm_aud_saved[i] = readl(aud_reg(i)) & aud_regs[i].mask;
+}
+static void aud_clocks_restore(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(aud_regs); i++) {
+		void __iomem *r = aud_reg(i);
+
+		if (aud_regs[i].mask == ~0U)
+			writel(pm_aud_saved[i], r);
+		else
+			writel((readl(r) & ~aud_regs[i].mask) | pm_aud_saved[i], r);
+		if (!aud_regs[i].sys && aud_regs[i].off == AUD_PLL_CON0 &&
+				(pm_aud_saved[i] & BIT(31))) {
+			int j;
+
+			for (j = 0; j < 1000 && !(readl(r) & BIT(29)); j++)
+				udelay(10);
+			if (!(readl(r) & BIT(29)))
+				pr_warn("snd-zrn-abox: PLL_AUD did not lock after resume\n");
+		}
+	}
+	gear_applied_khz = 0;	/* the APM level is set again in dsp_boot */
+}
+
 static void cmu_save(void)
 {
 	int i;
@@ -1342,6 +1432,9 @@ static int call_set(int route)
 	}
 	pr_info("snd-zrn-abox: call audio %s (%d)\n", route == 1 ? "earpiece" : route == 2 ? "speaker" : "off", ret);
 	call_route = route;
+	/* call ended with nothing else using the DSP: let it park and drop its MIF
+	 * vote after the autosuspend delay (arm_idle_if_quiet re-checks idleness) */
+	arm_idle_if_quiet();
 	return ret;
 }
 
@@ -1420,6 +1513,9 @@ static int dsm_set(bool on)
 		amp_vi(false);
 	}
 	pr_info("snd-zrn-abox: speaker DSM %s (%d)\n", on ? "on" : "off", ret);
+	/* DSM turned off with nothing else using the DSP: let it park (the helper
+	 * re-checks idleness, so a call still in setup keeps the DSP awake) */
+	arm_idle_if_quiet();
 	return ret;
 }
 
@@ -1462,11 +1558,14 @@ static int abox_pcm_open(struct snd_pcm_substream *s)
 {
 	int ret;
 
+	cancel_delayed_work_sync(&idle_work);	/* not under stream_lock: the work takes it */
 	mutex_lock(&stream_lock);
 	if (suspending || !booted) {
 		ret = -EIO;
 		goto out;
 	}
+	if (dsp_idle)
+		abox_dsp_unidle();		/* wake the parked DSP before any message */
 	s->runtime->hw = abox_hw;
 	/* the DSP takes the period size in bytes and its ring in whole periods */
 	snd_pcm_hw_constraint_integer(s->runtime, SNDRV_PCM_HW_PARAM_PERIODS);
@@ -1493,6 +1592,9 @@ static int abox_pcm_close(struct snd_pcm_substream *s)
 		writel(readl(sfr + ABOX_UAIF1_CTRL0) & ~BIT(0), sfr + ABOX_UAIF1_CTRL0);
 	if (!call_route && !dsm_on && !any_active())
 		mixp_flush();
+	/* nothing left using the DSP: park it after the autosuspend delay so its
+	 * MIF vote releases while audio is idle (vendor autosuspend = 500 ms) */
+	arm_idle_if_quiet();
 	mutex_unlock(&stream_lock);
 	return 0;
 }
@@ -1503,11 +1605,14 @@ static int abox_pcm_hw_params(struct snd_pcm_substream *s, struct snd_pcm_hw_par
 	struct snd_pcm_runtime *rt = s->runtime;
 	int ret;
 
+	cancel_delayed_work_sync(&idle_work);	/* not under stream_lock: the work takes it */
 	mutex_lock(&stream_lock);
 	if (suspending || !booted) {
 		ret = -EIO;
 		goto out;
 	}
+	if (dsp_idle)
+		abox_dsp_unidle();		/* wake if parked while this stream was mid-setup */
 	/* always the same memory: the DSP sees it at the stream's IOVA */
 	rt->dma_area = st->buf;
 	rt->dma_addr = st->buf_pa;
@@ -1540,11 +1645,14 @@ static int abox_pcm_prepare(struct snd_pcm_substream *s)
 	struct stream *st = stream_of(s);
 	int ret = 0;
 
+	cancel_delayed_work_sync(&idle_work);	/* not under stream_lock: the work takes it */
 	mutex_lock(&stream_lock);
 	if (suspending || !booted) {
 		ret = -EIO;
 		goto out;
 	}
+	if (dsp_idle)
+		abox_dsp_unidle();		/* wake the parked DSP before any message */
 	if (st->needs_reset) {
 		/* A lost DMA or a new firmware instance has no usable PCM state. */
 		ret = st_msg(st, PCM_PLTDAI_CLOSE, 0, 0, 0);
@@ -1697,6 +1805,13 @@ static void abox_watchdog(struct work_struct *work)
 	int i;
 
 	mutex_lock(&stream_lock);
+	/* parked idle (abox_idle_work): the DSP is in WFI on purpose. Do not
+	 * recover or poke it; the next open wakes it (abox_dsp_unidle). */
+	if (dsp_idle) {
+		mutex_unlock(&stream_lock);
+		schedule_delayed_work(&watchdog_work, msecs_to_jiffies(113));
+		return;
+	}
 	if (!suspending && READ_ONCE(dsp_fault) && !call_route && !dsm_on)
 		dsp_recover();
 	if (!suspending && booted) {
@@ -2392,11 +2507,14 @@ static int cap_open(struct snd_pcm_substream *s)
 {
 	int ret;
 
+	cancel_delayed_work_sync(&idle_work);	/* not under stream_lock: the work takes it */
 	mutex_lock(&stream_lock);
 	if (suspending || !booted) {
 		ret = -EIO;
 		goto out;
 	}
+	if (dsp_idle)
+		abox_dsp_unidle();		/* wake the parked DSP before any message */
 	ret = codec_power_up();
 	if (ret)
 		goto out;
@@ -2422,6 +2540,8 @@ static int cap_close(struct snd_pcm_substream *s)
 		cap_msg(PCM_PLTDAI_CLOSE, 0, 0, 0);
 	cap_path_off();
 	cap.opened = false;
+	/* nothing left using the DSP: park it after the autosuspend delay */
+	arm_idle_if_quiet();
 	mutex_unlock(&stream_lock);
 	return 0;
 }
@@ -2431,11 +2551,14 @@ static int cap_hw_params(struct snd_pcm_substream *s, struct snd_pcm_hw_params *
 	struct snd_pcm_runtime *rt = s->runtime;
 	int ret;
 
+	cancel_delayed_work_sync(&idle_work);	/* not under stream_lock: the work takes it */
 	mutex_lock(&stream_lock);
 	if (suspending || !booted) {
 		ret = -EIO;
 		goto out;
 	}
+	if (dsp_idle)
+		abox_dsp_unidle();		/* wake if parked while this stream was mid-setup */
 	rt->dma_area = cap.buf;
 	rt->dma_addr = cap.buf_pa;
 	rt->dma_bytes = params_buffer_bytes(p);
@@ -2466,11 +2589,14 @@ static int cap_prepare(struct snd_pcm_substream *s)
 	struct snd_pcm_runtime *rt = s->runtime;
 	int ret;
 
+	cancel_delayed_work_sync(&idle_work);	/* not under stream_lock: the work takes it */
 	mutex_lock(&stream_lock);
 	if (suspending || !booted) {
 		ret = -EIO;
 		goto out;
 	}
+	if (dsp_idle)
+		abox_dsp_unidle();		/* wake the parked DSP before any message */
 	if (cap.needs_reset) {
 		/* a new firmware instance: its routes and config gone too */
 		cap_path_off();
@@ -2672,6 +2798,7 @@ static int call_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 		return -EINVAL;
 	if (route == call_route)
 		return 0;
+	abox_wake_for_control();	/* the DSP may be parked idle: reload it first */
 	call_set(route);
 	return 1;
 }
@@ -2697,6 +2824,7 @@ static int dsm_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 
 	if (on == dsm_on)
 		return 0;
+	abox_wake_for_control();	/* the DSP may be parked idle: reload it first */
 	return dsm_set(on) ? -EINVAL : 1;
 }
 
@@ -2726,6 +2854,7 @@ static int dsmr_get(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 
 static int dsmr_put(struct snd_kcontrol *k, struct snd_ctl_elem_value *v)
 {
+	abox_wake_for_control();	/* the DSP may be parked idle: reload it first */
 	return dsm_read(v->value.integer.value[0], 4) ? -EIO : 1;
 }
 
@@ -2853,6 +2982,7 @@ static void teardown(void)
 	int i;
 
 	cancel_delayed_work_sync(&watchdog_work);
+	cancel_delayed_work_sync(&idle_work);
 	if (card)
 		snd_card_free(card);
 	if (capture) {
@@ -2924,6 +3054,7 @@ static int dsp_boot(void)
 	int i, ret;
 
 	booted = false;
+	dsp_idle = false;	/* a fresh boot is never the parked-idle state */
 	WRITE_ONCE(dsp_fault, false);
 	core_off();	/* a fresh start, whatever ran before */
 	/* Samsung's boot gear: the top level while the DSP starts, so what it is
@@ -3026,11 +3157,151 @@ static int dsp_boot(void)
 	return 0;
 }
 
+/* Arm the idle timer after a boot that leaves the DSP quiet (probe, watchdog
+ * recover, resume) so a freshly booted but unused DSP parks and drops its MIF
+ * vote, instead of holding it forever. NOT called from the open-path wake
+ * (abox_dsp_unidle): that boot exists precisely to use the DSP, and arming there
+ * could park it between open and prepare. Gated on abox_idle_ready(), which the
+ * resume path (suspending still set) fails, so PM arms it itself once clear. */
+static void arm_idle_if_quiet(void)
+{
+	if (dsp_autoidle && abox_idle_ready())
+		mod_delayed_work(system_wq, &idle_work, msecs_to_jiffies(500));
+}
+
 /* zrn-sleepd keeps the card and sound server alive. A firmware restart cannot
  * resume an old DMA: ALSA reports SUSPENDED and userspace must prepare again. */
 static u32 saved_effects[ARRAY_SIZE(effects)][26];
 static bool pm_ready;
 module_param(pm_ready, bool, 0444);
+
+/* abox_suspend_dsp: Samsung's ABOX_SUSPEND handshake. Tells the DSP to suspend
+ * so it DROPS its ACPM MIF/DRAM vote (acpm_get_mif_request bit4 = ABOX), then
+ * enters WFI. core_off() alone forcibly stops the core but leaves that ACPM vote
+ * SET, so ACPM cannot keep MIF powered down and bounces it back up in ~4ms --
+ * the deep-sleep self-exit. Confirmed live: the DSP idles in WFI with bit4 still
+ * set, so WFI is not enough; the ABOX_SUSPEND IPC is what releases the vote.
+ * Call with streams stopped (no DMA). Returns 1 if the DSP reached WFI. */
+static bool abox_mif_release = true;
+module_param(abox_mif_release, bool, 0644);
+MODULE_PARM_DESC(abox_mif_release, "send ABOX_SUSPEND before core_off on suspend so ABOX drops its MIF vote (default on)");
+static unsigned int abox_mif_release_wfi;
+module_param(abox_mif_release_wfi, uint, 0444);
+static int abox_suspend_dsp(void)
+{
+	u32 m[6] = { IPC_SYSTEM, 0, ABOX_SUSPEND, 0, 0, 0 };
+	int k;
+
+	if (!booted)
+		return 0;
+	ipc_send(m, 6);
+	for (k = 0; k < 1000 && !(readl(pmu + PMU_ABOX_CPU_STANDBY) & ABOX_CPU_WFI); k++)
+		udelay(10);
+	abox_mif_release_wfi = !!(readl(pmu + PMU_ABOX_CPU_STANDBY) & ABOX_CPU_WFI);
+	pr_info("snd-zrn-abox: ABOX_SUSPEND sent for MIF-vote release, wfi=%u\n",
+		abox_mif_release_wfi);
+	return abox_mif_release_wfi;
+}
+
+/* abox_dsp_unidle: wake the DSP from the parked-idle state (abox_idle_work).
+ *
+ * The reload-free wake (re-raise SYSPOWER_CTRL + ABOX_RESUME IPC) is a hardware
+ * dead-end on this SoC: the CA7 never leaves WFI, so it is gone. Waking is
+ * always a full firmware reload. The AUD power domain stayed up through idle --
+ * only the MIF vote was dropped, not domain power -- so dsp_boot() alone brings
+ * the DSP back without the suspend path's aud_power_cycle() (there was no -110:
+ * the SECURE TZPC state was never lost). dsp_boot() clears dsp_idle and, on the
+ * boot handshake, sets booted; on return booted is true exactly when the DSP is
+ * live again. Call with stream_lock held, before any DSP message.
+ *
+ * Self-recovers: if the reload fails (unusual, since the domain stayed powered),
+ * flag a DSP fault so the watchdog restarts it. Never leaves audio dead. */
+static void abox_dsp_unidle(void)
+{
+	if (!dsp_idle)
+		return;
+	if (!dsp_boot()) {		/* full reload; sets booted on success */
+		pr_info("snd-zrn-abox: DSP reloaded from idle\n");
+		return;
+	}
+	/* dsp_boot() already cleared dsp_idle and left booted false. Flag a fault
+	 * so the watchdog keeps restarting the DSP until it comes back. */
+	pr_warn("snd-zrn-abox: idle wake reload failed; watchdog will restart the DSP\n");
+	booted = false;
+	WRITE_ONCE(dsp_fault, true);
+}
+
+/* Controls that drive the DSP directly (voice call, DSM) can arrive while it is
+ * parked idle. Wake it first -- exactly as a stream open does -- so the IPC that
+ * follows reaches a live DSP, not one asleep in WFI. Not under stream_lock: the
+ * idle work takes it. */
+static void abox_wake_for_control(void)
+{
+	cancel_delayed_work_sync(&idle_work);
+	mutex_lock(&stream_lock);
+	if (dsp_idle)
+		abox_dsp_unidle();
+	mutex_unlock(&stream_lock);
+}
+
+/* abox_idle_work: run once the autosuspend delay elapses with audio quiet.
+ * Park the DSP without unloading it: ABOX_SUSPEND (-> WFI, drops its ACPM
+ * MIF/DRAM vote), then drop SYSPOWER_CTRL and wait for the Qchannel handshake.
+ * The AUD domain stays powered and SRAM retained, but the next use reloads the
+ * firmware anyway (abox_dsp_unidle: the reload-free wake is a hardware dead-end).
+ * Re-checks idleness under the lock and bails if a stream opened while queued.
+ * Keeps booted set and does NOT core_off: the domain stays up, only the MIF
+ * vote is released. */
+static void abox_idle_work(struct work_struct *work)
+{
+	int i;
+
+	mutex_lock(&stream_lock);
+	if (dsp_idle || !abox_idle_ready())
+		goto out;			/* already parked, or no longer idle */
+	if (abox_suspend_dsp()) {		/* ABOX_SUSPEND IPC, poll for WFI */
+		writel(0, sfr + ABOX_SYSPOWER_CTRL);
+		wmb();
+		for (i = 0; i < 1000; i++) {
+			if (!(readl(sfr + ABOX_SYSPOWER_STATUS) & 1))
+				break;
+			udelay(10);
+		}
+		dsp_idle = true;
+		pr_info("snd-zrn-abox: DSP parked idle; MIF vote released\n");
+	} else {
+		/* the DSP did not reach WFI: leave it running, do not cut power */
+		pr_warn("snd-zrn-abox: DSP would not idle (no WFI); left running\n");
+	}
+out:
+	mutex_unlock(&stream_lock);
+}
+
+/* dsp_idle_now: write 1 to park the DSP immediately (bench testing), subject to
+ * the same idle gate. */
+static int dsp_idle_now_set(const char *val, const struct kernel_param *kp)
+{
+	cancel_delayed_work_sync(&idle_work);
+	mod_delayed_work(system_wq, &idle_work, 0);
+	return 0;
+}
+static const struct kernel_param_ops dsp_idle_now_ops = { .set = dsp_idle_now_set };
+module_param_cb(dsp_idle_now, &dsp_idle_now_ops, NULL, 0200);
+
+/* mif_release_now: write 1 to send ABOX_SUSPEND right now (test). Leaves the DSP
+ * in WFI with its vote dropped; audio needs a reboot afterwards. Lets us confirm
+ * acpm_get_mif_request bit4 drops without a full system suspend. */
+static int mif_release_now_set(const char *val, const struct kernel_param *kp)
+{
+	cancel_delayed_work_sync(&watchdog_work);
+	mutex_lock(&stream_lock);
+	abox_suspend_dsp();
+	booted = false;
+	mutex_unlock(&stream_lock);
+	return 0;
+}
+static const struct kernel_param_ops mif_release_now_ops = { .set = mif_release_now_set };
+module_param_cb(mif_release_now, &mif_release_now_ops, NULL, 0200);
 
 static int abox_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
 {
@@ -3045,6 +3316,7 @@ static int abox_pm_event(struct notifier_block *nb, unsigned long event, void *u
 		if (READ_ONCE(cap.opened))
 			return notifier_from_errno(-EBUSY);
 		cancel_delayed_work_sync(&watchdog_work);
+		cancel_delayed_work_sync(&idle_work);	/* the full suspend path parks it instead */
 		snd_power_change_state(card, SNDRV_CTL_POWER_D3hot);
 		for (i = 0; i < ARRAY_SIZE(playback); i++)
 			snd_pcm_suspend_all(playback[i]);
@@ -3062,9 +3334,27 @@ static int abox_pm_event(struct notifier_block *nb, unsigned long event, void *u
 		}
 		cancel_delayed_work_sync(&gear_work);
 		cancel_delayed_work_sync(&gear_again);
+		if (abox_mif_release) {
+			abox_suspend_dsp();	/* DSP WFI before powering off */
+			aud_clocks_save();	/* snapshot the live AUD clock tree before
+						 * the sleep sequence powers the domain down */
+		}
+		/* Drop ABOX's MIF/DRAM request (flexpmu SW_FLAG bit1 = AUD) by zeroing
+		 * SYSPOWER_CTRL while the CA7 is STILL CLOCKED, then wait for the
+		 * Qchannel handshake (SYSPOWER_STATUS) to settle. The old order wrote
+		 * this AFTER core_off(), so the write never clocked through and the AUD
+		 * MIF vote stayed asserted -> ACPM self-exited the MIF-down sleep
+		 * (smc=0x01100000). Vendor abox_disable() order: SYSPOWER=0 (clocked),
+		 * then gate the core. */
+		writel(0, sfr + ABOX_SYSPOWER_CTRL);
+		wmb();
+		for (i = 0; i < 1000; i++) {
+			if (!(readl(sfr + ABOX_SYSPOWER_STATUS) & 1))
+				break;
+			udelay(10);
+		}
 		core_off();
 		booted = false;
-		writel(0, sfr + ABOX_SYSPOWER_CTRL);
 		writel(0, mmu + MMU_CTRL);
 		mutex_unlock(&stream_lock);
 		break;
@@ -3072,7 +3362,14 @@ static int abox_pm_event(struct notifier_block *nb, unsigned long event, void *u
 		if (!suspending)
 			break;
 		mutex_lock(&stream_lock);
-		cmu_compare();
+		cmu_compare();			/* log what the sleep changed */
+		if (abox_mif_release)
+			aud_power_cycle();	/* a clocks-only resume (aud_clocks_restore)
+						 * leaves the AUD domain's SECURE TZPC state
+						 * unrestored, so the CA7 times out at boot
+						 * (-110); the full PD_SAVE/PD_RESTORE SMC +
+						 * PMU AUD off->on (as the watchdog's recovery)
+						 * restores it and relocks PLL_AUD */
 		ret = dsp_boot();
 		if (!ret) {
 			for (i = 0; i < ARRAY_SIZE(effects); i++) {
@@ -3087,6 +3384,10 @@ static int abox_pm_event(struct notifier_block *nb, unsigned long event, void *u
 		}
 		pm_ready = !ret;
 		suspending = false;
+		/* the resume dsp_boot() ran with suspending still set, so it could not
+		 * arm the idle timer. Do it now: if userspace does not reopen a stream,
+		 * a quiet resumed DSP must still park and drop its MIF vote. */
+		arm_idle_if_quiet();
 		snd_power_change_state(card, SNDRV_CTL_POWER_D0);
 		pr_info("snd-zrn-abox: resume firmware %d; streams require prepare\n", ret);
 		mutex_unlock(&stream_lock);
@@ -3213,6 +3514,9 @@ static void dsp_recover(void)
 	pm_ready = !ret;
 	dsp_restarts++;
 	pr_warn("snd-zrn-abox: watchdog restarted DSP (%d), streams require prepare\n", ret);
+	/* if the restart left the DSP quiet, let it park again and drop its MIF vote */
+	if (!ret)
+		arm_idle_if_quiet();
 }
 
 static int __init abox_init(void)
@@ -3226,6 +3530,7 @@ static int __init abox_init(void)
 	INIT_DELAYED_WORK(&gear_work, gear_tell);
 	INIT_DELAYED_WORK(&gear_again, gear_tell);
 	INIT_DELAYED_WORK(&watchdog_work, abox_watchdog);
+	INIT_DELAYED_WORK(&idle_work, abox_idle_work);
 	apm_init();
 	pdev = platform_device_register_simple("snd-zrn-abox", -1, NULL, 0);
 	if (IS_ERR(pdev))
@@ -3426,6 +3731,11 @@ static int __init abox_init(void)
 		goto err;
 	pm_ready = true;
 	schedule_delayed_work(&watchdog_work, msecs_to_jiffies(113));
+	/* The DSP booted at probe with no stream ever opened. Without this it would
+	 * hold the AUD MIF vote forever (count 0x0204b264 never reaches 0); arm the
+	 * idle timer so a quiet freshly booted DSP parks after the autosuspend
+	 * delay. The first stream open cancels it and reloads (abox_dsp_unidle). */
+	arm_idle_if_quiet();
 	return 0;
 
 err:
