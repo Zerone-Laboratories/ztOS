@@ -92,11 +92,29 @@ static struct gpiod_lookup_table hub_gpios = {
 static void __iomem *gph0;
 static DEFINE_RAW_SPINLOCK(gph0_lock);
 
+/*
+ * The whole AP-side hub transport — this gph0 bank (0x13a80000), the SPI
+ * controller (0x13ac0000) and its CMU (0x13a00000) — sits in the CHUB power
+ * domain. MIF-down SYS_SLEEP powers CHUB off (zrn-pd, in syscore), so any
+ * access here aborts across the sleep, and CHUB comes back unclocked with
+ * gph0's CON and the controller reset to defaults. While parked, every CHUB
+ * access is a no-op; the unpark re-clocks and reconfigures the transport
+ * before releasing it. zrn_bbd_chub_park/unpark are driven by the hub's own
+ * .suspend/.resume, which bracket zrn-pd's syscore power-cycle.
+ */
+static atomic_t chub_parked = ATOMIC_INIT(0);
+bool zrn_bbd_chub_parked(void)
+{
+	return atomic_read(&chub_parked);
+}
+
 static void gph0_set(u32 pin, bool high)
 {
 	unsigned long flags;
 	u32 v;
 
+	if (atomic_read(&chub_parked))
+		return;
 	raw_spin_lock_irqsave(&gph0_lock, flags);
 	v = readl(gph0 + GPH0_DAT);
 	writel(high ? v | pin : v & ~pin, gph0 + GPH0_DAT);
@@ -117,6 +135,8 @@ static u8 spi_byte(u8 out)
 	u8 in = 0;
 	int bit;
 
+	if (atomic_read(&chub_parked))
+		return 0xff;
 	raw_spin_lock_irqsave(&gph0_lock, flags);
 	v = readl(gph0 + GPH0_DAT) & ~(PIN_SCK | PIN_MOSI);
 	for (bit = 7; bit >= 0; bit--) {
@@ -181,8 +201,16 @@ static int hw_spi_setup(void)
 	writel(0x00300000, cmu_chub + 0x2010);
 	writel(0x00300000, cmu_chub + 0x2090);
 	writel(0x00300000, cmu_chub + 0x20a8);
+	/* After a MIF-down power-cycle these gates are freshly re-opened; let the
+	 * CHUB bus/USI clock settle before the controller below is touched. A
+	 * too-early access on the not-yet-ready bus raises an async SError.
+	 * Harmless on the already-clocked probe path (a one-off 200 us). */
+	wmb();
+	udelay(200);
 	iounmap(cmu_chub);
+	pr_info("zrn-bbd: hw_spi: [a] SYSREG usi_sw_conf 0x13a13000\n");
 	writel(2, usi_sw_conf);
+	pr_info("zrn-bbd: hw_spi: [b] USI00 ctrl 0x13ac0000\n");
 	v = readl(spi_regs + USI_CON);
 	writel(v & ~1U, spi_regs + USI_CON);		/* out of reset */
 	udelay(10);
@@ -199,16 +227,180 @@ static int hw_spi_setup(void)
 	 * is a GPIO, as on the stock kernel */
 	writel(0, spi_regs + SPI_CS_REG);
 	/* clock, MOSI and MISO pins to the controller (function 2) */
+	pr_info("zrn-bbd: hw_spi: [c] gph0 CON 0x13a80000\n");
 	writel((readl(gph0 + GPH0_CON) & ~0xfffU) | 0x222, gph0 + GPH0_CON);
 	pr_info("zrn-bbd: SPI controller: ch %08x clk %08x usi %08x/%08x\n", readl(spi_regs + SPI_CH_CFG),
 		readl(spi_regs + SPI_CLK_CFG), readl(spi_regs + USI_CON), readl(spi_regs + USI_OPTION));
 	return 0;
 }
 
+/* Debug: dump the CHUB CMU clock registers (the ones chub_save covers plus the
+ * gates hw_spi_setup writes) so their live, working values can be captured and
+ * restored after a MIF-down power-cycle. */
+static void zrn_bbd_dump_chub_cmu(void)
+{
+	static const u16 off[] = {
+		0x100, 0x120, 0x1000, 0x1004, 0x1008, 0x100c, 0x1010,
+		0x1800, 0x1804, 0x1808, 0x180c, 0x2010, 0x2090, 0x20a8,
+		0x302c, 0x3030, 0x305c, 0x3060,
+	};
+	void __iomem *cmu = ioremap(0x13a00000, 0x4000);
+	int i;
+
+	if (!cmu)
+		return;
+	for (i = 0; i < ARRAY_SIZE(off); i++)
+		pr_info("zrn-bbd: CHUB-CMU[0x%04x]=0x%08x\n", off[i], readl(cmu + off[i]));
+	iounmap(cmu);
+}
+
+/* Gate for the hub-up-across-sleep experiment (park/unpark the CHUB transport
+ * around zrn-pd's syscore power-cycle). Default OFF: the hub powers down with
+ * the domain and re-inits via the daemon on resume -- the proven clean-wake
+ * path. The unpark reclock poke SErrors on the still-unclocked CMU (CHUB
+ * powered but CMU won't clock via either chub_non=2 reset-release or chub_non=12
+ * full on), so it stays strictly opt-in. */
+static unsigned int chub_reclock;
+module_param(chub_reclock, uint, 0644);
+MODULE_PARM_DESC(chub_reclock, "re-clock the CHUB SPI transport across MIF-down sleep (default 0: power-cycle + daemon re-init)");
+
+/* Called from the hub's .suspend, before zrn-pd powers CHUB off: from here on
+ * every CHUB-domain accessor above is a no-op, so nothing pokes gph0 or the
+ * controller while the domain is down. */
+void zrn_bbd_chub_park(void)
+{
+	if (!chub_reclock)
+		return;		/* stock power-cycle path: never park */
+	atomic_set(&chub_parked, 1);
+}
+
+/* Called from the hub's .resume, after zrn-pd has powered CHUB back on and
+ * before the host_req IRQ is re-armed. The power-cycle reset gph0's CON, the
+ * CHUB CMU gates and the SPI controller to defaults, so re-run the full setup
+ * (which writes those directly, bypassing the park gate) before releasing it.
+ * bit-bang mode is not driven across MIF sleep; the phone uses the controller. */
+/* PMU CHUB reset/clamp controls (0x14060000), from the vendor chub_on
+ * sequence. Bit 0 each. We drive every one EXCEPT CPU_RESET (the Cortex-M4):
+ * ztOS has no CHUB firmware, so releasing the M4 just waits forever on a
+ * handshake that never comes -- which is exactly why the sleep's power-on is
+ * truncated to the bare domain power and leaves the CMU held in reset. */
+#define CHUB_PMU_RESET_LOGIC	0x4b38
+#define CHUB_PMU_CPU_RESET	0x4b98	/* M4 -- left alone on purpose */
+#define CHUB_PMU_LOGIC_CLAMP	0x4b54
+#define CHUB_PMU_RESET_CMU	0x4c10
+#define CHUB_PMU_SWEEPER_CLEAN	0x4c30
+
+/* Resume diagnostics, read back in dmesg between iterations. unpark_trace is the
+ * last stage reached, so a hang's pstore pins the culprit CHUB sub-block. */
+static u32 unpark_chub_status, unpark_bus_test;
+static int unpark_trace;
+static unsigned int unpark_qch = 1;	/* write the GPIO/SYSREG/USI00 QCH gates */
+static unsigned int unpark_osc = 1;	/* point USI00/I2C at OSCCLK (always on, no PLL) */
+module_param(unpark_chub_status, uint, 0444);
+module_param(unpark_bus_test, uint, 0444);
+module_param(unpark_trace, int, 0444);
+module_param(unpark_qch, uint, 0644);
+module_param(unpark_osc, uint, 0644);
+
+void zrn_bbd_chub_unpark(void)
+{
+	void __iomem *pmu, *cmu;
+	int ret;
+
+	if (!chub_reclock)
+		return;		/* stock path: CHUB re-inits via the daemon, no CMU poke */
+
+	/* By here zrn-pd's chub_on (syscore resume, or a manual enable_off cycle)
+	 * has powered CHUB back on, de-asserted RESET_CMU (CMU clocked) and held the
+	 * M4 in reset. We only re-enable the peripheral Q-channel gates the AP SPI
+	 * transport needs and re-init the controller. No SError mask: the fault is a
+	 * clocked-bus hang, not a deferrable SEA, so a mask only hides where it
+	 * stalls. unpark_trace names the last sub-block we touched. */
+	unpark_trace = 1;
+	pmu = ioremap(0x14060000, 0x10000);
+	if (pmu) {
+		unpark_chub_status = readl(pmu + 0x4084);
+		/* Proven CMU reset-release (no M4): zrn-pd's chub_on WRITE_WAIT path
+		 * times out on the M4-held QCH and skips the sweeper, leaving the CMU
+		 * in reset -> SEA on the first CMU read. Drive the reset-release
+		 * directly here with pulse widths, as the original hub did. */
+		writel(1, pmu + CHUB_PMU_RESET_LOGIC);
+		writel(1, pmu + CHUB_PMU_RESET_CMU);
+		writel(1, pmu + CHUB_PMU_LOGIC_CLAMP);
+		writel(0, pmu + CHUB_PMU_SWEEPER_CLEAN);
+		wmb(); udelay(10);
+		writel(0, pmu + CHUB_PMU_LOGIC_CLAMP);
+		writel(0, pmu + CHUB_PMU_RESET_LOGIC);
+		writel(0, pmu + CHUB_PMU_RESET_CMU);
+		writel(1, pmu + CHUB_PMU_SWEEPER_CLEAN);
+		wmb(); udelay(50);
+		iounmap(pmu);
+	}
+	pr_info("zrn-bbd: unpark[1] CHUB_STATUS=%#x reset-release done\n", unpark_chub_status);
+
+	unpark_trace = 2;
+	cmu = ioremap(0x13a00000, 0x4000);
+	if (cmu) {
+		unpark_bus_test = readl(cmu + 0x0100);	/* CMU reachable (live=0x10) */
+		pr_info("zrn-bbd: unpark[2] cmu PLL_CON0=%#x\n", unpark_bus_test);
+		if (unpark_osc) {
+			/* Give USI00 (SPI) and I2C a known-live clock. OSCCLK (mux 0) is
+			 * always running; no PLL/CLKCMU source -> cannot dead-lock the
+			 * branch the way restoring a stale source mux did (that froze the
+			 * SoC). Does not touch MUX_BUS (the CMU's own feed). */
+			writel(0, cmu + 0x100c);	/* MUX_USI00 -> OSCCLK */
+			writel(0, cmu + 0x1808);	/* DIV_USI00 -> /1 */
+			writel(0, cmu + 0x1008);	/* MUX_I2C  -> OSCCLK */
+			wmb();
+			udelay(10);
+		}
+		if (unpark_qch) {
+			unpark_trace = 3;
+			writel(0x003f0002, cmu + 0x3028);	/* QCH GPIO_CHUB */
+			writel(0x003f0002, cmu + 0x3054);	/* QCH SYSREG_CHUB */
+			writel(0x003f0002, cmu + 0x305c);	/* QCH USI_CHUB00 */
+			wmb();
+			udelay(50);
+		}
+		iounmap(cmu);
+	}
+	pr_info("zrn-bbd: unpark[3] qch=%u done\n", unpark_qch);
+
+	unpark_trace = 4;
+	ret = hw_spi_setup();
+	unpark_trace = 5;
+	pr_info("zrn-bbd: unpark[5] re-init ret=%d\n", ret);
+	atomic_set(&chub_parked, 0);
+}
+
+/* Bench triggers (no sleep / no RTC needed): park the transport, cycle CHUB via
+ * zrn-pd's enable_off from userspace, then unpark -- reproduces the resume path. */
+static int do_park_set(const char *val, const struct kernel_param *kp)
+{
+	zrn_bbd_chub_park();
+	pr_info("zrn-bbd: do_park -> parked\n");
+	return 0;
+}
+static int do_unpark_set(const char *val, const struct kernel_param *kp)
+{
+	pr_info("zrn-bbd: do_unpark -> unparking\n");
+	zrn_bbd_chub_unpark();
+	return 0;
+}
+static const struct kernel_param_ops do_park_ops   = { .set = do_park_set };
+static const struct kernel_param_ops do_unpark_ops = { .set = do_unpark_set };
+module_param_cb(do_park,   &do_park_ops,   NULL, 0200);
+module_param_cb(do_unpark, &do_unpark_ops, NULL, 0200);
+
 static int hw_spi_xfer(const u8 *tx, u8 *rx, unsigned int len)
 {
 	const u32 cfg = BIT(3) | BIT(2);
 
+	if (atomic_read(&chub_parked)) {
+		if (rx)
+			memset(rx, 0, len);
+		return 0;
+	}
 	writel(cfg | 3, spi_regs + SPI_CH_CFG);		/* both directions on */
 	while (len) {
 		unsigned int n = min(len, 32U), i, spins = 0;
@@ -845,6 +1037,7 @@ static int __init board_init(void)
 		s9p_acpm_pmic_read(S2MPS18_L37CTRL, &b);
 		pr_info("zrn-bbd: PMIC LDO35 (touch, on) %02x, LDO37 (hub) %02x\n", a, b);
 	}
+	zrn_bbd_dump_chub_cmu();
 	ret = misc_register(&ssp_misc);
 	if (ret)
 		goto err;

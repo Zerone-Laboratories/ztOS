@@ -5,7 +5,7 @@
 #   systemd-run --unit=zrn-iso --collect -E CASES="plain accel prox both" test-hub-screen-off.sh
 # 30 Oct 2026: plain 0 asserts (2 runs); accel, prox, both: an assert and a
 # hub crash every time (8 of 8), Arg2=5, also with the sensor's delay in the
-# REMOVE payload. The hub recovers by itself (ztoscsf power retry).
+# REMOVE payload. The hub recovers by itself (ztoscoru power retry).
 H=${OUT:-/home/zerone/team-test}; mkdir -p $H; R=$H/iso.out; CTL=/run/user/1000/ztmetro.ctl; SCTL=/run/ztoscsf-sensord.ctl
 log() { echo "$(date +%T.%3N) $*" >> $R; }
 shell() { timeout 3 sh -c "echo \"$1\" > $CTL"; }

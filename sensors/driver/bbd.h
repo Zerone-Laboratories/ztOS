@@ -144,4 +144,9 @@ extern ssize_t	bbd_send_packet(unsigned char *buf, size_t size);
 extern ssize_t	bbd_pull_packet(unsigned char *buf, size_t size, unsigned int timeout_ms);
 extern int	bbd_mcu_reset(bool IsNoResp);
 extern int	bbd_init(struct device *dev);
+
+/* CHUB-domain transport park across MIF-down SYS_SLEEP (zrn_bbd_board.c) */
+extern void	zrn_bbd_chub_park(void);
+extern void	zrn_bbd_chub_unpark(void);
+extern bool	zrn_bbd_chub_parked(void);
 #endif /* __BBD_H__ */

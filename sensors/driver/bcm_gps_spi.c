@@ -881,6 +881,13 @@ static void bcm_rxtx_work_func(struct work_struct *work)
 	struct bcm_spi_strm_protocol *strm = &priv->tx_strm;
 	unsigned short rx_pckt_len = priv->rx_strm.pckt_len;
 
+	/* CHUB is powered off across MIF-down SYS_SLEEP: touching the hub
+	 * transport (gph0 / the SPI controller) then aborts. The .suspend parked
+	 * it and disabled this work's IRQ; bail if a wake re-queued us before
+	 * .resume re-clocked the domain. */
+	if (zrn_bbd_chub_parked())
+		return;
+
 	if (!bcm477x_hello(priv)) {
 		pr_err("[SSPBBD]: %s[%s] timeout!!\n", __func__,
 				bcm_work->type == WORK_TYPE_RX ? "RX WORK" : "TX WORK");
@@ -1073,7 +1080,11 @@ static int bcm_spi_suspend(struct device *dev)
 	if (priv->serial_wq)
 		flush_workqueue(priv->serial_wq);
 
-    ssi_pm_semaphore++; 
+	/* IRQ off and the work drained: park the CHUB transport before zrn-pd
+	 * powers the domain off in syscore suspend. */
+	zrn_bbd_chub_park();
+
+    ssi_pm_semaphore++;
 	pr_info("[SSPBBD]: %s --\n", __func__);
 	return 0;
 }
@@ -1087,6 +1098,11 @@ static int bcm_spi_resume(struct device *dev)
 
 	pr_info("[SSPBBD]: %s ++ \n", __func__);
 	atomic_set(&priv->suspending, 0);
+
+	/* CHUB is powered again (zrn-pd syscore resume ran before this): re-clock
+	 * and reconfigure the hub transport before re-arming its IRQ, since the
+	 * power-cycle reset gph0's CON and the controller. */
+	zrn_bbd_chub_unpark();
 
 	/* Enable irq */
 	spin_lock_irqsave(&priv->irq_lock, flags);
