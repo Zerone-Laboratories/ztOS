@@ -3,7 +3,7 @@
 # then the reader leaves and a plain `once 60` runs with GPS off.
 H=/home/zerone/team-r2-holes; R=$H/g1.txt; P=/sys/module/zrn_sleep_init/parameters
 start=$(date +%s)
-pids() { echo "lhd=$(pgrep -x lhd) csf=$(pgrep -x ztoscsf) sensord=$(pgrep -x ztoscsf-sensord) gpsd=$(pgrep -x gpsd)"; }
+pids() { echo "lhd=$(pgrep -x lhd) coru=$(pgrep -x ztoscoru) sensord=$(pgrep -x ztoscsf-sensord) gpsd=$(pgrep -x gpsd)"; }
 st() { echo "clear_grp4=$(cat $P/clear_grp4) entries=$(cat $P/entries) ready=$(cat /sys/class/sec/sensorhub/ready) hub_refused=$(cat $P/hub_refused) grp4_stale_clears=$(cat $P/grp4_stale_clears)"; }
 echo "$(date +%T) G1 start $(pids) $(st)" > $R
 python3 /home/zerone/team-r2/r2-reader.py 260 $H/g1-reader.out &

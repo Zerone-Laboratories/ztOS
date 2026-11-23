@@ -28,6 +28,7 @@ int zrn_sequence_run(struct zrn_seq *seq, unsigned int size,
 	unsigned int i, retry;
 	struct zrn_seq *s;
 	bool conditional;
+	bool skip_next = false;
 
 	if ((!seq && size) || !io || !io->read || !io->write || !io->delay_us ||
 	    (unsigned int)phase > ZRN_HANDLE)
@@ -36,6 +37,12 @@ int zrn_sequence_run(struct zrn_seq *seq, unsigned int size,
 		s = &seq[i];
 		if (failed)
 			*failed = i;
+		/* PMUCAL_CHECK_SKIP marks the following entry for skipping when
+		 * its own value test matches (vendor pmucal_rae need_skip). */
+		if (skip_next) {
+			skip_next = false;
+			continue;
+		}
 		if (phase == ZRN_SAVE)
 			s->valid = false;
 		conditional = s->op == PMUCAL_COND_READ ||
@@ -66,11 +73,36 @@ int zrn_sequence_run(struct zrn_seq *seq, unsigned int size,
 			if (phase != ZRN_SAVE)
 				write_value(s, s->value, io);
 			break;
+		case PMUCAL_CHECK_SKIP:
+			/* Vendor skips the next entry only on the restore pass
+			 * (e.g. skip the PLL-lock wait when the PLL is off). */
+			if (phase == ZRN_RESTORE &&
+			    (io->read(io->context, s->base, s->offset) &
+			     s->mask) == s->value)
+				skip_next = true;
+			break;
 		case PMUCAL_WAIT:
 			if (phase == ZRN_SAVE)
 				break;
 			for (retry = 0; retry <= 1000; retry++) {
 				if ((io->read(io->context, s->base, s->offset) &
+				     s->mask) == s->value)
+					break;
+				io->delay_us(io->context, 1);
+			}
+			if (retry > 1000)
+				return -ETIMEDOUT;
+			break;
+		case PMUCAL_WRITE_WAIT:
+			/* Vendor pmucal_rae: write the field, then poll the paired
+			 * STATUS register (CONFIGURATION offset + 4) until it reads
+			 * back the written value. CHUB bring-up uses it for the M4
+			 * reset / clamp / sweeper handshakes. Not a save-pass op. */
+			if (phase == ZRN_SAVE)
+				break;
+			write_value(s, s->value, io);
+			for (retry = 0; retry <= 1000; retry++) {
+				if ((io->read(io->context, s->base, s->offset + 0x4) &
 				     s->mask) == s->value)
 					break;
 				io->delay_us(io->context, 1);

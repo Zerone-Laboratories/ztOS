@@ -5,7 +5,7 @@ bt() { awk '{print $1}' /proc/uptime; }
 d() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.1f", a - b}'; }
 shell() { timeout 3 sh -c "echo \"$1\" > $CTL" 2>/dev/null; }
 sctl() { timeout 3 sh -c "echo \"$1\" > $SCTL" 2>/dev/null; }
-pids() { echo "lhd=$(pgrep -x lhd|tr '\n' ,) csf=$(pgrep -x ztoscsf|tr '\n' ,) sensord=$(pgrep -x ztoscsf-sensord) gpsd=$(pgrep -x gpsd) netd=$(pgrep -x ztoscorenetwork|tr '\n' ,) ready=$(cat $B/ready)"; }
+pids() { echo "lhd=$(pgrep -x lhd|tr '\n' ,) coru=$(pgrep -x ztoscoru|tr '\n' ,) sensord=$(pgrep -x ztoscsf-sensord) gpsd=$(pgrep -x gpsd) netd=$(pgrep -x ztoscorenetwork|tr '\n' ,) ready=$(cat $B/ready)"; }
 par() { for n in clear_grp4 eint_follow eint_effective hub_refused hub_pend_cleared grp4_stale_clears grp4_before grp4_at_smc entries; do printf '%s=%s ' $n "$(cat $P/$n 2>/dev/null)"; done; printf 'resume_seq=%s ap_suspends=%s pulse=%s' "$(cat $B/resume_seq)" "$(cat $B/ap_suspends)" "$(cat /sys/module/zrn_bbd/parameters/ap_sleep_pulse)"; }
 inh() { echo "[$(ls $INH 2>/dev/null | tr '\n' ' ')]"; }
 jcount() {	# jcount SINCE_EPOCH: hub error counts

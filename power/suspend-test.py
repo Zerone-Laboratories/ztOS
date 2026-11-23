@@ -42,7 +42,14 @@ p.add_argument('--ignore-host-req-wake', action='store_true',
 p.add_argument('--seconds', type=int, default=20, choices=range(10, 121))
 p.add_argument('--pm-test', choices=['none', 'devices', 'processors', 'core'], default='none')
 p.add_argument('--mem-sleep', choices=['s2idle', 'deep'], default='s2idle')
-p.add_argument('--wake-source', choices=['mct', 'rtc'], default='mct')
+p.add_argument('--wake-source', choices=['mct', 'rtc', 'pmic'], default='mct',
+               help='pmic: S2MPS18 RTC alarm 0 through EINT gpa0-1, as stock wakes; '
+                    'the SoC RTC is left disarmed (stock masks it in WAKEUP_MASK)')
+p.add_argument('--pmic-rtc-tool', type=Path,
+               help='pmic-rtc-alarm.py, required by --wake-source pmic')
+p.add_argument('--stock-devfreq', action='store_true',
+               help="stock suspend_late order: fsys0, cam, disp, intcam to their suspend "
+                    "frequencies, then INT release+frequency, then MIF release+frequency")
 p.add_argument('--validate-only', action='store_true',
                help='validate arguments and exit without accessing hardware')
 a = p.parse_args()
@@ -69,8 +76,12 @@ if a.allow_mif_sleep and not (
     p.error('--allow-mif-sleep requires deep or SICD/CPD and an actual suspend trial')
 if a.mem_sleep == 'deep' and a.sicd:
     p.error('deep uses the platform backend; --sicd applies to s2idle')
-if a.mem_sleep == 'deep' and a.pm_test == 'none' and a.wake_source != 'rtc':
+if a.mem_sleep == 'deep' and a.pm_test == 'none' and a.wake_source not in ('rtc', 'pmic'):
     p.error('a deep-sleep trial requires the independent RTC wake source')
+if a.wake_source == 'pmic' and not (a.pmic_rtc_tool and a.mem_sleep == 'deep'):
+    p.error('--wake-source pmic needs --pmic-rtc-tool and the platform deep backend')
+if a.stock_devfreq and not (a.mif_suspend_khz and a.int_suspend_khz):
+    p.error('--stock-devfreq needs the MIF and INT suspend frequencies')
 if a.connected_diagnostic and a.battery_only:
     p.error('--connected-diagnostic cannot claim battery-only validation')
 if a.ignore_host_req_wake and not (
@@ -118,6 +129,9 @@ def snapshot(label, wakeup_baseline=None):
         info['system_sleep'] = {name: (system_sleep / name).read_text().strip()
             for name in ['attempts', 'entries', 'last_error', 'last_smc',
                          'last_restore_error', 'dry_run', 'wake_stat', 'wake_stat2', 'wake_stat3', 'bid_pending', 'eint_pending', 'mif_sleep', 'mif_gate_before', 'mif_requests_before']}
+    for name in ('pmic_pend_after', 'pmic_refused', 'eint_effective'):
+        if (system_sleep / name).exists():
+            info.setdefault('system_sleep', {})[name] = (system_sleep / name).read_text().strip()
     rtc_fires = Path('/sys/module/zrn_exynos_rtc/parameters/alarm_fires')
     if rtc_fires.exists():
         info['rtc_alarm_fires'] = rtc_fires.read_text().strip()
@@ -211,6 +225,15 @@ old_cpu = (P / 'sicd_cpu').read_text().strip() if (P / 'sicd_cpu').exists() else
 bound = (W / DEV).exists()
 host_req_wake_masked = False
 fvp_domains = []
+# Stock DT (stock/twrp-live.dts:9159-9345): only mif and int are use_acpm;
+# the rest go through cal_dfs_set_rate -> ACPM FREQ_REQ (acpm_dvfs.c:21).
+# ACPM DVFS ids (acpm_dvfs_exynos9810.h): intcam 5, fsys0 6, cam 7, disp 8.
+# Suspend kHz = stock log twrp-stock-sleep.log:108-112 (= each DT minimum);
+# restore = DT freq_info[0] unless FREQ_GET answers.
+EXTRA_DEVFREQ = [('fsys0', 6, 73000, 336000), ('cam', 7, 590000, 690000),
+                 ('disp', 8, 200000, 640000), ('intcam', 5, 630000, 690000)]
+extra_changed = []
+pmic_armed = False
 mif_frequency_changed = False
 int_frequency_changed = False
 try:
@@ -248,18 +271,37 @@ try:
         # firmware MIF gate disabled during preparation; only the saved CPU
         # finisher may enable it. Include a possibly timed-out message in
         # rollback because firmware may have applied it without an ACK.
-        for domain in (0, 1):  # DEVFREQ_MIF, DEVFREQ_INT
-            fvp_domains.append(domain)
-            subprocess.run(['python3', str(a.acpm_fvp_tool), 'ipc', '1',
-                            str(domain), '0', '5', '2'], check=True, timeout=5)
-        if a.mif_suspend_khz:
-            mif_frequency_changed = True
-            subprocess.run(['python3', str(a.acpm_fvp_tool), 'dvfs', 'mif',
-                            str(a.mif_suspend_khz)], check=True, timeout=5)
-        if a.int_suspend_khz:
+        def acpm(*args):
+            subprocess.run(['python3', str(a.acpm_fvp_tool), *map(str, args)],
+                           check=True, timeout=5)
+        if a.stock_devfreq:
+            for name, dom, khz, restore in EXTRA_DEVFREQ:
+                got = subprocess.run(['python3', str(a.acpm_fvp_tool), 'dvfs', str(dom)],
+                                     capture_output=True, text=True, timeout=5)
+                words = got.stdout.split()
+                if got.returncode == 0 and 'kHz' in words:
+                    restore = int(words[words.index('kHz') - 1])
+                extra_changed.append((name, dom, restore))
+                acpm('dvfs', dom, khz)
+            # exynos-devfreq.c:1947-1976 per domain, INT's suspend_late first
+            fvp_domains.append(1)
+            acpm('ipc', 1, 1, 0, 5, 2)
             int_frequency_changed = True
-            subprocess.run(['python3', str(a.acpm_fvp_tool), 'dvfs', 'int',
-                            str(a.int_suspend_khz)], check=True, timeout=5)
+            acpm('dvfs', 'int', a.int_suspend_khz)
+            fvp_domains.append(0)
+            acpm('ipc', 1, 0, 0, 5, 2)
+            mif_frequency_changed = True
+            acpm('dvfs', 'mif', a.mif_suspend_khz)
+        else:
+            for domain in (0, 1):  # DEVFREQ_MIF, DEVFREQ_INT
+                fvp_domains.append(domain)
+                acpm('ipc', 1, domain, 0, 5, 2)
+            if a.mif_suspend_khz:
+                mif_frequency_changed = True
+                acpm('dvfs', 'mif', a.mif_suspend_khz)
+            if a.int_suspend_khz:
+                int_frequency_changed = True
+                acpm('dvfs', 'int', a.int_suspend_khz)
     before = snapshot('before')
     if a.wake_source == 'rtc':
         rtc_alarm = Path('/sys/class/rtc/rtc0/wakealarm')
@@ -268,7 +310,14 @@ try:
         write(rtc_alarm, 0)
         write(rtc_alarm, f'+{a.seconds}')
         # Independent fallback for s2idle diagnostics, not a deep-sleep wake.
-        write(P / 'alarm_seconds', a.seconds + 10)
+        if os.environ.get('NO_MCT_BACKSTOP') != '1': write(P / 'alarm_seconds', a.seconds + 10)
+    elif a.wake_source == 'pmic':
+        # stock arms no SoC RTC alarm and masks its wake bit; no MCT fallback
+        write('/sys/class/rtc/rtc0/wakealarm', 0)
+        write(P / 'alarm_seconds', 0)
+        pmic_armed = True
+        subprocess.run(['python3', str(a.pmic_rtc_tool), 'arm', str(a.seconds)],
+                       check=True, timeout=120)  # ~10 s awake, far slower at suspend clocks
     else:
         write(P / 'alarm_seconds', a.seconds)
     try:
@@ -277,8 +326,14 @@ try:
         after = snapshot('after', {**before.get('wakeup_sources', {}),
                                    **{f"irq-{irq}": counts for irq, counts in
                                       before.get('irq_counts', {}).items()}})
+    if a.wake_source == 'pmic':
+        ss = after.get('system_sleep', {})
+        if a.pm_test == 'none' and not (int(ss.get('wake_stat', '0'), 0) & 1 and
+                                        int(ss.get('pmic_pend_after', '0'), 0) & 2):
+            raise RuntimeError('Suspend returned without the PMIC EINT wake; '
+                               f"wake_stat={ss.get('wake_stat')} pmic_pend={ss.get('pmic_pend_after')}")
     alarm_field = 'rtc_alarm_fires' if a.wake_source == 'rtc' else 'alarm_fires'
-    if a.pm_test == 'none' and int(after[alarm_field]) <= int(before[alarm_field]):
+    if a.wake_source != 'pmic' and a.pm_test == 'none' and int(after[alarm_field]) <= int(before[alarm_field]):
         raise RuntimeError(f'Suspend returned without the {a.wake_source} wake alarm; '
                            f"last wake IRQ={after.get('pm_wakeup_irq', 'unknown')}")
     if ready_samples == 4 and after['sensorhub_ready'] != '1':
@@ -313,6 +368,9 @@ finally:
         mif_param = Path('/sys/module') / module / 'parameters/mif_sleep'
         if mif_param.exists():
             write(mif_param, 0)
+    if pmic_armed:
+        # also clears INT1-7, so the PMIC line is high for the next sleep
+        subprocess.run(['python3', str(a.pmic_rtc_tool), 'disarm'], timeout=120)
     fvp_errors = []
     for domain in reversed(fvp_domains):
         try:
@@ -337,6 +395,13 @@ finally:
         except (subprocess.SubprocessError, OSError) as error:
             fvp_errors.append(str(error))
             print(json.dumps({'phase': 'mif_frequency_restore_failed', 'error': str(error)}), flush=True)
+    for name, dom, khz in reversed(extra_changed):
+        try:
+            subprocess.run(['python3', str(a.acpm_fvp_tool), 'dvfs', str(dom), str(khz)],
+                           check=True, timeout=5)
+        except (subprocess.SubprocessError, OSError) as error:
+            fvp_errors.append(str(error))
+            print(json.dumps({'phase': f'{name}_frequency_restore_failed', 'error': str(error)}), flush=True)
     if host_req_wake_masked:
         subprocess.run(['rmmod', 'zrn_hostreq_wake_test'], check=True)
     write('/sys/power/pm_test', 'none')
