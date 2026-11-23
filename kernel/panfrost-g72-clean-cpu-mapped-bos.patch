@@ -1,0 +1,106 @@
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -7,6 +7,7 @@
+ #include <asm/arch_timer.h>
+ #endif
+ 
++#include <linux/dma-mapping.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/pagemap.h>
+@@ -284,6 +285,45 @@
+ 	return ret;
+ }
+ 
++/*
++ * Exynos 9810 (Mali-G72, non-coherent): userspace writes job descriptors
++ * through write-combined mappings, but the BO pages also sit in the kernel's
++ * cacheable linear map. The CPU can (speculatively) pull lines of those pages
++ * into its caches at any time, and a later write-combined store or GPU read
++ * then meets a stale CPU line: the GPU sees old descriptors (DATA_INVALID,
++ * JOB_BUS, page faults at VA 0x0/0x10). Invalidating once when the pages are
++ * first mapped is not enough, the lines come back. So before each job, clean
++ * and invalidate the CPU lines of every BO the job uses that userspace has
++ * mapped on the CPU. BOs never mapped by the CPU (render targets, heap) are
++ * written only by the GPU and are skipped.
++ */
++static void panfrost_job_drop_cpu_lines(struct panfrost_device *pfdev,
++					struct panfrost_job *job)
++{
++	u32 i;
++
++	if (pfdev->coherent)
++		return;
++
++	for (i = 0; i < job->bo_count; i++) {
++		struct panfrost_gem_object *bo = to_panfrost_bo(job->bos[i]);
++		struct sg_table *sgt;
++
++		if (!READ_ONCE(bo->cpu_mapped) || bo->is_heap ||
++		    drm_gem_is_imported(&bo->base.base))
++			continue;
++
++		/* The job holds a mapping, so the pages stay pinned. */
++		sgt = READ_ONCE(bo->base.sgt);
++		if (!sgt)
++			continue;
++
++		/* arm64: clean to PoC, then invalidate. */
++		dma_sync_sgtable_for_device(pfdev->base.dev, sgt, DMA_TO_DEVICE);
++		dma_sync_sgtable_for_cpu(pfdev->base.dev, sgt, DMA_FROM_DEVICE);
++	}
++}
++
+ static int panfrost_ioctl_submit(struct drm_device *dev, void *data,
+ 		struct drm_file *file)
+ {
+@@ -350,6 +390,8 @@
+ 	if (ret)
+ 		goto out_cleanup_job;
+ 
++	panfrost_job_drop_cpu_lines(pfdev, job);
++
+ 	ret = panfrost_job_push(job);
+ 	if (ret)
+ 		goto out_cleanup_job;
+--- a/drivers/gpu/drm/panfrost/panfrost_gem.c
++++ b/drivers/gpu/drm/panfrost/panfrost_gem.c
+@@ -400,6 +400,13 @@
+ 	return drm_gem_prime_import(dev, dma_buf);
+ }
+ 
++static int panfrost_gem_mmap(struct drm_gem_object *obj,
++			     struct vm_area_struct *vma)
++{
++	WRITE_ONCE(to_panfrost_bo(obj)->cpu_mapped, true);
++	return drm_gem_shmem_object_mmap(obj, vma);
++}
++
+ static const struct drm_gem_object_funcs panfrost_gem_funcs = {
+ 	.free = panfrost_gem_free_object,
+ 	.open = panfrost_gem_open,
+@@ -411,7 +418,7 @@
+ 	.export = panfrost_gem_prime_export,
+ 	.vmap = drm_gem_shmem_object_vmap,
+ 	.vunmap = drm_gem_shmem_object_vunmap,
+-	.mmap = drm_gem_shmem_object_mmap,
++	.mmap = panfrost_gem_mmap,
+ 	.status = panfrost_gem_status,
+ 	.rss = panfrost_gem_rss,
+ 	.vm_ops = &drm_gem_shmem_vm_ops,
+--- a/drivers/gpu/drm/panfrost/panfrost_gem.h
++++ b/drivers/gpu/drm/panfrost/panfrost_gem.h
+@@ -103,6 +103,13 @@
+ 	 */
+ 	bool wb_mmap		:1;
+ 
++	/*
++	 * Set once userspace has mapped the BO on the CPU (directly or through
++	 * an exported dma-buf). Only such BOs can carry CPU-written data that
++	 * has to be pushed out of the CPU caches before a job reads it.
++	 */
++	bool cpu_mapped;
++
+ #ifdef CONFIG_DEBUG_FS
+ 	struct panfrost_gem_debugfs debugfs;
+ #endif

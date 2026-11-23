@@ -1,0 +1,58 @@
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -478,6 +478,23 @@
+ 	return ret;
+ }
+ 
++/*
++ * Fresh shmem pages are zeroed through the kernel cached linear map and
++ * dma_map_sgtable() only cleans those lines (arm64 sync_for_device is a
++ * clean, not a clean+invalidate). Userspace then fills the BO through a
++ * write-combined mapping, straight to DRAM. On Exynos 9810 the GPU still
++ * reads stale (zero) data for such pages, so the first job of a new
++ * process sees zeroed descriptors (DATA_INVALID / JOB_BUS / VA 0 faults).
++ * Drop the CPU-side lines once, when the pages are first handed to the
++ * GPU: they are already clean, so this only invalidates.
++ */
++static void panfrost_mmu_drop_cpu_lines(struct panfrost_device *pfdev,
++				       struct sg_table *sgt)
++{
++	if (!pfdev->coherent)
++		dma_sync_sgtable_for_cpu(pfdev->base.dev, sgt, DMA_FROM_DEVICE);
++}
++
+ int panfrost_mmu_map(struct panfrost_gem_mapping *mapping)
+ {
+ 	struct panfrost_gem_object *bo = mapping->obj;
+@@ -486,6 +503,7 @@
+ 	struct panfrost_device *pfdev = to_panfrost_device(obj->dev);
+ 	struct sg_table *sgt;
+ 	int prot = IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE;
++	bool fresh;
+ 	int ret;
+ 
+ 	if (WARN_ON(mapping->active))
+@@ -494,10 +512,14 @@
+ 	if (bo->noexec)
+ 		prot |= IOMMU_NOEXEC;
+ 
++	fresh = !shmem->sgt && !drm_gem_is_imported(obj);
+ 	sgt = drm_gem_shmem_get_pages_sgt(shmem);
+ 	if (WARN_ON(IS_ERR(sgt)))
+ 		return PTR_ERR(sgt);
+ 
++	if (fresh)
++		panfrost_mmu_drop_cpu_lines(pfdev, sgt);
++
+ 	ret = mmu_map_sg(pfdev, mapping->mmu, mapping->mmnode.start << PAGE_SHIFT,
+ 			 prot, sgt);
+ 	if (ret)
+@@ -706,6 +728,8 @@
+ 	if (ret)
+ 		goto err_map;
+ 
++	panfrost_mmu_drop_cpu_lines(pfdev, sgt);
++
+ 	ret = mmu_map_sg(pfdev, bomapping->mmu, addr,
+ 			 IOMMU_WRITE | IOMMU_READ | IOMMU_CACHE | IOMMU_NOEXEC, sgt);
+ 	if (ret)

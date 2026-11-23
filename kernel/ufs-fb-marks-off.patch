@@ -1,0 +1,23 @@
+--- a/drivers/ufs/host/ufs-exynos9810.c
++++ b/drivers/ufs/host/ufs-exynos9810.c
+@@ -473,6 +473,11 @@
+  * the panel instead. One question to answer, one colour to report: whatever
+  * the screen is showing is the last step that completed.
+  */
++/* The colour steps are a bring-up aid; on a working phone they are a strip
++ * across the boot picture. Off unless ufs_exynos9810.fb_marks=1 is given. */
++static bool s9p_fb_marks;
++module_param_named(fb_marks, s9p_fb_marks, bool, 0444);
++
+ static void s9p_step(u32 colour)
+ {
+ 	size_t off = (size_t)S9P_BLOCK_TOP * S9P_FB_STRIDE;
+@@ -480,6 +485,8 @@
+ 	void __iomem *p;
+ 	size_t i;
+ 
++	if (!s9p_fb_marks)
++		return;
+ 	p = ioremap_wc(S9P_FB_BASE + off, len);
+ 	if (!p)
+ 		return;

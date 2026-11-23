@@ -1,0 +1,192 @@
+--- a/drivers/gpu/drm/panfrost/panfrost_gem.c
++++ b/drivers/gpu/drm/panfrost/panfrost_gem.c
+@@ -8,6 +8,10 @@
+ #include <linux/slab.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
++#include <linux/set_memory.h>
++#include <linux/vmalloc.h>
++#include <asm/cacheflush.h>
++#include <asm/tlbflush.h>
+ 
+ #include <drm/panfrost_drm.h>
+ #include <drm/drm_print.h>
+@@ -90,6 +94,9 @@
+ 	panfrost_gem_debugfs_bo_rm(bo);
+ 	mutex_destroy(&bo->label.lock);
+ 
++	/* Before any dma_unmap: arm64 cache maintenance uses the linear map. */
++	panfrost_gem_restore_linear_alias(bo);
++
+ 	if (bo->sgts) {
+ 		int i;
+ 		int n_sgt = bo->base.base.size / SZ_2M;
+@@ -366,9 +373,92 @@
+ 	.end_cpu_access = panfrost_gem_prime_end_cpu_access,
+ };
+ 
++/*
++ * Exynos 9810 (Mali-G72, non-coherent): userspace fills write-combined BOs
++ * straight to DRAM, but the pages also sit in the kernel's cacheable linear
++ * map, and the CPU can speculatively pull those lines into its caches at any
++ * time. The GPU then meets stale CPU lines (DATA_INVALID, JOB_BUS, page
++ * faults at VA 0x0/0x10). Invalidating once is not enough, the lines come
++ * back; flushing before every job costs too much. So while panfrost holds
++ * the pages of a WC BO, make their linear-map entries invalid: nothing can
++ * cache them any more. Lines already cached are cleaned and invalidated
++ * once, through a temporary write-combined alias, after the TLB flush.
++ * Restored before the pages are dma-unmapped or given back (free, purge)
++ * and for good when the BO is exported (importers may sync through the
++ * linear map). Needs a page-granular linear map (rodata=full, the arm64
++ * default).
++ */
++static void panfrost_gem_lm_tlb_flush(struct page **pages, pgoff_t n)
++{
++	unsigned long lo = ULONG_MAX, hi = 0, a;
++	pgoff_t i;
++
++	for (i = 0; i < n; i++) {
++		if (!pages[i])
++			continue;
++		a = (unsigned long)page_address(pages[i]);
++		lo = min(lo, a);
++		hi = max(hi, a + PAGE_SIZE);
++	}
++	if (lo < hi)
++		flush_tlb_kernel_range(lo, hi);
++}
++
++void panfrost_gem_unmap_linear_alias(struct panfrost_gem_object *bo,
++				     struct page **pages, pgoff_t n)
++{
++	struct drm_gem_object *obj = &bo->base.base;
++	pgoff_t i;
++	void *va;
++
++	dma_resv_assert_held(obj->resv);
++
++	if (!bo->base.map_wc || drm_gem_is_imported(obj) || bo->lm_keep ||
++	    obj->dma_buf || !can_set_direct_map())
++		return;
++
++	for (i = 0; i < n; i++)
++		if (set_direct_map_invalid_noflush(pages[i]))
++			break;
++	if (i < n) {
++		while (i--)
++			set_direct_map_default_noflush(pages[i]);
++		panfrost_gem_lm_tlb_flush(pages, n);
++		return;
++	}
++	bo->lm_unmapped = true;
++	panfrost_gem_lm_tlb_flush(pages, n);
++
++	/* Cache maintenance by VA acts on the PA whatever the VA's type. */
++	va = vmap(pages, n, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
++	if (va) {
++		dcache_clean_inval_poc((unsigned long)va,
++				       (unsigned long)va + n * PAGE_SIZE);
++		vunmap(va);
++	}
++}
++
++void panfrost_gem_restore_linear_alias(struct panfrost_gem_object *bo)
++{
++	struct drm_gem_shmem_object *shmem = &bo->base;
++	pgoff_t i, n = shmem->base.size >> PAGE_SHIFT;
++
++	if (!bo->lm_unmapped)
++		return;
++
++	if (shmem->pages) {
++		for (i = 0; i < n; i++)
++			if (shmem->pages[i])
++				set_direct_map_default_noflush(shmem->pages[i]);
++		panfrost_gem_lm_tlb_flush(shmem->pages, n);
++	}
++	bo->lm_unmapped = false;
++}
++
+ static struct dma_buf *
+ panfrost_gem_prime_export(struct drm_gem_object *obj, int flags)
+ {
++	struct panfrost_gem_object *bo = to_panfrost_bo(obj);
+ 	struct drm_device *dev = obj->dev;
+ 	struct dma_buf_export_info exp_info = {
+ 		.exp_name = KBUILD_MODNAME,
+@@ -380,6 +470,11 @@
+ 		.resv = obj->resv,
+ 	};
+ 
++	dma_resv_lock(obj->resv, NULL);
++	bo->lm_keep = true;
++	panfrost_gem_restore_linear_alias(bo);
++	dma_resv_unlock(obj->resv);
++
+ 	return drm_gem_dmabuf_export(dev, &exp_info);
+ }
+ 
+--- a/drivers/gpu/drm/panfrost/panfrost_gem.h
++++ b/drivers/gpu/drm/panfrost/panfrost_gem.h
+@@ -103,6 +103,15 @@
+ 	 */
+ 	bool wb_mmap		:1;
+ 
++	/*
++	 * Exynos 9810: the pages' cacheable linear-map alias is invalid while
++	 * set (see panfrost_gem_unmap_linear_alias()). lm_keep forbids it, for
++	 * BOs whose pages other code may touch through the linear map
++	 * (exported dma-bufs). Changed under the resv lock.
++	 */
++	bool lm_unmapped;
++	bool lm_keep;
++
+ #ifdef CONFIG_DEBUG_FS
+ 	struct panfrost_gem_debugfs debugfs;
+ #endif
+@@ -158,6 +167,9 @@
+ void panfrost_gem_shrinker_cleanup(struct drm_device *dev);
+ 
+ void panfrost_gem_set_label(struct drm_gem_object *obj, const char *label);
++void panfrost_gem_unmap_linear_alias(struct panfrost_gem_object *bo,
++				     struct page **pages, pgoff_t n);
++void panfrost_gem_restore_linear_alias(struct panfrost_gem_object *bo);
+ int panfrost_gem_sync(struct drm_gem_object *obj, u32 type,
+ 		      u32 offset, u32 size);
+ void panfrost_gem_internal_set_label(struct drm_gem_object *obj, const char *label);
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -525,6 +525,14 @@
+ 	if (ret)
+ 		goto err_put_pages;
+ 
++	if (fresh) {
++		dma_resv_lock(obj->resv, NULL);
++		if (shmem->pages)
++			panfrost_gem_unmap_linear_alias(bo, shmem->pages,
++							obj->size >> PAGE_SHIFT);
++		dma_resv_unlock(obj->resv);
++	}
++
+ 	mapping->active = true;
+ 
+ 	return 0;
+@@ -735,6 +743,8 @@
+ 	if (ret)
+ 		goto err_mmu_map_sg;
+ 
++	panfrost_gem_unmap_linear_alias(bo, pages + page_offset, NUM_FAULT_PAGES);
++
+ 	bomapping->active = true;
+ 	bo->heap_rss_size += SZ_2M;
+ 
+--- a/drivers/gpu/drm/panfrost/panfrost_gem_shrinker.c
++++ b/drivers/gpu/drm/panfrost/panfrost_gem_shrinker.c
+@@ -51,6 +51,7 @@
+ 		goto unlock_mappings;
+ 
+ 	panfrost_gem_teardown_mappings_locked(bo);
++	panfrost_gem_restore_linear_alias(bo);
+ 	drm_gem_shmem_purge_locked(&bo->base);
+ 	ret = true;
+ 

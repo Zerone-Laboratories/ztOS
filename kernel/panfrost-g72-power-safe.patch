@@ -1,0 +1,60 @@
+diff -ru a/drivers/gpu/drm/panfrost/panfrost_gpu.c b/drivers/gpu/drm/panfrost/panfrost_gpu.c
+--- a/drivers/gpu/drm/panfrost/panfrost_gpu.c	2026-11-20 09:32:41.064956302 +0530
++++ b/drivers/gpu/drm/panfrost/panfrost_gpu.c	2026-11-20 09:32:58.971199588 +0530
+@@ -497,6 +497,27 @@
+ 	if (ret)
+ 		dev_err(pfdev->base.dev, "tiler power transition timeout");
+ 
++	/*
++	 * GPU2017-1336: do not command the L2 off. Clean and invalidate it
++	 * instead, as kbase does with l2_always_on, and leave it powered.
++	 * The power domain (or clock) going off right after this removes
++	 * L2 power without the faulty L2 power-down sequence, so runtime
++	 * power gating still works; the soft reset on resume brings the
++	 * L2 back up from scratch.
++	 */
++	if (panfrost_has_hw_issue(pfdev, HW_ISSUE_GPU2017_1336)) {
++		gpu_write(pfdev, GPU_INT_CLEAR, GPU_IRQ_CLEAN_CACHES_COMPLETED);
++		gpu_write(pfdev, GPU_CMD, GPU_CMD_CLEAN_INV_CACHES);
++		ret = readl_relaxed_poll_timeout(pfdev->iomem + GPU_INT_RAWSTAT,
++						 val,
++						 val & GPU_IRQ_CLEAN_CACHES_COMPLETED,
++						 1, 2000);
++		if (ret)
++			dev_err(pfdev->base.dev, "l2 clean timeout");
++		gpu_write(pfdev, GPU_INT_CLEAR, GPU_IRQ_CLEAN_CACHES_COMPLETED);
++		return;
++	}
++
+ 	gpu_write(pfdev, L2_PWROFF_LO, pfdev->features.l2_present);
+ 	ret = readl_poll_timeout(pfdev->iomem + L2_PWRTRANS_LO,
+ 				 val, !val, 0, 2000);
+diff -ru a/drivers/gpu/drm/panfrost/panfrost_issues.h b/drivers/gpu/drm/panfrost/panfrost_issues.h
+--- a/drivers/gpu/drm/panfrost/panfrost_issues.h	2026-11-20 09:32:46.240925499 +0530
++++ b/drivers/gpu/drm/panfrost/panfrost_issues.h	2026-11-20 09:32:58.971019845 +0530
+@@ -135,6 +135,15 @@
+ 	/* Must issue a dummy job before starting real work to prevent hangs */
+ 	HW_ISSUE_TTRX_3485,
+ 
++	/*
++	 * Arm erratum GPU2017-1336 (1485982), Mali-G72 r0p1 (tHEx): an L2
++	 * power-down commanded through L2_PWROFF can leave later jobs reading
++	 * corrupt data. kbase's default workaround never issues L2_PWROFF
++	 * outside reset and power-down ("l2_always_on"), cleaning the L2
++	 * instead; its alternative drops the GPU clock before L2_PWROFF.
++	 */
++	HW_ISSUE_GPU2017_1336,
++
+ 	HW_ISSUE_END
+ };
+ 
+@@ -254,7 +263,8 @@
+ #define hw_issues_g71_r0p0_05dev0 (\
+ 	BIT_ULL(HW_ISSUE_T76X_3953))
+ 
+-#define hw_issues_g72 0
++#define hw_issues_g72 (\
++	BIT_ULL(HW_ISSUE_GPU2017_1336))
+ 
+ #define hw_issues_g76 0
+ 

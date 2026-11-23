@@ -1,0 +1,52 @@
+diff -ru a/drivers/gpu/drm/panfrost/panfrost_drv.c b/drivers/gpu/drm/panfrost/panfrost_drv.c
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -26,6 +26,7 @@
+ #include "panfrost_job.h"
+ #include "panfrost_gpu.h"
+ #include "panfrost_perfcnt.h"
++#include "panfrost_issues.h"
+ 
+ #define JOB_REQUIREMENTS (PANFROST_JD_REQ_FS | PANFROST_JD_REQ_CYCLE_COUNT)
+ 
+@@ -997,6 +998,15 @@
+ 	pm_runtime_use_autosuspend(pfdev->base.dev);
+ 
+ 	/*
++	 * Every runtime suspend powers the L2 off and every resume soft-resets
++	 * the GPU. On parts with erratum 1485982 that cycle corrupts later jobs
++	 * (DATA_INVALID_FAULT, JOB_BUS_FAULT, INSTR_INVALID_ENC). Keep the GPU
++	 * runtime-active, as kbase does; system suspend still powers it down.
++	 */
++	if (panfrost_has_hw_issue(pfdev, HW_ISSUE_GPU2017_1336))
++		pm_runtime_forbid(pfdev->base.dev);
++
++	/*
+ 	 * Register the DRM device with the core and the connectors with
+ 	 * sysfs
+ 	 */
+diff -ru a/drivers/gpu/drm/panfrost/panfrost_issues.h b/drivers/gpu/drm/panfrost/panfrost_issues.h
+--- a/drivers/gpu/drm/panfrost/panfrost_issues.h
++++ b/drivers/gpu/drm/panfrost/panfrost_issues.h
+@@ -135,6 +135,11 @@
+ 	/* Must issue a dummy job before starting real work to prevent hangs */
+ 	HW_ISSUE_TTRX_3485,
+ 
++	/* Arm erratum 1485982 (GPU2017-1336, Mali-G72): L2 power-down and
++	 * power-up cycles can corrupt data in later jobs. kbase keeps the L2
++	 * powered for the life of the device (its default workaround). */
++	HW_ISSUE_GPU2017_1336,
++
+ 	HW_ISSUE_END
+ };
+ 
+@@ -254,7 +259,8 @@
+ #define hw_issues_g71_r0p0_05dev0 (\
+ 	BIT_ULL(HW_ISSUE_T76X_3953))
+ 
+-#define hw_issues_g72 0
++#define hw_issues_g72 (\
++	BIT_ULL(HW_ISSUE_GPU2017_1336))
+ 
+ #define hw_issues_g76 0
+ 

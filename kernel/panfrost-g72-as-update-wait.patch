@@ -1,0 +1,36 @@
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -186,6 +186,16 @@
+ 	mmu_write(pfdev, AS_TRANSCFG_HI(as_nr), upper_32_bits(transcfg));
+ 
+ 	write_cmd(pfdev, as_nr, AS_COMMAND_UPDATE);
++
++	/* S9P_AS_UPDATE_WAIT: UPDATE is asynchronous. Without this wait the
++	 * caller can start a job on this AS while the MMU is still switching
++	 * TRANSTAB/MEMATTR/TRANSCFG, so the first job of a fresh address space
++	 * fetches its descriptors through the old (or unmapped) configuration:
++	 * DATA_INVALID_FAULT / JOB_BUS_FAULT / page fault at VA 0 on Mali-G72.
++	 * Same fix as upstream panthor d2c6fde56d45 ("Always wait after sending
++	 * a command to an AS").
++	 */
++	wait_ready(pfdev, as_nr);
+ }
+ 
+ static void panfrost_mmu_disable(struct panfrost_device *pfdev, u32 as_nr)
+@@ -202,6 +212,16 @@
+ 	mmu_write(pfdev, AS_TRANSCFG_HI(as_nr), 0);
+ 
+ 	write_cmd(pfdev, as_nr, AS_COMMAND_UPDATE);
++
++	/* S9P_AS_UPDATE_WAIT: UPDATE is asynchronous. Without this wait the
++	 * caller can start a job on this AS while the MMU is still switching
++	 * TRANSTAB/MEMATTR/TRANSCFG, so the first job of a fresh address space
++	 * fetches its descriptors through the old (or unmapped) configuration:
++	 * DATA_INVALID_FAULT / JOB_BUS_FAULT / page fault at VA 0 on Mali-G72.
++	 * Same fix as upstream panthor d2c6fde56d45 ("Always wait after sending
++	 * a command to an AS").
++	 */
++	wait_ready(pfdev, as_nr);
+ }
+ 
+ static int mmu_cfg_init_mali_lpae(struct panfrost_mmu *mmu)
