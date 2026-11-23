@@ -99,7 +99,8 @@ builder.
 | Name | What it is |
 |---|---|
 | ztMETRO | the shell: Start, the app list, the action centre, the keyboard, the lock screen |
-| ztOSCoreSensorFramework (`ztoscsf`) | starts and watches every piece of hardware support, and reports what fails; runs the sensor hub (`ztoscsf-sensorhub`) and the sensors (`ztoscsf-sensord`) |
+| ztOSCOR-U (`ztoscoru`), the ztOS Central Operations Register Unit | starts and watches every ztOS component (drivers, services, the session's programs), and reports what fails |
+| ztOSCoreSensorFramework | the sensor hub (`ztoscsf-sensorhub`) and the sensors (`ztoscsf-sensord`) |
 | ztOSCoreNetworking | the modem (`ztoscorenetworking-modem`), calls, messages and mobile data (`ztoscorenetworkingd`), and Wi-Fi joining (`ztoscorenetworking-wifi`) |
 | ztOSCirrusAudio (`ztoscirrusaudio`) | sound: the audio DSP and the Cirrus speaker amplifiers |
 | zrnperfd | power: dynamic boost and core power-down |
@@ -565,19 +566,31 @@ Known:
   the action centre, input-method commit strings and accent popups, a lock
   screen, screen blanking, XWayland.
 
+### ztOSCOR-U
+
+ztOSCOR-U, the ztOS Central Operations Register Unit: `ztmetro/coru/`
+(`ztoscoru`, `ztoscoru.service`), the one place that knows every component
+this system brings itself. At boot it loads the modules that have no service
+of their own (the LED, the vibration motor, core power) behind a mark in
+`/var/lib/ztoscoru` (a load that stops the kernel is not tried again;
+`ztoscoru retry NAME`), starts any listed unit that is not running, and then
+watches them all: units through one `systemctl show` every 60 s, modules in
+`/sys/module`, session programs in `/proc`, the shell restarting, and the
+kernel log for faults. Anything that does not start, stops, or is restarted
+is sent to ztMETRO as a notification from `ztOSCOR-U` (`notify APP|TITLE|TEXT`
+on the shell's control pipe: a banner, and kept in the action centre). It
+also holds the sensor hub's two recovery attempts. The list is
+`/etc/ztoscoru/components`; `ztoscoru status` prints the state. (It was
+`ztoscsf`, `ztoscoresensorframework.service`, until 2026-11;
+`scripts/dev/migrate-coru.sh` moves a phone over.)
+
 ### ztOSCoreSensorFramework
 
-`ztmetro/csf/` (`ztoscsf`, `ztoscoresensorframework.service`): the one place
-that knows every piece of hardware support this system brings itself. At boot
-it loads the modules that have no service of their own (the LED, the vibration
-motor) behind a mark in `/var/lib/ztoscsf` (a load that stops the kernel is
-not tried again; `ztoscsf retry NAME`), starts any listed unit that is not
-running, and then watches them all: units through one `systemctl show` every
-20 s, modules in `/sys/module`, session programs in `/proc`, and the kernel
-log for faults. Anything that does not start, stops, or is restarted is sent
-to ztMETRO as a notification (`notify TITLE|TEXT` on its control pipe: a
-banner, and kept in the action centre). The list is
-`/etc/ztoscoresensorframework/components`; `ztoscsf status` prints the state.
+The sensor hub and the sensors, nothing else: `ztoscsf-sensorhub` (Broadcom's
+`lhd` for the BCM4773, `ztoscsf-sensorhub.service`) and `ztoscsf-sensord`
+(`ztmetro/sensord/`: light, motion and proximity readings under
+`/run/ztoscsf-sensors/`, auto brightness and OpenTone). ztOSCOR-U starts and
+watches them like any other component.
 
 ### Haptics
 

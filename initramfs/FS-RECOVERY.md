@@ -77,4 +77,4 @@ salvaged it and rebooted (log /var/log/ztos-fsck/20261024-064611-sda25.log). A r
 same inode points at whatever writes that directory or at the UFS write path (unclean reset
 while it is written), not a random event. To investigate: what process writes
 ~/.local/share/ztos/whatsapp (node install?), whether the corruption follows a hard reset
-(watchdog / forced reboot / ztoscsf reboot_recovery), dumpe2fs error fields, UFS driver logs.
+(watchdog / forced reboot / ztoscsf, now ztoscoru, reboot_recovery), dumpe2fs error fields, UFS driver logs.

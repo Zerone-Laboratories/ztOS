@@ -289,7 +289,7 @@ What moves where, from today's `ztOSMobile`:
 | `ztmetro/` (shell, apps), `sdk/`, `apps/`, `os/` (except `overlay-starlte`, `packages/starlte`) | `ztos-core` |
 | `android/waydroid/`, `android/atl/`, `os/overlay/usr/local/bin/ztos-android` | `ztos-core` (`ztos-waydroid`, `ztos-atl`) |
 | `ztmetro/perfd` | `ztos-core` as the policy engine; topology, caps and sensors read from `Perf1` |
-| `ztmetro/sensord`, `ztmetro/modemd`, `ztmetro/csf` | split: client side to `ztos-core`, S9 backends to the device repo |
+| `ztmetro/sensord`, `ztmetro/modemd`, `ztmetro/coru` | split: client side to `ztos-core`, S9 backends to the device repo |
 | `kernel/`, `scripts/build-boot.sh`, `initramfs/`, `firmware/`, `prebuilts/modules` | `ztos-device-samsung-starlte` |
 | `audio/`, `sensors/`, `haptics/`, `leds/`, `modem/`, `score/`, `power/`, `bluetooth/`, `camera/` | `ztos-device-samsung-starlte` |
 | `rootfs/overlay` | split by file: generic to `ztos-core`, S9 to the device repo |

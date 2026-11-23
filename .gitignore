@@ -34,7 +34,7 @@ ztmetro/devtest/zrndevtest
 ztmetro/perfd/zrnperfd
 ztmetro/sensord/ztoscsf-sensord
 ztmetro/modemd/ztoscorenetworkingd
-ztmetro/csf/ztoscsf
+ztmetro/coru/ztoscoru
 ztmetro/notifyd/ztnotifyd
 ztmetro/phone/ztphone
 ztmetro/messages/ztmessages

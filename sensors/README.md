@@ -114,9 +114,10 @@ Samsung's device tree configures `gpg0-2` as the GPS power output.
 The driver leaves it alone. `gph0-4` is MCU_RESP input with pulls disabled;
 `gpa0-5` (AP_SLEEP) is held high; `gpa1-7` and `gpa4-0` remain inputs.
 
-`ztoscsf` no longer has a recovery reboot command. On hub failure it stops
-sensord, pulses the driver reset sequence, restarts lhd, and tries twice.
-It shows the failure dialog only after both retries fail.
+ztOSCOR-U (`ztoscoru`, `ztoscsf` until 2026-11) no longer has a recovery
+reboot command. On hub failure it stops sensord, pulses the driver reset
+sequence, restarts lhd, and tries twice. It shows the failure dialog only
+after both retries fail.
 
 Three normal `systemctl reboot` checks on 2026-10-24 passed. On each boot,
 `/sys/class/sec/sensorhub/ready` reached 1 within 28 seconds, sensord was
@@ -136,12 +137,12 @@ did not return, so its sensor state could not be verified.
 User-space failure containment follow-up (2026-10-25): the sensorhub helper now
 supervises lhd with a 30-second firmware startup deadline and two-second checks
 after readiness. The service does not automatically restart failed firmware;
-ztoscsf owns the two recovery attempts and stops both units when those fail.
+ztOSCOR-U owns the two recovery attempts and stops both units when those fail.
 `python sensors/test-sensorhub-watch.py` exercises the supervisor with mocks,
 without touching hardware. The helper, unit, and CSF binary are now deployed. A live failed startup stopped
 lhd after 30 seconds and left zero automatic restarts; no lhd survived. The
 CSF exhaustion test also verifies stop ordering with mocked hardware commands.
-Details and evidence are in `ztmetro/csf/POLISH.md` and `~/swarm/polish-report.md`.
+Details and evidence are in `ztmetro/coru/POLISH.md` and `~/swarm/polish-report.md`.
 
 - Auto rotation from the accelerometer, proximity for calls, the compass.
 - GNSS: the same chip and daemon, `gpsd` from VENDOR on top of lhd.

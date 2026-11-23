@@ -56,8 +56,8 @@ reading "+ sensor hub daemons paused"
 pause zrn-modemd
 reading "+ modem daemon paused"
 
-pause zrnperfd ztoscsf
-reading "+ perfd and the framework paused"
+pause zrnperfd ztoscoru
+reading "+ perfd and ztOSCOR-U paused"
 
 for c in 3 2 1; do echo 0 > /sys/devices/system/cpu/cpu$c/online 2>/dev/null; done
 say "online now: $(cat /sys/devices/system/cpu/online)"
@@ -74,7 +74,7 @@ fi
 
 # put everything back
 for c in 1 2 3; do echo 1 > /sys/devices/system/cpu/cpu$c/online 2>/dev/null; done
-resume zrnperfd ztoscsf zrn-modemd lhd zrnsensord
+resume zrnperfd ztoscoru zrn-modemd lhd zrnsensord
 nmcli radio wifi on 2>/dev/null
 say "online restored: $(cat /sys/devices/system/cpu/online)"
 say "done $(date +%T)"

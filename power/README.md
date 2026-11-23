@@ -141,7 +141,7 @@ on again `00100f0f`; eight rounds of cpu5-7 off and on and one of cpu3, no
 failure; the three big cores back in 87 ms. zrnperfd takes cpu5-7 offline in
 nominal and with the screen off and brings them back for big and rapid
 boost (seen: nominal 0-4, load -> 0-7 within 500 ms, idle -> 0-4 after 5 s).
-Loaded at boot by ztOSCoreSensorFramework (behind its mark).
+Loaded at boot by ztOSCOR-U (behind its mark).
 
 ## What is in place against the drain (2026-10-13)
 
@@ -156,9 +156,9 @@ could be done without risking a freeze on a phone nobody is next to.
   pins a core ("dynamic boost": nominal, big at 65 %, rapid). Screen off:
   both clusters and the GPU at their lowest, as before.
 - Fewer wake-ups with the screen off: zrn-modemd asks the modem every 120 s
-  instead of 15 and does not run `iw`; ztOSCoreSensorFramework looks every
+  instead of 15 and does not run `iw`; ztOSCOR-U looks every
   60 s instead of 20; the shell's once-a-second look at the network stops.
-- The battery is not run flat: the framework warns at 5 % and shuts the phone
+- The battery is not run flat: ztOSCOR-U warns at 5 % and shuts the phone
   down at 2 % with no charger in, and `zboot-charge-hold` (an early boot
   unit) keeps a phone that is started below 10 % from booting further: on a
   charger it waits there, clocks at their lowest and the screen dark, until

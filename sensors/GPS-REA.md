@@ -277,7 +277,7 @@ lhd -> gpsd -> zrn-gnss-nmea (127.0.0.1:10111)
 ### Costs
 
 - Each GPS session ends with ztos-gnss's ExecStopPost restarting
-  ztoscoresensorframework (see the unit).
+  ztoscoru, ztOSCOR-U (see the unit).
 - The bridge holds about 27 MB of anonymous memory while Android runs.
 - Logs carry no positions; `ZTOS_GNSS_DEBUG=1` prints every fix.
 
@@ -421,13 +421,13 @@ Two faults, found together with the sleep work (power/suspend/README.md):
 - All of these timers count on CLOCK_BOOTTIME (the bridge's hold on
   elapsedRealtime), so a sleep cannot stretch them.
 - ztos-gnss.service needs the hub with Requisite=, not Requires=: a GNSS
-  start never brings the hub up without ztoscsf's reset sequence; with it
+  start never brings the hub up without ztoscoru's reset sequence; with it
   down the start fails at once ("Dependency failed"). `--pre` waits up to
   60 s for lhd and `ready=1`.
 - The gate's retry resets the unit's start limit only once the hub has been
   ready for 10 s, so a reader that stays connected is not locked out for
   five minutes, and a flapping hub cannot restart gpsd every 30 s.
-- A hub reset (ztoscsf-sensorhub's start, ztoscsf's power retry) holds
+- A hub reset (ztoscsf-sensorhub's start, ztoscoru's power retry) holds
   `timed-hub` (45 s) until `hub ready`.
 
 Measured on the phone (screen off, on the charger, so no real sleep):
