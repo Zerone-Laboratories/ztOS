@@ -586,6 +586,8 @@ static void perf_tell(const char *command) {
 #include "boostpage.h"
 #include "passcodepage.h"
 
+static void about_summary(char *out, size_t size);	/* the about page's, below */
+
 /* Auto brightness is sensord's: it has the light sensor. Without its status
  * the phone has no light sensor to go by (the J5), and nothing is offered. */
 static bool light_sensor;
@@ -991,7 +993,8 @@ static double draw_main(cairo_t *cr) {
 
 	y = zmc_entry(cr, y, "date + region", "date, time zone and regional formats", ACT_OPEN_PAGE, PAGE_DATE);
 
-	y = zmc_entry(cr, y, "about", "Samsung Galaxy S9, ztOS Mobile", ACT_OPEN_PAGE, PAGE_ABOUT);
+	about_summary(detail, sizeof(detail));
+	y = zmc_entry(cr, y, "about", detail, ACT_OPEN_PAGE, PAGE_ABOUT);
 
 	return y + 20;
 }
@@ -2920,42 +2923,185 @@ static double draw_quick(cairo_t *cr) {
 	return y + 20;
 }
 
-static double draw_about(cairo_t *cr) {
-	char value[256];
-	double y = zmc_header(cr, "about");
+/* About: what this phone is and runs, read from the system rather than written
+ * in here: ztOSIAL (Device1), the device tree and the bootloader's command line,
+ * /etc/os-release, the kernel, and the running shell itself
+ * ($XDG_RUNTIME_DIR/ztmetro.version, which ztmetro writes when it starts). */
+#ifndef ZTMETRO_VERSION
+#define ZTMETRO_VERSION "unknown"
+#endif
 
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "Phone", FONT_REGULAR, 13, MARGIN, y, 0);
-	zmc_fg(cr);
-	y += zmc_text(cr, "Samsung Galaxy S9 (SM-G960N starlte)", FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
+struct about_info {
+	char phone[128];	/* Device1.Name, or the device tree's model */
+	char hardware[256];	/* the device tree's model and ztOSIAL's codename */
+	char bootloader[96];	/* androidboot.bootloader, when the bootloader passes it */
+	char os[160];		/* os-release: NAME VERSION_ID */
+	char os_detail[128];	/* what it is built on, and the GSI */
+	char kernel[160], kernel_build[160];
+	char shell[128], shell_detail[128];
+};
 
-	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "Operating System", FONT_REGULAR, 13, MARGIN, y, 0);
-	zmc_fg(cr);
-	y += zmc_text(cr, "ztOS Mobile (Arch Linux ARM)", FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
+/* a whole small file as one string: trailing newlines and NULs (the device
+ * tree's strings end in one) dropped */
+static bool about_file(const char *path, char *out, size_t size) {
+	out[0] = 0;
+	FILE *f = fopen(path, "r");
+	if (!f) return false;
+	size_t n = fread(out, 1, size - 1, f);
+	fclose(f);
+	out[n] = 0;
+	while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\0' || out[n - 1] == ' ')) out[--n] = 0;
+	return n > 0;
+}
 
-	struct utsname uts;
-	if (uname(&uts) == 0) {
-		snprintf(value, sizeof(value), "Linux %s", uts.release);
-		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		zmc_text(cr, "Kernel", FONT_REGULAR, 13, MARGIN, y, 0);
-		zmc_fg(cr);
-		y += zmc_text(cr, value, FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
+/* KEY=value from an os-release style file, its quotes taken off */
+static bool about_key(const char *path, const char *key, char *out, size_t size) {
+	out[0] = 0;
+	FILE *f = fopen(path, "r");
+	if (!f) return false;
+	char line[512];
+	size_t klen = strlen(key);
+	bool found = false;
+	while (!found && fgets(line, sizeof(line), f)) {
+		if (strncmp(line, key, klen) != 0 || line[klen] != '=') continue;
+		char *v = line + klen + 1;
+		v[strcspn(v, "\r\n")] = 0;
+		size_t n = strlen(v);
+		if (n >= 2 && (v[0] == '"' || v[0] == '\'') && v[n - 1] == v[0]) {
+			v[n - 1] = 0;
+			v++;
+		}
+		snprintf(out, size, "%s", v);
+		found = out[0] != 0;
+	}
+	fclose(f);
+	return found;
+}
+
+static bool about_ial(const char *property, char *out, size_t size) {
+	out[0] = 0;
+#ifdef HAVE_ZTOS_IAL
+	if (ztos_ial_get_string(NULL, "Device1", property, out, size) < 0) out[0] = 0;
+#else
+	(void)property; (void)size;
+#endif
+	return out[0] != 0;
+}
+
+static void about_load(struct about_info *a) {
+	char model[128], codename[64], name[64], version[64], like[64], gsi[32];
+	memset(a, 0, sizeof(*a));
+
+	/* the phone: ztOSIAL's name for it, and what its firmware calls it */
+	if (!about_file("/sys/firmware/devicetree/base/model", model, sizeof(model)))
+		about_file("/sys/devices/virtual/dmi/id/product_name", model, sizeof(model));
+	about_ial("Codename", codename, sizeof(codename));
+	if (!about_ial("Name", a->phone, sizeof(a->phone)))
+		snprintf(a->phone, sizeof(a->phone), "%s", model[0] ? model : "Unknown");
+	if (model[0] && strcmp(model, a->phone) != 0)
+		snprintf(a->hardware, sizeof(a->hardware), "%s%s%s", model, codename[0] ? ", " : "", codename);
+	else
+		snprintf(a->hardware, sizeof(a->hardware), "%s", codename);
+
+	char cmdline[2048];
+	if (about_file("/proc/cmdline", cmdline, sizeof(cmdline))) {
+		const char *b = strstr(cmdline, "androidboot.bootloader=");
+		if (b) {
+			b += strlen("androidboot.bootloader=");
+			snprintf(a->bootloader, sizeof(a->bootloader), "%.*s", (int)strcspn(b, " \n"), b);
+		}
 	}
 
+	/* the system */
+	const char *rel = access("/etc/os-release", R_OK) == 0 ? "/etc/os-release" : "/usr/lib/os-release";
+	if (!about_key(rel, "NAME", name, sizeof(name))) snprintf(name, sizeof(name), "ztOS");
+	if (about_key(rel, "VERSION_ID", version, sizeof(version)))
+		snprintf(a->os, sizeof(a->os), "%s %s", name, version);
+	else if (!about_key(rel, "PRETTY_NAME", a->os, sizeof(a->os)))
+		snprintf(a->os, sizeof(a->os), "%s", name);
+
+	struct utsname uts;
+	bool have_uts = uname(&uts) == 0;
+	const char *base = "";
+	if (about_key(rel, "ID_LIKE", like, sizeof(like)) && strstr(like, "arch"))
+		base = have_uts && strcmp(uts.machine, "aarch64") == 0 ? "Arch Linux ARM" : "Arch Linux";
+	about_ial("GsiVersion", gsi, sizeof(gsi));
+	if (strcmp(gsi, "unknown") == 0) gsi[0] = 0;
+	snprintf(a->os_detail, sizeof(a->os_detail), "%s%s%s%s%s", base[0] ? "on " : "", base,
+		base[0] && gsi[0] ? ", " : "", gsi[0] ? "GSI " : "", gsi);
+
+	if (have_uts) {
+		snprintf(a->kernel, sizeof(a->kernel), "Linux %s (%s)", uts.release, uts.machine);
+		snprintf(a->kernel_build, sizeof(a->kernel_build), "%s", uts.version);
+	}
+
+	/* the shell that is running, as it said when it started */
+	char path[512], shell_version[48], commit[24], wlroots[24];
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	if (runtime) snprintf(path, sizeof(path), "%s/ztmetro.version", runtime);
+	else snprintf(path, sizeof(path), "/run/user/%u/ztmetro.version", (unsigned)getuid());
+	if (about_key(path, "version", shell_version, sizeof(shell_version))) {
+		about_key(path, "commit", commit, sizeof(commit));
+		about_key(path, "wlroots", wlroots, sizeof(wlroots));
+		snprintf(a->shell, sizeof(a->shell), "ztMETRO %s%s%s%s", shell_version, commit[0] ? " (" : "", commit,
+			commit[0] ? ")" : "");
+		snprintf(a->shell_detail, sizeof(a->shell_detail), "Wayland, wlroots %s", wlroots[0] ? wlroots : "unknown");
+	} else {
+		/* a shell from before it said, or none: this Settings' own build */
+		snprintf(a->shell, sizeof(a->shell), "ztMETRO %s", ZTMETRO_VERSION);
+		snprintf(a->shell_detail, sizeof(a->shell_detail), "the running shell did not say which it is");
+	}
+}
+
+/* a caption and its value, and a smaller line under it when there is one */
+static double about_row(cairo_t *cr, double y, const char *caption, const char *value, const char *detail) {
+	double w = zmc.width - 2 * MARGIN;
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "Shell", FONT_REGULAR, 13, MARGIN, y, 0);
+	zmc_text(cr, caption, FONT_REGULAR, 13, MARGIN, y, 0);
 	zmc_fg(cr);
-	y += zmc_text(cr, "ztMETRO (Wayland / wlroots 0.20)", FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
+	double h = zmc_text(cr, value, FONT_SEMILIGHT, 19, MARGIN, y + 18, w);
+	if (!detail || !detail[0]) return y + h + 30;
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	double dh = zmc_text(cr, detail, FONT_REGULAR, 13, MARGIN, y + 18 + h + 2, w);
+	return y + h + dh + 32;
+}
+
+/* read again at most every few seconds: the page draws every frame of a turn */
+static const struct about_info *about_get(void) {
+	static struct about_info info;
+	static uint32_t loaded_at;
+	static bool loaded;
+	uint32_t now = zmc_now_ms();
+	if (!loaded || now - loaded_at > 3000) {
+		about_load(&info);
+		loaded_at = now;
+		loaded = true;
+	}
+	return &info;
+}
+
+/* the main list's line under "about" */
+static void about_summary(char *out, size_t size) {
+	const struct about_info *a = about_get();
+	snprintf(out, size, "%s, %s", a->phone, a->os);
+}
+
+static double draw_about(cairo_t *cr) {
+	char value[256];
+	const struct about_info *a = about_get();
+	double y = zmc_header(cr, "about");
+
+	y = about_row(cr, y, "Phone", a->phone, a->hardware);
+	if (a->bootloader[0]) y = about_row(cr, y, "Bootloader", a->bootloader, NULL);
+	y = about_row(cr, y, "Operating System", a->os, a->os_detail);
+	if (a->kernel[0]) y = about_row(cr, y, "Kernel", a->kernel, a->kernel_build);
+	y = about_row(cr, y, "Shell", a->shell, a->shell_detail);
 
 	struct sysinfo si;
 	if (sysinfo(&si) == 0) {
 		long up = si.uptime;
 		snprintf(value, sizeof(value), "%ld hours, %ld mins", up / 3600, (up % 3600) / 60);
-		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-		zmc_text(cr, "Uptime", FONT_REGULAR, 13, MARGIN, y, 0);
-		zmc_fg(cr);
-		y += zmc_text(cr, value, FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
+		y = about_row(cr, y, "Uptime", value, NULL);
 	}
 
 	double start_y = y;

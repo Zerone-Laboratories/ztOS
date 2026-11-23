@@ -1,9 +1,10 @@
 NAME="ztOS"
-PRETTY_NAME="ztOS BETA-1"
+PRETTY_NAME="ztOS 0.2.3-BETA-1.3"
 ID=ztos
 ID_LIKE=arch
-VERSION_ID="0.2.0-BETA-1"
-BUILD_ID="BETA-1"
+VERSION="0.2.3-BETA-1.3"
+VERSION_ID="0.2.3-BETA-1.3"
+BUILD_ID="BETA-1.3"
 ANSI_COLOR="38;2;0;80;239"
-HOME_URL="https://github.com/"
+HOME_URL="https://ztos.online/"
 LOGO=ztos

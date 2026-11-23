@@ -109,7 +109,16 @@
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
+#include <wlr/version.h>
 #include <xkbcommon/xkbcommon.h>
+
+/* the Makefile's, from VERSION and git */
+#ifndef ZTMETRO_VERSION
+#define ZTMETRO_VERSION "unknown"
+#endif
+#ifndef ZTMETRO_COMMIT
+#define ZTMETRO_COMMIT ""
+#endif
 
 /* A file in the session's runtime directory: $XDG_RUNTIME_DIR, or
  * /run/user/<our UID> when whatever started us did not set it. */
@@ -118,6 +127,20 @@ static const char *runtime_file(char *out, size_t size, const char *name) {
 	if (runtime) snprintf(out, size, "%s/%s", runtime, name);
 	else snprintf(out, size, "/run/user/%u/%s", (unsigned)getuid(), name);
 	return out;
+}
+
+/* $XDG_RUNTIME_DIR/ztmetro.version: what this running shell is, for Settings'
+ * About page ("key=value" lines), replaced whole so it is never half written */
+static void publish_version(void) {
+	char path[256], tmp[272];
+	runtime_file(path, sizeof(path), "ztmetro.version");
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	FILE *f = fopen(tmp, "w");
+	if (!f) return;
+	fprintf(f, "version=%s\ncommit=%s\nwlroots=%s\npid=%d\n", ZTMETRO_VERSION, ZTMETRO_COMMIT,
+		WLR_VERSION_STR, (int)getpid());
+	if (fclose(f) == 0) rename(tmp, path);
+	else unlink(tmp);
 }
 
 /* ztos-demoloop is running (its flag file is there) */
@@ -19211,6 +19234,16 @@ static void frost_prepare(struct zt_server *server, struct wlr_output *output, G
 		}
 		if (s->valid && s->sig == scan->sig[k]) {
 			frosted[k] = true;	/* nothing under it has changed */
+		} else if (s->valid && server->rot_phase == ROT_TURN &&
+				(frost_frame & 3u) != 2u * (uint32_t)k) {
+			/* Turning: each bar's blur once in four frames, and on the
+			 * frames between none at all. With one of the two blurred on
+			 * every frame of the turn, the frames that blurred were the
+			 * ones that missed their vblank (12 of 14 turn frames over
+			 * 20 ms in round 10, 2026-11-22: the blur's 1-2 ms of the GPU
+			 * on top of the turn's own 8-13). The turning picture under
+			 * a bar is blurred to nothing; three frames old does not show */
+			frosted[k] = true;
 		} else if (s->valid && (shell_in_motion(server) || server->rot_phase == ROT_TURN) &&
 				(s->made + 1 == frost_frame || (frost_frame & 1u) != (uint32_t)k)) {
 			/* (and the two bars take turns: the status bar's blur on even
@@ -22967,7 +23000,14 @@ static int render_to_files(struct zt_server *server, const char *dir) {
 }
 
 int main(int argc, char *argv[]) {
+	if (argc > 1 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+		printf("ztMETRO %s%s%s%s (wlroots %s)\n", ZTMETRO_VERSION, ZTMETRO_COMMIT[0] ? " (" : "",
+			ZTMETRO_COMMIT, ZTMETRO_COMMIT[0] ? ")" : "", WLR_VERSION_STR);
+		return 0;
+	}
 	wlr_log_init(getenv("ZTMETRO_DEBUG") ? WLR_DEBUG : WLR_INFO, NULL);
+	wlr_log(WLR_INFO, "ztMETRO %s %s, wlroots %s", ZTMETRO_VERSION, ZTMETRO_COMMIT, WLR_VERSION_STR);
+	publish_version();
 	/* children are reaped by the kernel; nothing here waits for them */
 	signal(SIGCHLD, SIG_IGN);
 

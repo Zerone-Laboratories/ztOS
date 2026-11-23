@@ -38,8 +38,15 @@ RETRO_DEPS = $(RETRO) core/zrnboard.h retro/dotmatrix.h retro/dm-launcher.h retr
 DM_WRAP = retro/dm-wrap.c
 DM_WRAP_LDFLAGS = -Wl,--wrap=cairo_fill,--wrap=cairo_fill_preserve,--wrap=cairo_stroke,--wrap=cairo_stroke_preserve,--wrap=cairo_paint
 
-ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h $(RETRO_DEPS) $(DM_WRAP)
-	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) $(IAL_FLAGS) \
+# ztMETRO's own version (VERSION here; ztOS's is ../VERSION) and, in a git
+# checkout, the commit: built into the shell, which tells Settings' About
+# page at run time ($XDG_RUNTIME_DIR/ztmetro.version)
+ZTMETRO_VERSION := $(shell tr -d ' \n' < VERSION 2>/dev/null)
+ZTMETRO_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null)
+VERSION_FLAGS = -DZTMETRO_VERSION='"$(ZTMETRO_VERSION)"' -DZTMETRO_COMMIT='"$(ZTMETRO_COMMIT)"'
+
+ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h VERSION $(RETRO_DEPS) $(DM_WRAP)
+	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(VERSION_FLAGS) $(shell pkg-config --cflags $(PKGS)) $(IAL_FLAGS) \
 		-o $@ ztmetro.c $(RETRO) $(DM_WRAP) $(DM_WRAP_LDFLAGS) $(shell pkg-config --libs $(PKGS)) $(IAL_LIBS) -lm -lpthread
 
 # the DotMatrix screens rendered offscreen to PNG files, to check them without a phone
@@ -76,8 +83,8 @@ passcoded/zrn-passcoded: passcoded/zrn-passcoded.c passcoded/passcode-proto.h zt
 passcoded/zrn-passcode: passcoded/zrn-passcode.c passcoded/passcode-proto.h
 	$(CC) $(CFLAGS) $(WARN) -o $@ passcoded/zrn-passcode.c
 
-settings/ztsettings: settings/ztsettings.c settings/boostpage.h settings/passcodepage.h passcoded/passcode-proto.h $(CORE_DEPS)
-	$(APP_BUILD) -o $@ settings/ztsettings.c $(CORE) $(APP_LIBS)
+settings/ztsettings: settings/ztsettings.c settings/boostpage.h settings/passcodepage.h passcoded/passcode-proto.h VERSION $(CORE_DEPS)
+	$(APP_BUILD) $(VERSION_FLAGS) -o $@ settings/ztsettings.c $(CORE) $(APP_LIBS)
 
 devtest/zrndevtest: devtest/zrndevtest.c $(CORE_DEPS)
 	$(APP_BUILD) -o $@ devtest/zrndevtest.c $(CORE) $(APP_LIBS)
