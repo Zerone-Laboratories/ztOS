@@ -20,7 +20,22 @@ setup_done() {	# $1: how many setups to wait for
 		i=$((i + 1)); [ $i -gt 90 ] && return 1; sleep 1
 	done
 }
-setup_done 1 || { echo "zrn-bluetooth-addr: setup never finished"; exit 1; }
+# Started long after the attach (bluetoothd started again, or unmasked, hours
+# into a boot), the kernel log has moved on and that line is gone, though the
+# setup it marks finished long ago. Then there is nothing to wait for: the
+# attach is over a minute old and the controller is there.
+settled() {
+	[ -e /sys/class/bluetooth/hci0 ] || return 1
+	at=$(systemctl show zrn-bluetooth.service -p ActiveEnterTimestampMonotonic --value 2>/dev/null)
+	[ -n "$at" ] && [ "$at" -gt 0 ] 2>/dev/null || return 1
+	up=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+	[ $((up - at)) -gt 60000000 ]
+}
+if settled; then
+	echo "zrn-bluetooth-addr: the controller was set up long ago; not waiting on the kernel log"
+else
+	setup_done 1 || { echo "zrn-bluetooth-addr: setup never finished"; exit 1; }
+fi
 # and registered a few seconds after that line; wait for it, asking once
 # a second only from now on
 sleep 5
