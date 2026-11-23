@@ -244,6 +244,11 @@ rm -rf "$R/usr/src/zrn-pushd"
 step "adding ztOS's files"
 cp -a "$SRC/os/overlay/." "$R/"
 cp -a "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
+# os-release from VERSION, so About and `cat /etc/os-release` say this release
+ZTOSVERSION=$(tr -d ' \n' < "$SRC/VERSION")
+sed -i -e "s/^PRETTY_NAME=.*/PRETTY_NAME=\"ztOS $ZTOSVERSION\"/" \
+	-e "s/^VERSION=.*/VERSION=\"$ZTOSVERSION\"/" -e "s/^VERSION_ID=.*/VERSION_ID=\"$ZTOSVERSION\"/" \
+	-e "s/^BUILD_ID=.*/BUILD_ID=\"${ZTOSVERSION#*-}\"/" "$R/etc/os-release"
 # the wallpapers and ringtones: scripts/pack-media.sh
 if [ -f "$SRC/prebuilts/ztos-media/ztos-media.tar.xz.partaa" ]; then
 	cat "$SRC"/prebuilts/ztos-media/ztos-media.tar.xz.part* | tar -C "$R" --no-same-owner -xJf -

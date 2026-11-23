@@ -23,7 +23,7 @@
 <meta name="twitter:description" content="ztOS is an open-source phone operating system with Windows Phone 8.1's look and motion (the ztMETRO shell), on Arch Linux ARM and mainline Linux. Runs on the Galaxy S9, in QEMU, and on phones postmarketOS supports, with Android apps through Waydroid.">
 <meta name="twitter:image" content="https://ztos.online/og.jpg">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"WebSite","@id":"https://ztos.online/#website","url":"https://ztos.online/","name":"ztOS","inLanguage":"en-AU","publisher":{"@id":"https://ztos.online/#org"}},{"@type":"Organization","@id":"https://ztos.online/#org","name":"Zerone Laboratories","url":"https://ztos.online/","logo":"https://ztos.online/favicon.svg","sameAs":["https://github.com/Zerone-Laboratories"]},{"@type":"SoftwareApplication","name":"ztOS","applicationCategory":"OperatingSystem","operatingSystem":"Linux (aarch64)","softwareVersion":"0.2.0 BETA-1","description":"ztOS is an open-source phone operating system with Windows Phone 8.1's look and motion (the ztMETRO shell), on Arch Linux ARM and mainline Linux. Runs on the Galaxy S9, in QEMU, and on phones postmarketOS supports, with Android apps through Waydroid.","url":"https://ztos.online/","image":"https://ztos.online/og.jpg","license":"https://www.gnu.org/licenses/gpl-3.0.html","downloadUrl":"https://github.com/Zerone-Laboratories/ztOS","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"author":{"@id":"https://ztos.online/#org"}}]}</script>
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"WebSite","@id":"https://ztos.online/#website","url":"https://ztos.online/","name":"ztOS","inLanguage":"en-AU","publisher":{"@id":"https://ztos.online/#org"}},{"@type":"Organization","@id":"https://ztos.online/#org","name":"Zerone Laboratories","url":"https://ztos.online/","logo":"https://ztos.online/favicon.svg","sameAs":["https://github.com/Zerone-Laboratories"]},{"@type":"SoftwareApplication","name":"ztOS","applicationCategory":"OperatingSystem","operatingSystem":"Linux (aarch64)","softwareVersion":"0.2.3 BETA-1.3","description":"ztOS is an open-source phone operating system with Windows Phone 8.1's look and motion (the ztMETRO shell), on Arch Linux ARM and mainline Linux. Runs on the Galaxy S9, in QEMU, and on phones postmarketOS supports, with Android apps through Waydroid.","url":"https://ztos.online/","image":"https://ztos.online/og.jpg","license":"https://www.gnu.org/licenses/gpl-3.0.html","downloadUrl":"https://github.com/Zerone-Laboratories/ztOS","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"author":{"@id":"https://ztos.online/#org"}}]}</script>
 <meta name="ztos-submit" content="https://ztos-device-submit.ztos.workers.dev/submit">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -391,7 +391,7 @@
       <aside class="infobox" aria-label="At a glance">
         <div class="cap">ztOS at a glance</div>
         <dl>
-          <dt>Version</dt><dd>0.2.1 beta 1.1</dd>
+          <dt>Version</dt><dd>0.2.3 beta 1.3</dd>
           <dt>Shell</dt><dd>ztMETRO</dd>
           <dt>Base</dt><dd>Arch Linux ARM, systemd</dd>
           <dt>Kernel</dt><dd>Mainline Linux 7.1</dd>
@@ -448,7 +448,7 @@
         <h3 id="install-new">Port it to another phone</h3>
         <p>ztOS is a generic system image (GSI) plus a device layer for each phone (see <a href="#structure">GSI and ztOSIAL</a>). For a phone postmarketOS already boots on mainline Linux, <a href="#ztconflo">ztConflo</a> builds an image from the GSI with a device layer made for it.</p>
         <ol class="steps">
-          <li><div><b>Build the GSI</b><span><code>installer/ztos build --target gsi</code> makes <code>build/ztos/gsi/ztos-gsi-0.2.0-aarch64.tar.zst</code>, with its <code>.sha256</code>.</span></div></li>
+          <li><div><b>Build the GSI</b><span><code>installer/ztos build --target gsi</code> makes <code>build/ztos/gsi/ztos-gsi-0.2.3-aarch64.tar.zst</code>, with its <code>.sha256</code>.</span></div></li>
           <li><div><b>Get ztConflo</b><span><code>git clone https://github.com/Zerone-Laboratories/ztconflo.git</code>, then in it <code>python -m ztconflo lookup &lt;codename&gt;</code> says whether your phone can be built. The codename is on the phone's postmarketOS wiki page.</span></div></li>
           <li><div><b>Try it first</b><span><code>python -m ztconflo build &lt;codename&gt; --gsi &lt;path to the GSI&gt; --dry-run</code> checks the phone's kernel against what ztOS needs and shows every command, without running them.</span></div></li>
           <li><div><b>Build and flash</b><span>The same without <code>--dry-run</code> writes <code>out/&lt;codename&gt;/</code>; <code>python -m ztconflo flash &lt;codename&gt;</code> shows the partitions and asks before writing.</span></div></li>
@@ -680,7 +680,7 @@ ztos-sdk logs -f         <span class="c"># what it prints, on the phone</span></
       <div class="body">
         <div class="alert" role="note">
           <b>Beta</b>
-          ztOS 0.2.1 beta 1.1 runs daily on one Galaxy S9, as the GSI and the S9's device layer. The installer's phone path is implemented but not yet validated end to end on a fresh install, and no ztConflo image has booted on another phone yet.
+          ztOS 0.2.3 beta 1.3 runs daily on one Galaxy S9, as the GSI and the S9's device layer. The installer's phone path is implemented but not yet validated end to end on a fresh install, and no ztConflo image has booted on another phone yet.
         </div>
         <ul class="prose" style="margin-top:1.25rem">
           <li>The first phone besides the S9 booting a ztConflo build from the GSI.</li>

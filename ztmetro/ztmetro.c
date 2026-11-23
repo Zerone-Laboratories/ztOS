@@ -109,7 +109,16 @@
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/edges.h>
 #include <wlr/util/log.h>
+#include <wlr/version.h>
 #include <xkbcommon/xkbcommon.h>
+
+/* the Makefile's, from VERSION and git */
+#ifndef ZTMETRO_VERSION
+#define ZTMETRO_VERSION "unknown"
+#endif
+#ifndef ZTMETRO_COMMIT
+#define ZTMETRO_COMMIT ""
+#endif
 
 /* A file in the session's runtime directory: $XDG_RUNTIME_DIR, or
  * /run/user/<our UID> when whatever started us did not set it. */
@@ -118,6 +127,20 @@ static const char *runtime_file(char *out, size_t size, const char *name) {
 	if (runtime) snprintf(out, size, "%s/%s", runtime, name);
 	else snprintf(out, size, "/run/user/%u/%s", (unsigned)getuid(), name);
 	return out;
+}
+
+/* $XDG_RUNTIME_DIR/ztmetro.version: what this running shell is, for Settings'
+ * About page ("key=value" lines), replaced whole so it is never half written */
+static void publish_version(void) {
+	char path[256], tmp[272];
+	runtime_file(path, sizeof(path), "ztmetro.version");
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	FILE *f = fopen(tmp, "w");
+	if (!f) return;
+	fprintf(f, "version=%s\ncommit=%s\nwlroots=%s\npid=%d\n", ZTMETRO_VERSION, ZTMETRO_COMMIT,
+		WLR_VERSION_STR, (int)getpid());
+	if (fclose(f) == 0) rename(tmp, path);
+	else unlink(tmp);
 }
 
 /* ztos-demoloop is running (its flag file is there) */
@@ -22977,7 +23000,14 @@ static int render_to_files(struct zt_server *server, const char *dir) {
 }
 
 int main(int argc, char *argv[]) {
+	if (argc > 1 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+		printf("ztMETRO %s%s%s%s (wlroots %s)\n", ZTMETRO_VERSION, ZTMETRO_COMMIT[0] ? " (" : "",
+			ZTMETRO_COMMIT, ZTMETRO_COMMIT[0] ? ")" : "", WLR_VERSION_STR);
+		return 0;
+	}
 	wlr_log_init(getenv("ZTMETRO_DEBUG") ? WLR_DEBUG : WLR_INFO, NULL);
+	wlr_log(WLR_INFO, "ztMETRO %s %s, wlroots %s", ZTMETRO_VERSION, ZTMETRO_COMMIT, WLR_VERSION_STR);
+	publish_version();
 	/* children are reaped by the kernel; nothing here waits for them */
 	signal(SIGCHLD, SIG_IGN);
 
