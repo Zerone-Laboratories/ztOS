@@ -1,0 +1,10 @@
+#!/bin/sh
+# zrn-uber: Uber's mobile web app (m.uber.com) in Superscan's engine, as an app
+# of its own: its own window and tile, its own cookies (sign-in kept between
+# runs), and the phone's GNSS for the pickup point (the GPS runs only while
+# the page watches the location).
+export ZTB_APP_ID=zrn-uber ZTB_APP_TITLE=Uber ZTB_APP_CAPS=UBER
+export ZTB_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zrn-uber"
+export ZTB_GEOLOCATION=1
+mkdir -p "$ZTB_DATA_DIR"
+exec /usr/local/libexec/zrn-uber/superscan-app "${1:-https://m.uber.com/}"

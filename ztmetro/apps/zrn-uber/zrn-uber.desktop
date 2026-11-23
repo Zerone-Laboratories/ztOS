@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Uber
+Comment=Ride with Uber (web app)
+Exec=zrn-uber
+Terminal=false
+Type=Application
+Icon=zrn-uber
+StartupWMClass=zrn-uber
+Categories=Network;Maps;
