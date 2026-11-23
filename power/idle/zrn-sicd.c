@@ -79,6 +79,24 @@ MODULE_PARM_DESC(sicd, "offer SICD when every online core is in C2");
 static bool s2idle_sicd;
 module_param(s2idle_sicd, bool, 0644);
 MODULE_PARM_DESC(s2idle_sicd, "offer SICD only after PM core freezes tasks and suspends devices");
+/*
+ * s2idle only. Normally only a boot-cluster core (0..3) may commit SICD, so
+ * the trial fires only when the core that happens to settle into C2 last is a
+ * little one. Under s2idle every wake runs wake_up_all_idle_cpus() and all
+ * eight cores re-descend together, so the last-man is effectively random; when
+ * it is a big core the gate falls through core>=4 and the all-eight-in-C2
+ * window is wasted with no SMC (last_block keeps showing whichever little core
+ * was still re-descending, e.g. "cpu0 up"). This lets the true last-man of
+ * either cluster issue the SICD SMC with all eight already informed C2, so the
+ * boot cluster need not be the one that settles last. Mutually exclusive with
+ * s2idle_cpd (cluster power-down): keep s2idle_cpd=0 when this is on.
+ */
+static bool s2idle_any_committer;
+module_param(s2idle_any_committer, bool, 0644);
+MODULE_PARM_DESC(s2idle_any_committer,
+	"s2idle: let the last-man of either cluster commit SICD (needs s2idle_cpd=0)");
+
+bool zrn_s2idle_any_committer(void) { return READ_ONCE(s2idle_any_committer); }
 static bool relax;
 module_param(relax, bool, 0644);
 MODULE_PARM_DESC(relax, "mask every idle-ip block out (they report nothing on this phone)");
@@ -162,8 +180,10 @@ bool zrn_sicd_try(struct cpuidle_device *dev, unsigned int core, bool suspended,
 	*ret = 0;
 	if (suspended ? !READ_ONCE(s2idle_sicd) : !READ_ONCE(sicd))
 		return false;			/* not configured in: no reason logged */
-	if (core >= 4)			/* SICD is entered from the boot cluster */
-		return false;
+	if (core >= 4 && !(suspended && READ_ONCE(s2idle_any_committer)))
+		return false;		/* SICD is entered from the boot cluster,
+					   unless s2idle_any_committer lets the
+					   last-man of either cluster commit it */
 	if (READ_ONCE(sicd_cpu) >= 0 && core != READ_ONCE(sicd_cpu))
 		return false;
 	if (!suspended && !next_event) {

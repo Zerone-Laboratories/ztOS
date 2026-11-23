@@ -201,7 +201,10 @@ static int enter_powerdown_common(struct cpuidle_device *dev, struct cpuidle_dri
 	core_off(core);
 	/* in C2 from here: SICD (zrn-sicd.c) looks for every online core set */
 	zrn_c2_mark(core, true);
-	cpd = suspended && cluster_prepare(core);
+	/* s2idle_any_committer lets a big core commit SICD as last-man; do not
+	 * also arm cluster power-down on it, or the CPD mailbox request and the
+	 * SICD CPU_INFORM would both be live for the same core. */
+	cpd = suspended && !zrn_s2idle_any_committer() && cluster_prepare(core);
 	if (!zrn_sicd_try(dev, core, suspended, &ret)) {
 		/*
 		 * Not psci_cpu_suspend_enter(): it reads bit 30 of the state

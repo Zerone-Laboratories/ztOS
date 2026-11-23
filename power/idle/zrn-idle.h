@@ -21,5 +21,6 @@ unsigned long zrn_mct_rate_now(void);
 
 struct cpuidle_device;
 bool zrn_sicd_try(struct cpuidle_device *dev, unsigned int core, bool suspended, int *ret);
+bool zrn_s2idle_any_committer(void);
 
 #endif
