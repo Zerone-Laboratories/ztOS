@@ -52,7 +52,12 @@ def binder_allowed():
             if tomllib.load(stream).get('android', {}).get('binder') == 'none':
                 return False
     filesystems = pathlib.Path('/proc/filesystems').read_text()
-    return 'binder' in filesystems
+    if 'binder' in filesystems:
+        return True
+    # binder built in without binderfs (the J5's msm8916 kernel): the kernel
+    # makes /dev/binder, /dev/hwbinder and /dev/vndbinder itself, the names
+    # Waydroid looks for
+    return all(pathlib.Path('/dev', node).is_char_device() for node in ('binder', 'hwbinder', 'vndbinder'))
 
 
 def sha256(path):

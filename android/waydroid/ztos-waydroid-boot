@@ -1,8 +1,28 @@
 #!/usr/bin/env bash
-# Start Android at desktop login, wait briefly for readiness, then restore idle freeze.
+# Start Android in the background, wait briefly for readiness, then restore idle freeze.
+#
+# Started at login (default.target), it no longer starts Android at once: it
+# waits for the shell's word, the file $XDG_RUNTIME_DIR/ztmetro-android-go,
+# which ztMETRO writes a few seconds after the lock screen has come down and
+# settled (or at once when an Android app is tapped), so that the boot does
+# not wait for Android and Android does not compete with the shell's start.
+# The shell also starts this unit itself (systemctl --user start) to bring
+# Android back after it stopped. A shell that never gives the word (an older
+# one) is waited for at most ZTOS_WAYDROID_GO_WAIT seconds (180).
 set -u
 marker=/run/ztos-waydroid-boot-ready
-rm -f "$marker"
+rm -f "$marker" 2>/dev/null	# only possible while it is ours; the session unit's state says the rest
+
+go=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ztmetro-android-go
+wait_s=${ZTOS_WAYDROID_GO_WAIT:-180}
+if [[ ! -e $go ]]; then
+	logger -t ztos-waydroid-boot "waiting for the shell's word ($go), at most ${wait_s} s"
+	for ((i=0; i<wait_s*2; i++)); do
+		[[ -e $go ]] && break
+		sleep 0.5
+	done
+	[[ -e $go ]] || logger -t ztos-waydroid-boot 'no word from the shell; starting anyway'
+fi
 
 if ! sudo -n /usr/local/libexec/ztos-waydroid-recover prepare; then
 	logger -t ztos-waydroid-boot 'container prepare failed; lazy launch remains available'
@@ -24,14 +44,26 @@ if ! systemctl --user start ztos-waydroid-session.service; then
 	exit 0
 fi
 
-if timeout --signal=TERM --kill-after=2 45 \
-	 sudo -n /usr/local/libexec/ztos-waydroid-recover ready; then
-	install -m644 /dev/null "$marker"
-	if ! ztos-waydroid-power idle; then
-		logger -t ztos-waydroid-boot 'Android ready; idle freeze deferred to normal policy'
+# Nothing waits for this any more (the shell shows the lock screen without
+# Android), so there is no reason to give up early: a first start after an
+# update or a long pause takes Android well over 45 seconds, and a readiness
+# that comes late would otherwise never be recorded. Keep asking for as long
+# as the unit may run (TimeoutStartSec=240).
+ready_limit=${ZTOS_WAYDROID_READY_WAIT:-210}
+started=$SECONDS
+while :; do
+	left=$((ready_limit - (SECONDS - started)))
+	(( left > 5 )) || break
+	if timeout --signal=TERM --kill-after=2 "$left" \
+		 sudo -n /usr/local/libexec/ztos-waydroid-recover ready; then
+		# (the marker is written by the helper itself, as root)
+		if ! ztos-waydroid-power idle; then
+			logger -t ztos-waydroid-boot 'Android ready; idle freeze deferred to normal policy'
+		fi
+		logger -t ztos-waydroid-boot "Android ready after $((SECONDS - started)) s; boot marker set"
+		exit 0
 	fi
-	logger -t ztos-waydroid-boot 'Android ready; boot marker set'
-else
-	logger -t ztos-waydroid-boot 'Android not ready within 45 seconds; continuing boot'
-fi
+	sleep 2
+done
+logger -t ztos-waydroid-boot "Android not ready within ${ready_limit} seconds"
 exit 0

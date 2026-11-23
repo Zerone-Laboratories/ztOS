@@ -136,6 +136,11 @@ case $1 in
         ;;
     close)
         [[ $# == 2 && $2 =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$ ]] || exit 2
+        # A backgrounded app is frozen (ztos-waydroid-power): force-stop in a
+        # frozen container never runs and times out, so the app survives and
+        # reappears in recents. Thaw first, then stop it for real.
+        thaw
+        [[ $(lxc-info "${lxc_args[@]}" -sH 2>/dev/null) == RUNNING ]] || exit 0
         env XDG_RUNTIME_DIR="$ZTOS_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="unix:path=$ZTOS_RUNTIME_DIR/bus" WAYLAND_DISPLAY=wayland-0 \
             timeout 10 waydroid shell -- am force-stop "$2"
         ;;
@@ -228,6 +233,9 @@ case $1 in
                timeout 3 lxc-attach "${lxc_args[@]}" -- /system/bin/service check waydroidplatform 2>/dev/null | grep -q ': found$'; then
                 settings
                 /usr/local/libexec/ztos-waydroid-audio
+                # The word the shell reads: Android is up. Written here, as
+                # root, because the user's start job cannot write in /run.
+                install -m644 /dev/null /run/ztos-waydroid-boot-ready
                 exit 0
             fi
             sleep 1
