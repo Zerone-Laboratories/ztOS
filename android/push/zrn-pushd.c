@@ -918,6 +918,34 @@ static void atl_start(struct push *p)
 		requeue(p, strerror(-r));
 }
 
+/* The Wake-on-WLAN choice the Settings app writes through `zrn-sleepd wowlan
+ * on|off`. '1' or an absent file (the default) means a push thaws Waydroid at
+ * once to decode the notification; '0' means leave the container frozen and let
+ * the notification wait for the next doze window. */
+static bool wowlan_enabled(void)
+{
+	char *t = read_file("/var/lib/zrn-sleep/wake_waydroid", 16);
+	bool on = !t || t[0] != '0';
+	free(t);
+	return on;
+}
+
+/* True when Android's container is frozen right now (screen off, between doze
+ * windows). An unknown state counts as not frozen, so a delivery is never
+ * wrongly held. */
+static bool container_frozen(void)
+{
+	char *t = read_file("/sys/fs/cgroup/lxc.payload.waydroid/cgroup.events", 256);
+	if (!t)
+		return false;
+	char *line = strstr(t, "frozen ");
+	bool frozen = line && line[7] == '1';
+	free(t);
+	return frozen;
+}
+
+#define WOWLAN_RETRY_MS 30000	/* re-check a held push this often while frozen */
+
 /* Everything due goes; the Waydroid helper takes one at a time. */
 static void dispatch(void)
 {
@@ -927,6 +955,16 @@ static void dispatch(void)
 		if (p->due > now || (!p->atl && waydroid_busy)) {
 			if (p->due > now && (!next || p->due < next))
 				next = p->due;
+			pp = &p->next;
+			continue;
+		}
+		/* WoWLAN off: hold a Waydroid push while the container is frozen and
+		 * deliver it once the next doze window (or the screen) thaws Android.
+		 * ATL apps (WhatsApp) go over D-Bus and are not held. */
+		if (!p->atl && !wowlan_enabled() && container_frozen()) {
+			long when = now + WOWLAN_RETRY_MS;
+			if (!next || when < next)
+				next = when;
 			pp = &p->next;
 			continue;
 		}

@@ -55,6 +55,12 @@ D = Path('/usr/local/libexec/ztos-power/mif-trial')
 LIB = Path('/usr/local/libexec/ztos-power')
 STATE = Path('/var/lib/zrn-sleep')
 ENABLED = STATE / 'enabled'
+# Wake-on-WLAN for notifications: '1' (the default) means an incoming push
+# thaws the Waydroid container at once to decode the notification; '0' means it
+# stays frozen and the notification waits for the next doze window. zrn-pushd
+# reads this file before thawing Android. The Settings app writes it through
+# `zrn-sleepd wowlan on|off`.
+WOWLAN = STATE / 'wake_waydroid'
 MARK = STATE / 'sleeping'
 LOG = STATE / 'log'
 INHIBIT = Path('/run/zrn-sleepd/inhibit')
@@ -64,7 +70,22 @@ CPUIDLE = Path('/sys/module/zrn_cpuidle/parameters')
 HOTPLUG = Path('/sys/module/zrn_hotplug/parameters/suspend_cluster_off')
 UFS = Path('/sys/devices/platform/soc@0/11120000.ufs/spm_lvl')
 WIFI = Path('/sys/bus/pci/drivers/brcmfmac')
+
+
+def wifi_associated():
+	"""wlp1s0 up with a carrier: connected to an access point."""
+	net = Path('/sys/class/net/wlp1s0')
+	try:
+		return ((net / 'operstate').read_text().strip() == 'up' and
+			(net / 'carrier').read_text().strip() == '1')
+	except OSError:
+		return False
 WIFI_DEV = '0000:01:00.0'
+# WoWLAN host-wake doorbell (kernel brcmfmac patch): with wifi left ASSOCIATED
+# across sleep and this armed, the chip raises WL_HOST_WAKE (gpa0-7 IRQ 76) on
+# an incoming packet and the AP resumes instantly - a real push instead of the
+# 120 s doze poll. Tied to the WoWLAN toggle (wake_waydroid).
+WOL_DOORBELL = Path('/sys/module/brcmfmac/parameters/wol_doorbell')
 PERF = Path('/run/zrnperfd.status')
 PUSH = Path(ztos_user.RUNTIME_DIR) / 'zrn-pushd.status'
 MODEM = Path('/run/ztoscorenetworking/status')
@@ -76,7 +97,7 @@ MODEM = Path('/run/ztoscorenetworking/status')
 WAKEUP = Path('/sys/class/wakeup')
 MODEM_SOURCES = ('umts_', 'rmnet', 'multipdp')
 
-SCREEN_OFF_S = 15	# off this long before the first sleep
+SCREEN_OFF_S = 90	# off this long before the first sleep (Android-like settle)
 MAX_SLEEP_S = 1800	# an RTC alarm at the latest after this
 # Doze: an app picked to run in the background no longer keeps the phone up.
 # It sleeps at most DOZE_SLEEP_S, then stays up DOZE_AWAKE_S with Wi-Fi back,
@@ -86,7 +107,7 @@ MAX_SLEEP_S = 1800	# an RTC alarm at the latest after this
 # holds the messages until a doze window lets it log in again. A window lasts
 # until zrn-pushd is back (and PUSH_GRACE_S more, for what Google had held to
 # arrive), DOZE_AWAKE_S at the least and DOZE_AWAKE_MAX_S at the most.
-DOZE_SLEEP_S = 300
+DOZE_SLEEP_S = 120	# poll interval: sleep this long, then a short wifi-up window
 DOZE_AWAKE_S = 10
 DOZE_AWAKE_MAX_S = 45
 PUSH_GRACE_S = 8
@@ -133,7 +154,7 @@ PAUSED = Path('/run/zrn-sleepd/paused')
 CANCEL_RETRY_S = 5	# something woke up during the preparations
 ALARM_RETRY_S = 3	# an alarm due within 2 s refused the suspend (EBUSY)
 DOZE_NO_NET_S = 15	# a doze window where zrn-pushd gets nowhere ends here
-# Low battery: shorter sleeps, so ztoscsf (which polls only while awake)
+# Low battery: shorter sleeps, so ztoscoru (which polls only while awake)
 # sees 2 % and shuts down cleanly before the cell cuts out.
 BATTERY = Path('/sys/class/power_supply/max170xx_battery')
 LOW_BATTERY = ((4, 120), (10, 600))	# (at or below %, longest sleep s)
@@ -967,19 +988,42 @@ def cycle(ignore=(), ignore_inhibits=()):
 		signal.alarm(PREPARE_S)
 		try:
 			if wifi_bound:
-				settle = 3
-				step('wifi down')
-				run('ip', 'link', 'set', 'wlp1s0', 'down')
-				step('wifi unbind')
-				write(WIFI / 'unbind', WIFI_DEV)
+				# WoWLAN wifi-push: keep wifi associated + arm the host-wake
+				# doorbell (absent wake_waydroid = on). The chip wakes the AP
+				# on a push; the brcmfmac suspend path holds the BSS. Do NOT
+				# unbind - the push socket survives and the wake is instant.
+				# The resume rebind (below) is skipped because wifi stays bound.
+				# Only while wifi is associated: switched off or not
+				# connected, the chip cannot enter D3 ("D3 not ACKed") and
+				# raises its host-wake at once (IRQ brcmf_hostwake), which
+				# ended every s2idle within 0.1 s while wifi was off.
+				wifi_push = (WOL_DOORBELL.exists() and read(WOWLAN) != '0'
+					and wifi_associated())
+				if wifi_push:
+					step('wifi doorbell arm')
+					write(WOL_DOORBELL, 'Y')
+				else:
+					settle = 3
+					step('wifi down')
+					run('ip', 'link', 'set', 'wlp1s0', 'down')
+					step('wifi unbind')
+					write(WIFI / 'unbind', WIFI_DEV)
 			step('ufs spm_lvl')
 			write(UFS, 5)
 			step('hotplug')
 			write(HOTPLUG, 1)
 			step('mif_sleep')
 			write(SLEEP / 'mif_sleep', 0)
-			step('mem_sleep deep')
-			write('/sys/power/mem_sleep', 'deep')
+			# s2idle (190 mA, measured) instead of the platform 'deep'
+			# backend: the firmware declines SOC_SLEEP_DOWN on this SoC
+			# (AP MIF vote cannot drop in the SLEEP path; EL3 self-exits
+			# 0x01100000), so 'deep' only reached ~291 mA shallow STANDBY.
+			# s2idle freezes tasks + idles the cores (wifi already unbound
+			# above, so brcmfmac's failed D3 cannot abort it). The whole
+			# prepare path below (dry_run, wakeup_count, gadget off) still
+			# applies; only the final echo 'mem' routes to s2idle now.
+			step('mem_sleep s2idle')
+			write('/sys/power/mem_sleep', 's2idle')
 			step('rtc alarm')
 			write('/sys/class/rtc/rtc0/wakealarm', 0)
 			write('/sys/class/rtc/rtc0/wakealarm', f'+{alarm_s}')
@@ -1392,6 +1436,13 @@ if __name__ == '__main__':
 		PAUSED.unlink(missing_ok=True)
 	elif cmd == 'disable':
 		ENABLED.unlink(missing_ok=True)
+	elif cmd == 'wowlan':
+		# zrn-sleepd wowlan on|off: whether an incoming push thaws the Waydroid
+		# container at once (on) or leaves it frozen until the next doze window
+		# (off). zrn-pushd reads /var/lib/zrn-sleep/wake_waydroid.
+		STATE.mkdir(parents=True, exist_ok=True)
+		on = len(sys.argv) > 2 and sys.argv[2] in ('on', '1', 'true', 'yes')
+		WOWLAN.write_text('1\n' if on else '0\n')
 	elif cmd == 'status':
 		print(read(STATUS) or 'not running')
 		print('enabled' if ENABLED.exists() else 'disabled')

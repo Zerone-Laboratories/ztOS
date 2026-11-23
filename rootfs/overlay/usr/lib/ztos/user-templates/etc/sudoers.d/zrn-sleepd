@@ -1,0 +1,8 @@
+# The Settings app (Power Management) and the Power app toggle the SoC-sleep
+# helper, which needs root. These exact commands, and nothing else, without a
+# password. @USER@ is filled in from user.conf by ztos-user-dropins.
+@USER@ ALL=(root) NOPASSWD: /usr/local/sbin/zrn-sleepd enable, \
+	/usr/local/sbin/zrn-sleepd disable, \
+	/usr/local/sbin/zrn-sleepd wowlan on, \
+	/usr/local/sbin/zrn-sleepd wowlan off, \
+	/usr/local/sbin/zrn-sleepd once 5
