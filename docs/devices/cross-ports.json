@@ -1,6 +1,6 @@
 {
- "generated": "2026-11-07T10:13:29+00:00",
- "pmaports": "d58ca1a2fe682277729a43775622fca012711024",
+ "generated": "2026-11-23T12:46:29+00:00",
+ "pmaports": "5d8de7e89f4d58d2dd34cae34d68bff2c94369dd",
  "devices": [
   {
    "codename": "fairphone-fp4",
@@ -688,6 +688,22 @@
    "flash_method": "fastboot",
    "kernel": "linux-postmarketos-qcom-sdm660",
    "screen": "1080x2160",
+   "warnings": []
+  },
+  {
+   "codename": "xiaomi-jason",
+   "name": "Xiaomi Mi Note 3",
+   "manufacturer": "Xiaomi",
+   "year": "2017",
+   "chassis": "handset",
+   "category": "testing",
+   "soc": "sdm660",
+   "gpu_driver": "freedreno",
+   "accelerated": true,
+   "archived": false,
+   "flash_method": "fastboot",
+   "kernel": "linux-postmarketos-qcom-sdm660",
+   "screen": "",
    "warnings": []
   },
   {
