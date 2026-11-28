@@ -94,4 +94,6 @@ if [[ -S $ZTOS_RUNTIME_DIR/bus ]]; then
     ztos_as_user systemctl --user daemon-reload
     ztos_as_user systemctl --user start ztos-waydroid-audio-reconnect.service
 fi
+# the last step: ztos-waydroid-images counts the setup done only with this
+printf '%s %s\n' "${1:---strip}" "$(date -u +%Y-%m-%dT%H:%MZ)" > "$backup/ztos-installed"
 echo 'Installed. Waydroid starts at desktop boot; launch apps with ztos-waydroid-launch PACKAGE.'

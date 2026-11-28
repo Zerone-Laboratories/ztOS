@@ -7,9 +7,11 @@ checked against the hashes pinned here, unpacked, initialised, then stripped
 and patched by install.sh as on the Galaxy S9 (2026-10-24). A phone that
 already has its images (the S9 before the GSI) keeps them untouched.
 
-Runs as root from ztos-waydroid-images.service; safe to run again (each step
-is skipped when done). Exit 0 also when Waydroid cannot run here (no binder):
-Android apps then stay with ATL.
+Runs as root from ztos-waydroid-images.service; safe to run again: each step
+is skipped when done, and a setup stopped half way is finished by the next run
+(the images being there is not enough: install.sh marks the end of its work).
+Exit 0 also when Waydroid cannot run here (no binder): Android apps then stay
+with ATL.
 """
 import hashlib
 import json
@@ -56,6 +58,13 @@ CACHE = pathlib.Path('/var/cache/ztos-waydroid')
 READY = pathlib.Path('/var/lib/ztos/waydroid-ready')
 RECIPE = pathlib.Path('/usr/share/ztos-waydroid')      # android/waydroid, installed
 MANIFEST = pathlib.Path('/vendor/ztos/manifest.toml')
+CONFIG = pathlib.Path('/var/lib/waydroid/waydroid.cfg')
+# written by install.sh as its last step: the stripped image and its setup are done
+INSTALLED = pathlib.Path('/var/lib/waydroid/ztos-backup/ztos-installed')
+# this service has begun a setup here: from then on only INSTALLED means done
+STARTED = pathlib.Path('/var/lib/ztos/waydroid-setup-started')
+# install.sh's last files, on a system set up before INSTALLED existed (the S9)
+SUDOERS = pathlib.Path('/etc/sudoers.d/ztos-waydroid')
 
 
 def say(text):
@@ -113,24 +122,49 @@ def unpack(kind, archive):
     (IMAGES / (name + '.part')).replace(IMAGES / name)
 
 
+def have_images():
+    return (IMAGES / 'system.img').exists() and (IMAGES / 'vendor.img').exists()
+
+
+def installed():
+    if INSTALLED.exists():
+        return True
+    # set up before install.sh left its mark, and never begun by this service
+    return not STARTED.exists() and SUDOERS.exists() and have_images() and CONFIG.exists()
+
+
 def main():
     if READY.exists():
         return 0
     if not binder_allowed():
         say('no binder in this kernel: Waydroid stays off, ATL runs Android apps')
         return 0
-    if (IMAGES / 'system.img').exists() and (IMAGES / 'vendor.img').exists() and \
-            pathlib.Path('/var/lib/waydroid/waydroid.cfg').exists():
-        say('images already in place: kept as they are')
+    if installed():
+        say('Android is already set up: kept as it is')
+    elif have_images() and CONFIG.exists() and not STARTED.exists() and \
+            not (IMAGES / 'system.img.stock').exists():
+        # images and a Waydroid made by hand, never touched by install.sh
+        say('images already in place (not set up by ztOS): kept as they are')
     else:
+        STARTED.parent.mkdir(parents=True, exist_ok=True)
+        STARTED.write_text('started\n')
         for kind in ('system', 'vendor'):
-            unpack(kind, fetch(kind))
-        say('initialising Waydroid')
-        subprocess.run(['waydroid', 'init', '-f', '-i', str(IMAGES)], check=True)
+            if not (IMAGES / f'{kind}.img').exists():
+                unpack(kind, fetch(kind))
+        if not CONFIG.exists():
+            say('initialising Waydroid')
+            subprocess.run(['waydroid', 'init', '-f', '-i', str(IMAGES)], check=True)
+        else:
+            say('Waydroid is initialised: finishing its setup')
+        # install.sh strips from system.img.stock when that is there, so a
+        # rerun after a failed strip starts again from the stock image
         say('stripping and patching (install.sh)')
         subprocess.run([str(RECIPE / 'install.sh'), '--strip'], check=True)
-        for kind in PINNED:
-            pathlib.Path(CACHE / PINNED[kind]['file']).unlink(missing_ok=True)
+        if not INSTALLED.exists():
+            raise SystemExit('install.sh finished without marking its work done')
+    for kind in PINNED:
+        pathlib.Path(CACHE / PINNED[kind]['file']).unlink(missing_ok=True)
+    STARTED.unlink(missing_ok=True)
     READY.parent.mkdir(parents=True, exist_ok=True)
     READY.write_text('ready\n')
     say('Android is ready')
