@@ -1488,11 +1488,11 @@ static int view_h(struct zt_server *server) {
 /* and pixels (the output's, turned) */
 static __attribute__((unused)) int view_pw(struct zt_server *server) {
 	struct wlr_output *o = server->output->wlr_output;
-	return server->orient % 180 ? o->height : o->width;
+	return server->orient % 180 ? OUT_H(o) : OUT_W(o);
 }
 static __attribute__((unused)) int view_ph(struct zt_server *server) {
 	struct wlr_output *o = server->output->wlr_output;
-	return server->orient % 180 ? o->width : o->height;
+	return server->orient % 180 ? OUT_W(o) : OUT_H(o);
 }
 /* where the bars are, in the view */
 static int inset_top(struct zt_server *server) {
