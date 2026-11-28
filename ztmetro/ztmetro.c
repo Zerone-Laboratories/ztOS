@@ -789,6 +789,7 @@ struct zt_server {
 	struct zt_layer wall_layer;
 	double wall_h;			/* points: the start photo's height */
 	cairo_surface_t *lock_wall;
+	cairo_surface_t *lock_wall_land;	/* the same photo covering the landscape view (made when wanted) */
 	bool locked;
 	bool call_over_lock;	/* only the phone call may cover the lock */
 	bool ringing;		/* ztphone: an incoming call is ringing ("ringing on|off") */
@@ -5452,6 +5453,10 @@ static void walls_load(struct zt_server *server) {
 		cairo_surface_destroy(server->lock_wall);
 		server->lock_wall = NULL;
 	}
+	if (server->lock_wall_land) {
+		cairo_surface_destroy(server->lock_wall_land);
+		server->lock_wall_land = NULL;
+	}
 	if (server->lock_wall_path[0]) {
 		server->lock_wall = image_cover(server->lock_wall_path,
 			(int)ceil(server->width * server->scale), (int)ceil(server->height * server->scale));
@@ -8488,15 +8493,16 @@ static void retro_paint_lock(struct zt_server *server, cairo_t *cr) {
  * nav bar's height and a little over: the row ends 43 points under the date
  * at rest, and NAV_H + 16 is the room wanted below it. */
 #define LOCK_LIFT (NAV_H + 16 - 43)
-#define LOCK_CLOCK_Y(server) ((double)(server)->height - 280)	/* the clock layer's top */
+#define LOCK_CLOCK_Y(server) ((double)view_h(server) - 280)	/* the clock layer's top */
 #define LOCK_CLOCK_H 220.0
-#define LOCK_NOTE_Y(server) ((double)(server)->height - 100)	/* the row layer's top */
+#define LOCK_NOTE_Y(server) ((double)view_h(server) - 100)	/* the row layer's top */
 #define LOCK_NOTE_H 80.0
 
 static void draw_lock_clock(struct zt_server *server) {
 	double y0 = LOCK_CLOCK_Y(server);
 	cairo_t *cr;
-	struct zt_buffer *buffer = zt_buffer_create(server, server->width, LOCK_CLOCK_H, &cr);
+	double H = view_h(server);	/* (the lock is laid out in the view: landscape on a turned panel) */
+	struct zt_buffer *buffer = zt_buffer_create(server, view_w(server), LOCK_CLOCK_H, &cr);
 	cairo_translate(cr, 0, -y0);	/* drawn in screen coordinates, at rest (low) */
 	time_t now = time(NULL);
 	struct tm tm;
@@ -8504,12 +8510,12 @@ static void draw_lock_clock(struct zt_server *server) {
 	char line[64];
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	strftime(line, sizeof(line), "%H:%M", &tm);
-	draw_text(cr, line, FONT_LIGHT, 92, 16, server->height - 268, 0, 0, false);
+	draw_text(cr, line, FONT_LIGHT, 92, 16, H - 268, 0, 0, false);
 	strftime(line, sizeof(line), "%A", &tm);
-	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 156, 0, 0, false);
+	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, H - 156, 0, 0, false);
 	strftime(line, sizeof(line), "%B %-d", &tm);
-	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, server->height - 120, 0, 0, false);
-	zt_buffer_show(server, &server->lock_clock_layer, buffer, cr, server->width, LOCK_CLOCK_H);
+	draw_text(cr, line, FONT_SEMILIGHT, 30, 20, H - 120, 0, 0, false);
+	zt_buffer_show(server, &server->lock_clock_layer, buffer, cr, view_w(server), LOCK_CLOCK_H);
 }
 
 /* The row of each app's glyph (or initial) with its count, as Windows Phone's,
@@ -8524,10 +8530,10 @@ static void draw_lock_notes(struct zt_server *server) {
 	}
 	double y0 = LOCK_NOTE_Y(server);
 	cairo_t *cr;
-	struct zt_buffer *buffer = zt_buffer_create(server, server->width, LOCK_NOTE_H, &cr);
+	struct zt_buffer *buffer = zt_buffer_create(server, view_w(server), LOCK_NOTE_H, &cr);
 	cairo_translate(cr, 0, -y0);
 	char line[64];
-	double x = 22, cy = server->height - 120 - LOCK_LIFT + 30 + 34;
+	double x = 22, cy = view_h(server) - 120 - LOCK_LIFT + 30 + 34;
 	for (int i = 0; i < n; i++) {
 		const char *key = note_key(server, names[i], note_who(server, names[i]));
 		const char *glyph = note_glyph(names[i]);
@@ -8551,7 +8557,7 @@ static void draw_lock_notes(struct zt_server *server) {
 		draw_text(cr, line, FONT_SEMILIGHT, 22, x + 32, cy - 15, 0, 0, false);
 		x += 32 + text_width(line, FONT_SEMILIGHT, 22) + 22;
 	}
-	zt_buffer_show(server, &server->lock_note_layer, buffer, cr, server->width, LOCK_NOTE_H);
+	zt_buffer_show(server, &server->lock_note_layer, buffer, cr, view_w(server), LOCK_NOTE_H);
 }
 
 /* Raise the clock block (and show the row) while any notification waits, and
@@ -8587,9 +8593,16 @@ static void lock_notes_changed(struct zt_server *server) {
 /* the Metro lock's status row, in the ink the wallpaper chose */
 static void draw_lock_status(struct zt_server *server) {
 	cairo_t *cr;
-	struct zt_buffer *buffer = zt_buffer_create(server, server->width, STATUS_H, &cr);
+	/* across the view's top: landscape on a turned panel (status_row lays
+	 * itself out by the screen's width, so it is given the view's) */
+	int sw = server->width, sh = server->height, vw = view_w(server), vh = view_h(server);
+	struct zt_buffer *buffer = zt_buffer_create(server, vw, STATUS_H, &cr);
+	server->width = vw;
+	server->height = vh;
 	status_row(server, cr, false, false, false, server->lock_status_ink);
-	zt_buffer_show(server, &server->lock_status_layer, buffer, cr, server->width, STATUS_H);
+	server->width = sw;
+	server->height = sh;
+	zt_buffer_show(server, &server->lock_status_layer, buffer, cr, vw, STATUS_H);
 }
 
 /* the lock's status row changed: under DotMatrix the lock is one picture */
@@ -8603,7 +8616,8 @@ static void lock_status_redraw(struct zt_server *server) {
 
 static void draw_lock(struct zt_server *server) {
 	cairo_t *cr;
-	struct zt_buffer *buffer = zt_buffer_create(server, server->width, server->height, &cr);
+	struct zt_buffer *buffer = retro_on(server) ? zt_buffer_create(server, server->width, server->height, &cr) :
+		zt_buffer_create(server, view_w(server), view_h(server), &cr);
 	if (retro_on(server)) {
 		cairo_set_source_rgb(cr, 0, 0, 0);
 		cairo_paint(cr);
@@ -8611,23 +8625,41 @@ static void draw_lock(struct zt_server *server) {
 		zt_buffer_show(server, &server->lock_layer, buffer, cr, server->width, server->height);
 		return;
 	}
+	/* Laid out in the view: upright as ever on a phone (the lock keeps it
+	 * upright there), landscape on a turned panel (a tablet), whose lock
+	 * follows the turn as Start does. The DotMatrix lock is upright only. */
+	double W = view_w(server), H = view_h(server);
 	double r = ((server->accent >> 16) & 0xff) / 255.0, g = ((server->accent >> 8) & 0xff) / 255.0,
 		b = (server->accent & 0xff) / 255.0;
-	cairo_pattern_t *fade = cairo_pattern_create_linear(0, 0, 0, server->height);
+	cairo_pattern_t *fade = cairo_pattern_create_linear(0, 0, 0, H);
 	cairo_pattern_add_color_stop_rgb(fade, 0.0, 0, 0, 0);
 	cairo_pattern_add_color_stop_rgb(fade, 0.25, 0, 0, 0);
 	cairo_pattern_add_color_stop_rgb(fade, 1.0, r * 0.5, g * 0.5, b * 0.5);
 	cairo_set_source(cr, fade);
 	cairo_paint(cr);
 	cairo_pattern_destroy(fade);
-	if (server->lock_wall) {
+	cairo_surface_t *wall = server->lock_wall;
+	if (wall && W != server->width) {
+		/* landscape: the photo cropped to cover the view, never stretched */
+		int pw = (int)ceil(W * server->scale), ph = (int)ceil(H * server->scale);
+		if (server->lock_wall_land && (cairo_image_surface_get_width(server->lock_wall_land) != pw ||
+				cairo_image_surface_get_height(server->lock_wall_land) != ph)) {
+			cairo_surface_destroy(server->lock_wall_land);
+			server->lock_wall_land = NULL;
+		}
+		if (!server->lock_wall_land && server->lock_wall_path[0]) {
+			server->lock_wall_land = image_cover(server->lock_wall_path, pw, ph);
+		}
+		wall = server->lock_wall_land;
+	}
+	if (wall) {
 		/* the photo, and a shade rising from the bottom for the clock */
 		cairo_save(cr);
 		cairo_scale(cr, 1.0 / server->scale, 1.0 / server->scale);
-		cairo_set_source_surface(cr, server->lock_wall, 0, 0);
+		cairo_set_source_surface(cr, wall, 0, 0);
 		cairo_paint(cr);
 		cairo_restore(cr);
-		cairo_pattern_t *shade = cairo_pattern_create_linear(0, 0, 0, server->height);
+		cairo_pattern_t *shade = cairo_pattern_create_linear(0, 0, 0, H);
 		cairo_pattern_add_color_stop_rgba(shade, 0.0, 0, 0, 0, 0.25);
 		cairo_pattern_add_color_stop_rgba(shade, 0.15, 0, 0, 0, 0.0);
 		cairo_pattern_add_color_stop_rgba(shade, 0.55, 0, 0, 0, 0.0);
@@ -8638,7 +8670,7 @@ static void draw_lock(struct zt_server *server) {
 	}
 	/* over the wallpaper/accent: white by default, or the ink the wallpaper's
 	 * brightness chose (lock_status_ink; -1 until computed falls back to white) */
-	zt_buffer_show(server, &server->lock_layer, buffer, cr, server->width, server->height);
+	zt_buffer_show(server, &server->lock_layer, buffer, cr, W, H);
 	/* the status row is a layer of its own over the photo: a signal bar
 	 * stepping or an icon coming in redraws that strip, not the whole
 	 * screen (a full lock redraw every 320 ms stuttered the boot drop) */
@@ -15711,7 +15743,7 @@ static void lock_open(struct zt_server *server) {
 	}
 	hap(server, HAP_TAP, HG_SLIDE);
 	ui_sound(server, UIS_UNLOCK);
-	animate(server, &server->lock_y, (float)-server->height, 200, 0, false);
+	animate(server, &server->lock_y, (float)-view_h(server), 200, 0, false);
 	if (retro_on(server) && server->shown) {
 		/* the app that was open lights up again, dot by dot */
 		server->app_angle = TURN_IN_DEG;
@@ -15964,27 +15996,51 @@ static void pc_submit(struct zt_server *server) {
 	draw_pc(server);
 }
 
-/* the pad's geometry, in screen points */
-struct pc_geo { double top, box_y, note_y, keys_y, kw, kh, gap, em_y; };
+/* the pad's geometry, in view points. Upright: the panel from 0.26 of the
+ * height down, the keys across under the boxes. Landscape (a turned panel,
+ * whose view is too short for that): the panel over the whole view, the key
+ * grid on the right half centred between the status row and the bottom, and
+ * on the left "enter PIN" level with the grid's top, the boxes, the note,
+ * and "emergency call" level with the grid's bottom. */
+struct pc_geo { double W, H, top, box_y, note_y, keys_y, kx, kw, kh, gap, em_x, em_y, em_w; bool land; };
 static struct pc_geo pc_geo(struct zt_server *server) {
 	struct pc_geo g;
-	g.top = server->height * 0.26;
+	g.W = view_w(server);
+	g.H = view_h(server);
+	g.land = g.W > g.H;
+	g.gap = 6;
+	g.kh = 62;
+	g.em_w = text_width("emergency call", FONT_SEMILIGHT, 17) + 28;
+	if (g.land) {
+		double grid = 4 * g.kh + 3 * g.gap;
+		g.keys_y = round(STATUS_H + (g.H - STATUS_H - grid) / 2);
+		g.kx = round(g.W / 2 + 12);
+		g.kw = (g.W - 24 - g.kx - 2 * g.gap) / 3;
+		g.top = g.keys_y - 8 - 16;	/* (so that the text's capitals stand level with the grid's top) */
+		g.box_y = g.top + 62;	/* (the text, boxes and note spaced as upright) */
+		g.note_y = g.box_y + 46;
+		g.em_x = 24;
+		g.em_y = g.keys_y + grid - 38 - 3;	/* (the button sits 3 into its 44 row) */
+		return g;
+	}
+	g.top = g.H * 0.26;
 	g.box_y = g.top + 62;
 	g.note_y = g.box_y + 46;
 	g.keys_y = g.note_y + 28;
-	g.gap = 6;
-	g.kh = 62;
-	g.kw = (server->width - 2 * 24 - 2 * g.gap) / 3;
+	g.kx = 24;
+	g.kw = (g.W - 2 * 24 - 2 * g.gap) / 3;
 	g.em_y = g.keys_y + 4 * (g.kh + g.gap) + 4;
+	g.em_x = (g.W - g.em_w) / 2;
 	return g;
 }
 
 /* which key (0..11), PC_EMERGENCY, or -1 */
 static int pc_hit(struct zt_server *server, double x, double y) {
 	struct pc_geo g = pc_geo(server);
-	if (y >= g.em_y && y < g.em_y + 44) return PC_EMERGENCY;
-	if (y < g.keys_y || x < 24 || x >= server->width - 24) return -1;
-	int row = (int)((y - g.keys_y) / (g.kh + g.gap)), col = (int)((x - 24) / (g.kw + g.gap));
+	if (g.land ? x >= g.em_x - 12 && x < g.em_x + g.em_w + 12 && y >= g.em_y && y < g.em_y + 44 :
+			y >= g.em_y && y < g.em_y + 44) return PC_EMERGENCY;
+	if (y < g.keys_y || x < g.kx || x >= g.kx + 3 * g.kw + 2 * g.gap) return -1;
+	int row = (int)((y - g.keys_y) / (g.kh + g.gap)), col = (int)((x - g.kx) / (g.kw + g.gap));
 	if (row > 3 || col > 2) return -1;
 	return row * 3 + col;
 }
@@ -15992,7 +16048,7 @@ static int pc_hit(struct zt_server *server, double x, double y) {
 static void draw_pc(struct zt_server *server) {
 	if (!server->width) return;
 	struct pc_geo g = pc_geo(server);
-	double W = server->width, H = server->height;
+	double W = g.W, H = g.H, panel_top = g.land ? 0 : g.top;
 	double ar = ((server->accent >> 16) & 0xff) / 255.0, ag = ((server->accent >> 8) & 0xff) / 255.0,
 		ab = (server->accent & 0xff) / 255.0;
 	bool waiting = pc_wait_left(server) > 0, off = waiting || server->pc_checking;
@@ -16003,7 +16059,7 @@ static void draw_pc(struct zt_server *server) {
 	cairo_paint(cr);
 	cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 	cairo_set_source_rgba(cr, 0, 0, 0, 0.7);
-	cairo_rectangle(cr, 0, g.top, W, H - g.top);
+	cairo_rectangle(cr, 0, panel_top, W, H - panel_top);
 	cairo_fill(cr);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	draw_text(cr, "enter PIN", FONT_SEMILIGHT, 24, 24, g.top + 16, 0, 0, false);
@@ -16014,7 +16070,7 @@ static void draw_pc(struct zt_server *server) {
 	}
 	static const char *labels[PC_KEYS] = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "delete", "0", "ok" };
 	for (int i = 0; i < PC_KEYS; i++) {
-		double x = 24 + (i % 3) * (g.kw + g.gap), y = g.keys_y + (i / 3) * (g.kh + g.gap);
+		double x = g.kx + (i % 3) * (g.kw + g.gap), y = g.keys_y + (i / 3) * (g.kh + g.gap);
 		bool down = server->pc_pressed == i && !off;
 		if (down) cairo_set_source_rgb(cr, ar, ag, ab);
 		else cairo_set_source_rgba(cr, 1, 1, 1, off ? 0.14 * 0.4 : 0.14);
@@ -16026,11 +16082,11 @@ static void draw_pc(struct zt_server *server) {
 	}
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	cairo_set_line_width(cr, 2);
-	double ew = text_width("emergency call", FONT_SEMILIGHT, 17) + 28;
-	cairo_rectangle(cr, (W - ew) / 2, g.em_y + 3, ew, 38);
+	double ew = g.em_w;
+	cairo_rectangle(cr, g.em_x, g.em_y + 3, ew, 38);
 	if (server->pc_pressed == PC_EMERGENCY) cairo_fill(cr); else cairo_stroke(cr);
 	if (server->pc_pressed == PC_EMERGENCY) cairo_set_source_rgb(cr, 0, 0, 0);
-	draw_text(cr, "emergency call", FONT_SEMILIGHT, 17, (W - ew) / 2, g.em_y + 3, ew, 38, true);
+	draw_text(cr, "emergency call", FONT_SEMILIGHT, 17, g.em_x, g.em_y + 3, ew, 38, true);
 	zt_buffer_show(server, &server->pc_layer, buffer, cr, W, H);
 	/* the boxes, a layer of their own: they shake without a redraw */
 	struct zt_buffer *bb = zt_buffer_create(server, W, 40, &cr);
@@ -16087,7 +16143,7 @@ static void pc_touch_up(struct zt_server *server, struct touch_point *p, bool ca
 	int k = p->index >= 100 ? p->index - 100 : -1;
 	bool was = server->pc_pressed >= 0;
 	server->pc_pressed = -1;
-	if (!cancelled && p->moved && p->py - p->py0 > server->height / 6.0) {
+	if (!cancelled && p->moved && p->y - p->y0 > view_h(server) / 6.0) {
 		pc_pad_close(server);
 		return;
 	}
@@ -16327,7 +16383,7 @@ static void touch_begin(struct zt_server *server, int32_t id, double px, double 
 		p->role = ROLE_LOCK;	/* nothing under it can be reached */
 		p->index = -1;
 		if (server->pc_pad && !retro_on(server)) {
-			pc_touch_down(server, p, px, py);
+			pc_touch_down(server, p, x, y);	/* (the pad is laid out in the view) */
 			return;
 		}
 		if (!retro_on(server)) pc_status_refresh(server);	/* fresh by the time the swipe ends */
@@ -16838,8 +16894,8 @@ static void touch_update(struct zt_server *server, int32_t id, double px, double
 		}
 		if (p->moved && server->locked) {
 			/* it goes up with the finger, and no lower than where it sits
-			 * (the lock is upright on the glass: the glass's points) */
-			server->lock_y = py < p->py0 ? (float)(py - p->py0) : 0.0f;
+			 * (in the view: upright on a phone, turned with the panel's turn) */
+			server->lock_y = y < p->y0 ? (float)(y - p->y0) : 0.0f;
 			damage(server);
 		}
 		break;
@@ -17214,7 +17270,7 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 				break;
 			}
 		}
-		if (dm_swiped || (!retro_on(server) && !cancelled && p->py - p->py0 < -server->height / 5.0)) {
+		if (dm_swiped || (!retro_on(server) && !cancelled && p->y - p->y0 < -view_h(server) / 5.0)) {
 			if (pc_needed(server) && !retro_on(server)) {
 				pc_pad_open(server);	/* the lock rises and the pad comes up */
 				break;
@@ -18974,7 +19030,7 @@ static bool plane_pick(struct zt_server *server, struct zt_toplevel *app, const 
 	if (!app_covers || !app || !app->mapped) PLANE_NO("no app at rest in front");
 	if (server->peek > 0.001f || server->shade_h > 0.5f || server->splash ||
 			server->sensorhub_fail_screen || server->osk_slide > 0.003f || server->hyper_t > 0.003f ||
-			server->locked || server->lock_y > 1.0f - server->height || server->call_over_lock ||
+			server->locked || server->lock_y > 1.0f - view_h(server) || server->call_over_lock ||
 
 			server->switch_t > 0.001f || server->keypop) {
 		PLANE_NO("something of the shell's over the app");
@@ -20322,8 +20378,9 @@ static int rot_target_urgent(struct zt_server *server, bool *urgent) {
 	} else if (server->rotation_enabled && !server->rotation_lock && server->orient_sensor >= 0) {
 		want = server->orient_sensor;
 	}
-	if (want != 0 && (server->width <= 0 || !server->screen_on || server->locked ||
-			server->lock_y > 1.0f - server->height || server->splash || !server->boot_logo_done ||
+	/* (on a turned panel, a tablet, the lock turns with the rest) */
+	if (want != 0 && (server->width <= 0 || !server->screen_on ||
+			(!g_panel_turn && (server->locked || server->lock_y > 1.0f - view_h(server))) || server->splash || !server->boot_logo_done ||
 			server->boot_logo_stage || server->sensorhub_fail_screen || retro_on(server) ||
 			server->call_over_lock || server->switcher || server->switch_t > 0.001f)) {
 		want = 0;	/* (the portrait switcher only opens upright) */
@@ -20526,6 +20583,17 @@ static void rot_relayout(struct zt_server *server) {
 	/* (the switcher's titles are made each time it opens; it is upright here) */
 	server->notes_dirty = true;	/* the action centre is laid out anew when it is next pulled */
 	draw_status(server);	/* and the clock as two lines, for the turned bar */
+	/* the lock is laid out in the view (landscape on a turned panel): again
+	 * at the new size, and put off the new top while it is not up */
+	if (server->lock_layer.tex && !retro_on(server)) {
+		if (!server->locked && !animating(server, &server->lock_y)) {
+			server->lock_y = (float)-view_h(server);
+		}
+		draw_lock(server);
+		if (server->pc_pad) {
+			draw_pc(server);
+		}
+	}
 	server->moving = true;	/* the list's rows near the screen, over the next frames */
 }
 
@@ -21721,11 +21789,12 @@ static void render_frame(struct zt_server *server) {
 	 * J5's Adreno 306 about 3 ms, and Start, an app and the panel under a
 	 * resting lock screen were 4.5 screens a frame. */
 	/* (the DotMatrix style's lock is a screen of its home, not this picture) */
-	bool lock_shown = server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height) &&
+	bool lock_shown = server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - view_h(server)) &&
 		!retro_on(server);
-	float under = lock_shown ? server->lock_y + server->height : 0.0f;	/* the first row it leaves */
-	bool lock_covers = lock_shown && under >= server->height - 0.5f;
-	int under_top = lock_shown && under > 0.5f ? (int)floorf(under * server->scale) : 0;
+	float under = lock_shown ? server->lock_y + view_h(server) : 0.0f;	/* the first row it leaves */
+	bool lock_covers = lock_shown && under >= view_h(server) - 0.5f;
+	/* (turned, the rows it leaves are the view's, across the glass: all drawn) */
+	int under_top = lock_shown && under > 0.5f && server->orient == 0 ? (int)floorf(under * server->scale) : 0;
 	/* The action centre's panel and the nav bar are opaque black as well, and
 	 * what the panel uncovers below its bar goes dim: that dim is folded
 	 * into the tint (as the brightness is) instead of a layer over it all */
@@ -21758,7 +21827,7 @@ static void render_frame(struct zt_server *server) {
 			 * not when the app's window happens to map */
 			app_in = lf_e(server);
 		}
-		float lock_off = server->locked || lock_shown ? -server->lock_y / (float)server->height : 1.0f;
+		float lock_off = server->locked || lock_shown ? -server->lock_y / (float)view_h(server) : 1.0f;
 		float shade_off = 1.0f - server->shade_h / (float)(SHADE_MAX_H * 0.5);
 		float f[8] = { 1.0f - server->start_t, 1.0f - app_in, 1.0f - server->switch_t,
 			1.0f - server->hyper_t, 1.0f - server->osk_slide, 1.0f - server->menu_t, lock_off, shade_off };
@@ -22440,7 +22509,8 @@ static void render_frame(struct zt_server *server) {
 		layer_draw(server, &server->keypop_layer, server->keypop_x, server->keypop_y, 1.0f);
 		view_end(server);
 	}
-	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height) && !retro_on(server)) {
+	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - view_h(server)) && !retro_on(server)) {
+		view_begin(server);	/* (laid out in the view: landscape on a turned panel) */
 		layer_draw(server, &server->lock_layer, 0, server->lock_y, 1.0f);
 		if (server->lock_status_layer.tex) {
 			layer_draw(server, &server->lock_status_layer, 0, server->lock_y, 1.0f);
@@ -22457,6 +22527,7 @@ static void render_frame(struct zt_server *server) {
 		}
 		plug_over(server, server->lock_y, true);
 		pc_render(server);
+		view_end(server);
 	}
 	/* The call: its backdrop over the whole screen, the nav bar's strip
 	 * included, as one picture, from the call's first frame to its last; then
