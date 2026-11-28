@@ -21273,15 +21273,14 @@ static void cf_divider_draw(struct zt_server *server, float page_dx) {
  * launch is unchanged; an upright-only app from landscape is not flipped: the
  * screen turns upright and it opens as upright apps do. Going back to Start
  * is the usual return (the app swings out, the tiles turn in). */
-/* as long as the upright launch it stands for: Start's tiles out, the gap,
- * the app's swing in (start_turn, TURN_GAP_MS, APP_IN_MS). It was 380 ms,
- * the upright launch over 1.3 s, so a launch in landscape took a third of
- * the time of the same launch upright (the owner, 2026-11-28: "the
- * animations in landscape are faster than animations in portrait") */
-#define LAUNCH_MS		((uint32_t)(start_out_ms(server) + TURN_GAP_MS + APP_IN_MS))
+/* one flip, at Settings' animation speed (lf_begin). Made as long as the
+ * whole upright launch it stands for (tiles out, gap, swing in) it took
+ * near two seconds: the owner, 2026-11-28, "the landscape launch speed is
+ * too slow its like 50% mode now" */
+#define LAUNCH_MS		380
 #define LAUNCH_FLIP_DEG		180.0f
 #define LAUNCH_FLIP_DIR		(-1.0f)
-#define LAUNCH_XFADE_MS		150
+#define LAUNCH_XFADE_MS		300	/* the splash into the app: at 150 it read as a blip, not a fade (the owner, 2026-11-28) */
 #define LAUNCH_FADE		0.85f	/* how far the rest of Start fades */
 #define LAUNCH_RECEDE		0.05f	/* and shrinks back */
 #define LAUNCH_ICON		0.30f	/* the splash's icon, of the box's smaller side */
