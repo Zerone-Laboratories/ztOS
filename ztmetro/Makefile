@@ -290,13 +290,31 @@ install: check-arch
 	install -Dm644 coru/components /etc/ztoscoru/components
 	install -Dm644 coru/ztoscoru.service /etc/systemd/system/ztoscoru.service
 
+# A desktop or tablet (x86-64, no S9 hardware): the shell and what its session
+# needs, none of the phone's daemons (zrnperfd, modemd, sensord, touchkeyd,
+# the splash); a landscape panel is laid on its side (config `panel_turn`) and
+# desktop/zrn-iio-orient turns it from iio-sensor-proxy's accelerometer.
+DESKTOP = ztmetro apps/ztapps settings/ztsettings notifyd/ztnotifyd sounds/ztos-sounds auth/ztos-polkit-agent
+desktop: $(DESKTOP)
+
+install-desktop: $(DESKTOP)
+	install -Dm755 -t /usr/local/bin $(DESKTOP) ztmetro-session desktop/zrn-iio-orient
+	install -Dm755 -t /usr/local/bin ../os/overlay/usr/local/bin/ztos-askpass ../os/overlay/usr/local/bin/ztos-bt-state
+	install -Dm644 -t /usr/local/share/fonts/segoe ../os/overlay/usr/local/share/fonts/segoe/*.ttf
+	install -Dm644 -t /usr/local/share/fonts/selawik ../os/fonts/selawik/*
+	install -Dm644 -t /usr/local/share/sounds/ztos/keyboard ../os/overlay/usr/local/share/sounds/ztos/keyboard/*.wav
+	install -Dm644 ../os/overlay/etc/fonts/conf.d/45-ztos-segoe.conf /etc/fonts/conf.d/45-ztos-segoe.conf
+	install -Dm644 desktop/ztmetro.desktop /usr/share/wayland-sessions/ztmetro.desktop
+	install -Dm644 desktop/50-zrn-iio-orient.rules /etc/polkit-1/rules.d/50-zrn-iio-orient.rules
+	fc-cache -f >/dev/null 2>&1 || true
+
 clean:
 	rm -f sound/ztsound osial/ztosial auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest devices/ztdevices power/ztpower perfd/zrnperfd passcoded/zrn-passcoded passcoded/zrn-passcode touchkeyd/ztos-touchkeyd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd coru/ztoscoru notifyd/ztnotifyd splash/ztos-splash \
 		phone/ztphone messages/ztmessages contacts/ztcontacts files/ztfiles store/ztstore camera/ztcamera core/viewporter-protocol.c core/viewporter-client-protocol.h \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c
 
 # Uses a private Wayland seat; does not touch the running compositor or display.
-.PHONY: check-arch check-keyboard
+.PHONY: check-arch check-keyboard desktop install-desktop
 check-keyboard: xdg-shell-protocol.h
 	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
 		-o /tmp/ztmetro-keyboard-test tests/keyboard-trackpad.c $(shell pkg-config --libs $(PKGS)) -lm

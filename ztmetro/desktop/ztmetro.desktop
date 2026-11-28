@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=ztMETRO
+Comment=ztOS's Metro shell
+Exec=/usr/local/bin/ztmetro-session
+Type=Application
+DesktopNames=ztMETRO

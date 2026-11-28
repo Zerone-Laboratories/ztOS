@@ -92,6 +92,7 @@
 #include <wlr/types/wlr_idle_notify_v1.h>
 #include <wlr/types/wlr_input_device.h>
 #include <wlr/types/wlr_keyboard.h>
+#include <wlr/types/wlr_tablet_tool.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layer.h>
 #include <wlr/types/wlr_buffer.h>
@@ -469,6 +470,17 @@ struct zt_pointer_device {
 	struct wl_listener motion, motion_absolute, button, destroy;
 };
 
+/* A pen (a tablet's tool, e.g. the Wacom ISD-V4 on a Fujitsu Stylistic):
+ * its tip is one more finger */
+#define PEN_TOUCH_ID	901
+struct zt_tablet_device {
+	struct zt_server *server;
+	struct wlr_tablet *tablet;
+	struct wl_listener axis, tip, destroy;
+	bool down;
+	double x, y;	/* the tool's place, 0-1 across the panel */
+};
+
 enum shell_style { STYLE_METRO, STYLE_DOTMATRIX };
 enum shell_theme { THEME_DARK, THEME_LIGHT };	/* Metro's light/dark (SDK Z_THEME_*); DotMatrix ignores it */
 /* The shell's style, for the drawing helpers that have no server to ask:
@@ -585,6 +597,7 @@ struct zt_server {
 	struct wlr_output_layout *output_layout;
 	struct zt_output *output;
 	float scale;
+	int panel_turn_cfg;	/* config `panel_turn`: 0, 90, 270, or -1 automatic */
 	float size_step;	/* Settings' display size: 0.875, 1 or 1.125 of the automatic scale */
 	/* what every colour drawn this frame is multiplied by: the software
 	 * brightness and the colour temperature (see frame_tint) */
@@ -1249,6 +1262,43 @@ static bool ringing_key(struct zt_server *server, uint32_t keycode);
  * to wait for at boot. Asked for with ZTMETRO_NESTED=1, and only taken when
  * wlroots did open a window (see main). */
 static bool g_nested;
+
+/* The panel's turn (config `panel_turn`, auto by default): 0 on a phone,
+ * whose panel is portrait, as everything here is laid out. A landscape panel
+ * (a tablet: 1920x1080) gets 90 (or 270): the shell draws a portrait screen
+ * into a texture of its own (g_pt_*), panel_blit() lays that on the panel on
+ * its side, and touches come back through panel_point(). Upright, the shell
+ * is then a portrait phone with its top on the panel's left (270: its right),
+ * and its own turn (orient 90) gives landscape the right way up. */
+static int g_panel_turn;
+static GLuint g_pt_fbo, g_pt_tex, g_pt_prog;
+static int g_pt_w, g_pt_h;
+/* the size of what the shell draws into: the panel's, turned */
+#define OUT_W(o) (g_panel_turn ? (o)->height : (o)->width)
+#define OUT_H(o) (g_panel_turn ? (o)->width : (o)->height)
+
+/* a point on the panel (a, b: 0-1 from its top left) to the shell's
+ * portrait screen (u, v: 0-1 from its top left) */
+static void panel_point(double a, double b, double *u, double *v) {
+	if (g_panel_turn == 90) {
+		*u = 1.0 - b, *v = a;
+	} else if (g_panel_turn == 270) {
+		*u = b, *v = 1.0 - a;
+	} else {
+		*u = a, *v = b;
+	}
+}
+
+/* a movement on the panel to one on the portrait screen */
+static void panel_delta(double dx, double dy, double *du, double *dv) {
+	if (g_panel_turn == 90) {
+		*du = -dy, *dv = dx;
+	} else if (g_panel_turn == 270) {
+		*du = dy, *dv = -dx;
+	} else {
+		*du = dx, *dv = dy;
+	}
+}
 
 static void backend_is_window(struct wlr_backend *backend, void *data) {
 	bool *window = data;
@@ -2042,6 +2092,76 @@ static void gl_end(struct zt_server *server) {
 }
 
 static GLuint gl_link(const char *vertex, const char *fragment);
+
+/* The portrait picture's framebuffer, for a panel turned (g_panel_turn): made
+ * at the panel's size turned, again if that changes. 0 if it cannot be. */
+static GLuint panel_fbo_get(struct wlr_output *o) {
+	int w = o->height, h = o->width;
+	if (g_pt_fbo && g_pt_w == w && g_pt_h == h) {
+		return g_pt_fbo;
+	}
+	if (!g_pt_tex) glGenTextures(1, &g_pt_tex);
+	glBindTexture(GL_TEXTURE_2D, g_pt_tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	if (!g_pt_fbo) glGenFramebuffers(1, &g_pt_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, g_pt_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_pt_tex, 0);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		wlr_log(WLR_ERROR, "panel turn: the %dx%d framebuffer is not complete", w, h);
+		return 0;
+	}
+	g_pt_w = w, g_pt_h = h;
+	wlr_log(WLR_INFO, "panel turn %d: drawn %dx%d, laid on the panel on its side", g_panel_turn, w, h);
+	return g_pt_fbo;
+}
+
+/* The portrait picture onto the panel's buffer (panel_fbo), turned. */
+static void panel_blit(GLuint panel_fbo, struct wlr_output *o) {
+	if (!g_pt_prog) {
+		static const char *vertex =
+			"attribute vec2 pos;\n"
+			"uniform float turn;\n"
+			"varying vec2 uv;\n"
+			"void main() {\n"
+			"	vec2 a = (pos + 1.0) * 0.5;\n"
+			"	uv = turn > 180.0 ? vec2(a.y, 1.0 - a.x) : vec2(1.0 - a.y, a.x);\n"
+			"	gl_Position = vec4(pos, 0.0, 1.0);\n"
+			"}\n";
+		static const char *fragment =
+			"precision mediump float;\n"
+			"varying vec2 uv;\n"
+			"uniform sampler2D tex;\n"
+			"void main() { gl_FragColor = vec4(texture2D(tex, uv).rgb, 1.0); }\n";
+		g_pt_prog = gl_link(vertex, fragment);
+		if (!g_pt_prog) {
+			return;
+		}
+	}
+	static const GLfloat corners[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+	GLint array_buffer = 0;
+	glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &array_buffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, panel_fbo);
+	glViewport(0, 0, o->width, o->height);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_BLEND);
+	glUseProgram(g_pt_prog);
+	glUniform1f(glGetUniformLocation(g_pt_prog, "turn"), (float)g_panel_turn);
+	glUniform1i(glGetUniformLocation(g_pt_prog, "tex"), 0);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, g_pt_tex);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, corners);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glBindBuffer(GL_ARRAY_BUFFER, (GLuint)array_buffer);
+	glEnable(GL_BLEND);
+}
 
 static GLuint gl_program(const char *fragment_head, const char *sampler) {
 	static const char *vertex =
@@ -4513,6 +4633,7 @@ static void load_config(struct zt_server *server) {
 	}
 	server->scale = 0.0f;	/* automatic: from the panel's width (server_new_output) */
 	server->size_step = 1.0f;
+	server->panel_turn_cfg = -1;
 	server->units = 6;		/* three medium tiles across */
 	server->shade_scale = 0.95f;
 	server->shade_dim = 0.6f;
@@ -4604,6 +4725,10 @@ static void load_config(struct zt_server *server) {
 			quick_parse(server, value);
 		} else if (strcmp(key, "scale") == 0) {
 			server->scale = strcmp(value, "auto") == 0 ? 0.0f : strtof(value, NULL);
+		} else if (strcmp(key, "panel_turn") == 0) {
+			/* a landscape panel laid on its side: auto, 0, 90 or 270 */
+			int t = atoi(value);
+			server->panel_turn_cfg = strcmp(value, "auto") == 0 ? -1 : t == 90 || t == 270 ? t : 0;
 		} else if (strcmp(key, "display_size") == 0) {
 			/* Settings' step either side of the automatic scale */
 			server->size_step = strcmp(value, "compact") == 0 ? 0.875f :
@@ -7251,7 +7376,28 @@ static int read_battery(void) {
 			return capacity;
 		}
 	}
-	return -1;
+	/* a laptop's or a tablet's (BAT0, CMB1, ...): any supply of type Battery */
+	DIR *dir = opendir("/sys/class/power_supply");
+	struct dirent *e;
+	int found = -1;
+	while (dir && found < 0 && (e = readdir(dir))) {
+		char path[300], type[32] = "";
+		if (e->d_name[0] == '.') continue;
+		snprintf(path, sizeof(path), "/sys/class/power_supply/%s/type", e->d_name);
+		FILE *f = fopen(path, "r");
+		if (!f) continue;
+		if (!fgets(type, sizeof(type), f)) type[0] = 0;
+		fclose(f);
+		if (strncmp(type, "Battery", 7) != 0) continue;
+		snprintf(path, sizeof(path), "/sys/class/power_supply/%s/capacity", e->d_name);
+		f = fopen(path, "r");
+		if (f) {
+			if (fscanf(f, "%d", &found) != 1) found = -1;
+			fclose(f);
+		}
+	}
+	if (dir) closedir(dir);
+	return found;
 }
 
 static bool wifi_up(void) {
@@ -9728,8 +9874,13 @@ static bool splash_first_frame(struct zt_server *server, struct wlr_output *wlr_
 		wlr_buffer_unlock(buffer);
 		return false;
 	}
+	GLuint panel_fbo = fbo;
+	if (g_panel_turn) {
+		GLuint pt = panel_fbo_get(wlr_output);
+		if (pt) fbo = pt;
+	}
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-	glViewport(0, 0, buffer->width, buffer->height);
+	glViewport(0, 0, OUT_W(buffer), OUT_H(buffer));
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_CULL_FACE);
@@ -9743,6 +9894,9 @@ static bool splash_first_frame(struct zt_server *server, struct wlr_output *wlr_
 	glClear(GL_COLOR_BUFFER_BIT);
 	splash_draw(server);
 	splash_tree_draw(server);
+	if (fbo != panel_fbo) {
+		panel_blit(panel_fbo, wlr_output);
+	}
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glFinish();
 	GLenum error = glGetError();
@@ -17272,16 +17426,18 @@ static void touch_down(struct wl_listener *listener, void *data) {
 	struct zt_touch_device *device = wl_container_of(listener, device, down);
 	struct zt_server *server = device->server;
 	struct wlr_touch_down_event *event = data;
-	touch_begin(server, event->touch_id, event->x * server->width,
-		event->y * server->height, event->time_msec);
+	double u, v;
+	panel_point(event->x, event->y, &u, &v);
+	touch_begin(server, event->touch_id, u * server->width, v * server->height, event->time_msec);
 }
 
 static void touch_motion(struct wl_listener *listener, void *data) {
 	struct zt_touch_device *device = wl_container_of(listener, device, motion);
 	struct zt_server *server = device->server;
 	struct wlr_touch_motion_event *event = data;
-	touch_update(server, event->touch_id, event->x * server->width,
-		event->y * server->height, event->time_msec);
+	double u, v;
+	panel_point(event->x, event->y, &u, &v);
+	touch_update(server, event->touch_id, u * server->width, v * server->height, event->time_msec);
 }
 
 static void touch_up(struct wl_listener *listener, void *data) {
@@ -17318,8 +17474,10 @@ static void pointer_motion(struct wl_listener *listener, void *data) {
 	struct zt_pointer_device *device = wl_container_of(listener, device, motion);
 	struct wlr_pointer_motion_event *event = data;
 	struct zt_server *server = device->server;
-	server->pointer_x += event->delta_x / server->scale;
-	server->pointer_y += event->delta_y / server->scale;
+	double du, dv;
+	panel_delta(event->delta_x, event->delta_y, &du, &dv);
+	server->pointer_x += du / server->scale;
+	server->pointer_y += dv / server->scale;
 	pointer_moved(server, event->time_msec);
 }
 
@@ -17327,8 +17485,10 @@ static void pointer_motion_absolute(struct wl_listener *listener, void *data) {
 	struct zt_pointer_device *device = wl_container_of(listener, device, motion_absolute);
 	struct wlr_pointer_motion_absolute_event *event = data;
 	struct zt_server *server = device->server;
-	server->pointer_x = event->x * server->width;
-	server->pointer_y = event->y * server->height;
+	double u, v;
+	panel_point(event->x, event->y, &u, &v);
+	server->pointer_x = u * server->width;
+	server->pointer_y = v * server->height;
 	pointer_moved(server, event->time_msec);
 }
 
@@ -17347,6 +17507,46 @@ static void pointer_button(struct wl_listener *listener, void *data) {
 		server->pointer_down = false;
 		touch_end(server, POINTER_TOUCH_ID, event->time_msec, false);
 	}
+}
+
+static void tablet_axis(struct wl_listener *listener, void *data) {
+	struct zt_tablet_device *device = wl_container_of(listener, device, axis);
+	struct wlr_tablet_tool_axis_event *event = data;
+	if (event->updated_axes & WLR_TABLET_TOOL_AXIS_X) device->x = event->x;
+	if (event->updated_axes & WLR_TABLET_TOOL_AXIS_Y) device->y = event->y;
+	if (device->down) {
+		struct zt_server *server = device->server;
+		double u, v;
+		panel_point(device->x, device->y, &u, &v);
+		touch_update(server, PEN_TOUCH_ID, u * server->width, v * server->height, event->time_msec);
+	}
+}
+
+static void tablet_tip(struct wl_listener *listener, void *data) {
+	struct zt_tablet_device *device = wl_container_of(listener, device, tip);
+	struct wlr_tablet_tool_tip_event *event = data;
+	struct zt_server *server = device->server;
+	device->x = event->x, device->y = event->y;
+	bool down = event->state == WLR_TABLET_TOOL_TIP_DOWN;
+	if (down && !device->down) {
+		double u, v;
+		panel_point(device->x, device->y, &u, &v);
+		touch_begin(server, PEN_TOUCH_ID, u * server->width, v * server->height, event->time_msec);
+	} else if (!down && device->down) {
+		touch_end(server, PEN_TOUCH_ID, event->time_msec, false);
+	}
+	device->down = down;
+}
+
+static void tablet_destroy(struct wl_listener *listener, void *data) {
+	struct zt_tablet_device *device = wl_container_of(listener, device, destroy);
+	if (device->down) {
+		touch_end(device->server, PEN_TOUCH_ID, 0, true);
+	}
+	wl_list_remove(&device->axis.link);
+	wl_list_remove(&device->tip.link);
+	wl_list_remove(&device->destroy.link);
+	free(device);
 }
 
 static void pointer_destroy(struct wl_listener *listener, void *data) {
@@ -18048,7 +18248,8 @@ static bool hardware_nav_keys(void) {
 		}
 		char path[300], real[PATH_MAX], caps[1024];
 		snprintf(path, sizeof(path), "/sys/class/input/%s/device", e->d_name);
-		if (!realpath(path, real) || strstr(real, "/usb")) {
+		/* (not USB, nor a virtual device: uinput's, e.g. ydotool or a remote) */
+		if (!realpath(path, real) || strstr(real, "/usb") || strstr(real, "/virtual/")) {
 			continue;
 		}
 		snprintf(path, sizeof(path), "/sys/class/input/%s/device/capabilities/key", e->d_name);
@@ -18069,8 +18270,12 @@ static bool hardware_nav_keys(void) {
 		}
 		int bits = sizeof(unsigned long) * 8;
 		#define HAS_KEY(k) ((k) / bits < n && (words[n - 1 - (k) / bits] >> ((k) % bits) & 1))
-		back |= HAS_KEY(KEY_BACK);
-		home |= HAS_KEY(KEY_HOMEPAGE);
+		/* a whole keyboard (a laptop's or a tablet's, letters and all) may
+		 * have both and is not a phone's keys: those still want the nav bar */
+		if (!HAS_KEY(KEY_Q) || !HAS_KEY(KEY_A)) {
+			back |= HAS_KEY(KEY_BACK);
+			home |= HAS_KEY(KEY_HOMEPAGE);
+		}
 		#undef HAS_KEY
 	}
 	if (dir) {
@@ -18264,6 +18469,17 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 		pointer->destroy.notify = pointer_destroy;
 		wl_signal_add(&device->events.destroy, &pointer->destroy);
 		wlr_log(WLR_INFO, "pointer, used as a finger: %s", device->name);
+	} else if (device->type == WLR_INPUT_DEVICE_TABLET) {
+		struct zt_tablet_device *tablet = calloc(1, sizeof(*tablet));
+		tablet->server = server;
+		tablet->tablet = wlr_tablet_from_input_device(device);
+		tablet->axis.notify = tablet_axis;
+		wl_signal_add(&tablet->tablet->events.axis, &tablet->axis);
+		tablet->tip.notify = tablet_tip;
+		wl_signal_add(&tablet->tablet->events.tip, &tablet->tip);
+		tablet->destroy.notify = tablet_destroy;
+		wl_signal_add(&device->events.destroy, &tablet->destroy);
+		wlr_log(WLR_INFO, "pen, its tip used as a finger: %s", device->name);
 	} else if (device->type == WLR_INPUT_DEVICE_KEYBOARD) {
 		struct wlr_keyboard *wlr_keyboard = wlr_keyboard_from_input_device(device);
 		struct zt_keyboard *keyboard = calloc(1, sizeof(*keyboard));
@@ -18728,6 +18944,7 @@ static bool plane_pick(struct zt_server *server, struct zt_toplevel *app, const 
 	const char *why = NULL;
 #define PLANE_NO(reason) do { why = reason; goto no; } while (0)
 	if (server->plane_off || getenv("ZTMETRO_NO_PLANE")) PLANE_NO("off");
+	if (g_panel_turn) PLANE_NO("the panel is turned");
 	/* (the plane cannot turn: a turned page is the GPU's) */
 	if (server->orient != 0 || !server->frame_ident) PLANE_NO("turned");
 	if (!app_covers || !app || !app->mapped) PLANE_NO("no app at rest in front");
@@ -19073,7 +19290,7 @@ static bool frost_atlas_draw(struct zt_server *server, struct wlr_output *output
 	}
 	frost_recording = false;	/* (what is drawn from here on is over the bars' blur) */
 	struct frost_strip *st[2] = { &server->frost[0], &server->frost[1] };
-	int hk[2], aw = (output->width + 1) / 2, ah = 0, off[2];
+	int hk[2], aw = (OUT_W(output) + 1) / 2, ah = 0, off[2];
 	for (int k = 0; k < 2; k++) {
 		hk[k] = st[k]->h > 0 ? st[k]->h : 0;
 		if (todo[k] && (!st[k]->fbo[0] || hk[k] < 4)) {
@@ -19130,8 +19347,8 @@ static bool frost_atlas_draw(struct zt_server *server, struct wlr_output *output
 		if (!todo[k]) {
 			continue;
 		}
-		int y0 = k == 0 ? 0 : output->height - hk[k];
-		float a = (float)output->height / hk[k], c = a - 1.0f - 2.0f * y0 / hk[k];
+		int y0 = k == 0 ? 0 : OUT_H(output) - hk[k];
+		float a = (float)OUT_H(output) / hk[k], c = a - 1.0f - 2.0f * y0 / hk[k];
 		glViewport(0, off[k], aw, hk[k] / 2);
 		for (int i = 0; i < n_frost_recs; i++) {
 			struct quad_rec r = frost_recs[i];
@@ -19226,10 +19443,10 @@ static void frost_prepare(struct zt_server *server, struct wlr_output *output, G
 		struct frost_strip *s = &server->frost[k];
 		int h = (int)ceilf(((k == 0 ? STATUS_H : NAV_H) + FROST_MARGIN) * server->scale);
 		h = (h + 3) / 4 * 4;
-		if (h > output->height) {
-			h = output->height / 4 * 4;
+		if (h > OUT_H(output)) {
+			h = OUT_H(output) / 4 * 4;
 		}
-		if (h < 4 || !frost_strip_alloc(server, s, output->width, h, fbo)) {
+		if (h < 4 || !frost_strip_alloc(server, s, OUT_W(output), h, fbo)) {
 			return;
 		}
 		if (s->valid && s->sig == scan->sig[k]) {
@@ -19274,7 +19491,7 @@ static void frost_prepare(struct zt_server *server, struct wlr_output *output, G
 	glDisable(GL_BLEND);
 	if (frost_atlas_draw(server, output, fbo, scan, todo, frosted)) {
 		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-		glViewport(0, 0, output->width, output->height);
+		glViewport(0, 0, OUT_W(output), OUT_H(output));
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 		glScissor(box[0], box[1], box[2], box[3]);
@@ -19300,8 +19517,8 @@ static void frost_prepare(struct zt_server *server, struct wlr_output *output, G
 		 * after it read the frame back in: 1.3-9 ms of the CPU (the frame's
 		 * submission) and more of the GPU, on every frame of a swipe or a
 		 * turn, the most of any one thing drawn (2026-11-21). */
-		int y0 = k == 0 ? 0 : output->height - s->h;
-		float a = (float)output->height / s->h, c = a - 1.0f - 2.0f * y0 / s->h;
+		int y0 = k == 0 ? 0 : OUT_H(output) - s->h;
+		float a = (float)OUT_H(output) / s->h, c = a - 1.0f - 2.0f * y0 / s->h;
 		glBindFramebuffer(GL_FRAMEBUFFER, s->src_fbo);
 		glViewport(0, 0, s->w, s->h);
 		glClearColor(frost_rec_clear[0], frost_rec_clear[1], frost_rec_clear[2], 1.0f);
@@ -19335,7 +19552,7 @@ static void frost_prepare(struct zt_server *server, struct wlr_output *output, G
 		glBindTexture(GL_TEXTURE_2D, s->src);
 		while (!s->checked && glGetError() != GL_NO_ERROR) {
 		}
-		glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, k == 0 ? 0 : output->height - s->h, s->w, s->h);
+		glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, k == 0 ? 0 : OUT_H(output) - s->h, s->w, s->h);
 		if (!s->checked) {
 			GLenum error = glGetError();
 			if (error != GL_NO_ERROR) {
@@ -19390,7 +19607,7 @@ static void frost_prepare(struct zt_server *server, struct wlr_output *output, G
 	}
 	glBindTexture(GL_TEXTURE_2D, 0);
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-	glViewport(0, 0, output->width, output->height);
+	glViewport(0, 0, OUT_W(output), OUT_H(output));
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 	glScissor(box[0], box[1], box[2], box[3]);
@@ -19557,8 +19774,8 @@ static uint32_t call_backdrop_sig(struct zt_server *server) {
 static bool call_backdrop_draw(struct zt_server *server, struct wlr_output *output, GLuint fbo, bool fresh, float alpha) {
 	static const GLfloat corners[8] = { 0, 0, 1, 0, 0, 1, 1, 1 };
 	struct frost_strip *s = &server->call_bd;
-	int h = output->height / 4 * 4;
-	if (h < 4 || !frost_strip_alloc(server, s, output->width, h, fbo)) {
+	int h = OUT_H(output) / 4 * 4;
+	if (h < 4 || !frost_strip_alloc(server, s, OUT_W(output), h, fbo)) {
 		return false;
 	}
 	if (fresh || !s->valid) {
@@ -19605,7 +19822,7 @@ static bool call_backdrop_draw(struct zt_server *server, struct wlr_output *outp
 		glDisableVertexAttribArray(0);
 		glBindTexture(GL_TEXTURE_2D, 0);
 		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-		glViewport(0, 0, output->width, output->height);
+		glViewport(0, 0, OUT_W(output), OUT_H(output));
 		glEnable(GL_BLEND);
 		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 		if (scissor) glEnable(GL_SCISSOR_TEST);
@@ -19647,7 +19864,7 @@ static bool call_backdrop_draw(struct zt_server *server, struct wlr_output *outp
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, 0);
 	frame_quads++;
-	frame_px += (double)output->width * output->height;
+	frame_px += (double)OUT_W(output) * OUT_H(output);
 	return true;
 }
 
@@ -19837,8 +20054,8 @@ static void rot_frame_turn(struct zt_server *server) {
  * (and every turn instant from then on) if it cannot be had. `y0`: its top row. */
 static bool rot_tex_ready(struct zt_server *server, struct wlr_output *output, int *y0) {
 	int top = (int)floorf(STATUS_H * server->scale);
-	int bottom = output->height - (int)floorf(NAV_H * server->scale);
-	int w = output->width, h = bottom - top;
+	int bottom = OUT_H(output) - (int)floorf(NAV_H * server->scale);
+	int w = OUT_W(output), h = bottom - top;
 	*y0 = top;
 	if (server->rot_tex_failed || h <= 0 || w <= 0) {
 		return false;
@@ -21402,6 +21619,11 @@ static void render_frame(struct zt_server *server) {
 		render_retry_later(server);
 		return;
 	}
+	GLuint panel_fbo = fbo;
+	if (g_panel_turn) {
+		GLuint pt = panel_fbo_get(output);
+		if (pt) fbo = pt;
+	}
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 	server->rot_snap_early = false;
 	if (server->rot_phase == ROT_SNAP && server->output->last_submitted) {
@@ -21410,7 +21632,9 @@ static void render_frame(struct zt_server *server) {
 		 * out of this frame half-way, the tiler wrote the frame out and read
 		 * it back in for the rest, and that frame took 12-14 ms of the GPU
 		 * and missed its vblank (2026-11-21) */
-		GLuint prev = wlr_gles2_renderer_get_buffer_fbo(server->renderer, server->output->last_submitted);
+		/* (turned: the portrait picture still holds the last frame) */
+		GLuint prev = fbo != panel_fbo ? fbo :
+			wlr_gles2_renderer_get_buffer_fbo(server->renderer, server->output->last_submitted);
 		if (prev) {
 			glBindFramebuffer(GL_FRAMEBUFFER, prev);
 			rot_snapshot(server, output);
@@ -21418,7 +21642,7 @@ static void render_frame(struct zt_server *server) {
 			glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 		}
 	}
-	glViewport(0, 0, output->width, output->height);
+	glViewport(0, 0, OUT_W(output), OUT_H(output));
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_CULL_FACE);
@@ -21445,7 +21669,7 @@ static void render_frame(struct zt_server *server) {
 	n_frost_recs = 0;
 	frost_rec_full = false;
 	frost_recording = !server->frost_failed && !server->frost_off;
-	frost_rec_height = output->height;
+	frost_rec_height = OUT_H(output);
 	glGetFloatv(GL_COLOR_CLEAR_VALUE, frost_rec_clear);
 	for (int k = 0; k < 2; k++) {
 		int h = (int)ceilf(((k == 0 ? STATUS_H : NAV_H) + FROST_MARGIN) * server->scale);
@@ -21535,8 +21759,8 @@ static void render_frame(struct zt_server *server) {
 	/* (and what shows through a held bar is still drawn under it) */
 	bool under_held = server->bar_held_diffuse > 0.003f && (bar_turning || server->bar_mix > 0.003f);
 	/* frosted, they have Start and the list drawn under them too */
-	int under_bottom = server->sensorhub_fail_screen || diffuse > 0.0f || under_held ? output->height :
-		output->height - (int)floorf(NAV_H * server->scale);
+	int under_bottom = server->sensorhub_fail_screen || diffuse > 0.0f || under_held ? OUT_H(output) :
+		OUT_H(output) - (int)floorf(NAV_H * server->scale);
 	/* the lock screen nearly down: only the nav bar's strip, which covers
 	 * the rest, is left. An empty scissor (height below zero) was a GL
 	 * error, and every frame of the lock screen's last 0.5 s was dropped */
@@ -21550,13 +21774,13 @@ static void render_frame(struct zt_server *server) {
 	struct frost_scan scan;
 	bool frosted[2] = { false, false };
 	frost_scan_begin(server, &scan, under_top, under_bottom);
-	if (!lock_covers && (under_top > 0 || under_bottom < output->height)) {
+	if (!lock_covers && (under_top > 0 || under_bottom < OUT_H(output))) {
 		glEnable(GL_SCISSOR_TEST);
-		glScissor(0, under_top, output->width, under_bottom - under_top);	/* row 0 is the top */
+		glScissor(0, under_top, OUT_W(output), under_bottom - under_top);	/* row 0 is the top */
 	}
 	/* The opaque boot splash covers these layers; avoid drawing them underneath. */
 	if (server->splash || lock_covers) {
-		retro_draw(server, output->width, output->height, true, false);	/* only notes it is covered */
+		retro_draw(server, OUT_W(output), OUT_H(output), true, false);	/* only notes it is covered */
 	}
 	/* the call with its frosted backdrop: the call is drawn last, over the
 	 * lock (call_backdrop_draw); what is behind it is blurred again only when
@@ -21620,7 +21844,7 @@ static void render_frame(struct zt_server *server) {
 		server->start_t = 0.0f;	/* (Start at rest, for the call's backdrop) */
 	}
 	if (retro_on(server)) {
-		retro_draw(server, output->width, output->height, server->boot_logo_stage != 0, app_covers);
+		retro_draw(server, OUT_W(output), OUT_H(output), server->boot_logo_stage != 0, app_covers);
 	} else if (server->start_t < 0.999f && !app_covers) {
 		/* (Start and the list are laid out in the view frame) */
 		view_begin(server);
@@ -22074,7 +22298,7 @@ static void render_frame(struct zt_server *server) {
 		 * down over it, as the action centre's does, only as far as its
 		 * second line */
 		glEnable(GL_SCISSOR_TEST);
-		glScissor(0, 0, output->width, (int)((STATUS_H + (PEEK_H - STATUS_H) * server->peek) * server->scale));
+		glScissor(0, 0, OUT_W(output), (int)((STATUS_H + (PEEK_H - STATUS_H) * server->peek) * server->scale));
 		layer_draw(server, &server->peek_layer, 0, 0, 1.0f);
 		plug_over(server, 0.0f, false);
 		glDisable(GL_SCISSOR_TEST);
@@ -22097,7 +22321,7 @@ static void render_frame(struct zt_server *server) {
 		 */
 		float reveal = server->shade_h, bar = SHADE_HANDLE;
 		float cover = reveal > bar ? reveal - bar : 0;
-		int px_w = output->width;
+		int px_w = OUT_W(output);
 		int px_cover = (int)(cover * server->scale), px_bar = (int)(bar * server->scale);
 		float m[16];
 		mat_identity(m);
@@ -22299,7 +22523,7 @@ static void render_frame(struct zt_server *server) {
 		 * image once. Per-pixel stdio used to stall the transition we measured. */
 		static uint8_t *pixels;
 		static size_t capacity;
-		int w = output->width, h = output->height;
+		int w = OUT_W(output), h = OUT_H(output);
 		if (server->record_top && h > 240 * server->scale) h = 240 * server->scale;
 		size_t rgba = (size_t)w * h * 4, rgb = (size_t)(w/4) * (h/4) * 3;
 		if (capacity < rgba + rgb) {
@@ -22324,6 +22548,9 @@ static void render_frame(struct zt_server *server) {
 				fclose(f);
 			}
 		}
+	}
+	if (fbo != panel_fbo) {
+		panel_blit(panel_fbo, output);
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	struct timespec t1, t2, t3;
@@ -22556,6 +22783,18 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		wlr_output_state_set_custom_mode(&state, w, h, 0);
 		px_w = w, px_h = h;	/* the automatic scale below works from these */
 	}
+	{
+		/* the panel's turn: automatic, 90 for a landscape panel (a tablet's);
+		 * a window on a desktop is drawn as it is */
+		int tw = mode ? mode->width : px_w, th = mode ? mode->height : px_h;
+		const char *env = getenv("ZTMETRO_PANEL_TURN");
+		int want = env ? atoi(env) : server->panel_turn_cfg;
+		if (want < 0) {
+			want = mode && tw > th ? 90 : 0;
+		}
+		g_panel_turn = want == 90 || want == 270 ? want : 0;
+		wlr_log(WLR_INFO, "output %s: %dx%d, panel turn %d", wlr_output->name, tw, th, g_panel_turn);
+	}
 	if (server->scale <= 0.0f) {
 		/* automatic: 360 points across the panel, as the S9 (1440 px, 4.0)
 		 * was laid out, so every phone shows the same layout; the J5's
@@ -22609,8 +22848,8 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	uint32_t splash_from = now_ms();
 	{
 		int mw = mode ? mode->width : px_w, mh = mode ? mode->height : px_h;
-		server->width = (int)(mw / server->scale);
-		server->height = (int)(mh / server->scale);
+		server->width = (int)((g_panel_turn ? mh : mw) / server->scale);
+		server->height = (int)((g_panel_turn ? mw : mh) / server->scale);
 	}
 	projection_set(server);
 	renderer_init(server);
@@ -22638,6 +22877,10 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	wlr_output_layout_add_auto(server->output_layout, wlr_output);
 
 	wlr_output_effective_resolution(wlr_output, &server->width, &server->height);
+	if (g_panel_turn) {
+		int t = server->width;
+		server->width = server->height, server->height = t;
+	}
 	wlr_log(WLR_INFO, "output %s: %dx%d points at scale %g", wlr_output->name,
 		server->width, server->height, server->scale);
 	projection_set(server);	/* (the same, unless wlroots' points differ) */

@@ -23,6 +23,12 @@ export ZTRF_SHELL_STYLE=$style
 envf=${XDG_CONFIG_HOME:-$HOME/.config}/ztmetro/env
 [ -f "$envf" ] && { set -a; . "$envf"; set +a; }
 systemctl --user set-environment ZTRF_SHELL_STYLE=$style >/dev/null 2>&1 || true
+# A tablet's accelerometer (iio-sensor-proxy) for the turn, where the phone's
+# ztoscsf-sensord is not there; it waits for the shell's control pipe itself.
+if [ ! -e /run/ztoscsf-sensord.ctl ] && command -v zrn-iio-orient >/dev/null 2>&1; then
+	pkill -x zrn-iio-orient 2>/dev/null; pkill -x monitor-sensor 2>/dev/null
+	setsid zrn-iio-orient </dev/null >/dev/null 2>&1 &
+fi
 # Not exec'd: when the shell ends, how it ended goes to the end of its log
 # (a signal shows as 128 + its number, e.g. 139 for SIGSEGV, 134 for SIGABRT).
 # greetd sees the session end when this script does, as before.

@@ -1,0 +1,32 @@
+#!/bin/sh
+# zrn-iio-orient: a tablet's accelerometer (iio-sensor-proxy) to ztMETRO's
+# turn, where the phone's ztoscsf-sensord is not there. ztMETRO takes
+# `orientation N` on its control pipe, N the edge of its portrait screen
+# pointing up (0 top, 90 right, 270 left, 180 bottom). On a landscape panel
+# the shell's portrait screen lies on its side (config `panel_turn`, 90 by
+# default: its top on the panel's left), so the panel's edges map to it here.
+turn=${ZTMETRO_PANEL_TURN:-90}
+ctl=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ztmetro.ctl
+command -v monitor-sensor >/dev/null || exit 0
+i=0; while [ ! -p "$ctl" ] && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
+[ -p "$ctl" ] || exit 0
+tell() {
+	case "$turn:$1" in
+	90:normal) n=90 ;; 90:bottom-up) n=270 ;; 90:left-up) n=0 ;; 90:right-up) n=180 ;;
+	270:normal) n=270 ;; 270:bottom-up) n=90 ;; 270:right-up) n=0 ;; 270:left-up) n=180 ;;
+	*:normal) n=0 ;; *:bottom-up) n=180 ;; *:left-up) n=90 ;; *:right-up) n=270 ;;
+	*) return ;;
+	esac
+	timeout 2 sh -c "printf 'orientation %s\n' $n > '$ctl'" 2>/dev/null
+}
+# (line by line: monitor-sensor writes into a pipe in blocks otherwise; and
+# again while the shell is there, as monitor-sensor ends when its claim fails)
+while [ -p "$ctl" ]; do
+	stdbuf -oL monitor-sensor --accel 2>/dev/null | while IFS= read -r line; do
+		case "$line" in
+		*"orientation changed:"*) tell "${line##*: }" ;;
+		*"Has accelerometer"*"orientation: "*) o=${line##*orientation: }; tell "${o%%[,)]*}" ;;
+		esac
+	done
+	sleep 5
+done
