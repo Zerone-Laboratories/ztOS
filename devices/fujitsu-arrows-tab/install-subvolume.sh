@@ -45,6 +45,17 @@ NEWHOME=0
 
 echo "unpacking ztOS into @ztos"
 bsdtar -xpf "$TAR" -C "$TOP/@ztos" --numeric-owner
+# Outside /home and /var every directory must be root's (sshd refuses keys
+# under a /usr another user owns, and that user could replace root's files).
+# A tarball that breaks this is not booted: no kernel or boot entry is written.
+BAD=$(find "$TOP/@ztos" -xdev \( -path "$TOP/@ztos/home" -o -path "$TOP/@ztos/var" -o -path "$TOP/@ztos/run" \
+	-o -path "$TOP/@ztos/tmp" \) -prune -o -type d ! -uid 0 -print | head -20)
+if [ -n "$BAD" ]; then
+	echo "these directories in $TAR are not root's (outside /home and /var):" >&2
+	printf '%s\n' "$BAD" | sed "s|^$TOP/@ztos|  |" >&2
+	echo "not installed: @ztos is left for a look, the boot entry is unchanged" >&2
+	exit 1
+fi
 if [ $NEWHOME = 1 ]; then
 	cp -a "$TOP/@ztos/home/." "$TOP/@ztos-home/"
 fi

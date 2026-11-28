@@ -11,8 +11,8 @@ D=$DEVSRC
 
 step "adding the Fujitsu ARROWS Tab device layer"
 install -d "$R/vendor/ztos"
-cp -a "$D/vendor/ztos/." "$R/vendor/ztos/"
-cp -a "$D/overlay/." "$R/"
+cpin "$D/vendor/ztos/." "$R/vendor/ztos/"
+cpin "$D/overlay/." "$R/"
 chown -R 0:0 "$R/vendor" "$R/etc/skel/.config"
 chmod 755 "$R"/usr/local/sbin/ztos-wakeups "$R"/usr/local/sbin/ztos-esp-sync "$R"/usr/local/sbin/ztos-bootwatch "$R"/usr/local/sbin/ztos-emergency
 
@@ -23,7 +23,7 @@ install -Dm644 "$SRC/ztmetro/desktop/50-zrn-iio-orient.rules" "$R/etc/polkit-1/r
 # zrn-touchguard: this tablet's touch panel fires ghost touches (stuck points,
 # lines that blink); the guard grabs it and passes on only real contacts
 rm -rf "$R/usr/src/zrn-touchguard"; mkdir -p "$R/usr/src"
-cp -a "$DEVROOT/input/touchguard" "$R/usr/src/zrn-touchguard"
+cpin "$DEVROOT/input/touchguard" "$R/usr/src/zrn-touchguard"
 ch sh -c 'cd /usr/src/zrn-touchguard && make clean >/dev/null 2>&1; make && make install PREFIX=/usr/local'
 rm -rf "$R/usr/src/zrn-touchguard"
 

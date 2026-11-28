@@ -174,6 +174,24 @@ set -eu
 step() { echo "STEP $*"; }
 R=$ROOTFS
 umask 022
+# Files from the source tree belong to whoever checked it out. cp -a would
+# carry that owner into the root, and onto every directory an overlay shares
+# with it (/, /usr, /etc, /etc/systemd/system...): sshd then refuses keys
+# ("bad ownership or modes for directory /usr"). Under a user namespace the
+# checkout's owner is root there, so only a build run as real root showed it;
+# copies into the root keep modes and times, never the owner.
+cpin() { cp -a --no-preserve=ownership "$@"; }
+# Everything outside /home and /var must be root's: a directory another user
+# owns is a way into root's files. Checked before the root is packed.
+check_root_owned() {
+	bad=$(find "$R" -xdev \( -path "$R/home" -o -path "$R/var" -o -path "$R/run" -o -path "$R/tmp" \
+		-o -path "$R/proc" -o -path "$R/sys" -o -path "$R/dev" \) -prune -o -type d ! -uid 0 -print | head -20)
+	if [ -n "$bad" ]; then
+		echo "these directories are not root's (outside /home and /var):" >&2
+		printf '%s\n' "$bad" | sed "s|^$R|  |" >&2
+		exit 1
+	fi
+}
 
 # A run stopped half way through the unpack leaves etc/arch-release without
 # the rest (no var/lib/pacman): only a mark written after the whole tarball
@@ -237,7 +255,7 @@ if [ "$ARCH" != aarch64 ]; then
 elif [ -f "$ATL_PACKAGES/SHA256SUMS" ]; then
     step "installing ztOSAndroidRuntimeV1 (prebuilt ARM64 runtime)"
     mkdir -p "$R/var/tmp/ztos-atl-packages"
-    cp -a "$ATL_PACKAGES/." "$R/var/tmp/ztos-atl-packages/"
+    cpin "$ATL_PACKAGES/." "$R/var/tmp/ztos-atl-packages/"
     cp "$SRC/android/atl/install-runtime.sh" "$R/var/tmp/ztos-atl-install.sh"
     ch bash /var/tmp/ztos-atl-install.sh /var/tmp/ztos-atl-packages
     mkdir -p "$R/usr/local/share/ztos/android-runtime"
@@ -258,7 +276,7 @@ done
 # before ztMETRO: the shell links libztos-ial
 step "installing ztOSIAL (the hardware interfaces)"
 rm -rf "$R/usr/src/ztos-ial"; mkdir -p "$R/usr/src"
-cp -a "$SRC/ial" "$R/usr/src/ztos-ial"
+cpin "$SRC/ial" "$R/usr/src/ztos-ial"
 sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$GSIVERSION\"/" "$R/usr/src/ztos-ial/gsi.json"
 ch sh -c 'cd /usr/src/ztos-ial && make clean >/dev/null 2>&1; make && make install PREFIX=/usr'
 rm -rf "$R/usr/src/ztos-ial"
@@ -272,7 +290,7 @@ rm -rf "$R/usr/src/zrn-sdk"
 
 step "building ztMETRO and its apps"
 rm -rf "$R/usr/src/ztmetro"; mkdir -p "$R/usr/src"
-cp -a "$SRC/ztmetro" "$R/usr/src/ztmetro"
+cpin "$SRC/ztmetro" "$R/usr/src/ztmetro"
 rm -rf "$R/usr/src/ztmetro/ref"
 ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1; make -j"$(nproc)" && make install'
 ch sh -c 'cd /usr/src/ztmetro && make install-browser'
@@ -282,15 +300,15 @@ ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1' || true
 # from the user templates in the rootfs overlay)
 step "building zrn-pushd (push for Android apps)"
 rm -rf "$R/usr/src/zrn-pushd"; mkdir -p "$R/usr/src"
-cp -a "$SRC/android/push" "$R/usr/src/zrn-pushd"
+cpin "$SRC/android/push" "$R/usr/src/zrn-pushd"
 ch sh -c 'cd /usr/src/zrn-pushd && make clean >/dev/null 2>&1; make && make install'
 install -Dm644 "$SRC/android/push/README.md" "$R/usr/local/share/doc/zrn-pushd/README.md"
 ch systemctl --global enable zrn-pushd.service
 rm -rf "$R/usr/src/zrn-pushd"
 
 step "adding ztOS's files"
-cp -a "$SRC/os/overlay/." "$R/"
-cp -a "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
+cpin "$SRC/os/overlay/." "$R/"
+cpin "$SRC/rootfs/overlay/." "$R/"         # every phone's: USB link, session, memory and fs recovery
 # os-release from VERSION, so About and `cat /etc/os-release` say this release
 ZTOSVERSION=$(tr -d ' \n' < "$SRC/VERSION")
 sed -i -e "s/^PRETTY_NAME=.*/PRETTY_NAME=\"ztOS $ZTOSVERSION\"/" \
@@ -311,7 +329,7 @@ for f in install.sh strip-image.sh patch-vendor.sh patch-composer.py patch-init-
 		audio-recover.py launch.sh power.sh ztos-waydroid-boot README.md \
 		ztos-waydroid-network.service ztos-waydroid-session.service ztos-waydroid-boot.service \
 		ztos-waydroid-audio-reconnect.service; do
-	[ -e "$SRC/android/waydroid/$f" ] && cp -a "$SRC/android/waydroid/$f" "$W/"
+	[ -e "$SRC/android/waydroid/$f" ] && cpin "$SRC/android/waydroid/$f" "$W/"
 done
 install -Dm755 "$SRC/android/waydroid/ztos-waydroid-images" "$R/usr/lib/ztos/ztos-waydroid-images"
 install -Dm644 "$SRC/android/waydroid/ztos-waydroid-images.service" \
@@ -327,7 +345,7 @@ ch fc-cache -f > /dev/null 2>&1 || true
 
 step "installing the ztOS SDK"
 rm -rf "$R/usr/local/lib/ztos-sdk"; mkdir -p "$R/usr/local/lib"
-cp -a "$SRC/sdk" "$R/usr/local/lib/ztos-sdk"
+cpin "$SRC/sdk" "$R/usr/local/lib/ztos-sdk"
 ln -sf ../lib/ztos-sdk/bin/ztos-sdk "$R/usr/local/bin/ztos-sdk"
 S=$R/etc/skel/.local/share/ztos
 install -Dm644 "$SRC/sdk/runtime/zygote.py" "$S/zygote.py"
@@ -427,6 +445,7 @@ if [ "$OUTPUT" = tar ]; then
 	umount -l "$R/tmp" "$R/proc" 2>/dev/null || true
 	umount -lR "$R/dev" 2>/dev/null || true
 	umount -l "$R" 2>/dev/null || true
+	check_root_owned
 	rm -f "$GSITAR"
 	bsdtar --zstd -cpf "$GSITAR" -C "$R" .
 	echo STAGE-OK
@@ -443,6 +462,7 @@ umount -l "$R/var/cache/pacman/pkg" 2>/dev/null || true
 umount -l "$R/tmp" "$R/proc" 2>/dev/null || true
 umount -lR "$R/dev" 2>/dev/null || true
 umount -l "$R" 2>/dev/null || true
+check_root_owned
 rm -f "$ROOTIMG"
 "$MKE2FS" -q -t ext4 -L "$LABEL" -m 1 -O ^orphan_file -d "$R" "$ROOTIMG" "${SIZE}G"
 echo STAGE-OK
