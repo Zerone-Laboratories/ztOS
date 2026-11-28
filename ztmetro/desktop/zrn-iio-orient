@@ -17,7 +17,15 @@ tell() {
 	*:normal) n=0 ;; *:bottom-up) n=180 ;; *:left-up) n=90 ;; *:right-up) n=270 ;;
 	*) return ;;
 	esac
-	timeout 2 sh -c "printf 'orientation %s\n' $n > '$ctl'" 2>/dev/null
+	# Started with the session, before the shell: the pipe there may still be
+	# the last shell's, with nobody reading, so a write that times out is
+	# tried again (up to a minute) until the new shell takes it. Lost, the
+	# screen stayed upright on a landscape panel until the tablet was moved.
+	i=0
+	until timeout 2 sh -c "printf 'orientation %s\n' $n > '$ctl'" 2>/dev/null; do
+		i=$((i+1)); [ $i -ge 30 ] && return
+		sleep 1
+	done
 }
 # (line by line: monitor-sensor writes into a pipe in blocks otherwise; and
 # again while the shell is there, as monitor-sensor ends when its claim fails)
