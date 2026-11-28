@@ -21292,10 +21292,18 @@ static void cf_divider_draw(struct zt_server *server, float page_dx) {
 #define LAUNCH_HOLD_MS		1000	/* a window that has not redrawn at its size by then: shown fitted */
 
 /* Whether the app can be shown as itself: drawn, ready, and at the size it
- * was asked for (not still its portrait shape) */
+ * was asked for (not still its portrait shape). Its first frame on a cold
+ * start can still be of its own shape, narrower than asked: taken as ready,
+ * the splash at the flip's end jumped to that narrow, tall box (the owner,
+ * 2026-11-28, "the app icon and the red background glitches"), so a frame
+ * narrower than sent_w keeps the splash (a wider one is as app_fit shows) */
 static bool lf_ready(struct zt_server *server, struct zt_toplevel *app) {
-	return app && app->mapped && app->commit_ms && !app->awaiting && !app->rot_pending &&
-		app->conf_orient == server->orient;
+	if (!app || !app->mapped || !app->commit_ms || app->awaiting || app->rot_pending ||
+			app->conf_orient != server->orient) {
+		return false;
+	}
+	int gw = app->xdg_toplevel->base->geometry.width;
+	return app->sent_w <= 0 || gw <= 0 || gw >= app->sent_w - 2;
 }
 
 /* A part of a window's frame of the box's shape, from its top (centred
