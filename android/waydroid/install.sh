@@ -54,7 +54,10 @@ with open(path + '.ztos-new', 'w') as output:
 os.chmod(path + '.ztos-new', 0o644)
 os.replace(path + '.ztos-new', path)
 PY
-"$here/patch-vendor.sh"
+# The composer patch is for the tested ARM64 vendor binary only
+if [[ $(uname -m) == aarch64 ]]; then
+    "$here/patch-vendor.sh"
+fi
 install -Dm644 "$here/README.md" /usr/local/share/doc/ztos-waydroid/README.md
 install -Dm755 "$here/network.py" /usr/local/libexec/ztos-waydroid-network
 install -Dm755 "$here/recover.sh" /usr/local/libexec/ztos-waydroid-recover
