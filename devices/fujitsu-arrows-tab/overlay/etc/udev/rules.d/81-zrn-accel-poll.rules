@@ -1,0 +1,7 @@
+# The ARROWS Tab's sensor hub (Intel ISH) stops sending the accelerometer's
+# stream after a while: iio-sensor-proxy, reading its buffer, gets nothing
+# and the screen no longer turns, while a reading asked for is still
+# answered. So the proxy asks (iio-poll-accel), never streams.
+ACTION=="remove", GOTO="zrn_accel_poll_end"
+SUBSYSTEM=="iio", ENV{IIO_SENSOR_PROXY_TYPE}=="*iio-buffer-accel*", ENV{IIO_SENSOR_PROXY_TYPE}="iio-poll-accel"
+LABEL="zrn_accel_poll_end"
