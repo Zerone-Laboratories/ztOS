@@ -325,7 +325,7 @@ ch update-desktop-database /usr/share/applications
 step "adding Android (Waydroid and the recipe for its image)"
 W=$R/usr/share/ztos-waydroid
 rm -rf "$W"; install -d "$W"
-for f in install.sh strip-image.sh patch-vendor.sh patch-composer.py patch-init-wake-alarm.py waydroid.cfg network.py recover.sh \
+for f in install.sh strip-image.sh patch-vendor.sh patch-composer.py patch-init-wake-alarm.py prune-missing-services.py waydroid.cfg network.py recover.sh \
 		audio-recover.py launch.sh power.sh ztos-waydroid-boot README.md \
 		ztos-waydroid-network.service ztos-waydroid-session.service ztos-waydroid-boot.service \
 		ztos-waydroid-audio-reconnect.service; do

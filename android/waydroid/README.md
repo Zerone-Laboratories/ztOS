@@ -177,6 +177,20 @@ at file offset 0xf4b88), in place, on the known init only (sha256
 REA evidence is in its docstring. strip-image.sh runs it on new images.
 Test: `tests/test-patch-init-wake-alarm.py INIT` on a copy.
 
+**HALs the vendor does not have.** The system image's init.waydroid.rc
+declares the HALs of every vendor Waydroid pairs with. The x86_64 MAINLINE
+vendor has android.hardware.audio.service (vendor.audio-hal, the one Android
+uses) but not android.hardware.audio@2.0-service or the 2.4 camera provider,
+so init logged "Could not restart 'vendor.audio-hal-2-0': Cannot find ..."
+at each Android start and each audio reconnect (ztOS restarts the HAL when
+the host's audio server changes). That is not a loop, and nothing can start
+there. `prune-missing-services.py RC VENDOR_IMAGE` drops such sections, in
+place; strip-image.sh runs it with the vendor.img next to the source image.
+The `createProcessGroup(...) failed ...: Read-only file system` lines (one
+per service start) come from Waydroid's `lxc.mount.auto = cgroup:ro` on a
+cgroup2 host: harmless, and kept, since a writable cgroup would give the
+container the host's cgroup tree.
+
 The live S9 image was swapped without stopping the container (30 Oct), as
 one root script: copy system.img to system.img.before-r2 and to a work
 copy, mount the work copy rw, patch its init, unmount, `e2fsck -fy` (rc <= 1),

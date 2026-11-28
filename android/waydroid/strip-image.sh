@@ -49,6 +49,13 @@ if (( rc == 3 )); then
 elif (( rc != 0 )); then
     exit "$rc"
 fi
+# init.waydroid.rc declares the HALs of every vendor Waydroid pairs with; one
+# this vendor lacks (audio@2.0 and camera 2.4 on the x86_64 MAINLINE vendor)
+# can never start and only fills the log at each Android start and audio
+# reconnect. The vendor image sits next to the source image.
+vendor_image=${VENDOR_IMAGE:-$(dirname "$source_image")/vendor.img}
+python3 "$(dirname "$(readlink -f "$0")")/prune-missing-services.py" \
+    "$root/system/etc/init/init.waydroid.rc" "$vendor_image"
 # HOME is com.android.launcher3/.uioverrides.QuickstepLauncher on the tested image.
 # Keep Launcher3: disabling it leaves HOME unresolved. Keep SystemUI too: hiding
 # its bars in multi-window mode does not prove its framework services are unused.
