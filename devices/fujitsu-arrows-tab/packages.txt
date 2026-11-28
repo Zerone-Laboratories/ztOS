@@ -32,3 +32,8 @@ nss-mdns
 
 # the pen and touch panel: libinput's wacom support
 libwacom
+
+# for bring-up: screenshots and input traces
+grim
+evtest
+libinput-tools

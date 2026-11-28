@@ -62,13 +62,22 @@ static struct {
 	double band_hold_s;   /* band mask cool-down */
 	int max_bands;        /* never mask more bands than this */
 	double release_mm;    /* a held contact moving this far is let through */
+	double line_mm;       /* contacts starting together this close in x (or y) form a line */
+	double line_gap_mm;   /* and at least this far apart along it */
+	double line_hold_s;   /* a line that fired is masked this long */
+	double hold_ms;       /* a held contact down this long is a real finger */
+	double repeat_mm;     /* touch-downs this close count as the same point */
+	int repeat_n;         /* this many at one point within window_s: a ghost point */
+	double repeat_hold_ms;/* a contact on a ghost point down this long is real */
 } cfg = {
 	.device = "Wacom Multitouch sensor Finger",
 	.stuck_ms = 8000, .stuck_mm = 2.0, .spot_mm = 4.0,
 	.spot_hold_s = 60, .spot_max_s = 1800,
 	.blip_ms = 60, .blip_mm = 0.5, .band_mm = 2.0, .window_s = 30,
-	.band_blips = 6, .band_spread = 4, .band_hold_s = 120, .max_bands = 4,
+	.band_blips = 100000, .band_spread = 4, .band_hold_s = 120, .max_bands = 4,
 	.release_mm = 3.0,
+	.line_mm = 5.0, .line_gap_mm = 8.0, .line_hold_s = 300, .hold_ms = 40,
+	.repeat_mm = 0.8, .repeat_n = 5, .repeat_hold_ms = 250,
 };
 
 static volatile sig_atomic_t want_stats, want_quit;
@@ -126,7 +135,9 @@ static struct {
 	unsigned long keybits[NBITS(KEY_CNT)];
 	int last_count;
 	/* stats */
-	long contacts, cut_stuck, held, held_dropped, released, blips_seen, bands_marked;
+	long contacts, cut_stuck, held, held_dropped, released, blips_seen, bands_marked, lines, repeats;
+	struct blip downs[MAX_BLIPS];   /* recent touch-downs, for ghost points */
+	int ndown;
 } d;
 
 static double dist_mm(int x1, int y1, int x2, int y2) {
@@ -251,6 +262,25 @@ static void contact_begin(struct slot *s, double t) {
 	s->spot = -1;
 	s->verdict = PASS;
 	s->why = NULL;
+	/* a ghost point: the panel fires at the same place, to within a
+	 * fraction of a millimetre, again and again (no finger lands that
+	 * exactly) */
+	int same = 0;
+	for (int i = 0; i < d.ndown; i++) {
+		if (d.downs[i].t >= t - cfg.window_s && dist_mm(s->x, s->y, d.downs[i].x, d.downs[i].y) <= cfg.repeat_mm) same++;
+	}
+	if (d.ndown == MAX_BLIPS) { memmove(d.downs, d.downs + 1, sizeof(d.downs[0]) * (MAX_BLIPS - 1)); d.ndown--; }
+	d.downs[d.ndown++] = (struct blip){ t, s->x, s->y };
+	if (same + 1 >= cfg.repeat_n) {
+		s->verdict = HELD;
+		s->why = "ghost point";
+		d.repeats++;
+		d.held++;
+		if (cfg.verbose || same + 1 == cfg.repeat_n)
+			logf_("ghost point at (%.1f,%.1f) mm: %d touch-downs within %.1f mm in %.0f s",
+				s->x / d.ux, s->y / d.uy, same + 1, cfg.repeat_mm, cfg.window_s);
+		return;
+	}
 	int sp = spot_at(s->x, s->y, t), bd = band_at(s->x, s->y, t);
 	if (sp >= 0 || bd >= 0) {
 		s->verdict = HELD;
@@ -274,6 +304,45 @@ static void contact_end(struct slot *s, double t) {
 	s->spot = -1;
 }
 
+/* The panel's ghost lines: two or more contacts that start in the same
+ * frame on one vertical (or horizontal) line, far apart along it. Fingers
+ * landing in the same 10 ms that close in x and far apart in y are rare;
+ * the faulty panel does it every few seconds. They are held, and the line
+ * is masked (held contacts there pass after hold_ms, which ghosts never
+ * last). */
+static void mask_line(bool row, int v, double t) {
+	double w = cfg.line_mm / 2 * (row ? d.uy : d.ux);
+	int i = band_at(row ? 0 : v, row ? v : 0, -1e18);
+	if (i >= 0 && d.bands[i].row == row) { d.bands[i].until = t + cfg.line_hold_s; return; }
+	int slot = 0;
+	for (int j = 0; j < MAX_BANDS; j++) {
+		if (!d.bands[j].used || d.bands[j].until <= t) { slot = j; break; }
+		if (d.bands[j].until < d.bands[slot].until) slot = j;
+	}
+	d.bands[slot] = (struct band){ .used = true, .row = row, .lo = v - (int)w, .hi = v + (int)w,
+		.until = t + cfg.line_hold_s };
+	d.bands_marked++;
+	logf_("ghost %s at %.1f mm: masked %.0f s", row ? "row" : "column", v / (row ? d.uy : d.ux), cfg.line_hold_s);
+}
+
+static void line_burst(const int *fresh, int nf, double t) {
+	for (int a = 0; a < nf; a++) {
+		for (int b = a + 1; b < nf; b++) {
+			struct slot *p = &d.s[fresh[a]], *q = &d.s[fresh[b]];
+			double dx = fabs((p->x - q->x) / d.ux), dy = fabs((p->y - q->y) / d.uy);
+			bool col = dx < cfg.line_mm && dy > cfg.line_gap_mm;
+			bool row = dy < cfg.line_mm && dx > cfg.line_gap_mm;
+			if (!col && !row) continue;
+			d.lines++;
+			for (int k = 0; k < 2; k++) {
+				struct slot *s = k ? q : p;
+				if (s->verdict == PASS) { s->verdict = HELD; s->why = "line"; d.held++; }
+			}
+			mask_line(row, row ? (p->y + q->y) / 2 : (p->x + q->x) / 2, t);
+		}
+	}
+}
+
 /* re-evaluate one live contact; true if its verdict changed */
 static void judge(struct slot *s, double t) {
 	if (s->tid < 0) return;
@@ -284,8 +353,10 @@ static void judge(struct slot *s, double t) {
 	}
 	switch (s->verdict) {
 	case HELD:
-		if (dist_mm(s->x, s->y, s->x0, s->y0) >= cfg.release_mm ||
-		    ((t - s->t0) * 1000 >= cfg.blip_ms && strcmp(s->why, "masked band") == 0)) {
+		if ((dist_mm(s->x, s->y, s->x0, s->y0) >= cfg.release_mm && strcmp(s->why, "masked spot") == 0) ||
+		    ((t - s->t0) * 1000 >= cfg.hold_ms && (strcmp(s->why, "masked band") == 0 ||
+		                                           strcmp(s->why, "line") == 0)) ||
+		    ((t - s->t0) * 1000 >= cfg.repeat_hold_ms && strcmp(s->why, "ghost point") == 0)) {
 			s->verdict = PASS;
 			d.released++;
 			if (cfg.verbose) logf_("released held contact (%s)", s->why);
@@ -437,8 +508,8 @@ static int open_device(char *name, size_t nlen) {
 
 static void stats(void) {
 	double t = now_s();
-	logf_("stats: contacts %ld, stuck cut %ld, held %ld (dropped %ld, released %ld), blips %ld, bands marked %ld",
-		d.contacts, d.cut_stuck, d.held, d.held_dropped, d.released, d.blips_seen, d.bands_marked);
+	logf_("stats: contacts %ld, stuck cut %ld, held %ld (dropped %ld, released %ld), blips %ld, bands marked %ld, ghost lines %ld, ghost points %ld",
+		d.contacts, d.cut_stuck, d.held, d.held_dropped, d.released, d.blips_seen, d.bands_marked, d.lines, d.repeats);
 	for (int i = 0; i < MAX_SPOTS; i++) {
 		struct spot *p = &d.spots[i];
 		if (p->used && (p->live || p->until > t))
@@ -531,13 +602,17 @@ static void run_device(int fd, const char *name) {
 					e->code <= BTN_TOOL_QUADTAP) || e->code == BTN_TOOL_QUINTTAP)) {
 					emit(EV_KEY, e->code, e->value);
 				} else if (e->type == EV_SYN && e->code == SYN_REPORT) {
+					int fresh[MAX_SLOTS], nf = 0;
+					for (int k = 0; k < d.nslots; k++) {
+						if (d.s[k].dirty) { d.s[k].dirty = false; contact_begin(&d.s[k], t); fresh[nf++] = k; }
+					}
+					line_burst(fresh, nf, t);
 					for (int k = 0; k < d.nslots; k++) {
 						struct slot *s = &d.s[k];
-						if (s->dirty) { s->dirty = false; contact_begin(s, t); }
 						if (s->tid == -2) {
 							/* a held band contact that outlasted a blip is a real tap */
-							if (s->verdict == HELD && strcmp(s->why, "masked band") == 0 &&
-							    (t - s->t0) * 1000 >= cfg.blip_ms) {
+							if (s->verdict == HELD && (strcmp(s->why, "masked band") == 0 ||
+							    strcmp(s->why, "line") == 0) && (t - s->t0) * 1000 >= cfg.hold_ms) {
 								s->verdict = PASS; d.released++; s->tid = 0;
 								sync_out();
 							}
@@ -589,6 +664,13 @@ static struct opt { const char *name; char kind; void *p; const char *help; } op
 	{ "band-hold-s", 'd', &cfg.band_hold_s, "band mask cool-down" },
 	{ "max-bands", 'i', &cfg.max_bands, "most bands masked at once" },
 	{ "release-mm", 'd', &cfg.release_mm, "a held contact moving this far goes through" },
+	{ "line-mm", 'd', &cfg.line_mm, "contacts starting together this close across form a ghost line" },
+	{ "line-gap-mm", 'd', &cfg.line_gap_mm, "and at least this far apart along it" },
+	{ "line-hold-s", 'd', &cfg.line_hold_s, "a ghost line is masked this long" },
+	{ "hold-ms", 'd', &cfg.hold_ms, "a contact on a masked line down this long is a finger" },
+	{ "repeat-mm", 'd', &cfg.repeat_mm, "touch-downs this close are the same point" },
+	{ "repeat-n", 'i', &cfg.repeat_n, "touch-downs at one point within window-s: a ghost point" },
+	{ "repeat-hold-ms", 'd', &cfg.repeat_hold_ms, "a contact on a ghost point down this long is a finger" },
 };
 
 static bool set_opt(const char *k, const char *v) {

@@ -54,4 +54,5 @@ ch mkinitcpio -P > /dev/null 2>&1 || ch mkinitcpio -P
 
 DEVICE_UNITS="zrn-touchguard bluetooth avahi-daemon ztos-bootwatch.timer systemd-timesyncd"
 # the S9's clocks and cores: nothing for zrnperfd to do on a PC
-DEVICE_OFF="zrnperfd"
+# Waydroid: the GSI pins ARM64 Android images; none for x86_64 yet
+DEVICE_OFF="zrnperfd waydroid-container ztos-waydroid-images"
