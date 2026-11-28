@@ -602,6 +602,8 @@ struct zt_server {
 	struct wlr_output_layout *output_layout;
 	struct zt_output *output;
 	float scale;
+	bool tablet_mode;	/* config `mode = tablet`: other apps drawn smaller (FOREIGN_ZOOM_TABLET) */
+	float foreign_zoom;	/* config `foreign_zoom`: that size, overriding it (0.5..1) */
 	int panel_turn_cfg;	/* config `panel_turn`: 0, 90, 270, or -1 automatic */
 	float size_step;	/* Settings' display size: 0.875, 1 or 1.125 of the automatic scale */
 	/* what every colour drawn this frame is multiplied by: the software
@@ -4739,6 +4741,14 @@ static void load_config(struct zt_server *server) {
 			quick_parse(server, value);
 		} else if (strcmp(key, "scale") == 0) {
 			server->scale = strcmp(value, "auto") == 0 ? 0.0f : strtof(value, NULL);
+		} else if (strcmp(key, "mode") == 0) {
+			/* `mode = tablet` (a device layer's, on a tablet port): apps not
+			 * ztOS's own are given more room and drawn smaller, as on a
+			 * phone's scale they are too zoomed in on a tablet's glass */
+			server->tablet_mode = strcmp(value, "tablet") == 0;
+		} else if (strcmp(key, "foreign_zoom") == 0) {
+			float z = strtof(value, NULL);
+			server->foreign_zoom = z >= 0.5f && z <= 1.0f ? z : 0.0f;
 		} else if (strcmp(key, "panel_turn") == 0) {
 			/* a landscape panel laid on its side: auto, 0, 90 or 270 */
 			int t = atoi(value);
@@ -10477,6 +10487,24 @@ static void osk_lift(struct zt_server *server) {
 
 /* Some apps will not go as narrow as the screen (a browser stops at 450
  * points or so). Such a window is shown smaller, so that all of it is there. */
+/* How much smaller an app not ztOS's own is drawn in tablet mode: it is
+ * told a room 1/zoom as big and drawn shrunk to fit it (app_fit), at a
+ * fractional scale as much lower so its pixels stay one to one. ztOS's own
+ * apps (zt*, zrn*) are laid out for the shell's points already, and
+ * Waydroid/ATL have their own density. */
+#define FOREIGN_ZOOM_TABLET 0.75
+static double app_zoom(struct zt_server *server, struct zt_toplevel *toplevel) {
+	if (!server->tablet_mode) {
+		return 1.0;
+	}
+	const char *id = toplevel->xdg_toplevel->app_id;
+	if (toplevel->android_runtime || (id && (!strncmp(id, "waydroid.", 9) || !strcmp(id, "Waydroid") ||
+			!strncmp(id, "zt", 2) || !strncmp(id, "zrn", 3)))) {
+		return 1.0;
+	}
+	return server->foreign_zoom > 0.0f ? server->foreign_zoom : FOREIGN_ZOOM_TABLET;
+}
+
 static double app_fit(struct zt_server *server, struct zt_toplevel *toplevel) {
 	int w = toplevel->xdg_toplevel->base->geometry.width;
 	return w > area_w(server) ? (double)area_w(server) / w : 1.0;
@@ -10507,6 +10535,9 @@ static void app_configure(struct zt_server *server, struct zt_toplevel *toplevel
 		room = server->height - STATUS_H - NAV_H;
 		w = server->width;
 	}
+	double zoom = app_zoom(server, toplevel);
+	w = (int)lround(w / zoom);
+	room /= zoom;
 	int gw = toplevel->xdg_toplevel->base->geometry.width;
 	int h = (int)(room / (gw > w ? (double)w / gw : 1.0));	/* (as app_fit) */
 	if ((h != toplevel->sent_h || w != toplevel->sent_w) &&
@@ -12268,8 +12299,9 @@ static void cf_prepare(struct zt_server *server, struct zt_toplevel *t) {
 			!t->xdg_toplevel->base->initialized) {
 		return;
 	}
-	int w = area_w(server), gw = t->xdg_toplevel->base->geometry.width;
-	int h = (int)(area_h(server) / (gw > w ? (double)w / gw : 1.0));
+	double zoom = app_zoom(server, t);
+	int w = (int)lround(area_w(server) / zoom), gw = t->xdg_toplevel->base->geometry.width;
+	int h = (int)(area_h(server) / zoom / (gw > w ? (double)w / gw : 1.0));
 	t->sent_w = w;
 	t->sent_h = h;
 	t->size_serial = wlr_xdg_toplevel_set_size(t->xdg_toplevel, w, h);
@@ -13393,6 +13425,15 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 			/* (upright only, the screen turned: the upright area) */
 			toplevel->sent_h = server->height - STATUS_H - NAV_H;
 			toplevel->sent_w = server->width;
+		}
+		double zoom = app_zoom(server, toplevel);
+		if (zoom < 1.0) {
+			toplevel->sent_w = (int)lround(toplevel->sent_w / zoom);
+			toplevel->sent_h = (int)lround(toplevel->sent_h / zoom);
+			/* its pixels one to one on the glass, drawn at zoom */
+			wlr_fractional_scale_v1_notify_scale(toplevel->xdg_toplevel->base->surface, server->scale * zoom);
+			wlr_surface_set_preferred_buffer_scale(toplevel->xdg_toplevel->base->surface,
+				(int32_t)ceilf(server->scale * (float)zoom));
 		}
 		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, toplevel->sent_w, toplevel->sent_h);
 		wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, true);

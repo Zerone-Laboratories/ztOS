@@ -2,6 +2,8 @@
 # (panel_turn auto), turned by the accelerometer
 rotation = on
 panel_turn = auto
+# a tablet: apps not ztOS's own drawn 25 % smaller (foreign_zoom 0.5..1 to tune)
+mode = tablet
 display_size = compact
 brightness = 50
 theme = dark
