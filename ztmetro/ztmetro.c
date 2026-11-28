@@ -20712,9 +20712,11 @@ static void rot_cancel_touches(struct zt_server *server) {
 	}
 }
 
-/* The turn itself, from the frozen picture: ROT_MS_90 or ROT_MS_180, exactly
- * (not stretched by Settings' animation speed as animate() would; only the
- * developer's slow motion still applies). */
+/* The turn itself, from the frozen picture: ROT_MS_90 or ROT_MS_180 at
+ * Settings' animation speed, like every other motion (it used to run at
+ * exactly these, so at the default 75 % the turn and everything after it
+ * in landscape was a third quicker than the same motion upright: the
+ * owner, 2026-11-28, "the animations in landscape are faster"). */
 static void rot_turn_start(struct zt_server *server) {
 	float span = fabsf(rot_ang(server->orient) - rot_ang(server->rot_from));
 	uint32_t ms = span > 135.0f ? ROT_MS_180 : ROT_MS_90;
@@ -20725,12 +20727,6 @@ static void rot_turn_start(struct zt_server *server) {
 	server->rot_phase = ROT_TURN;
 	server->rot_t = 0.0f;
 	animate(server, &server->rot_t, 1.0f, ms, 0, true);
-	for (int i = 0; i < MAX_ANIMS; i++) {
-		if (server->anims[i].active && server->anims[i].value == &server->rot_t) {
-			server->anims[i].duration = ms * (server->slow_motion ? 5 : 1);
-			break;
-		}
-	}
 	rot_frame_turn(server);
 }
 
@@ -21277,7 +21273,12 @@ static void cf_divider_draw(struct zt_server *server, float page_dx) {
  * launch is unchanged; an upright-only app from landscape is not flipped: the
  * screen turns upright and it opens as upright apps do. Going back to Start
  * is the usual return (the app swings out, the tiles turn in). */
-#define LAUNCH_MS		380
+/* as long as the upright launch it stands for: Start's tiles out, the gap,
+ * the app's swing in (start_turn, TURN_GAP_MS, APP_IN_MS). It was 380 ms,
+ * the upright launch over 1.3 s, so a launch in landscape took a third of
+ * the time of the same launch upright (the owner, 2026-11-28: "the
+ * animations in landscape are faster than animations in portrait") */
+#define LAUNCH_MS		((uint32_t)(start_out_ms(server) + TURN_GAP_MS + APP_IN_MS))
 #define LAUNCH_FLIP_DEG		180.0f
 #define LAUNCH_FLIP_DIR		(-1.0f)
 #define LAUNCH_XFADE_MS		150
@@ -21367,13 +21368,9 @@ static void lf_begin(struct zt_server *server, int kind, int index, float x, flo
 	lf_adopt(server);
 	server->lf_t = 0.0f;
 	anim_stop(server, &server->lf_t);
+	/* at Settings' animation speed, as the upright launch is (it ran at
+	 * exactly LAUNCH_MS, a third quicker at the default 75 %) */
 	animate(server, &server->lf_t, 1.0f, LAUNCH_MS, 0, true);
-	for (int i = 0; i < MAX_ANIMS; i++) {
-		if (server->anims[i].active && server->anims[i].value == &server->lf_t) {
-			server->anims[i].duration = LAUNCH_MS * (server->slow_motion ? 5 : 1);	/* (exactly) */
-			break;
-		}
-	}
 	wlr_log(WLR_INFO, "launch flip from %s %d%s", kind == LF_TILE ? "tile" : kind == LF_ITEM ? "row" :
 		kind == LF_ICON ? "rail icon" : kind == LF_CARD ? "card" : "the middle",
 		index, drawn ? " to its window" : live && live->mapped ? ", its picture until it redraws at its size" :
