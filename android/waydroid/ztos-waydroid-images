@@ -22,19 +22,35 @@ import tomllib
 import urllib.request
 import zipfile
 
-# The images ztOS's Waydroid work was done on (android/waydroid/README.md).
-PINNED = {
-    'system': {
-        'file': 'lineage-20.0-20260927-VANILLA-waydroid_arm64-system.zip',
-        'sha256': '5fb8179ed4455f45919c5a2bfbfdd1591619295994ad321217f03bb1dcfc53a7',
-        'channel': 'https://ota.waydro.id/system/lineage/waydroid_arm64/VANILLA.json',
+# The images ztOS's Waydroid work was done on (android/waydroid/README.md),
+# for each architecture the GSI is built for.
+PINS = {
+    'aarch64': {
+        'system': {
+            'file': 'lineage-20.0-20260927-VANILLA-waydroid_arm64-system.zip',
+            'sha256': '5fb8179ed4455f45919c5a2bfbfdd1591619295994ad321217f03bb1dcfc53a7',
+            'channel': 'https://ota.waydro.id/system/lineage/waydroid_arm64/VANILLA.json',
+        },
+        'vendor': {
+            'file': 'lineage-20.0-20260927-MAINLINE-waydroid_arm64-vendor.zip',
+            'sha256': '20a49c11961a5ac7295320f578764eeab3c982b217f1bfde7473adfc22e747ae',
+            'channel': 'https://ota.waydro.id/vendor/waydroid_arm64/MAINLINE.json',
+        },
     },
-    'vendor': {
-        'file': 'lineage-20.0-20260927-MAINLINE-waydroid_arm64-vendor.zip',
-        'sha256': '20a49c11961a5ac7295320f578764eeab3c982b217f1bfde7473adfc22e747ae',
-        'channel': 'https://ota.waydro.id/vendor/waydroid_arm64/MAINLINE.json',
+    'x86_64': {
+        'system': {
+            'file': 'lineage-20.0-20260927-VANILLA-waydroid_x86_64-system.zip',
+            'sha256': '053552725bf4ae25e2d3f7e6f1947203294aa9d73dc17fe1f3abe646e5d3bd8a',
+            'channel': 'https://ota.waydro.id/system/lineage/waydroid_x86_64/VANILLA.json',
+        },
+        'vendor': {
+            'file': 'lineage-20.0-20261022-MAINLINE-waydroid_x86_64-vendor.zip',
+            'sha256': '91663c337013145208b6c533d7e1fa2a915a9864ddc8fc56966f40cd759648ac',
+            'channel': 'https://ota.waydro.id/vendor/waydroid_x86_64/MAINLINE.json',
+        },
     },
 }
+PINNED = PINS[os.uname().machine]
 IMAGES = pathlib.Path('/usr/share/waydroid-extra/images')
 CACHE = pathlib.Path('/var/cache/ztos-waydroid')
 READY = pathlib.Path('/var/lib/ztos/waydroid-ready')

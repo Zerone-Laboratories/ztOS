@@ -15,6 +15,9 @@
 # Environment: ZTOS_PASSWORD_FILE  the user's password (first line), else unchanged
 #              ZTOS_REPLACE=1      an @ztos already there is moved to @ztos-prev
 #              ZTOS_COPY_WIFI=1    copy this system's NetworkManager profiles (default)
+#              ZTOS_COPY_HOSTKEYS=1 give ztOS this system's SSH host keys (default), so
+#                                  one known_hosts entry works for both; ztOS's own
+#                                  are kept in /etc/ssh/ztos-own-hostkeys
 set -eu
 TAR=$(readlink -f "$1")
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
@@ -57,6 +60,17 @@ if [ "${ZTOS_COPY_WIFI:-1}" = 1 ] && [ -d /etc/NetworkManager/system-connections
 	install -d -m700 "$R/etc/NetworkManager/system-connections"
 	for f in /etc/NetworkManager/system-connections/*.nmconnection; do
 		[ -f "$f" ] && install -m600 -o0 -g0 "$f" "$R/etc/NetworkManager/system-connections/"
+	done
+fi
+
+if [ "${ZTOS_COPY_HOSTKEYS:-1}" = 1 ] && ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+	install -d -m700 "$R/etc/ssh/ztos-own-hostkeys"
+	for f in "$R"/etc/ssh/ssh_host_*; do
+		[ -f "$f" ] && mv -f "$f" "$R/etc/ssh/ztos-own-hostkeys/"
+	done
+	for f in /etc/ssh/ssh_host_*; do
+		case $f in *.pub) m=644 ;; *) m=600 ;; esac
+		install -m$m -o0 -g0 "$f" "$R/etc/ssh/"
 	done
 fi
 

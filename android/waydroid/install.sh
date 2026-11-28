@@ -38,10 +38,16 @@ config = configparser.ConfigParser()
 config.read(path)
 new = configparser.ConfigParser()
 new.read(sys.argv[1])
+# the ARM64 image's own ABI and names: not for another architecture's image
+arm_only = ('ro.zygote', 'ro.product.cpu.abilist', 'ro.product.cpu.abilist64', 'ro.product.cpu.abilist32',
+            'ro.product.device_for_attestation', 'ro.product.name_for_attestation',
+            'ro.product.product_for_attestation')
 for section in new.sections():
     if not config.has_section(section):
         config.add_section(section)
     for key, value in new[section].items():
+        if os.uname().machine != 'aarch64' and key in arm_only:
+            continue
         config[section][key] = value
 with open(path + '.ztos-new', 'w') as output:
     config.write(output)

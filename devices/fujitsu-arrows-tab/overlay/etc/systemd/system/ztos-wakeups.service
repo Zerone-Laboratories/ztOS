@@ -1,0 +1,9 @@
+[Unit]
+Description=ztOS: only the lid, power button and RTC wake the tablet
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ztos-wakeups
+
+[Install]
+WantedBy=multi-user.target

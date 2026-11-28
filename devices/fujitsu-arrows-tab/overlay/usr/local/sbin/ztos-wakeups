@@ -1,0 +1,9 @@
+#!/bin/sh
+# ztos-wakeups: what may wake the Fujitsu ARROWS Tab from sleep. The USB
+# controller (XHC) carries the touch panel, whose ghost touches would wake it
+# at once; the wired LAN and PCIe root ports have no reason to. The lid, the
+# power button (a fixed ACPI event) and the RTC stay wake sources.
+for d in XHC GLAN RP01 RP04 RP05; do
+	grep -q "^$d[[:space:]].*\*enabled" /proc/acpi/wakeup && echo "$d" > /proc/acpi/wakeup
+done
+exit 0
