@@ -701,8 +701,9 @@ struct zt_server {
 	float lf_src[4];
 	/* the status bar's glyphs, each turned about its own middle while the
 	 * screen is turned (see status_bar_draw): their boxes in the status layer */
-	struct { float x0, y0, x1, y1; bool on; } st_cell[6];
+	struct { float x0, y0, x1, y1; bool on; } st_cell[6], lock_st_cell[6];	/* (the lock's row: its own) */
 	bool st_recording;		/* status_row is drawing the status bar's own row */
+	bool st_lock_recording;		/* or the lock's, into lock_st_cell */
 	struct zt_layer status_clock2;	/* the clock as two lines (hours over minutes), for landscape */
 	char st_clock2_key[24];		/* what it shows, and in which ink */
 	/* landscape Start: how wide its content is, where its arrow is, and the
@@ -7719,14 +7720,15 @@ static bool on_charger(void) {
  * noted as draw_status draws its row (st_recording). */
 enum { ST_SIGNAL, ST_TECH, ST_WIFI, ST_BT, ST_BATTERY, ST_CLOCK, ST_CELLS };
 static void st_cell_put(struct zt_server *server, int k, double x0, double y0, double x1, double y1) {
-	if (!server->st_recording) {
+	if (!server->st_recording && !server->st_lock_recording) {
 		return;
 	}
-	server->st_cell[k].x0 = (float)(x0 - 1);	/* a point round it, for the edges' smoothing */
-	server->st_cell[k].y0 = (float)(y0 - 1);
-	server->st_cell[k].x1 = (float)(x1 + 1);
-	server->st_cell[k].y1 = (float)(y1 + 1);
-	server->st_cell[k].on = true;
+	__typeof__(server->st_cell[0]) *c = server->st_lock_recording ? &server->lock_st_cell[k] : &server->st_cell[k];
+	c->x0 = (float)(x0 - 1);	/* a point round it, for the edges' smoothing */
+	c->y0 = (float)(y0 - 1);
+	c->x1 = (float)(x1 + 1);
+	c->y1 = (float)(y1 + 1);
+	c->on = true;
 }
 
 static bool call_backdrop_on(struct zt_server *server);
@@ -8593,16 +8595,17 @@ static void lock_notes_changed(struct zt_server *server) {
 /* the Metro lock's status row, in the ink the wallpaper chose */
 static void draw_lock_status(struct zt_server *server) {
 	cairo_t *cr;
-	/* across the view's top: landscape on a turned panel (status_row lays
-	 * itself out by the screen's width, so it is given the view's) */
-	int sw = server->width, sh = server->height, vw = view_w(server), vh = view_h(server);
-	struct zt_buffer *buffer = zt_buffer_create(server, vw, STATUS_H, &cr);
-	server->width = vw;
-	server->height = vh;
+	/* along the screen's own top, as Start's: on a turned panel that is the
+	 * side strip, each glyph group turned in place (lock_status_draw), the
+	 * owner: "the status bar icons should rotate inplace like in homescreen" */
+	struct zt_buffer *buffer = zt_buffer_create(server, server->width, STATUS_H, &cr);
+	for (int k = 0; k < ST_CELLS; k++) {
+		server->lock_st_cell[k].on = false;
+	}
+	server->st_lock_recording = true;
 	status_row(server, cr, false, false, false, server->lock_status_ink);
-	server->width = sw;
-	server->height = sh;
-	zt_buffer_show(server, &server->lock_status_layer, buffer, cr, vw, STATUS_H);
+	server->st_lock_recording = false;
+	zt_buffer_show(server, &server->lock_status_layer, buffer, cr, server->width, STATUS_H);
 }
 
 /* the lock's status row changed: under DotMatrix the lock is one picture */
@@ -21497,30 +21500,38 @@ static void bar_cell_quad(struct zt_server *server, struct zt_layer *layer, floa
 	server->uv_off[0] = server->uv_off[1] = 0;
 }
 
+static void status_cells_draw(struct zt_server *server, bool lock, float angle, float alpha);
 static void status_bar_draw(struct zt_server *server, float angle) {
 	if (fabsf(angle) < 0.01f || retro_on(server)) {
 		layer_draw(server, &server->status_layer, 0, 0, 1.0f);
 		return;
 	}
-	struct zt_layer *l = &server->status_layer;
+	status_cells_draw(server, false, angle, 1.0f);
+}
+
+/* The status row's glyph groups each turned about its own middle: Start's
+ * (status_layer, st_cell) or the lock's (lock_status_layer, lock_st_cell). */
+static void status_cells_draw(struct zt_server *server, bool lock, float angle, float alpha) {
+	struct zt_layer *l = lock ? &server->lock_status_layer : &server->status_layer;
+	__typeof__(server->st_cell[0]) *cells = lock ? server->lock_st_cell : server->st_cell;
 	float lean = fminf(fabsf(angle), 180.0f - fabsf(angle));	/* from upright, either way */
 	float two = smooth01((lean - 30.0f) / 30.0f);	/* the two-line clock's share */
 	for (int k = 0; k < ST_CELLS; k++) {
-		if (!server->st_cell[k].on) {
+		if (!cells[k].on) {
 			continue;
 		}
-		float x0 = server->st_cell[k].x0, y0 = server->st_cell[k].y0;
-		float x1 = server->st_cell[k].x1, y1 = server->st_cell[k].y1;
+		float x0 = cells[k].x0, y0 = cells[k].y0;
+		float x1 = cells[k].x1, y1 = cells[k].y1;
 		float cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
 		if (k == ST_CLOCK) {
-			bar_cell_quad(server, l, x0, y0, x1, y1, cx, cy, angle, 1.0f - two);
+			bar_cell_quad(server, l, x0, y0, x1, y1, cx, cy, angle, (1.0f - two) * alpha);
 			struct zt_layer *c2 = &server->status_clock2;
 			if (two > 0.003f && c2->tex) {
-				bar_cell_quad(server, c2, 0, 0, (float)c2->w, (float)c2->h, cx, cy, angle, two);
+				bar_cell_quad(server, c2, 0, 0, (float)c2->w, (float)c2->h, cx, cy, angle, two * alpha);
 			}
 			continue;
 		}
-		bar_cell_quad(server, l, x0, y0, x1, y1, cx, cy, angle, 1.0f);
+		bar_cell_quad(server, l, x0, y0, x1, y1, cx, cy, angle, alpha);
 	}
 }
 
@@ -22512,22 +22523,54 @@ static void render_frame(struct zt_server *server) {
 	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - view_h(server)) && !retro_on(server)) {
 		view_begin(server);	/* (laid out in the view: landscape on a turned panel) */
 		layer_draw(server, &server->lock_layer, 0, server->lock_y, 1.0f);
-		if (server->lock_status_layer.tex) {
+		bool lock_bar_turned = fabsf(bar_angle) >= 0.01f;
+		if (server->lock_status_layer.tex && !lock_bar_turned) {
 			layer_draw(server, &server->lock_status_layer, 0, server->lock_y, 1.0f);
 		}
 		/* the clock block rises by LOCK_LIFT as the notification row comes in */
 		float lift = server->lock_lift < 0.0f ? 0.0f : server->lock_lift > 1.0f ? 1.0f : server->lock_lift;
+		/* turned, the status row is a strip down the left: the clock block
+		 * starts past it, as Start's tiles do */
+		float lock_dx = fabsf(bar_angle) >= 0.01f ? (float)STATUS_H : 0.0f;
+		float lock_dy = 0.0f;
+		if (lock_dx > 0.0f) {
+			/* and no nav bar under it (that is the right-hand strip): its
+			 * lowest line (the date, or the row of marks once raised)
+			 * ends level with the strip's bottom glyph, the signal bars
+			 * (turned in place, so as far up from the bottom as its
+			 * cell's middle less half its height). The owner: "get the
+			 * clock to the bottom, without whitespace, same level as the
+			 * network icon". At rest the date ends 86 points over the
+			 * bottom and the raised row NAV_H + 16 (LOCK_LIFT's note). */
+			float gap = 16.0f;
+			if (server->lock_st_cell[ST_SIGNAL].on) {
+				float cx = (server->lock_st_cell[ST_SIGNAL].x0 + server->lock_st_cell[ST_SIGNAL].x1) / 2;
+				gap = cx - (server->lock_st_cell[ST_SIGNAL].y1 - server->lock_st_cell[ST_SIGNAL].y0) / 2 + 1;
+			}
+			lock_dy = (86.0f - gap) * (1.0f - lift) + ((float)NAV_H + 16.0f - gap) * lift;
+		}
 		if (server->lock_clock_layer.tex && !server->pc_pad) {
-			layer_draw(server, &server->lock_clock_layer, 0,
-				server->lock_y + (float)LOCK_CLOCK_Y(server) - LOCK_LIFT * lift, 1.0f);
+			layer_draw(server, &server->lock_clock_layer, lock_dx,
+				server->lock_y + (float)LOCK_CLOCK_Y(server) - LOCK_LIFT * lift + lock_dy, 1.0f);
 		}
 		if (server->lock_note_layer.tex && lift > 0.0f && !server->pc_pad) {
-			layer_draw(server, &server->lock_note_layer, 0,
-				server->lock_y + (float)LOCK_NOTE_Y(server) + LOCK_LIFT * (1.0f - lift), lift);
+			layer_draw(server, &server->lock_note_layer, lock_dx,
+				server->lock_y + (float)LOCK_NOTE_Y(server) + LOCK_LIFT * (1.0f - lift) + lock_dy, lift);
 		}
-		plug_over(server, server->lock_y, true);
+		if (!lock_bar_turned) {
+			plug_over(server, server->lock_y, true);
+		}
 		pc_render(server);
 		view_end(server);
+		if (lock_bar_turned && server->lock_status_layer.tex) {
+			/* turned: the lock's row stays on the screen's own top (the side
+			 * strip) as Start's does, its glyphs turned in place, and fades
+			 * as the lock goes up rather than sliding along the strip */
+			float vh = (float)view_h(server);
+			float a = vh > 0 ? 1.0f + server->lock_y / vh : 1.0f;
+			a = a < 0 ? 0 : a > 1 ? 1 : a;
+			status_cells_draw(server, true, bar_angle, a);
+		}
 	}
 	/* The call: its backdrop over the whole screen, the nav bar's strip
 	 * included, as one picture, from the call's first frame to its last; then
