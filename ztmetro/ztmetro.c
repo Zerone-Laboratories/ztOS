@@ -21477,6 +21477,7 @@ static void lf_draw(struct zt_server *server, struct zt_toplevel *app, struct ap
 /* The status bar, drawn on the glass: as one picture upright, else each
  * glyph group turned about its own middle by `angle` (the clock as two lines
  * past 45 degrees, the two cross-fading). */
+static float g_cell_fit = 1.0f;	/* a turned glyph group's own scale (status_cell_fit) */
 static void bar_cell_quad(struct zt_server *server, struct zt_layer *layer, float x0, float y0,
 		float x1, float y1, float cx, float cy, float angle, float alpha) {
 	x0 = fmaxf(x0, 0.0f);
@@ -21490,6 +21491,7 @@ static void bar_cell_quad(struct zt_server *server, struct zt_layer *layer, floa
 	mat_identity(m);
 	mat_translate(m, cx, cy);
 	mat_rotate_z(m, angle);
+	mat_scale(m, g_cell_fit, g_cell_fit);
 	mat_translate(m, -w / 2, -h / 2);
 	mat_scale(m, w, h);
 	server->uv_off[0] = x0 * (float)layer->pw / (float)layer->w / (float)layer->tw;
@@ -21501,6 +21503,19 @@ static void bar_cell_quad(struct zt_server *server, struct zt_layer *layer, floa
 }
 
 static void status_cells_draw(struct zt_server *server, bool lock, float angle, float alpha);
+/* Turned, the row is a strip as thick as the bar: each glyph group at most
+ * the Wi-Fi glyph's size (its longer side), so the wide battery does not
+ * stick out past the strip (the owner: "get every icon the same size as the
+ * wifi icon when rotated"). The clock is two lines of its own. */
+static float status_cell_fit(struct zt_server *server, bool lock, int k) {
+	__typeof__(server->st_cell[0]) *c = lock ? server->lock_st_cell : server->st_cell;
+	if (k == ST_CLOCK || k == ST_WIFI || !c[ST_WIFI].on || !c[k].on) {
+		return 1.0f;
+	}
+	float wifi = fmaxf(c[ST_WIFI].x1 - c[ST_WIFI].x0, c[ST_WIFI].y1 - c[ST_WIFI].y0);
+	float own = fmaxf(c[k].x1 - c[k].x0, c[k].y1 - c[k].y0);
+	return own > wifi && own > 0 ? wifi / own : 1.0f;
+}
 static void status_bar_draw(struct zt_server *server, float angle) {
 	if (fabsf(angle) < 0.01f || retro_on(server)) {
 		layer_draw(server, &server->status_layer, 0, 0, 1.0f);
@@ -21531,7 +21546,9 @@ static void status_cells_draw(struct zt_server *server, bool lock, float angle, 
 			}
 			continue;
 		}
+		g_cell_fit = status_cell_fit(server, lock, k);
 		bar_cell_quad(server, l, x0, y0, x1, y1, cx, cy, angle, alpha);
+		g_cell_fit = 1.0f;
 	}
 }
 
@@ -21548,6 +21565,8 @@ static void plug_draw(struct zt_server *server, float angle) {
 	mat_identity(m);
 	mat_translate(m, bx, by);
 	mat_rotate_z(m, angle);
+	float fit = status_cell_fit(server, false, ST_BATTERY);	/* (with its battery) */
+	mat_scale(m, fit, fit);
 	mat_translate(m, server->plug_x - bx, server->plug_y - by);
 	mat_scale(m, (float)pl->w, (float)pl->h);
 	quad(server, GL_TEXTURE_2D, pl->tex, m, 1.0f, true, false,
