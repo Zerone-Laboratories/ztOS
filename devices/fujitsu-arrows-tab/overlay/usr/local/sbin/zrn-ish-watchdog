@@ -1,0 +1,28 @@
+#!/bin/sh
+# zrn-ish-watchdog: the Fujitsu ARROWS Tab's Intel sensor hub (ISH, PCI
+# 00:13.0, the accelerometer the screen turns by) sometimes stops sending
+# while a reading is claimed: no interrupts, the last reading forever, and
+# the screen no longer turns. While monitor-sensor holds the accelerometer
+# (it reads at 10 Hz then), an ISH with no interrupt for 15 s is bound again
+# and iio-sensor-proxy restarted; zrn-iio-orient claims it again by itself.
+dev=0000:00:13.0
+drv=/sys/bus/pci/drivers/intel_ish_ipc
+count() { awk '/intel_ish/{s=0; for (i=2; i<=NF; i++) if ($i ~ /^[0-9]+$/) s+=$i; print s}' /proc/interrupts; }
+last=$(count); still=0
+while sleep 5; do
+	now=$(count)
+	if [ "$now" = "$last" ] && pgrep -x monitor-sensor >/dev/null; then
+		still=$((still + 5))
+	else
+		still=0
+	fi
+	last=$now
+	if [ $still -ge 15 ] && [ -e "$drv/$dev" ]; then
+		echo "the sensor hub went silent while claimed: binding it again"
+		systemctl stop iio-sensor-proxy
+		echo "$dev" > "$drv/unbind"; sleep 2; echo "$dev" > "$drv/bind"; sleep 5
+		systemctl start iio-sensor-proxy
+		pkill -x monitor-sensor	# (zrn-iio-orient starts it again, with the new proxy)
+		still=0; last=$(count)
+	fi
+done

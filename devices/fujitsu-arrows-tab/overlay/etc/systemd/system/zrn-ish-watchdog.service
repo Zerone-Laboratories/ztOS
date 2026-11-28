@@ -1,0 +1,10 @@
+[Unit]
+Description=Bind the sensor hub again when it goes silent (Fujitsu ARROWS Tab)
+After=iio-sensor-proxy.service
+
+[Service]
+ExecStart=/usr/local/sbin/zrn-ish-watchdog
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

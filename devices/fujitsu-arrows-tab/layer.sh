@@ -14,7 +14,7 @@ install -d "$R/vendor/ztos"
 cpin "$D/vendor/ztos/." "$R/vendor/ztos/"
 cpin "$D/overlay/." "$R/"
 chown -R 0:0 "$R/vendor" "$R/etc/skel/.config"
-chmod 755 "$R"/usr/local/sbin/ztos-wakeups "$R"/usr/local/sbin/ztos-esp-sync "$R"/usr/local/sbin/ztos-bootwatch "$R"/usr/local/sbin/ztos-emergency
+chmod 755 "$R"/usr/local/sbin/ztos-wakeups "$R"/usr/local/sbin/ztos-esp-sync "$R"/usr/local/sbin/ztos-bootwatch "$R"/usr/local/sbin/ztos-emergency "$R"/usr/local/sbin/zrn-ish-watchdog
 
 # the tablet's shell pieces (ztmetro's install-desktop has them; make install not)
 install -Dm755 "$SRC/ztmetro/desktop/zrn-iio-orient" "$R/usr/local/bin/zrn-iio-orient"
@@ -52,6 +52,6 @@ step "making the start-up image (initramfs)"
 # no autodetect: built here, it would keep only this computer's drivers
 ch mkinitcpio -P > /dev/null 2>&1 || ch mkinitcpio -P
 
-DEVICE_UNITS="ztos-wakeups zrn-touchguard bluetooth avahi-daemon ztos-bootwatch.timer systemd-timesyncd"
+DEVICE_UNITS="ztos-wakeups zrn-ish-watchdog bluetooth avahi-daemon ztos-bootwatch.timer systemd-timesyncd"
 # the S9's clocks and cores: nothing for zrnperfd to do on a PC
 DEVICE_OFF="zrnperfd"
