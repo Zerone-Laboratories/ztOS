@@ -459,7 +459,12 @@ struct zt_touch_device {
 	struct zt_server *server;
 	struct wlr_touch *touch;
 	struct wl_listener down, up, motion, cancel, destroy;
+	/* this device's contacts carry ids from here up (TOUCH_ID_SPAN of them):
+	 * two touchscreens' slot 0 are two fingers, and a device that goes away
+	 * takes only its own contacts with it */
+	int32_t id_base;
 };
+#define TOUCH_ID_SPAN	1000
 
 /* A mouse (or an emulator's pointer) taken as a finger: the left button
  * touches, moving drags, letting go lifts. Where it is, in points. */
@@ -17428,7 +17433,7 @@ static void touch_down(struct wl_listener *listener, void *data) {
 	struct wlr_touch_down_event *event = data;
 	double u, v;
 	panel_point(event->x, event->y, &u, &v);
-	touch_begin(server, event->touch_id, u * server->width, v * server->height, event->time_msec);
+	touch_begin(server, device->id_base + event->touch_id, u * server->width, v * server->height, event->time_msec);
 }
 
 static void touch_motion(struct wl_listener *listener, void *data) {
@@ -17437,23 +17442,32 @@ static void touch_motion(struct wl_listener *listener, void *data) {
 	struct wlr_touch_motion_event *event = data;
 	double u, v;
 	panel_point(event->x, event->y, &u, &v);
-	touch_update(server, event->touch_id, u * server->width, v * server->height, event->time_msec);
+	touch_update(server, device->id_base + event->touch_id, u * server->width, v * server->height, event->time_msec);
 }
 
 static void touch_up(struct wl_listener *listener, void *data) {
 	struct zt_touch_device *device = wl_container_of(listener, device, up);
 	struct wlr_touch_up_event *event = data;
-	touch_end(device->server, event->touch_id, event->time_msec, false);
+	touch_end(device->server, device->id_base + event->touch_id, event->time_msec, false);
 }
 
 static void touch_cancel(struct wl_listener *listener, void *data) {
 	struct zt_touch_device *device = wl_container_of(listener, device, cancel);
 	struct wlr_touch_cancel_event *event = data;
-	touch_end(device->server, event->touch_id, event->time_msec, true);
+	touch_end(device->server, device->id_base + event->touch_id, event->time_msec, true);
 }
 
 static void touch_destroy(struct wl_listener *listener, void *data) {
 	struct zt_touch_device *device = wl_container_of(listener, device, destroy);
+	/* a device unplugged (or a filter's virtual one stopped) mid-touch never
+	 * sends its lifts: left held, its contacts would make every later finger
+	 * the second one of a gesture and the glass would seem dead (2026-11-28) */
+	for (int i = 0; i < MAX_TOUCH; i++) {
+		struct touch_point *p = &device->server->touches[i];
+		if (p->used && p->id >= device->id_base && p->id < device->id_base + TOUCH_ID_SPAN) {
+			touch_end(device->server, p->id, now_ms(), true);
+		}
+	}
 	wl_list_remove(&device->down.link);
 	wl_list_remove(&device->up.link);
 	wl_list_remove(&device->motion.link);
@@ -18445,6 +18459,8 @@ static void server_new_input(struct wl_listener *listener, void *data) {
 		struct zt_touch_device *touch = calloc(1, sizeof(*touch));
 		touch->server = server;
 		touch->touch = wlr_touch_from_input_device(device);
+		static int32_t touch_devices;
+		touch->id_base = TOUCH_ID_SPAN * ++touch_devices;
 		touch->down.notify = touch_down;
 		wl_signal_add(&touch->touch->events.down, &touch->down);
 		touch->up.notify = touch_up;
