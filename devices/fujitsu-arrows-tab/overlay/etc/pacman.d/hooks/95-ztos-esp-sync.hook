@@ -1,0 +1,15 @@
+# After the kernel, its initramfs or the microcode change: copy them to the
+# EFI partition's /ztos directory (ztos-esp-sync), never anywhere else there.
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Target = usr/lib/modules/*/vmlinuz
+Target = usr/lib/initcpio/*
+Target = boot/intel-ucode.img
+Target = usr/lib/firmware/*
+
+[Action]
+Description = Copying ztOS's kernel to the EFI partition (/efi/ztos)...
+When = PostTransaction
+Exec = /usr/local/sbin/ztos-esp-sync

@@ -7,6 +7,9 @@
     ztos emulator                start the emulator with the ztOS installed there
     ztos build --target T        only build the system (for qemu: the disk too)
     ztos build --target gsi      the generic system image alone, for ztConflo (--gsi)
+    ztos build --target gsi --arch x86_64   the same for PCs
+    ztos install --target fujitsu-tablet    ztOS next to the system on a Fujitsu ARROWS Tab
+                                 (x86_64; its own btrfs subvolume and boot entry)
     ztos guide                   how installing on the phone goes, step by step
     ztos doctor                  is this computer ready to build ztOS?
 """
@@ -98,9 +101,13 @@ def wizard(args) -> b.Settings:
                                          lambda a: None if re.fullmatch(r"[a-zA-Z0-9-]{1,63}", a) else "letters, digits and -")
     s.timezone = args.timezone or prompt("  time zone", "UTC", valid_timezone)
     s.fresh = args.fresh
-    print(f"\nztOS for {'the emulator' if target == 'qemu' else 'the Galaxy S9'}, user {s.user}, "
+    where = {"qemu": "the emulator", "starlte": "the Galaxy S9"}.get(target, f"the {target}")
+    print(f"\nztOS for {where}, user {s.user}, "
           f"named {s.hostname}, time zone {s.timezone}.")
-    print("Building it downloads about 2 GB and takes a while (30-60 minutes: ARM programs run emulated because this computer is x86).")
+    if s.machine == "aarch64":
+        print("Building it downloads about 2 GB and takes a while (30-60 minutes: ARM programs run emulated because this computer is x86).")
+    else:
+        print("Building it downloads about 2 GB and takes 15-30 minutes.")
     if not args.yes and not ask("Start?"):
         sys.exit(0)
     return s
@@ -172,13 +179,16 @@ def cmd_install(args):
             t.run_qemu(headless=args.headless, gl=getattr(args, "gl", False))
         else:
             print("Start it later with: installer/ztos emulator")
+    elif s.target in b.ARCHES:
+        t.install_pc(s, image)
     else:
         t.install_phone(image, ask)
 
 
 def cmd_build(args):
     s = b.Settings(target=args.target, user=args.user or "ztos", password=args.password or "ztos",
-                   hostname=args.hostname or "ztos", timezone=args.timezone or "UTC", fresh=args.fresh)
+                   hostname=args.hostname or "ztos", timezone=args.timezone or "UTC", fresh=args.fresh,
+                   arch=args.arch or "")
     b.build(s)
 
 
@@ -213,7 +223,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command")
 
     def with_settings(p):
-        p.add_argument("--target", choices=["qemu", "starlte", "gsi"])
+        p.add_argument("--target", choices=["qemu", "starlte", "fujitsu-tablet", "gsi"])
+        p.add_argument("--arch", choices=["aarch64", "x86_64"], help="the GSI's architecture (a device has its own)")
         p.add_argument("--user")
         p.add_argument("--password", help="(else asked; never stored)")
         p.add_argument("--hostname")

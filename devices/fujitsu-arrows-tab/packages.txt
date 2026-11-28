@@ -1,0 +1,34 @@
+# ztOS on the Fujitsu ARROWS Tab (DMI FARQ11001, family ARROWS-JC): Core
+# i5-6300U (Skylake-U, HD Graphics 520), Intel 8260 Wi-Fi and Bluetooth,
+# HD Audio (Realtek ALC269), the Integrated Sensor Hub's accelerometer, a
+# Wacom pen and touch panel. Arch Linux x86_64 names.
+
+# the kernel: Arch's own, its firmware and the CPU's microcode
+linux
+linux-firmware
+intel-ucode
+mkinitcpio
+btrfs-progs
+dosfstools
+
+# the GPU (i915; ztMETRO and apps draw with OpenGL ES through mesa) and video
+mesa
+vulkan-intel
+intel-media-driver
+libva-utils
+
+# sound: HD Audio needs no DSP firmware; sof-firmware for the newer codecs' paths
+sof-firmware
+alsa-ucm-conf
+
+# the accelerometer for the turn (ztmetro's zrn-iio-orient), Bluetooth
+iio-sensor-proxy
+bluez
+bluez-utils
+
+# a findable name on the network (zrndeck-ztos.local)
+avahi
+nss-mdns
+
+# the pen and touch panel: libinput's wacom support
+libwacom

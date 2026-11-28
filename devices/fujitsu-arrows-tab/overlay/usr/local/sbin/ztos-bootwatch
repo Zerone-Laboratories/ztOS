@@ -1,0 +1,16 @@
+#!/bin/sh
+# ztos-bootwatch: on a trial boot of ztOS (systemd-boot's one-shot entry),
+# go back to the other system when ztOS is not reachable a few minutes in.
+# The one-shot is used up as it boots, so a reboot lands on the default entry.
+# /etc/ztos/boot-trusted (made when ztOS becomes the default) turns it off.
+[ -e /etc/ztos/boot-trusted ] && exit 0
+ok=1
+systemctl -q is-active sshd.service || ok=0
+systemctl -q is-active NetworkManager.service || ok=0
+ip -4 -o addr show scope global | grep -q inet || ok=0
+if [ $ok = 1 ]; then
+	echo "ztos-bootwatch: ztOS is up and reachable"
+	exit 0
+fi
+echo "ztos-bootwatch: ztOS is not reachable (sshd, NetworkManager or an address missing): rebooting to the default entry"
+systemctl --no-block reboot || reboot -f

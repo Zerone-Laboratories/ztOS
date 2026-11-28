@@ -1,0 +1,9 @@
+#!/bin/sh
+# Emergency or rescue mode on a trial boot: nobody is at the tablet to log in,
+# so reboot (to the default entry); on a trusted install, the usual shell.
+if [ -e /etc/ztos/boot-trusted ]; then
+	exec /usr/lib/systemd/systemd-sulogin-shell "${1:-emergency}"
+fi
+echo "ztos: $1 mode on a trial boot: rebooting to the default entry in 10 s" > /dev/console
+sleep 10
+exec systemctl --force reboot

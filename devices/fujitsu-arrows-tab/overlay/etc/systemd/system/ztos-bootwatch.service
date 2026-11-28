@@ -1,0 +1,6 @@
+[Unit]
+Description=ztOS trial boot: back to the default entry when not reachable
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ztos-bootwatch

@@ -1,0 +1,6 @@
+# ztOS: the initramfs stays in ztOS's own /boot (in @ztos); ztos-esp-sync
+# copies it with the kernel to the EFI partition's /ztos directory. Never the
+# other system's /boot/EFI/Linux or /boot/vmlinuz-linux.
+ALL_kver="/boot/vmlinuz-linux"
+PRESETS=('default')
+default_image="/boot/initramfs-linux.img"

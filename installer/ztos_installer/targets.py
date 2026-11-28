@@ -222,3 +222,22 @@ def install_phone(root_image: Path, ask) -> None:
     say("")
     say("Hold Power and Volume+, Volume- keys to reboot.")
     say("done: ztOS starts on the phone (the first start takes a minute)")
+
+
+# --- a PC: a btrfs subvolume next to the system already there ---------------------
+
+
+def install_pc(s, tarball: Path) -> None:
+    """A PC target's root goes into btrfs subvolumes (@ztos, @ztos-home) next
+    to the installed system, with its own systemd-boot entry; nothing is
+    repartitioned and the default entry is left alone. The device layer's
+    install-subvolume.sh does it, as root, on the PC itself."""
+    from .build import ROOT, DEVICES
+    script = ROOT / "devices" / DEVICES[s.target] / "install-subvolume.sh"
+    print(f"""
+ztOS for {s.target} is built: {tarball}
+Put it on the PC (copy the tarball there if this is another computer), then, on it:
+  sudo sh {script.relative_to(ROOT)} {tarball.name}
+It makes the subvolumes, adds the boot entry ztos.conf, and leaves the default
+entry as it was. Try ztOS once with:  sudo bootctl set-oneshot ztos.conf && sudo reboot
+""")

@@ -1,0 +1,22 @@
+#!/bin/sh
+# ztos-esp-sync: ztOS's kernel, initramfs and microcode to /efi/ztos, the only
+# place on the EFI system partition ztOS writes (the other system's kernels
+# and loader entries are next to it, and are never touched). Each file goes in
+# under a temporary name and is renamed, so a cut-off copy never boots.
+set -eu
+ESP=${ZTOS_ESP:-/efi}
+[ -n "${ZTOS_IN_BUILD:-}" ] && exit 0
+# the automount: looking is enough to mount it
+if ! ls "$ESP/loader" >/dev/null 2>&1; then
+	echo "ztos-esp-sync: no EFI partition at $ESP (nothing copied)" >&2
+	exit 0
+fi
+install -d "$ESP/ztos"
+for f in vmlinuz-linux initramfs-linux.img intel-ucode.img; do
+	[ -f "/boot/$f" ] || continue
+	cp "/boot/$f" "$ESP/ztos/.$f.new"
+	sync "$ESP/ztos/.$f.new" 2>/dev/null || sync
+	mv -f "$ESP/ztos/.$f.new" "$ESP/ztos/$f"
+done
+sync
+echo "ztos-esp-sync: $ESP/ztos is up to date"
