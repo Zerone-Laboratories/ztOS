@@ -1,6 +1,6 @@
 {
- "generated": "2026-11-23T12:46:29+00:00",
- "pmaports": "5d8de7e89f4d58d2dd34cae34d68bff2c94369dd",
+ "generated": "2026-11-28T11:47:36+00:00",
+ "pmaports": "c20e3b4a9448c790399db526cd5d0f1b271efda0",
  "devices": [
   {
    "codename": "fairphone-fp4",
@@ -784,22 +784,6 @@
    "flash_method": "fastboot",
    "kernel": "linux-postmarketos-qcom-sdm670",
    "screen": "1080x2340",
-   "warnings": []
-  },
-  {
-   "codename": "xiaomi-scorpio",
-   "name": "Xiaomi Mi Note 2",
-   "manufacturer": "Xiaomi",
-   "year": "2016",
-   "chassis": "handset",
-   "category": "testing",
-   "soc": "msm8996pro",
-   "gpu_driver": "freedreno",
-   "accelerated": true,
-   "archived": false,
-   "flash_method": "fastboot",
-   "kernel": "linux-postmarketos-qcom-msm8996",
-   "screen": "1080x1920",
    "warnings": []
   },
   {
@@ -1911,6 +1895,24 @@
    ]
   },
   {
+   "codename": "xiaomi-scorpio",
+   "name": "Xiaomi Mi Note 2",
+   "manufacturer": "Xiaomi",
+   "year": "2016",
+   "chassis": "handset",
+   "category": "archived",
+   "soc": "msm8996pro",
+   "gpu_driver": "freedreno",
+   "accelerated": true,
+   "archived": true,
+   "flash_method": "fastboot",
+   "kernel": "linux-postmarketos-qcom-msm8996",
+   "screen": "1080x1920",
+   "warnings": [
+    "postmarketOS no longer maintains this phone's port: it is archived, so it may not build or boot, and it has had no recent testing."
+   ]
+  },
+  {
    "codename": "xiaomi-tissot",
    "name": "Xiaomi Mi A1",
    "manufacturer": "Xiaomi",
@@ -2235,24 +2237,6 @@
    ]
   },
   {
-   "codename": "xiaomi-lancelot",
-   "name": "Xiaomi Redmi 9",
-   "manufacturer": "Xiaomi",
-   "year": "2020",
-   "chassis": "handset",
-   "category": "testing",
-   "soc": "mt6769t",
-   "gpu_driver": "",
-   "accelerated": false,
-   "archived": false,
-   "flash_method": "fastboot",
-   "kernel": "linux-postmarketos-mediatek-mt6768",
-   "screen": "",
-   "warnings": [
-    "Unable to detect a Graphics Accelerator for the selected device, the Metro Shell will not start or work properly !"
-   ]
-  },
-  {
    "codename": "htc-flounder",
    "name": "Google Nexus 9",
    "manufacturer": "HTC",
@@ -2380,6 +2364,25 @@
    "flash_method": "fastboot",
    "kernel": "linux-postmarketos-mediatek-mt6768",
    "screen": "1080x2340",
+   "warnings": [
+    "Unable to detect a Graphics Accelerator for the selected device, the Metro Shell will not start or work properly !",
+    "postmarketOS no longer maintains this phone's port: it is archived, so it may not build or boot, and it has had no recent testing."
+   ]
+  },
+  {
+   "codename": "xiaomi-lancelot",
+   "name": "Xiaomi Redmi 9",
+   "manufacturer": "Xiaomi",
+   "year": "2020",
+   "chassis": "handset",
+   "category": "archived",
+   "soc": "mt6769t",
+   "gpu_driver": "",
+   "accelerated": false,
+   "archived": true,
+   "flash_method": "fastboot",
+   "kernel": "linux-postmarketos-mediatek-mt6768",
+   "screen": "",
    "warnings": [
     "Unable to detect a Graphics Accelerator for the selected device, the Metro Shell will not start or work properly !",
     "postmarketOS no longer maintains this phone's port: it is archived, so it may not build or boot, and it has had no recent testing."
