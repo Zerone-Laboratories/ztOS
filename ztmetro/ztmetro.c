@@ -12152,6 +12152,14 @@ static void cf_split_toggle(struct zt_server *server) {
 	server->cf_w_v = 0;
 	server->cf_w_moving = true;
 	server->cf_sweep_landing = flow;
+	if (flow) {
+		/* on the first card already as it fades in: the sweep once the
+		 * divider lands starts there, not the last card the previous one
+		 * ended on jumping back to the first (the owner, 2026-11-28) */
+		anim_stop(server, &server->cf_x);
+		server->cf_moving = false;
+		server->cf_x = 0.0f;
+	}
 	server->physics_ms = now_ms();
 	server->moving = true;
 	server->cf_flow_kept = flow;
