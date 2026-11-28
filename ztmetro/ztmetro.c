@@ -695,6 +695,10 @@ struct zt_server {
 	struct zt_layer lf_icon;	/* the splash's icon, made at the tap */
 	float alpha_mul;		/* every quad's opacity times this (1 but under a launch flip) */
 	uint32_t lf_hold_ms;		/* the flip over and the app not yet drawn at its size: since */
+	bool ts_on;			/* an upright app from landscape: its splash through the screen's turn */
+	float ts_alpha;			/* that splash, 1 until the turn is over and the app has drawn */
+	uint32_t ts_color, ts_hold_ms;
+	bool lf_cold;			/* a cold start: the splash until the flip is over, whenever the window comes */
 	struct wl_event_source *lf_timer;	/* how long that is held at most (LAUNCH_HOLD_MS) */
 	struct zt_toplevel *cf_prepared;	/* the cover-flow's middle window, already asked for its landscape size */
 	int lf_src_kind, lf_src_index;	/* what launch_tile/launch_item tapped, for launch() */
@@ -1382,6 +1386,9 @@ static void lf_begin(struct zt_server *server, int kind, int index, float x, flo
 	uint32_t color, const char *icon, const char *label, struct zt_toplevel *live);
 static void lf_adopt(struct zt_server *server);
 static void lf_end(struct zt_server *server);
+static void ts_begin(struct zt_server *server, uint32_t color, const char *icon, const char *label);
+static void ts_step(struct zt_server *server);
+static void ts_draw(struct zt_server *server);
 static void cf_mode_update(struct zt_server *server, bool snap_it);
 static double rail_max(struct zt_server *server);
 static void cf_divider_bake(struct zt_server *server);
@@ -10857,17 +10864,39 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 			list_relayout(server);
 		}
 		/* the app swings out, then the tiles swing back in */
-		if (previous && previous->mapped) {
+		bool turn_back = !start_land(server) && g_panel_turn && rot_target(server) % 180 != 0;
+		if (turn_back) {
+			/* an upright app on a turned panel, landscape Start behind it:
+			 * the screen's turn is the way back (the owner, 2026-11-28:
+			 * "the animation when pressed home is too slow"); a swing,
+			 * a gap and the tiles, and the turn only after them, took
+			 * well over a second. Start is in place at once, and the turn
+			 * (ROT_MS_90) starts next frame: nothing holds it. The
+			 * app stays drawn, still, until the turn's picture is taken
+			 * (rot_apply lets it go), so the turn carries it away. */
+			server->leaving = previous;
+			anim_stop(server, &server->app_angle);
+			anim_stop(server, &server->app_alpha);
+			anim_stop(server, &server->start_t);
+			server->start_back = true;
+			server->start_t = 0.0f;
+			server->app_angle = 0.0f;
+			server->app_alpha = 1.0f;
+		} else if (previous && previous->mapped) {
 			server->leaving = previous;
 			/* closing is the opening played backwards (the owner,
 			 * 2026-11-21): the app swings back the way it came, over
 			 * APP_IN_MS on the time-reversed curve, the launch's gap,
 			 * then the tiles (start_turn, the launch's clock reversed) */
-			animate_rev(server, &server->app_angle, TURN_IN_DEG, APP_IN_MS, 0);
-			animate_rev(server, &server->app_alpha, 0.0f, APP_IN_MS, 0);
-			start_turn(server, false, APP_IN_MS + BACK_GAP_MS);	/* animate() stretches it */
+			/* the window's own swing out over APP_OUT_MS, not the
+			 * arrival's APP_IN_MS (the owner, 2026-11-28: "the app
+			 * close animation when press home is slow ... the window
+			 * closes", in both orientations; the tiles as they were) */
+			animate_rev(server, &server->app_angle, TURN_IN_DEG, APP_OUT_MS, 0);
+			animate_rev(server, &server->app_alpha, 0.0f, APP_OUT_MS, 0);
+			start_turn(server, false, APP_OUT_MS + BACK_GAP_MS);	/* animate() stretches it */
 			home_flip_arm(server, previous,
-				APP_IN_MS + BACK_GAP_MS + (uint32_t)server->return_ms);
+				APP_OUT_MS + BACK_GAP_MS + (uint32_t)server->return_ms);
 		} else {
 			/* it closed by itself: a moment of black, then Start */
 			server->leaving = NULL;
@@ -10875,6 +10904,7 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 		}
 		cf_rebuild(server, false);	/* (landscape: the cover-flow as Start comes back) */
 		lf_end(server);		/* (a launch flip given up: Start is back) */
+		server->ts_on = false;	/* (and a turn's splash) */
 		return;
 	}
 	wlr_log(WLR_INFO, "showing app '%s'", app_name(toplevel));
@@ -10929,6 +10959,15 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 		server->app_alpha = 0.0f;
 		animate(server, &server->app_angle, 0.0f, APP_IN_MS, delay, false);
 		animate(server, &server->app_alpha, 1.0f, APP_IN_MS, delay, false);
+	}
+	if (server->ts_on) {
+		/* (behind the turn's splash: in place, no arrival of its own) */
+		anim_stop(server, &server->app_angle);
+		server->app_angle = 0.0f;
+		if (!toplevel->awaiting) {
+			anim_stop(server, &server->app_alpha);
+			server->app_alpha = 1.0f;
+		}
 	}
 	toplevel->introduced = true;
 	if (!toplevel->awaiting) {
@@ -11129,8 +11168,14 @@ static void launch(struct zt_server *server, const char *command) {
 		damage(server);
 		return;	/* (Waydroid not ready: said on the banner, see "Waydroid in the background") */
 	}
+	/* an upright-only app from landscape on a turned panel: the screen
+	 * turns upright at once (rot_target, urgent) */
+	bool upright = g_panel_turn && start_land(server) && !server->lf_on && !command_turns(command);
 	launch_core(server, command);
-	if (!launch_flips(server, command) || !(server->shown || server->pending_command[0])) {
+	if (upright && server->shown && app_turns(server->shown)) {
+		upright = false;
+	}
+	if ((!upright && !launch_flips(server, command)) || !(server->shown || server->pending_command[0])) {
 		return;
 	}
 	if (kind < 0) {
@@ -11172,6 +11217,10 @@ static void launch(struct zt_server *server, const char *command) {
 			snprintf(icon, sizeof(icon), "@%s", server->items[j].key);
 			label = server->items[j].name;
 		}
+	}
+	if (upright) {
+		ts_begin(server, color, icon, label);
+		return;
 	}
 	lf_begin(server, kind, index, src[0], src[1], src[2], src[3], color, icon, label, server->shown);
 }
@@ -11232,6 +11281,7 @@ static int launch_timed_out(void *data) {
 	if (!server->shown) {
 		wlr_log(WLR_INFO, "launch: no window, back to Start");
 		lf_end(server);
+		server->ts_on = false;
 		start_turn(server, false, 0);
 		/* (Android may have been kept awake for a window: waydroid_rewake) */
 		waydroid_power_request(demoloop_active() ? "active" : "idle");
@@ -20672,6 +20722,10 @@ static void rot_apply(struct zt_server *server, int to, bool turn) {
 	server->rot_h0 = (float)area_h(server);
 	server->orient = to;
 	server->rot_phase = turn ? ROT_FREEZE : ROT_IDLE;
+	if (g_panel_turn && !server->shown && server->leaving && !animating(server, &server->app_alpha)) {
+		server->leaving = NULL;	/* (an upright app gone home: in the turn's picture now) */
+		server->app_alpha = 0.0f;
+	}
 	server->rot_t = 0.0f;
 	double relayout0 = ftrace_clock();
 	rot_relayout(server);
@@ -20746,8 +20800,17 @@ static void rot_step(struct zt_server *server) {
 			now_ms() - rot_wait_since);
 	}
 	rot_wait_since = 0;
-	bool covered = !server->screen_on || (server->locked && server->lock_y >= -0.5f) ||
+	/* (on a turned panel, a tablet, the lock turns with the rest: not
+	 * covered by it; and the orientation found as the shell starts is
+	 * turned to, not jumped to, once the boot splash is gone: the owner,
+	 * 2026-11-28, "check the orientation when the shell is booting up, and
+	 * smoothly switch the modes from portrait to landscape") */
+	bool covered = !server->screen_on || (!g_panel_turn && server->locked && server->lock_y >= -0.5f) ||
 		server->splash || server->sensorhub_fail_screen;
+	if (g_panel_turn && !covered && server->rot_instant) {
+		wlr_log(WLR_INFO, "rotation: `instant` not taken on a turned panel: it turns");
+		server->rot_instant = false;
+	}
 	if (server->rot_instant && !covered) {
 		/* The sensor's `instant` (its first decision after it was switched
 		 * on or the screen came on) can come long after, the phone picked up
@@ -21249,6 +21312,7 @@ static void lf_begin(struct zt_server *server, int kind, int index, float x, flo
 	bool drawn = lf_ready(server, live);
 	server->lf_splash = drawn ? 0.0f : 1.0f;	/* (the stand-in: the window's picture, or the splash) */
 	server->lf_hold_ms = 0;
+	server->lf_cold = !drawn && !(live && live->mapped);
 	anim_stop(server, &server->lf_splash);
 	if (!drawn && icon) {
 		/* the splash's icon, white, made now (not per frame) */
@@ -21293,6 +21357,102 @@ static void lf_end(struct zt_server *server) {
 static int lf_timer_fired(void *data) {
 	damage(data);	/* (lf_step looks at the hold again) */
 	return 0;
+}
+
+/* ---- an upright app from landscape: its splash through the turn -----------
+ *
+ * On a turned panel (the tablet) an app that is only laid out upright,
+ * opened from landscape Start, turns the screen upright at once. The turn
+ * used to run under the portrait turnstile, the app appearing half way
+ * round (the owner, 2026-11-28: "it should not rush the rotation, until the
+ * rotation finishes it should show the icon splash then fade into the
+ * application"). Now the new layout under the turning picture of Start is
+ * the app's splash (its tile's colour, its icon), the turn at its own speed
+ * (ROT_MS_90); once it is over and the app has drawn, the splash fades into
+ * it (LAUNCH_XFADE_MS). A window that has not drawn LAUNCH_HOLD_MS after
+ * the turn is shown as it is. */
+static void ts_begin(struct zt_server *server, uint32_t color, const char *icon, const char *label) {
+	server->ts_on = true;
+	server->ts_color = color;
+	server->ts_hold_ms = 0;
+	anim_stop(server, &server->ts_alpha);
+	server->ts_alpha = 1.0f;
+	if (icon) {
+		cairo_t *cr;
+		struct zt_buffer *buffer = zt_buffer_create(server, LAUNCH_ICON_PT, LAUNCH_ICON_PT, &cr);
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		draw_glyph(server, cr, icon, label ? label : "", LAUNCH_ICON_PT / 2.0, LAUNCH_ICON_PT / 2.0,
+			LAUNCH_ICON_PT * 0.8);
+		zt_buffer_show(server, &server->lf_icon, buffer, cr, LAUNCH_ICON_PT, LAUNCH_ICON_PT);
+	}
+	wlr_log(WLR_INFO, "launch: upright app from landscape: its splash through the turn");
+	damage(server);
+}
+
+static void ts_step(struct zt_server *server) {
+	if (!server->ts_on || animating(server, &server->ts_alpha)) {
+		return;
+	}
+	if (server->ts_alpha <= 0.003f) {
+		server->ts_on = false;
+		wlr_log(WLR_INFO, "launch: turned, splash faded into '%s'", server->shown ? app_name(server->shown) : "?");
+		damage(server);
+		return;
+	}
+	if (server->rot_phase != ROT_IDLE || server->orient % 180 != 0) {
+		return;	/* still turning: the splash stays */
+	}
+	struct zt_toplevel *app = server->shown;
+	if (!app && !server->pending_command[0]) {
+		server->ts_on = false;	/* (nothing coming) */
+		return;
+	}
+	bool window = app && !server->pending_command[0] && app->mapped && app->commit_ms && !app->awaiting;
+	if (!window || app->rot_pending) {
+		uint32_t now = now_ms();
+		if (!server->ts_hold_ms) {
+			server->ts_hold_ms = now | 1;
+			if (!server->lf_timer) {
+				server->lf_timer = wl_event_loop_add_timer(server->loop, lf_timer_fired, server);
+			}
+			if (server->lf_timer) {
+				wl_event_source_timer_update(server->lf_timer, LAUNCH_HOLD_MS + 20);
+			}
+		}
+		if (!window || now - server->ts_hold_ms < LAUNCH_HOLD_MS) {
+			return;
+		}
+	}
+	animate(server, &server->ts_alpha, 0.0f, LAUNCH_XFADE_MS, 0, false);
+}
+
+/* in the view frame, over the app: only once laid out upright (the frame
+ * copied for the turn is Start's) */
+static void ts_draw(struct zt_server *server) {
+	if (!server->ts_on || server->orient % 180 != 0 || server->rot_phase == ROT_SNAP) {
+		return;
+	}
+	float a = server->ts_alpha, bw = (float)area_w(server), bh = (float)area_h(server), m[16];
+	mat_identity(m);
+	mat_translate(m, (float)area_x(server), (float)area_y(server) - server->app_lift);
+	float pre[16];
+	memcpy(pre, m, sizeof(pre));
+	mat_scale(m, bw, bh);
+	float tint[3] = { server->tint[0], server->tint[1], server->tint[2] };
+	uint32_t c = server->ts_color;
+	server->tint[0] = tint[0] * ((c >> 16) & 0xff) / 255.0f;
+	server->tint[1] = tint[1] * ((c >> 8) & 0xff) / 255.0f;
+	server->tint[2] = tint[2] * (c & 0xff) / 255.0f;
+	quad(server, GL_TEXTURE_2D, server->white_tex, m, a, false, false, 1.0f, 1.0f);
+	memcpy(server->tint, tint, sizeof(tint));
+	struct zt_layer *l = &server->lf_icon;
+	if (l->tex && l->tw && l->th) {
+		float is = fminf(bw, bh) * LAUNCH_ICON;
+		memcpy(m, pre, sizeof(m));
+		mat_translate(m, bw / 2 - is / 2, bh / 2 - is / 2);
+		mat_scale(m, is, is);
+		quad(server, GL_TEXTURE_2D, l->tex, m, a, true, false, (float)l->pw / l->tw, (float)l->ph / l->th);
+	}
 }
 
 /* At the start of a frame: the flip over, its stand-in (the splash, or the
@@ -21342,6 +21502,16 @@ static void lf_draw(struct zt_server *server, struct zt_toplevel *app, struct ap
 	float e = lf_e(server);
 	bool ready = lf_ready(server, app);
 	bool window = app && app->mapped && app->commit_ms && !app->awaiting;
+	/* A cold start turns over to its splash and keeps it to the end of
+	 * the turn, however early its window comes: only then is the splash
+	 * cross-faded into it (lf_step). Its first frame used to replace the
+	 * splash mid-turn, and the box's end jump to the window's place (the
+	 * owner, 2026-11-28: "it should not rush the rotation, until the
+	 * rotation finishes it should show the icon splash then fade into
+	 * the application"). */
+	if (server->lf_cold && animating(server, &server->lf_t)) {
+		ready = window = false;
+	}
 	/* where it ends: the window's place once it is drawn at its size, else
 	 * the apps' area (never a mis-sized window's shape) */
 	float x1 = (float)area_x(server), y1 = (float)area_y(server) - server->app_lift;
@@ -21439,7 +21609,7 @@ static void lf_draw(struct zt_server *server, struct zt_toplevel *app, struct ap
 			wlr_xdg_surface_for_each_surface(app->xdg_toplevel->base, draw_app_surface, &d);
 		}
 		float splash = live ? server->lf_splash : 1.0f;
-		struct zt_toplevel *pic = window ? app : server->lf_card && server->lf_card->mapped &&
+		struct zt_toplevel *pic = server->lf_cold ? NULL : window ? app : server->lf_card && server->lf_card->mapped &&
 			server->lf_card->commit_ms ? server->lf_card : NULL;
 		if (splash > 0.003f && pic) {
 			/* the stand-in: the window's own picture, of the box's shape
@@ -21625,6 +21795,7 @@ static void render_frame(struct zt_server *server) {
 	running = running || server->boot_logo_stage != 0;
 	rot_step(server);	/* the turn: on its way, finished, or due (see "the turn") */
 	lf_step(server);	/* a landscape launch flip: over, cross-faded, done */
+	ts_step(server);	/* an upright app from landscape: its splash, once turned, faded */
 	if (start_land(server) && !server->shown && server->start_t < 0.001f && !server->cf_rail &&
 			server->cf_n > 0 && server->split_t > 0.999f && !server->cf_moving &&
 			!animating(server, &server->cf_x) && server->rot_phase == ROT_IDLE) {
@@ -22373,6 +22544,7 @@ static void render_frame(struct zt_server *server) {
 		wlr_xdg_surface_for_each_surface(app->xdg_toplevel->base, draw_app_surface, &draw);
 		server->quad_reveal = 1.0f;
 	}
+	ts_draw(server);
 	draw_loading(server);
 
 	if (server->hyper_t > 0.003f && server->hyper_layer.tex) {
