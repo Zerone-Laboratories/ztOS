@@ -1,0 +1,55 @@
+# ztOSIAL manifest: Fujitsu ARROWS Tab (DMI product FARQ11001, family
+# ARROWS-JC), a Skylake-U tablet. Everything is mainline Linux: generic
+# backends with this tablet's nodes; no modem, telephony, haptics or LEDs.
+
+[device]
+codename = "fujitsu-arrows-tab"
+name = "Fujitsu ARROWS Tab"
+form_factor = "tablet"
+arch = "x86_64"
+scale = 1.5
+
+[gsi]
+min = "0.2.0"
+
+[ial.Power1]
+backend = "generic"
+battery = "/sys/class/power_supply/CMB1"
+charger = "/sys/class/power_supply/AC"
+current_sign = 1
+
+[ial.Display1]
+backend = "generic"
+node = "/sys/class/backlight/intel_backlight"
+
+[ial.Perf1]
+backend = "generic"
+# a PC's cores: none is ever taken offline, the kernel's own idle states
+hotplug = false
+keep_online = [0, 1, 2, 3]
+thermal_unit = "millicelsius"
+
+[ial.Sleep1]
+backend = "generic"
+
+# the Integrated Sensor Hub's accelerometer (hid-sensor-accel-3d, IIO);
+# the shell turns through iio-sensor-proxy (zrn-iio-orient)
+[ial.Sensors1]
+backend = "generic"
+
+[ial.Haptics1]
+backend = "none"
+
+[ial.Lights1]
+backend = "none"
+
+[ial.Modem1]
+backend = "none"
+
+[ial.CallAudio1]
+backend = "none"
+
+[android]
+binder = "binderfs"
+gralloc = "gbm"
+memory_budget_mb = 1024

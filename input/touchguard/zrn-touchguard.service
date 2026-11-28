@@ -1,0 +1,11 @@
+[Unit]
+Description=zrn-touchguard: filter ghost touches from the touchscreen
+After=systemd-udevd.service
+
+[Service]
+ExecStart=@BINDIR@/zrn-touchguard
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -21,4 +21,12 @@ if [ ! -f "$HOME/.config/ztos/welcomed" ] && [ -x "$welcome" ]; then
 	(sleep 5; [ -p "$runtime/ztmetro.ctl" ] && printf 'launch %s\n' "$welcome" > "$runtime/ztmetro.ctl") &
 fi
 
+# A tablet's accelerometer (iio-sensor-proxy) for the turn, where the phone's
+# ztoscsf-sensord is not there (zrn-iio-orient: devices that ship it); it
+# waits for the shell's control pipe itself.
+if [ ! -e /run/ztoscsf-sensord.ctl ] && command -v zrn-iio-orient >/dev/null 2>&1; then
+	pkill -x zrn-iio-orient 2>/dev/null; pkill -x monitor-sensor 2>/dev/null
+	setsid zrn-iio-orient </dev/null >/dev/null 2>&1 &
+fi
+
 exec /usr/local/bin/ztmetro > "$log" 2>&1

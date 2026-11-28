@@ -1651,10 +1651,10 @@ static __attribute__((unused)) void scissor_view(struct zt_server *server, int x
 	struct wlr_output *o = server->output->wlr_output;
 	switch (server->orient) {
 	case 90:	/* view x runs down the glass, view y from its right edge */
-		glScissor(o->width - (y + h), x, h, w);
+		glScissor(OUT_W(o) - (y + h), x, h, w);
 		break;
 	case 270:	/* view x runs up the glass, view y from its left edge */
-		glScissor(y, o->height - (x + w), h, w);
+		glScissor(y, OUT_H(o) - (x + w), h, w);
 		break;
 	default:
 		glScissor(x, y, w, h);
@@ -20718,8 +20718,8 @@ static void scissor_view_box(struct zt_server *server, float x0, float x1, float
 	d = d < c ? c : d > vh ? vh : d;
 	int r[4];	/* on the glass: x, y (row 0 the top), w, h */
 	switch (server->orient) {
-	case 90: r[0] = o->width - d; r[1] = a; r[2] = d - c; r[3] = b - a; break;
-	case 270: r[0] = c; r[1] = o->height - b; r[2] = d - c; r[3] = b - a; break;
+	case 90: r[0] = OUT_W(o) - d; r[1] = a; r[2] = d - c; r[3] = b - a; break;
+	case 270: r[0] = c; r[1] = OUT_H(o) - b; r[2] = d - c; r[3] = b - a; break;
 	default: r[0] = a; r[1] = c; r[2] = b - a; r[3] = d - c; break;
 	}
 	if (base && base->on) {

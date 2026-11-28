@@ -558,6 +558,17 @@ static void hub_release(void)
 static void sensorhub_look(void)
 {
 	static bool dialog_shown = false;
+	/* only a device whose components name the sensor hub has one (a PC,
+	 * a tablet: no Samsung hub, nothing to warn about) */
+	static int has_hub = -1;
+	if (has_hub < 0) {
+		has_hub = 0;
+		for (int i = 0; i < n_parts; i++)
+			if (!strcmp(parts[i].id, "ztoscsf-sensorhub.service"))
+				has_hub = 1;
+	}
+	if (!has_hub)
+		return;
 	if (access("/run/ztoscsf-sensorhub.stopped", F_OK) == 0 ||
 	    access("/run/sensorhub.stopped", F_OK) == 0) {
 		return;

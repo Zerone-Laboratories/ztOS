@@ -1,0 +1,9 @@
+[Unit]
+Description=ztOS trial boot watch (four minutes after start)
+
+[Timer]
+OnBootSec=4min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

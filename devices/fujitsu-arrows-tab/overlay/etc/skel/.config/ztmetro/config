@@ -1,0 +1,7 @@
+# ztMETRO on the Fujitsu ARROWS Tab: a landscape panel laid on its side
+# (panel_turn auto), turned by the accelerometer
+rotation = on
+panel_turn = auto
+display_size = compact
+brightness = 50
+theme = dark

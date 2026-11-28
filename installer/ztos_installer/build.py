@@ -23,8 +23,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]          # the repository
 OS = ROOT / "os"
 WORK = ROOT / "build" / "ztos"
-TARBALL = ROOT / "build" / "alarm.tar.gz"
-TARBALL_URL = "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
+# The base system each architecture starts from: Arch Linux ARM's root
+# tarball for the phones, Arch Linux's bootstrap tarball for PCs (its files
+# sit under root.x86_64/).
+TARBALLS = {
+    "aarch64": (ROOT / "build" / "alarm.tar.gz",
+                "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"),
+    "x86_64": (ROOT / "build" / "archlinux-bootstrap-x86_64.tar.zst",
+               "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst"),
+}
+TARBALL, TARBALL_URL = TARBALLS["aarch64"]
 SDK = ROOT / "sdk"
 PKGCACHE = ROOT / "build" / "pkg-cache"
 # Arch's edk2-aarch64 package; the Nix development shell exports ZTOS_EDK2
@@ -45,6 +53,16 @@ class Settings:
     timezone: str = "UTC"
     size_gb: int = 10               # the root filesystem
     fresh: bool = False             # start from the tarball again
+    arch: str = ""                  # the GSI's: aarch64 (default) or x86_64; a device's is its own
+
+    @property
+    def machine(self) -> str:
+        """The architecture: a property of the device (ARCHES), aarch64 unless named."""
+        return ARCHES.get(self.target) or self.arch or "aarch64"
+
+    @property
+    def tarball(self) -> Path:
+        return TARBALLS[self.machine][0]
 
     @property
     def dir(self) -> Path:
@@ -61,7 +79,16 @@ def say(*words):
 
 # a target's device layer (devices/<dir>/: manifest, layer.sh, packages.txt);
 # the GSI has none (design/ztOSIAL.md)
-DEVICES = {"starlte": "samsung-starlte", "qemu": "qemu-virt"}
+DEVICES = {"starlte": "samsung-starlte", "qemu": "qemu-virt", "fujitsu-tablet": "fujitsu-arrows-tab"}
+# each device's architecture (aarch64 when not named here)
+ARCHES = {"fujitsu-tablet": "x86_64"}
+# targets whose system is handed over as a tarball of the root (a PC's
+# subvolume) rather than an ext4 image
+TAR_TARGETS = ("gsi", "fujitsu-tablet")
+
+
+def gsi_name(arch: str = "aarch64") -> str:
+    return f"ztos-gsi-{gsi_version()}-{arch}.tar.zst"
 
 
 def gsi_version() -> str:
@@ -83,7 +110,7 @@ def packages(target: str) -> list:
     return names
 
 
-def check_host():
+def check_host(arch: str = "aarch64"):
     """What building needs on this computer."""
     missing = []
     for tool in ("unshare", "newuidmap", "bsdtar", "mkfs.fat", "mcopy", "mmd", "sfdisk", "python3", "xz"):
@@ -91,10 +118,9 @@ def check_host():
             missing.append(tool)
     if not Path("/usr/bin/mke2fs").exists() and not Path("/usr/sbin/mke2fs").exists():
         missing.append("mke2fs (e2fsprogs)")
-    if platform.machine() not in ("aarch64", "arm64") and not Path(
-        "/proc/sys/fs/binfmt_misc/qemu-aarch64"
-    ).exists():
-        missing.append("qemu-user-static + qemu-user-static-binfmt (to run aarch64 programs)")
+    host = {"arm64": "aarch64", "amd64": "x86_64"}.get(platform.machine(), platform.machine())
+    if host != arch and not Path(f"/proc/sys/fs/binfmt_misc/qemu-{arch}").exists():
+        missing.append(f"qemu-user-static + qemu-user-static-binfmt (to run {arch} programs)")
     user = os.environ.get("USER", "")
     subuid = Path("/etc/subuid").read_text() if Path("/etc/subuid").exists() else ""
     if os.geteuid() != 0 and not re.search(rf"^{re.escape(user)}:", subuid, re.M):
@@ -105,18 +131,19 @@ def check_host():
                    "qemu-user-static qemu-user-static-binfmt")
 
 
-def fetch_tarball():
+def fetch_tarball(arch: str = "aarch64"):
+    TARBALL, TARBALL_URL = TARBALLS[arch]
     if TARBALL.exists() and TARBALL.stat().st_size > 100_000_000:
         return
-    say(f"downloading Arch Linux ARM ({TARBALL_URL})")
+    say(f"downloading {'Arch Linux ARM' if arch == 'aarch64' else 'Arch Linux'} ({TARBALL_URL})")
     TARBALL.parent.mkdir(parents=True, exist_ok=True)
     tmp = TARBALL.with_suffix(".part")
     subprocess.run(["curl", "-L", "--fail", "-o", str(tmp), TARBALL_URL], check=True)
     tmp.replace(TARBALL)
 
 
-def build_apps(stage: Path):
-    """Build the selected default system apps for aarch64."""
+def build_apps(stage: Path, arch: str = "aarch64"):
+    """Build the selected default system apps for the system's architecture."""
     out = stage / "apps"
     # A reused staging directory must not keep apps removed from the defaults.
     if out.exists():
@@ -128,7 +155,7 @@ def build_apps(stage: Path):
     for project in projects:
         p = sdk.find_project(str(project))
         python = "%d.%d" % sys.version_info[:2]
-        binary = sdk.build(p, "aarch64", python=python)
+        binary = sdk.build(p, arch, python=python)
         shutil.copy2(binary, out / p.id)
         shutil.copy2(project / p.icon, out / f"{p.id}.svg")
         (out / f"{p.id}.desktop").write_text("\n".join([
@@ -152,9 +179,26 @@ umask 022
 # the rest (no var/lib/pacman): only a mark written after the whole tarball
 # counts as unpacked.
 if [ "$FRESH" = 1 ] || [ ! -e "$R/.ztos-unpacked" ]; then
-	step "unpacking Arch Linux ARM"
 	rm -rf "$R"; mkdir -p "$R"
-	bsdtar -xpf "$TARBALL" -C "$R" --no-xattrs --no-acls --no-fflags
+	if [ "$ARCH" = aarch64 ]; then
+		step "unpacking Arch Linux ARM"
+		bsdtar -xpf "$TARBALL" -C "$R" --no-xattrs --no-acls --no-fflags
+	else
+		step "unpacking Arch Linux ($ARCH)"
+		bsdtar -xpf "$TARBALL" -C "$R" --no-xattrs --no-acls --no-fflags --strip-components 1
+		# the bootstrap tarball has every mirror commented out: this computer's
+		# own (an Arch Linux host's are near it), else a few worldwide ones
+		if [ "$(uname -m)" = "$ARCH" ] && grep -q '^Server' /etc/pacman.d/mirrorlist 2>/dev/null; then
+			grep '^Server' /etc/pacman.d/mirrorlist > "$R/etc/pacman.d/mirrorlist"
+		else
+		printf 'Server = %s/$repo/os/$arch\n' https://geo.mirror.pkgbuild.com https://mirror.rackspace.com/archlinux \
+			https://mirrors.kernel.org/archlinux https://mirror.pkgbuild.com > "$R/etc/pacman.d/mirrorlist"
+		fi
+		# a slow mirror is waited for, not dropped half way through a signature
+		sed -i 's/^#\?DisableDownloadTimeout/DisableDownloadTimeout/' "$R/etc/pacman.conf"
+		grep -q '^DisableDownloadTimeout' "$R/etc/pacman.conf" || sed -i '/^\[options\]/a DisableDownloadTimeout' "$R/etc/pacman.conf"
+		sed -i 's/^#\?ParallelDownloads.*/ParallelDownloads = 5/' "$R/etc/pacman.conf"
+	fi
 	touch "$R/.ztos-unpacked"
 fi
 
@@ -174,7 +218,8 @@ if [ "$TARGET" = starlte ]; then
 fi
 
 step "setting up package signing keys"
-ch sh -c 'pacman-key --init && pacman-key --populate archlinuxarm' > /dev/null
+KEYRING=archlinuxarm; [ "$ARCH" = aarch64 ] || KEYRING=archlinux
+ch sh -c "pacman-key --init && pacman-key --populate $KEYRING" > /dev/null
 
 step "updating the base system"
 ch $P -Syu
@@ -187,7 +232,9 @@ ATL_PACKAGES="$SRC/prebuilts/ztOSAndroidRuntimeV1/packages"
 if [ ! -f "$ATL_PACKAGES/SHA256SUMS" ]; then
     ATL_PACKAGES="$SRC/build/atl/packages"
 fi
-if [ -f "$ATL_PACKAGES/SHA256SUMS" ]; then
+if [ "$ARCH" != aarch64 ]; then
+    echo "ztOSAndroidRuntimeV1 is ARM64 only: none on $ARCH (Waydroid is the Android runtime here)"
+elif [ -f "$ATL_PACKAGES/SHA256SUMS" ]; then
     step "installing ztOSAndroidRuntimeV1 (prebuilt ARM64 runtime)"
     mkdir -p "$R/var/tmp/ztos-atl-packages"
     cp -a "$ATL_PACKAGES/." "$R/var/tmp/ztos-atl-packages/"
@@ -351,6 +398,10 @@ done
 for u in $DEVICE_UNITS; do
 	ch systemctl enable "$u" > /dev/null 2>&1 || echo "(no $u)"
 done
+# the GSI's services a device has no use for (a PC has no S9 clocks)
+for u in ${DEVICE_OFF:-}; do
+	ch systemctl disable "$u" > /dev/null 2>&1 || true
+done
 
 step "tidying up"
 rm -f "$R/etc/resolv.conf"; ln -sf /run/systemd/resolve/stub-resolv.conf "$R/etc/resolv.conf"
@@ -359,13 +410,19 @@ install -d "$R/etc/ztos"
 echo ztos > "$R/etc/ztos/built"
 date -u +%Y-%m-%dT%H:%MZ >> "$R/etc/ztos/built"
 
-if [ "$TARGET" = gsi ]; then
-	# the kernel and its modules are each phone's (its device layer): not the GSI's
-	if ch pacman -Qq linux-aarch64 > /dev/null 2>&1; then
-		ch pacman --noconfirm -Rdd linux-aarch64 > /dev/null
+if [ "$OUTPUT" = tar ]; then
+	if [ "$TARGET" = gsi ]; then
+		# the kernel and its modules are each phone's (its device layer): not the GSI's
+		for k in linux-aarch64 linux; do
+			if ch pacman -Qq $k > /dev/null 2>&1; then
+				ch pacman --noconfirm -Rdd $k > /dev/null
+			fi
+		done
+		rm -f "$R/etc/ztos/user.conf"
+		step "packing the GSI"
+	else
+		step "packing the system (a tarball of its root)"
 	fi
-	rm -f "$R/etc/ztos/user.conf"
-	step "packing the GSI"
 	umount -l "$R/var/cache/pacman/pkg" 2>/dev/null || true
 	umount -l "$R/tmp" "$R/proc" 2>/dev/null || true
 	umount -lR "$R/dev" 2>/dev/null || true
@@ -396,11 +453,12 @@ def run_stage(s: Settings, log: Path) -> None:
     """The system, built in the namespace; its steps shown as they go."""
     s.dir.mkdir(parents=True, exist_ok=True)
     stage_dir = s.dir / "stage"
-    build_apps(stage_dir)
+    build_apps(stage_dir, s.machine)
     mke2fs = "/usr/bin/mke2fs" if Path("/usr/bin/mke2fs").exists() else "/usr/sbin/mke2fs"
     env = {
-        "ROOTFS": str(s.dir / "root"), "TARBALL": str(TARBALL), "SRC": str(ROOT), "STAGEDIR": str(stage_dir),
-        "TARGET": s.target, "PACKAGES": " ".join(packages(s.target)), "USERNAME": s.user,
+        "ROOTFS": str(s.dir / "root"), "SRC": str(ROOT), "STAGEDIR": str(stage_dir),
+        "TARGET": s.target, "ARCH": s.machine, "TARBALL": str(s.tarball),
+        "OUTPUT": "tar" if s.target in TAR_TARGETS else "ext4", "PACKAGES": " ".join(packages(s.target)), "USERNAME": s.user,
         "PASSWORD": s.password, "HOSTNAME": s.hostname, "TIMEZONE": s.timezone, "FRESH": "1" if s.fresh else "0",
         "ROOTIMG": str(s.dir / "root.img"), "SIZE": str(s.size_gb), "MKE2FS": mke2fs,
         "LABEL": "ZR_ARCH" if s.target == "starlte" else "ztos-root",
@@ -410,7 +468,7 @@ def run_stage(s: Settings, log: Path) -> None:
         # checkout of the device's own repository (ZTOS_DEVICE=<path>)
         "DEVSRC": os.environ.get("ZTOS_DEVICE") or str(ROOT / "devices" / DEVICES.get(s.target, "none")),
         "DEVROOT": os.environ.get("ZTOS_DEVICE") or str(ROOT),
-        "GSITAR": str(s.dir / f"ztos-gsi-{gsi_version()}-aarch64.tar.zst"),
+        "GSITAR": str(output(s)),
         "PATH": os.environ.get("PATH", "/usr/bin"),
     }
     script = s.dir / "stage.sh"
@@ -522,22 +580,33 @@ def make_qemu_disk(s: Settings) -> Path:
     return disk
 
 
+def output(s: Settings) -> Path:
+    """What a build leaves: the GSI or a PC's root as a tarball, else root.img."""
+    if s.target == "gsi":
+        return s.dir / gsi_name(s.machine)
+    if s.target in TAR_TARGETS:
+        return s.dir / f"ztos-{s.target}-{gsi_version()}-{s.machine}.tar.zst"
+    return s.dir / "root.img"
+
+
 def build(s: Settings) -> Path:
-    check_host()
-    fetch_tarball()
+    check_host(s.machine)
+    fetch_tarball(s.machine)
     log = s.dir / "build.log"
-    rootimg = s.dir / ("ztos-gsi-%s-aarch64.tar.zst" % gsi_version() if s.target == "gsi" else "root.img")
+    rootimg = output(s)
     if rootimg.exists() and not s.fresh:
         say(f"using existing system image: {rootimg}")
     else:
         say(f"building ztOS for {s.target} (log: {log})")
         run_stage(s, log)
-    if s.target == "gsi":
-        tarball = s.dir / f"ztos-gsi-{gsi_version()}-aarch64.tar.zst"
+    if s.target in TAR_TARGETS:
+        tarball = rootimg
         digest = subprocess.run(["sha256sum", tarball.name], cwd=s.dir, check=True,
                                 capture_output=True, text=True).stdout
         (s.dir / (tarball.name + ".sha256")).write_text(digest)
-        say(f"ready: {tarball} ({tarball.stat().st_size // (1024 ** 2)} MB), the GSI for ztConflo (--gsi)")
+        say(f"ready: {tarball} ({tarball.stat().st_size // (1024 ** 2)} MB)" +
+            (", the GSI for ztConflo (--gsi)" if s.target == "gsi" else
+             ": installer/ztos install --target fujitsu-tablet puts it in a btrfs subvolume"))
         return tarball
     if s.target == "qemu":
         disk = make_qemu_disk(s)
